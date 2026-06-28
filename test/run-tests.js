@@ -174,6 +174,25 @@ test("alignTranslations 无行号且行数不足 → 缺的留原文", () => {
   assert.deepStrictEqual(out, ["甲", "乙", "c"]);
 });
 
+test("alignTranslations 语序自由/措辞改写（长度差异大）仍按行号就位（P0-b）", () => {
+  // 放宽语序后模型会为自然度大幅改写、调整行内语序，译文长度与原文差异很大；
+  // 只要行号顺序正确、行数一致，对齐结果仍每行精确就位（不破坏时间轴对齐）。
+  const originals = [
+    "so the thing about transformers",
+    "is that they use attention",
+    "to look at the whole sequence at once",
+  ];
+  const model =
+    "1. 关于 Transformer 这个东西呢\n" +
+    "2. 它的精髓在于用上了注意力机制\n" +
+    "3. 一次性地纵观整个序列，而不是逐个去看";
+  const out = Core.alignTranslations(originals, model);
+  assert.strictEqual(out.length, 3, "行数与输入一致");
+  assert.strictEqual(out[0], "关于 Transformer 这个东西呢");
+  assert.strictEqual(out[1], "它的精髓在于用上了注意力机制");
+  assert.strictEqual(out[2], "一次性地纵观整个序列，而不是逐个去看");
+});
+
 /* ============ 4. clip 切分 ============ */
 console.log("\n[clip 切分]");
 
@@ -279,6 +298,53 @@ test("resegment minWords：短句后接大间隙 → 无法合并，碎句单独
   assert.strictEqual(seg.length, 2, "大间隙阻断黏合，碎句单独成段");
   assert.strictEqual(seg[0].content, "ok.");
   assert.strictEqual(seg[1].content, "much later text.");
+});
+
+test("resegment 长停顿切句（P1-b）：无标点但中间 800ms 长停顿 → 在停顿处切成两段", () => {
+  // 两组无标点的连续语流，组内小间隙(<700ms)合并，组间 800ms(>=longPauseMs) 长停顿处切开。
+  const frags = Core.cleanupCues([
+    { start: 0, end: 600, content: "so we open the box" },
+    { start: 650, end: 1200, content: "and take a look inside" }, // 与上间隙 50ms → 合并
+    { start: 2000, end: 2600, content: "then we close it again" }, // 与上间隙 800ms → 切
+    { start: 2650, end: 3200, content: "and walk away slowly" }, // 间隙 50ms → 合并
+  ]);
+  const seg = Core.resegmentCues(frags, { longPauseMs: 700 });
+  assert.strictEqual(seg.length, 2, "长停顿处应切成两段");
+  assert.strictEqual(seg[0].content, "so we open the box and take a look inside");
+  assert.strictEqual(seg[0].start, 0);
+  assert.strictEqual(seg[0].end, 1200, "第一段时间轴取并集");
+  assert.strictEqual(seg[1].content, "then we close it again and walk away slowly");
+  assert.strictEqual(seg[1].start, 2000);
+  assert.strictEqual(seg[1].end, 3200);
+});
+
+test("resegment 无标点无长停顿连续语流 → 到 maxWords(16) 才切", () => {
+  // 20 词、全程小间隙(50ms<700ms)、无标点 → 既不长停顿也不到句末，靠 maxWords=16 切。
+  const frags = [];
+  for (var i = 0; i < 20; i++) {
+    frags.push({ start: i * 100, end: i * 100 + 80, content: "w" + i });
+  }
+  const seg = Core.resegmentCues(Core.cleanupCues(frags), {
+    maxWords: 16,
+    longPauseMs: 700,
+    maxDurationMs: 60000, // 排除时长触发，单测 maxWords 边界
+  });
+  // 第一段应恰好在第 16 词处切（防超长），剩余 4 词成第二段
+  assert.strictEqual(seg.length, 2, "应被 maxWords=16 切成两段");
+  assert.strictEqual(seg[0].content.split(" ").length, 16, "首段恰好 16 词");
+  assert.strictEqual(seg[1].content.split(" ").length, 4, "余 4 词成第二段");
+});
+
+test("resegment 长停顿优先于碎句黏合（短句遇长停顿不黏合）", () => {
+  // "ok" 仅 1 词 (<minWords)，本想黏进下一句；但与下一条间隙 800ms 长停顿 → 不黏合，各自成段。
+  const frags = Core.cleanupCues([
+    { start: 0, end: 500, content: "ok" },
+    { start: 1300, end: 2000, content: "let us begin now" }, // 间隙 800ms >= longPauseMs
+  ]);
+  const seg = Core.resegmentCues(frags, { longPauseMs: 700, minWords: 3 });
+  assert.strictEqual(seg.length, 2, "长停顿优先于黏合，碎句单独成段");
+  assert.strictEqual(seg[0].content, "ok");
+  assert.strictEqual(seg[1].content, "let us begin now");
 });
 
 /* ============ 5c. sliceClipsByCue：按 cue 边界切 ============ */
@@ -486,16 +552,30 @@ test("importConfig 坏 JSON / 空对象报错", () => {
   assert.strictEqual(Core.importConfig("{}").ok, false, "无可识别字段应失败");
 });
 
-/* ============ 5j. 瘦身后的 system prompt ============ */
-console.log("\n[system prompt 瘦身校验]");
+/* ============ 5j. 升级后的 system prompt（P0-a：加料换质量）============ */
+console.log("\n[system prompt 升级校验]");
 
-test("DEFAULT_SYSTEM_PROMPT 已瘦身（填充后 < 254 字符，约砍半）", () => {
+test("DEFAULT_SYSTEM_PROMPT 升级：覆盖口语/连贯/语序自由/术语 + 保留硬约束", () => {
   const filled = Core.buildSystemPrompt("zh-Hans");
-  assert.ok(filled.length < 254, "填充后应 < 254 字符，实际 " + filled.length);
-  // 仍含三条硬约束的关键词
-  assert.ok(/numbered/i.test(filled), "应保留行号约束");
-  assert.ok(/context/i.test(filled), "应保留结合上下文");
+  // 有意加回固定开销换质量：比瘦身版长很多（推翻 509→3 句的省 token 决策）
+  assert.ok(filled.length > 400, "升级后应是有料的长 prompt，实际 " + filled.length);
+  // 质量引导关键词
+  assert.ok(/natural|fluent|colloquial/i.test(filled), "应含口语/自然引导");
+  assert.ok(/context/i.test(filled), "应含结合上下文");
+  assert.ok(/reorder|rephrase/i.test(filled), "应含行内语序自由");
+  assert.ok(/proper noun|term/i.test(filled), "应含术语/专名约束");
+  // 硬约束（不能破坏逐行对齐）
+  assert.ok(/line number/i.test(filled), "应保留行号硬约束");
+  assert.ok(/same number|identical/i.test(filled), "应要求行号/行数一致");
+  assert.ok(/only/i.test(filled), "应要求只输出译文");
+  // 目标语言占位符被替换
   assert.ok(/zh-Hans/.test(filled), "应替换目标语言");
+  assert.ok(!/\{TARGET_LANG\}/.test(filled), "占位符应被全部替换");
+});
+
+test("自定义 systemPrompt 仍覆盖默认（现有逻辑不变）", () => {
+  const custom = Core.buildSystemPrompt("ja", "MY CUSTOM {TARGET_LANG} PROMPT");
+  assert.strictEqual(custom, "MY CUSTOM ja PROMPT", "非空自定义应覆盖默认并替换占位符");
 });
 
 /* ============ 5f. normalizeColor ============ */
@@ -514,6 +594,7 @@ test("DEFAULT_CONFIG 含关键字段且颜色非空", () => {
   assert.ok(d && typeof d === "object");
   assert.ok(/^#/.test(d.fontColor) && /^#/.test(d.transColor), "默认颜色非空");
   assert.ok(d.clipSeconds > 0 && d.batchLines > 0);
+  assert.strictEqual(d.contextLines, 3, "新增 contextLines 默认 3（每批带前 3 条原文作上下文）");
   assert.strictEqual(typeof d.showLoading, "boolean", "新增 showLoading 加载态开关");
   assert.ok(d.batchLines >= 12 && d.batchLines <= 15, "batchLines 默认在 12–15（瘦身后调优）");
   // v4 新增显示字段
@@ -947,6 +1028,89 @@ async function main() {
       assert.strictEqual(out[i], "Tline" + i, "第 " + i + " 行应正确对齐");
     }
     assert.ok(calls >= 3, "应分多批（并发）调用");
+  });
+
+  await asyncTest("translateCues contextLines=3：每批带前 3 条原文作上下文，编号区只含本批（P1-a）", async () => {
+    // 18 条 cue，batchSize=6，单并发(顺序)便于稳定断言。非首批应带前 3 条原文作 context。
+    const cues = Array.from({ length: 18 }, (_, i) => ({ content: "src" + i }));
+    const captured = []; // 每次 fetch 的 user message
+    const mockFetch = async (url, opts) => {
+      const body = JSON.parse(opts.body);
+      const userMsg = body.messages[1].content;
+      captured.push(userMsg);
+      const userLines = userMsg.split("\n").filter((l) => /^\d+\.\s/.test(l));
+      const content = userLines
+        .map((l) => {
+          const m = l.match(/^(\d+)\.\s*(.*)$/);
+          return m[1] + ". T" + m[2];
+        })
+        .join("\n");
+      return { ok: true, status: 200, async json() { return { choices: [{ message: { content } }] }; }, async text() { return ""; } };
+    };
+    const out = await Core.translateCues({
+      cues,
+      apiBaseUrl: "https://gw/v1",
+      apiModel: "m",
+      targetLang: "zh-Hans",
+      batchSize: 6,
+      contextLines: 3,
+      concurrency: 1, // 串行：批顺序稳定，便于断言
+      fetchImpl: mockFetch,
+    });
+    // 对齐结果仍每行就位、行数 == 输入数
+    assert.strictEqual(out.length, 18);
+    for (let i = 0; i < 18; i++) assert.strictEqual(out[i], "Tsrc" + i, "第 " + i + " 行对齐");
+
+    // 找到「第二批(start=6)」对应的 user message：它编号区第一行是 "1. src6"
+    const secondBatchMsg = captured.find((m) => /(^|\n)1\. src6(\n|$)/.test(m));
+    assert.ok(secondBatchMsg, "应能定位到第二批的请求");
+    // 含 context 标记 + 前 3 条原文(src3,src4,src5)，且明确"不翻译"
+    assert.ok(/do NOT translate/i.test(secondBatchMsg), "应有不翻译的 context 前缀");
+    assert.ok(/src3[\s\S]*src4[\s\S]*src5/.test(secondBatchMsg), "context 应是前 3 条原文 src3/4/5");
+    // context 行不进编号区：src3/4/5 不应带行号出现在编号块
+    assert.ok(!/\d+\.\s*src3\b/.test(secondBatchMsg), "context 行不计入编号");
+    // 编号区只含本批 6 条（行号 1..6），不多不少 → 对齐契约不被 context 污染
+    const numberedLines = secondBatchMsg.split("\n").filter((l) => /^\d+\.\s/.test(l));
+    assert.strictEqual(numberedLines.length, 6, "编号区行数 == 本批 cue 数(6)，不含 context");
+    assert.ok(/^1\. src6$/.test(numberedLines[0]), "编号区从本批首条开始(1. src6)");
+    assert.ok(/^6\. src11$/.test(numberedLines[5]), "编号区到本批末条(6. src11)");
+
+    // 首批(start=0)不应带 context（前面没有原文可借）
+    const firstBatchMsg = captured.find((m) => /(^|\n)1\. src0(\n|$)/.test(m));
+    assert.ok(firstBatchMsg, "应能定位首批请求");
+    assert.ok(!/do NOT translate/i.test(firstBatchMsg), "clip 首批不带 context");
+  });
+
+  await asyncTest("translateCues contextLines 未配置时退化为旧行为（仅句中断点带 1 句）", async () => {
+    // 不传 contextLines：上一条无句末标点 → 带 1 句；clip 首批不带。
+    const cues = [
+      { content: "this sentence keeps going" }, // 无句末标点
+      { content: "and finishes right here." },
+      { content: "brand new sentence." },
+    ];
+    const captured = [];
+    const mockFetch = async (url, opts) => {
+      const body = JSON.parse(opts.body);
+      captured.push(body.messages[1].content);
+      const userLines = body.messages[1].content.split("\n").filter((l) => /^\d+\.\s/.test(l));
+      const content = userLines.map((l) => l.match(/^(\d+)\./)[1] + ". ok").join("\n");
+      return { ok: true, status: 200, async json() { return { choices: [{ message: { content } }] }; }, async text() { return ""; } };
+    };
+    await Core.translateCues({
+      cues,
+      apiBaseUrl: "https://gw/v1",
+      apiModel: "m",
+      batchSize: 1, // 每条一批，凸显逐批 context 决策
+      concurrency: 1,
+      fetchImpl: mockFetch,
+    });
+    // 第二批(start=1)上一条"this sentence keeps going"无句末标点 → 带 1 句 context
+    const b2 = captured.find((m) => /(^|\n)1\. and finishes right here\.(\n|$)/.test(m));
+    assert.ok(b2 && /do NOT translate/i.test(b2), "句中断点应带 1 句 context");
+    assert.ok(/this sentence keeps going/.test(b2), "带的是上一条原文");
+    // 第三批(start=2)上一条"and finishes right here."有句末标点 → 不带 context
+    const b3 = captured.find((m) => /(^|\n)1\. brand new sentence\.(\n|$)/.test(m));
+    assert.ok(b3 && !/do NOT translate/i.test(b3), "自然句首不带 context");
   });
 
   await asyncTest("translateCues 首句优先批最先返回（onProgress 首回调含优先区）", async () => {

@@ -370,6 +370,7 @@
         targetLang: config.targetLang,
         systemPrompt: config.systemPrompt,
         batchSize: config.batchLines > 0 ? config.batchLines : 14,
+        contextLines: config.contextLines != null ? config.contextLines : 3,
         priorityIndex: priorityIndex != null ? priorityIndex : 0,
         concurrency: 3,
         gate: ensureGate(), // 全局并发上限：所有 clip 共享，避免滑动窗口预取冲垮网关

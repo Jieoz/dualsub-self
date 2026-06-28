@@ -187,10 +187,13 @@
 
   function resegmentCues(cues, opts) {
     opts = opts || {};
-    var maxGap = opts.maxGapMs != null ? opts.maxGapMs : 300; // 小于此间隙视为同句延续
     var maxDur = opts.maxDurationMs != null ? opts.maxDurationMs : 6000; // 单句最长时长
-    var maxWords = opts.maxWords != null ? opts.maxWords : 12; // 单句最多词数
+    var maxWords = opts.maxWords != null ? opts.maxWords : 16; // 单句最多词数（12→16：12 对中文目标偏短）
     var minWords = opts.minWords != null ? opts.minWords : 3; // 单句最少词数（碎句黏合下限）
+    // 长停顿阈值：明显大于旧 maxGap(300，"同句紧密延续")。ASR 常无标点，单靠 maxWords
+    // 硬切会断在半句；一个超过 longPauseMs 的间隙本身就是自然停顿边界，即使没标点也在此切句。
+    // 间隙 < longPauseMs 视为同一语流可继续合并（含正常换气停顿），>= 即断。
+    var longPauseMs = opts.longPauseMs != null ? opts.longPauseMs : 700;
     var list = (cues || []).filter(function (c) {
       return c && c.content;
     });
@@ -228,25 +231,27 @@
         var wouldWords = cur.words.length + added.length;
         var wouldDur = c.end - cur.start;
         // 可并入下一条：续句(未自然结束) 或 自然结束但太短(< minWords，碎句黏合)；
-        // 两种都仍受「间隙小 + 不超 maxWords/maxDur」约束。这样 "OK." 这种孤立短句
-        // 会优先黏进相邻句，而不是句尾标点一到就立即单独成段。
+        // 两种都仍受「间隙不超 longPauseMs + 不超 maxWords/maxDur」约束。
+        // 长停顿(gap >= longPauseMs)是自然边界，优先于碎句黏合：即使当前段太短/未结束，
+        // 一旦遇到长停顿也不再合并，断在此处（比 maxWords 硬切更自然）。
         var canMerge = !ended || cur.words.length < minWords;
         var mergeable =
-          gap <= maxGap && canMerge && wouldWords <= maxWords && wouldDur <= maxDur;
+          gap < longPauseMs && canMerge && wouldWords <= maxWords && wouldDur <= maxDur;
         if (mergeable) {
           for (var w = 0; w < added.length; w++) cur.words.push(added[w]);
           cur.end = Math.max(cur.end, c.end);
         } else {
-          // 确实无法再合并（间隙过大 / 会超上限）→ 当前段（含太短的碎句）单独成段
+          // 无法再合并（长停顿 / 会超上限）→ 当前段（含太短的碎句）单独成段
           flush();
           cur = { start: c.start, end: c.end, words: words.slice() };
         }
       }
 
-      // 切句时机：
-      //  - 超 maxWords / 超 maxDur → 立即切（防超长段，逻辑不变）。
+      // 切句时机（优先级）：
+      //  - 超 maxWords / 超 maxDur → 立即切（防超长段，不变）。
       //  - 自然结束(句尾标点)但仅当词数已达 minWords 才切；不足 minWords 先不切，
       //    留待与下一条 cue 黏合（minWords 合并优先于句尾立即切）。
+      //  长停顿切句已在上面的合并判定中处理（gap >= longPauseMs 不再并入，自然成段）。
       var curWords = cur.words.length;
       var endedNow = SENTENCE_END_RE.test(cur.words.join(" "));
       if (
@@ -296,6 +301,8 @@
     showLoading: true, // 译文未到时显示轻量"翻译中…"指示（false=只显原文）
     clipSeconds: 30, // 每个翻译 clip 多少秒（按 cue 边界就近切）
     batchLines: 14, // 每批最多多少行（clip 内再分批）。瘦身 prompt 后调高省固定开销
+    contextLines: 3, // 每批携带的「前 N 条原文」作为上下文（不翻译、不计入对齐）。
+    //                  跨批不再孤立翻译：模型可借上下文理解碎片/指代/话题连贯。0=关闭。
     globalConcurrency: 4, // 跨 clip 的全局 in-flight 翻译请求上限（信号量）。滑动窗口预取
     //                       (depth=2)叠加批内并发(3)若不封顶会冲垮网关→429；此值统一封顶。
   };
@@ -423,12 +430,27 @@
    */
 
   // 默认 system prompt（{TARGET_LANG} 会被替换为目标语言）
-  // 已进一步瘦身：相比最初 ~509 字符砍掉一大半固定开销，但保留三条硬约束：
-  //  1) 结合上下文理解碎片语义；2) 每个输入行号一行译文；3) 行号与行数完全一致。
+  // ⚠️ 取舍说明（经 Jay 确认，推翻原来"砍到 509→3 句"的省 token 决策）：
+  //   之前为省 token 把 prompt 砍到只剩 3 句，结果译文翻译腔重、不连贯，明显逊于
+  //   沉浸式翻译/sider 类原版。根因不是模型弱，是策略砍太狠——模型只能逐行硬译。
+  //   这里有意把固定开销加回来换质量：给足口语化/连贯性/语序自由/术语约束。
+  // 硬约束（绝不能动，否则破坏逐行→时间轴对齐）：每个输入行号对应输出同一行号的
+  //   一行译文、行号与行数完全一致、只输出译文。其余是质量引导。
   var DEFAULT_SYSTEM_PROMPT =
-    "Translate each numbered subtitle line to natural {TARGET_LANG}. " +
-    "Fragments may lack punctuation; use context to infer meaning. " +
-    "Keep the same line numbers, one translation per line, no extra text.";
+    "You are translating video subtitles into natural, fluent {TARGET_LANG}. " +
+    "Write the way a native speaker actually speaks: colloquial, smooth, easy to read. " +
+    "Avoid stiff word-for-word translation, literal translationese, or bookish phrasing.\n" +
+    "Use the surrounding context lines to understand fragments, resolve pronouns and references, " +
+    "and keep the topic coherent across lines. The text comes from speech recognition, so a line " +
+    "may lack punctuation or be cut mid-sentence; mentally restore the meaning before translating.\n" +
+    "You may freely reorder words and rephrase WITHIN each line so the {TARGET_LANG} reads naturally — " +
+    "do not translate word by word. But every input line number must map to exactly one output line " +
+    "with the SAME number; never merge, split, drop, or reorder the lines themselves.\n" +
+    "Keep proper nouns, names, and technical terms sensible: preserve them or use the common accepted " +
+    "translation, do not invent odd renderings.\n" +
+    "Output format (strict): one translation per input line, prefixed with its original line number, " +
+    "line count identical to the input. Output ONLY the translations — no explanations, no source text, " +
+    "no extra commentary.";
 
   function buildSystemPrompt(targetLang, customPrompt) {
     var tpl = customPrompt && String(customPrompt).trim() ? customPrompt : DEFAULT_SYSTEM_PROMPT;
@@ -940,13 +962,29 @@
     });
 
     var bi = 0;
+    // 上下文窗口：每批携带前 contextLines 条原文作为「参考不翻译」前缀，
+    // 让模型借上下文理解碎片/代词指代/话题连贯（P1-a：扩上下文窗口）。
+    //  - contextLines > 0：每批都带前 N 条原文（不只在句中断点），更连贯。
+    //  - contextLines 未配置（null/未传）：退化为旧行为——仅当批起点不在自然句首
+    //    (上一条原文无句末标点)时带 1 句，clip 第一批不带。保持向后兼容。
+    // context 行不计入编号、不计入对齐（translateBatch 已把它放在编号区之外）。
+    var contextLines = opts.contextLines != null ? opts.contextLines : null;
     async function worker() {
       while (bi < batches.length) {
         var b = batches[bi++];
         var sub = cues.slice(b.start, b.end);
-        // 仅当批起点不在自然句首时带 1 句上下文；clip 第一批(start=0)不带
         var ctx = null;
-        if (b.start > 0) {
+        if (contextLines != null) {
+          // 新策略：每批都带前 N 条原文（N = contextLines，受 clip 起点裁剪）。
+          var cl = contextLines > 0 ? Math.floor(contextLines) : 0;
+          if (cl > 0 && b.start > 0) {
+            var from = Math.max(0, b.start - cl);
+            ctx = [];
+            for (var ci = from; ci < b.start; ci++) ctx.push(cues[ci].content);
+            if (!ctx.length) ctx = null;
+          }
+        } else if (b.start > 0) {
+          // 旧策略：仅当批起点不在自然句首时带 1 句上下文；clip 第一批(start=0)不带。
           var prev = cues[b.start - 1];
           if (prev && !SENTENCE_END_RE.test(prev.content)) ctx = [prev.content];
         }
