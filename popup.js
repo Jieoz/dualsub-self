@@ -21,7 +21,7 @@
   var TEXT_FIELDS = ["apiBaseUrl", "apiKey", "apiModel", "targetLang"];
   var NUM_FIELDS = ["fontSize", "bottomOffset"];
   var COLOR_FIELDS = ["fontColor", "transColor"];
-  var BOOL_FIELDS = ["enabled", "stroke", "shadow", "background", "transOnTop", "showOriginal"];
+  var BOOL_FIELDS = ["enabled", "stroke", "shadow", "background", "transOnTop", "showOriginal", "showLoading"];
   var SELECT_FIELDS = ["sourceLang"];
 
   function $(id) {
@@ -257,6 +257,55 @@
       } else {
         setStatus("连接失败：" + (resp.error || "未知错误"), "err");
       }
+    });
+
+    /* ---------------- 配置导入 / 导出 ---------------- */
+    // 导出：把当前表单配置序列化下载为 JSON 文件（含 key，已在 UI 提示用户）
+    $("exportBtn").addEventListener("click", function () {
+      var cfg = readForm();
+      var text = Core.exportConfig ? Core.exportConfig(cfg) : JSON.stringify({ config: cfg }, null, 2);
+      try {
+        var blob = new Blob([text], { type: "application/json" });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement("a");
+        a.href = url;
+        a.download = "mydualsub-config.json";
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(function () {
+          URL.revokeObjectURL(url);
+        }, 1000);
+        setStatus("已导出配置（文件含 API Key，请妥善保管）", "ok");
+      } catch (e) {
+        setStatus("导出失败：" + (e && e.message ? e.message : e), "err");
+      }
+    });
+
+    // 导入：选 JSON 文件 → 解析 → 校验 → 回填表单（用户再点保存生效）
+    $("importBtn").addEventListener("click", function () {
+      $("importFile").click();
+    });
+    $("importFile").addEventListener("change", function (ev) {
+      var file = ev.target.files && ev.target.files[0];
+      if (!file) return;
+      var reader = new FileReader();
+      reader.onload = function () {
+        var res = Core.importConfig
+          ? Core.importConfig(String(reader.result || ""))
+          : { ok: false, error: "core.js 未加载" };
+        if (res.ok) {
+          fillForm(res.config);
+          setStatus('已导入配置 ✓ 点"保存设置"生效', "ok");
+        } else {
+          setStatus("导入失败：" + (res.error || "未知错误"), "err");
+        }
+        $("importFile").value = ""; // 允许重复导入同一文件
+      };
+      reader.onerror = function () {
+        setStatus("读取文件失败", "err");
+      };
+      reader.readAsText(file);
     });
   });
 })();

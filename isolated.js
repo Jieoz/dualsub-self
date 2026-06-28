@@ -37,16 +37,28 @@
     videoId: null,
     tracks: [], // main.js 推来的轨道清单
     activeTrack: null, // 当前选中的轨道
-    cues: [], // 清洗 + 语义重组后的原文 cue
+    cues: [], // 清洗 + 语义重组后的原文 cue（全局，按 start 升序）
     clips: [], // 按 cue 边界切的 clip
+    cueMap: [], // 全局 cue 下标 -> {clipIdx,cueIdx}（cueClipIndexMap 建表）
     clipCache: {}, // clipIndex -> translated string[]（与该 clip cues 等长，可含空洞，边翻边填）
     clipState: {}, // clipIndex -> 'pending'|'done'|'error'
     clipBackoff: {}, // clipIndex -> backoff 控制器（失败退避）
     renderer: null, // 叠加层 DOM
     videoEl: null,
-    rafBound: false,
+    // ---- 运行循环 / 生命周期（低配机占用优化）----
+    renderTimer: null, // 单一节流渲染定时器 id
+    prefetchTimer: null, // 预取定时器 id（与渲染解耦、降频）
+    seekTimer: null, // seek 防抖定时器 id
+    listeners: [], // 已绑定的监听器 [{target,type,fn}]，teardown 时统一解绑
+    lastHitCueIdx: -1, // 上次命中的全局 cue 下标（findCueIndexAt 的 O(1) 提示）
     lastPrefetchMs: -1e9, // 上次 prefetch 的播放位置（节流）
+    seeking: false, // 进度条拖动中（防抖期间不渲染/不预取目标外位置）
   };
+
+  // 渲染/预取节拍（ms）。渲染 250ms 人眼无感；预取降到 1.5s 一次，与渲染解耦。
+  var RENDER_INTERVAL_MS = 250;
+  var PREFETCH_INTERVAL_MS = 1500;
+  var SEEK_SETTLE_MS = 350; // seek 停稳多少 ms 后才翻目标 clip
 
   /* =====================================================
    * 配置存取
@@ -155,8 +167,11 @@
     state.activeTrack = null;
     state.cues = [];
     state.clips = [];
+    state.cueMap = [];
     state.clipCache = {};
     state.clipState = {};
+    state.lastHitCueIdx = -1;
+    state.lastPrefetchMs = -1e9;
     clearRenderer();
   }
 
@@ -213,13 +228,17 @@
       state.cues = cues;
       // 按 cue 边界切 clip（不在句子中间断、clip 间不重叠 → 省 token）
       state.clips = Core.sliceClipsByCue(cues, config.clipSeconds * 1000);
+      // 建全局 cue→clip 映射表，渲染时 O(1) 反查所属 clip
+      state.cueMap = Core.cueClipIndexMap(state.clips);
       state.clipCache = {};
       state.clipState = {};
       state.clipBackoff = {};
+      state.lastHitCueIdx = -1;
       ensureRenderer();
       bindVideo();
       // 立即预取当前播放位置所在的 clip
       prefetchAround(currentTimeMs(), true);
+      requestRender();
     } catch (e) {
       console.warn("[dualsub] loadTrack 出错", e);
     }
@@ -249,7 +268,7 @@
    */
   function prefetchAround(ms, force) {
     if (!config.enabled || !state.clips.length) return;
-    // 节流：onTick 高频触发，位置没明显移动就不重复跑昂贵逻辑
+    // 节流：预取循环低频(1.5s)调用，位置没明显移动就不重复跑昂贵逻辑
     if (!force && Math.abs(ms - state.lastPrefetchMs) < 1000) return;
     state.lastPrefetchMs = ms;
 
@@ -297,7 +316,7 @@
     if (cached[key] && Array.isArray(cached[key].lines)) {
       state.clipCache[idx] = cached[key].lines.slice();
       state.clipState[idx] = "done";
-      lastRenderedKey = ""; // 强制下次 onTick 重渲染
+      requestRender(); // 命中缓存：强制刷新把译文显示上去
       return;
     }
 
@@ -313,16 +332,17 @@
         apiModel: config.apiModel,
         targetLang: config.targetLang,
         systemPrompt: config.systemPrompt,
-        batchSize: config.batchLines > 0 ? config.batchLines : 10,
+        batchSize: config.batchLines > 0 ? config.batchLines : 14,
         priorityIndex: priorityIndex != null ? priorityIndex : 0,
         concurrency: 3,
+        timeoutMs: 20000,
         fetchImpl: function (u, o) {
           return fetch(u, o);
         },
         onProgress: function (updates) {
           var arr = state.clipCache[idx];
           for (var i = 0; i < updates.length; i++) arr[updates[i].index] = updates[i].text;
-          lastRenderedKey = ""; // 让 onTick 立即把新译文刷上去
+          requestRender(); // 新译文到 → 立即把当前 cue 刷新（暂停/隐藏时也补一帧）
         },
         onError: function () {
           hadError = true;
@@ -368,11 +388,20 @@
     return v ? Math.floor(v.currentTime * 1000) : 0;
   }
 
-  /** 确保叠加层 DOM 存在并挂到播放器上 */
+  /** 确保叠加层 DOM 存在并挂到当前播放器上（全屏/影院/SPA 换播放器时重挂） */
   function ensureRenderer() {
     var player = playerEl();
     if (!player) return;
-    if (state.renderer && state.renderer.parentNode) {
+    // 已存在且仍挂在当前播放器下 → 只刷新样式
+    if (state.renderer && state.renderer.parentNode === player) {
+      applyStyleVars();
+      return;
+    }
+    // 渲染器还在但挂错了父节点（播放器被换/重建）→ 迁移到当前播放器
+    if (state.renderer) {
+      try {
+        player.appendChild(state.renderer);
+      } catch (e) {}
       applyStyleVars();
       return;
     }
@@ -432,6 +461,7 @@
       ".dualsub-bg .dualsub-subtitle{",
       "  background:rgba(0,0,0,0.6); padding:1px 8px; border-radius:4px;",
       "}",
+      ".dualsub-trans.dualsub-pending{ opacity:0.55; font-style:italic; }",
       ".dualsub-hidden{ display:none !important; }",
     ].join("\n");
     var styleEl = document.createElement("style");
@@ -468,63 +498,235 @@
     }
   }
 
-  /** 绑定 video 的播放事件，按 currentTime 刷新显示 */
+  /* =====================================================
+   * 运行循环 + 生命周期（低配机占用优化）
+   * -----------------------------------------------------
+   * 原实现：timeupdate 监听 + setInterval(250) 双触发，每次都线性扫 cue +
+   * 无条件 prefetch，即使字幕没变也每秒约 4 次全量计算；定时器/监听器还泄漏。
+   * 现实现：
+   *  - 单一节流渲染循环（250ms）。cue 未变化 → 提前 return，零 DOM/查找工作。
+   *  - 预取与渲染解耦：单独 1.5s 一次的低频循环。
+   *  - 二分查找 + 上次命中下标提示（Core.findCueIndexAt），大多数 tick O(1)。
+   *  - 完整生命周期：所有 timer id / listener 引用都存下，切视频 / 禁用 /
+   *    video 更换 / 标签页隐藏 / 暂停时彻底停循环、解绑，空闲零开销。
+   *  - seek 防抖：拖动进度条停稳后才翻目标 clip。
+   * ===================================================== */
+
+  /** 注册监听器并记账，便于 teardown 统一解绑（杜绝泄漏） */
+  function addListener(target, type, fn, opts) {
+    if (!target) return;
+    target.addEventListener(type, fn, opts);
+    state.listeners.push({ target: target, type: type, fn: fn, opts: opts });
+  }
+
+  function removeAllListeners() {
+    for (var i = 0; i < state.listeners.length; i++) {
+      var l = state.listeners[i];
+      try {
+        l.target.removeEventListener(l.type, l.fn, l.opts);
+      } catch (e) {}
+    }
+    state.listeners = [];
+  }
+
+  /** 启动渲染循环（幂等）。仅在启用 + 有字幕时跑 */
+  function startRenderLoop() {
+    if (state.renderTimer != null) return;
+    if (!config.enabled || !state.cues.length) return;
+    state.renderTimer = setInterval(onRenderTick, RENDER_INTERVAL_MS);
+  }
+  function stopRenderLoop() {
+    if (state.renderTimer != null) {
+      clearInterval(state.renderTimer);
+      state.renderTimer = null;
+    }
+  }
+
+  /** 启动预取循环（幂等、低频，与渲染解耦） */
+  function startPrefetchLoop() {
+    if (state.prefetchTimer != null) return;
+    if (!config.enabled || !state.clips.length) return;
+    state.prefetchTimer = setInterval(function () {
+      if (state.seeking) return; // 拖动中不预取（防抖统一在 seeked 后处理）
+      prefetchAround(currentTimeMs(), false);
+    }, PREFETCH_INTERVAL_MS);
+  }
+  function stopPrefetchLoop() {
+    if (state.prefetchTimer != null) {
+      clearInterval(state.prefetchTimer);
+      state.prefetchTimer = null;
+    }
+  }
+
+  /** 视频在播放且页面可见时才需要循环；否则停掉省占用 */
+  function loopsShouldRun() {
+    if (!config.enabled || !state.cues.length) return false;
+    if (document.hidden) return false;
+    var v = state.videoEl;
+    if (!v) return false;
+    return !v.paused && !v.ended;
+  }
+
+  /** 按当前状态决定起停循环（播放/暂停/可见性变化时调用） */
+  function syncLoops() {
+    if (loopsShouldRun()) {
+      startRenderLoop();
+      startPrefetchLoop();
+    } else {
+      stopRenderLoop();
+      stopPrefetchLoop();
+    }
+  }
+
+  /**
+   * 绑定 video 的生命周期事件，建立单一渲染循环。
+   * 每次调用先彻底 teardown 旧绑定（切 video / SPA 换视频时防泄漏）。
+   */
   function bindVideo() {
     var v = videoEl();
     if (!v) return;
-    if (state.videoEl === v && state.rafBound) return;
+    // 同一 video 已绑定：只确保循环状态正确即可
+    if (state.videoEl === v && state.listeners.length) {
+      syncLoops();
+      return;
+    }
+    // 换了 video（或首次）：清掉旧的一切
+    teardownRuntime(false);
     state.videoEl = v;
-    state.rafBound = true;
-    v.addEventListener("timeupdate", onTick);
-    // timeupdate 频率不稳，再叠加一个轻量定时器兜底刷新
-    setInterval(onTick, 250);
+
+    // 播放状态变化 → 起停循环（暂停/结束时零开销）
+    addListener(v, "play", syncLoops);
+    addListener(v, "playing", syncLoops);
+    addListener(v, "pause", function () {
+      onRenderTick(); // 暂停瞬间补刷一帧，保证停在正确字幕
+      syncLoops();
+    });
+    addListener(v, "ended", function () {
+      setRendererText("", "", false);
+      syncLoops();
+    });
+    // seek：拖动进度条防抖，停稳后才翻目标 clip
+    addListener(v, "seeking", onSeeking);
+    addListener(v, "seeked", onSeeked);
+    // 标签页切到后台 → 停循环；切回来恢复
+    addListener(document, "visibilitychange", function () {
+      syncLoops();
+      if (!document.hidden) onRenderTick();
+    });
+
+    syncLoops();
+    onRenderTick(); // 立即渲染一帧（暂停在某处加载时也能先显原文）
+  }
+
+  function onSeeking() {
+    state.seeking = true;
+    if (state.seekTimer != null) clearTimeout(state.seekTimer);
+  }
+  function onSeeked() {
+    if (state.seekTimer != null) clearTimeout(state.seekTimer);
+    // 停稳 SEEK_SETTLE_MS 后才认为 seek 结束，避免中间位置逐个触发翻译/预取
+    state.seekTimer = setTimeout(function () {
+      state.seeking = false;
+      state.lastHitCueIdx = -1; // 跳转后命中下标失效，下次走二分
+      prefetchAround(currentTimeMs(), true); // 立即翻目标位置所在 clip
+      requestRender();
+      syncLoops();
+    }, SEEK_SETTLE_MS);
+  }
+
+  /** 强制下一帧重渲染（清缓存键），并在循环没跑时（暂停/隐藏）补刷一帧 */
+  function requestRender() {
+    lastRenderedKey = "";
+    if (config.enabled && state.renderer) onRenderTick();
   }
 
   var lastRenderedKey = "";
-  function onTick() {
+  /**
+   * 单一渲染 tick：找当前 cue，未变化则提前 return（idle 零工作）。
+   * 不在这里做预取（预取已解耦到独立低频循环）。
+   */
+  function onRenderTick() {
     if (!config.enabled || !state.renderer || !state.cues.length) return;
+    if (state.seeking) return; // 拖动中不渲染，停稳后统一刷
+    // 渲染器被播放器重建踢出 DOM（全屏/影院/SPA）→ 重挂（isConnected 是 O(1)）
+    if (!state.renderer.isConnected) {
+      ensureRenderer();
+      lastRenderedKey = "";
+    }
     var ms = currentTimeMs();
 
-    // 顺带触发预取
-    prefetchAround(ms);
+    // 二分 + 上次命中提示：大多数相邻 tick O(1)
+    var cueIdx = Core.findCueIndexAt(state.cues, ms, state.lastHitCueIdx);
 
-    // 找当前时间命中的 cue（线性查找，字幕量级不大；可优化为二分）
-    var clipIdx = clipIdxAt(ms);
-    var hitCue = null;
-    var hitCueIdxInClip = -1;
-    if (clipIdx !== -1) {
-      var clip = state.clips[clipIdx];
-      for (var i = 0; i < clip.cues.length; i++) {
-        var c = clip.cues[i];
-        if (ms >= c.start && ms < c.end) {
-          hitCue = c;
-          hitCueIdxInClip = i;
-          break;
-        }
+    if (cueIdx === -1) {
+      // 落在间隙/越界：仅当之前有字幕时才清一次（避免每 tick 重复写 DOM）
+      if (state.lastHitCueIdx !== -1 || lastRenderedKey !== "") {
+        state.lastHitCueIdx = -1;
+        setRendererText("", "", false);
+        lastRenderedKey = "";
       }
-    }
-
-    if (!hitCue) {
-      setRendererText("", "");
       return;
     }
-    var orig = hitCue.content;
-    var trans = translationFor(clipIdx, hitCueIdxInClip);
-    var key = clipIdx + ":" + hitCueIdxInClip + ":" + (trans || "");
+    state.lastHitCueIdx = cueIdx;
+
+    var loc = state.cueMap[cueIdx];
+    if (!loc) return;
+    var hitCue = state.cues[cueIdx];
+    var trans = translationFor(loc.clipIdx, loc.cueIdx);
+    var pending = trans == null && state.clipState[loc.clipIdx] !== "error";
+
+    // 命中键：cue 下标 + 译文 + 是否 pending。键未变 → 不动 DOM（idle 零开销）
+    var key = cueIdx + ":" + (trans || "") + ":" + (pending ? "p" : "");
     if (key === lastRenderedKey) return;
     lastRenderedKey = key;
-    setRendererText(orig, trans);
+    setRendererText(hitCue.content, trans, pending);
   }
 
-  function setRendererText(orig, trans) {
+  /**
+   * 写字幕文本。
+   *  - orig/trans 为当前 cue 的原文/译文。
+   *  - pending=true 且无译文时，按配置显示轻量"翻译中…"指示（不闪烁）。
+   */
+  function setRendererText(orig, trans, pending) {
     var r = state.renderer;
     if (!r) return;
     // 原文行
     r._orig.textContent = config.showOriginal ? orig || "" : "";
     r._orig.classList.toggle("dualsub-hidden", !config.showOriginal || !orig);
-    // 译文行：没翻好时留空（原文照常显示）
-    r._trans.textContent = trans || "";
-    r._trans.classList.toggle("dualsub-hidden", !trans);
+    // 译文行：有译文显译文；没翻好时按 showLoading 显"翻译中…"，否则留空
+    if (trans) {
+      r._trans.textContent = trans;
+      r._trans.classList.remove("dualsub-hidden", "dualsub-pending");
+    } else if (pending && config.showLoading && orig) {
+      r._trans.textContent = "翻译中…";
+      r._trans.classList.remove("dualsub-hidden");
+      r._trans.classList.add("dualsub-pending");
+    } else {
+      r._trans.textContent = "";
+      r._trans.classList.add("dualsub-hidden");
+      r._trans.classList.remove("dualsub-pending");
+    }
+  }
+
+  /**
+   * 彻底清理运行时（定时器 + 监听器 + seek 防抖）。
+   * full=true 时连 renderer 也移除（禁用扩展）；false 仅清循环/监听（换 video）。
+   */
+  function teardownRuntime(full) {
+    stopRenderLoop();
+    stopPrefetchLoop();
+    if (state.seekTimer != null) {
+      clearTimeout(state.seekTimer);
+      state.seekTimer = null;
+    }
+    removeAllListeners();
+    state.seeking = false;
+    state.videoEl = null;
+    state.lastHitCueIdx = -1;
+    if (full) {
+      clearRenderer();
+      lastRenderedKey = "";
+    }
   }
 
   /* =====================================================
@@ -590,7 +792,8 @@
         }
       }
       if (!config.enabled) {
-        clearRenderer();
+        // 禁用：彻底停掉所有循环 + 解绑监听 + 移除渲染器（空闲零开销）
+        teardownRuntime(true);
       } else {
         ensureRenderer();
         // 源语言变了 → 重新选轨并重载
@@ -601,11 +804,19 @@
             state.clipCache = {};
             state.clipState = {};
             state.clipBackoff = {};
-            loadTrack(track);
+            loadTrack(track); // 内部会 bindVideo + 起循环 + 预取
+          } else {
+            // 没轨道也要把循环按当前状态接起来
+            bindVideo();
           }
         } else if (apiChanged || !prevEnabled) {
-          // 配置变了但轨道没变：立即按当前播放位置重新预取
+          // 配置变了但轨道没变：重绑循环、立即按当前播放位置重新预取并刷新
+          bindVideo();
           prefetchAround(currentTimeMs(), true);
+          requestRender();
+        } else {
+          // 仅样式/显示项变化：刷新一帧即可
+          requestRender();
         }
       }
       sendResponse({ ok: true });

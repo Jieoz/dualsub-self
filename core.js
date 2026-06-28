@@ -278,8 +278,9 @@
     background: false, // 背景框
     transOnTop: true, // true=译文在上，原文在下
     showOriginal: true, // 是否显示原文行
+    showLoading: true, // 译文未到时显示轻量"翻译中…"指示（false=只显原文）
     clipSeconds: 30, // 每个翻译 clip 多少秒（按 cue 边界就近切）
-    batchLines: 10, // 每批最多多少行（clip 内再分批）
+    batchLines: 14, // 每批最多多少行（clip 内再分批）。瘦身 prompt 后调高省固定开销
   };
 
   /**
@@ -314,13 +315,12 @@
    */
 
   // 默认 system prompt（{TARGET_LANG} 会被替换为目标语言）
-  // 精简措辞、去冗余以省固定 token 开销，但保留三条硬约束：
-  // 结合上下文理解碎片语义 / 每个输入行号一行译文 / 行号与行数完全一致。
+  // 已进一步瘦身：相比最初 ~509 字符砍掉一大半固定开销，但保留三条硬约束：
+  //  1) 结合上下文理解碎片语义；2) 每个输入行号一行译文；3) 行号与行数完全一致。
   var DEFAULT_SYSTEM_PROMPT =
-    "Translate these subtitle fragments into {TARGET_LANG}. They may lack " +
-    "punctuation or be split mid-sentence; use context to infer meaning. " +
-    "Output exactly one line per numbered input line, same numbers and same " +
-    "line count, natural spoken {TARGET_LANG}, numbered lines only, no extra text.";
+    "Translate each numbered subtitle line to natural {TARGET_LANG}. " +
+    "Fragments may lack punctuation; use context to infer meaning. " +
+    "Keep the same line numbers, one translation per line, no extra text.";
 
   function buildSystemPrompt(targetLang, customPrompt) {
     var tpl = customPrompt && String(customPrompt).trim() ? customPrompt : DEFAULT_SYSTEM_PROMPT;
@@ -406,9 +406,10 @@
    *   - systemPrompt: 可选自定义 system prompt
    *   - temperature: 默认 0.3
    *   - contextTail: 可选，上一批末尾若干原文，作为上下文（不计入对齐）
+   *   - timeoutMs: 可选，单次请求超时（默认 20000，<=0 关闭）。超时按失败抛错走兜底。
    *   - fetchImpl: 注入的 fetch（默认用全局 fetch）
    * 返回：与 cues 等长的 string[]（译文）。
-   * 出错（HTTP 非 200、网络异常）时抛出 Error，由调用方决定兜底（保留原文）。
+   * 出错（HTTP 非 200、网络异常、超时）时抛出 Error，由调用方决定兜底（保留原文）。
    */
   async function translateBatch(opts) {
     var cues = opts.cues || [];
@@ -441,14 +442,38 @@
       ],
     };
 
-    var resp = await fetchImpl(url, {
+    // 超时控制：AbortController 在 timeoutMs 后中断请求，按失败走兜底 + 退避，
+    // 避免网关无响应时 clip 永久挂在 pending、占着并发位。
+    var timeoutMs = typeof opts.timeoutMs === "number" ? opts.timeoutMs : 20000;
+    var fetchOpts = {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: "Bearer " + (opts.apiKey || ""),
       },
       body: JSON.stringify(body),
-    });
+    };
+    var timer = null;
+    if (timeoutMs > 0 && typeof AbortController !== "undefined") {
+      var ac = new AbortController();
+      fetchOpts.signal = ac.signal;
+      timer = setTimeout(function () {
+        try {
+          ac.abort();
+        } catch (e) {}
+      }, timeoutMs);
+    }
+
+    var resp;
+    try {
+      resp = await fetchImpl(url, fetchOpts);
+    } catch (e) {
+      if (timer) clearTimeout(timer);
+      // AbortError（超时）与网络异常统一抛出，调用方兜底显示原文
+      var aborted = e && (e.name === "AbortError" || /abort/i.test(String(e.message || "")));
+      throw new Error(aborted ? "translate timeout (" + timeoutMs + "ms)" : "translate network error: " + (e && e.message ? e.message : e));
+    }
+    if (timer) clearTimeout(timer);
 
     if (!resp.ok) {
       var errText = "";
@@ -697,6 +722,7 @@
             systemPrompt: opts.systemPrompt,
             temperature: opts.temperature,
             contextTail: ctx,
+            timeoutMs: opts.timeoutMs,
             fetchImpl: opts.fetchImpl,
           });
         } catch (e) {
@@ -717,6 +743,124 @@
     for (var w = 0; w < Math.min(concurrency, batches.length); w++) pool.push(worker());
     await Promise.all(pool);
     return result;
+  }
+
+  /* ---------------------------------------------------------------
+   * 9. 运行时占用优化：二分查找当前 cue + cue→clip 映射
+   * -------------------------------------------------------------
+   * 渲染 tick 高频触发，原来每次线性扫整个 clip 的 cues 找命中。这里提供
+   * O(log n) 二分 + "上次命中下标"提示，使大多数相邻 tick 退化为 O(1)。
+   * 纯函数，便于离线单测。cues 必须按 start 升序（cleanupCues 已保证）。
+   */
+
+  /**
+   * 找 ms 命中哪条 cue（cue.start <= ms < cue.end）。
+   *  - cues: 按 start 升序的 cue[]。
+   *  - hint: 上次命中的下标（可选）。先看 hint 及其相邻是否仍命中（O(1)），
+   *          不中再二分。
+   * 返回命中下标；ms 落在两条 cue 的间隙（无字幕）或越界时返回 -1。
+   */
+  function findCueIndexAt(cues, ms, hint) {
+    var n = (cues || []).length;
+    if (!n) return -1;
+    // 快路径：先验证 hint 及相邻下标（连续播放时命中率极高）
+    if (hint != null && hint >= 0 && hint < n) {
+      if (ms >= cues[hint].start && ms < cues[hint].end) return hint;
+      var nx = hint + 1;
+      if (nx < n && ms >= cues[nx].start && ms < cues[nx].end) return nx;
+    }
+    // 二分：找最后一个 start <= ms 的 cue
+    var lo = 0;
+    var hi = n - 1;
+    var cand = -1;
+    while (lo <= hi) {
+      var mid = (lo + hi) >> 1;
+      if (cues[mid].start <= ms) {
+        cand = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    if (cand === -1) return -1; // ms 在第一条 cue 之前
+    return ms < cues[cand].end ? cand : -1; // 落在间隙里则不命中
+  }
+
+  /**
+   * 由 clip 列表构造一个"全局 cue 下标 → {clipIdx, cueIdxInClip}"的映射数组。
+   * clip 内的 cues 是原始 cues 的连续切片（sliceClipsByCue 保证），所以可一次
+   * 遍历建表。渲染时用 findCueIndexAt 拿到全局下标后 O(1) 反查所属 clip。
+   * 返回长度 = 总 cue 数的数组，元素 { clipIdx, cueIdx }。
+   */
+  function cueClipIndexMap(clips) {
+    var map = [];
+    if (!Array.isArray(clips)) return map;
+    for (var ci = 0; ci < clips.length; ci++) {
+      var cs = clips[ci].cues || [];
+      for (var k = 0; k < cs.length; k++) {
+        map.push({ clipIdx: ci, cueIdx: k });
+      }
+    }
+    return map;
+  }
+
+  /* ---------------------------------------------------------------
+   * 10. 配置导入 / 导出（换机器、重装免重填）
+   * -------------------------------------------------------------
+   * 导出：把当前配置序列化为带版本号的 JSON 文本（含 apiKey，调用方需提示用户）。
+   * 导入：解析 JSON，只接受 DEFAULT_CONFIG 已知的键，类型不符的回落默认。
+   * 纯函数（不碰 storage/DOM），round-trip 后配置应等价。
+   */
+  function exportConfig(config) {
+    var out = {};
+    var keys = Object.keys(DEFAULT_CONFIG);
+    for (var i = 0; i < keys.length; i++) {
+      var k = keys[i];
+      out[k] = config && config[k] != null ? config[k] : DEFAULT_CONFIG[k];
+    }
+    return JSON.stringify({ __dualsub: 1, config: out }, null, 2);
+  }
+
+  /**
+   * 解析导入文本，返回 { ok, config?, error? }。
+   * 兼容两种格式：{__dualsub,config} 包裹 或 直接的扁平配置对象。
+   * 只挑 DEFAULT_CONFIG 已知键，并按默认值类型做最小校验（数字/布尔/字符串）。
+   */
+  function importConfig(text) {
+    var parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch (e) {
+      return { ok: false, error: "JSON 解析失败：" + (e && e.message ? e.message : e) };
+    }
+    if (!parsed || typeof parsed !== "object") {
+      return { ok: false, error: "内容不是有效的配置对象" };
+    }
+    var src = parsed.config && typeof parsed.config === "object" ? parsed.config : parsed;
+    var out = Object.assign({}, DEFAULT_CONFIG);
+    var keys = Object.keys(DEFAULT_CONFIG);
+    var any = false;
+    for (var i = 0; i < keys.length; i++) {
+      var k = keys[i];
+      if (src[k] == null) continue;
+      var def = DEFAULT_CONFIG[k];
+      var v = src[k];
+      if (typeof def === "number") {
+        var num = parseInt(v, 10);
+        if (Number.isFinite(num)) {
+          out[k] = num;
+          any = true;
+        }
+      } else if (typeof def === "boolean") {
+        out[k] = !!v;
+        any = true;
+      } else {
+        out[k] = String(v);
+        any = true;
+      }
+    }
+    if (!any) return { ok: false, error: "未找到任何可识别的配置字段" };
+    return { ok: true, config: out };
   }
 
   var EXPORTS = {
@@ -741,6 +885,10 @@
     pruneCache: pruneCache,
     makeBackoff: makeBackoff,
     joinUrl: joinUrl,
+    findCueIndexAt: findCueIndexAt,
+    cueClipIndexMap: cueClipIndexMap,
+    exportConfig: exportConfig,
+    importConfig: importConfig,
   };
 
   return EXPORTS;

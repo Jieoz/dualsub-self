@@ -329,6 +329,149 @@ test("makeBackoff reset 恢复（模拟用户手动重试）", () => {
   assert.ok(!bo.stopped && bo.shouldTry(0), "reset 后恢复可重试");
 });
 
+/* ============ 5g. findCueIndexAt：二分 + hint O(1) ============ */
+console.log("\n[findCueIndexAt：二分查找当前 cue]");
+
+const fcCues = [
+  { start: 0, end: 1000, content: "a" },
+  { start: 1000, end: 2000, content: "b" },
+  { start: 2500, end: 3000, content: "c" }, // 与 b 之间有 500ms 间隙
+  { start: 3000, end: 4000, content: "d" },
+];
+
+test("findCueIndexAt 空数组返回 -1", () => {
+  assert.strictEqual(Core.findCueIndexAt([], 100), -1);
+  assert.strictEqual(Core.findCueIndexAt(null, 100), -1);
+});
+
+test("findCueIndexAt 单元素命中/不命中", () => {
+  const one = [{ start: 100, end: 200, content: "x" }];
+  assert.strictEqual(Core.findCueIndexAt(one, 150), 0);
+  assert.strictEqual(Core.findCueIndexAt(one, 50), -1, "之前不命中");
+  assert.strictEqual(Core.findCueIndexAt(one, 200), -1, "end 是开区间，不命中");
+  assert.strictEqual(Core.findCueIndexAt(one, 250), -1, "之后不命中");
+});
+
+test("findCueIndexAt 各 cue 边界命中正确", () => {
+  assert.strictEqual(Core.findCueIndexAt(fcCues, 0), 0, "start 命中");
+  assert.strictEqual(Core.findCueIndexAt(fcCues, 999), 0);
+  assert.strictEqual(Core.findCueIndexAt(fcCues, 1000), 1, "下一条 start");
+  assert.strictEqual(Core.findCueIndexAt(fcCues, 2999), 2);
+  assert.strictEqual(Core.findCueIndexAt(fcCues, 3500), 3);
+});
+
+test("findCueIndexAt 落在间隙返回 -1（无字幕区）", () => {
+  assert.strictEqual(Core.findCueIndexAt(fcCues, 2200), -1, "1000~2500 的间隙(2000~2500)不命中");
+  assert.strictEqual(Core.findCueIndexAt(fcCues, 5000), -1, "越过最后一条不命中");
+});
+
+test("findCueIndexAt hint 命中相邻 O(1) 与二分结果一致", () => {
+  // 给一个正确 hint：当前 cue
+  assert.strictEqual(Core.findCueIndexAt(fcCues, 1500, 1), 1, "hint 命中自身");
+  // 给上一条的 hint，播放推进到下一条：应走 hint+1 快路径
+  assert.strictEqual(Core.findCueIndexAt(fcCues, 3500, 2), 3, "hint+1 命中");
+  // 错误/过时 hint 也能靠二分纠正
+  assert.strictEqual(Core.findCueIndexAt(fcCues, 0, 3), 0, "过时 hint 不影响正确性");
+  assert.strictEqual(Core.findCueIndexAt(fcCues, 2999, 0), 2, "远 hint 走二分");
+});
+
+/* ============ 5h. cueClipIndexMap：全局 cue→clip 映射 ============ */
+console.log("\n[cueClipIndexMap：cue→clip 反查表]");
+
+test("cueClipIndexMap 与 sliceClipsByCue 协作映射正确", () => {
+  const cues = [
+    { start: 0, end: 10000, content: "a" },
+    { start: 10000, end: 20000, content: "b" },
+    { start: 20000, end: 35000, content: "c" }, // clip0 收尾(跨度>=30s)
+    { start: 35000, end: 40000, content: "d" }, // clip1
+    { start: 40000, end: 45000, content: "e" },
+  ];
+  const clips = Core.sliceClipsByCue(cues, 30000);
+  const map = Core.cueClipIndexMap(clips);
+  // 映射长度 == 总 cue 数
+  assert.strictEqual(map.length, cues.length);
+  // 全局下标 0..2 在 clip0，3..4 在 clip1
+  assert.deepStrictEqual(map[0], { clipIdx: 0, cueIdx: 0 });
+  assert.deepStrictEqual(map[2], { clipIdx: 0, cueIdx: 2 });
+  assert.deepStrictEqual(map[3], { clipIdx: 1, cueIdx: 0 });
+  assert.deepStrictEqual(map[4], { clipIdx: 1, cueIdx: 1 });
+  // 用 findCueIndexAt + map 能正确反查某时间点的 clip 与 clip 内下标
+  const gi = Core.findCueIndexAt(cues, 36000);
+  assert.strictEqual(gi, 3);
+  assert.deepStrictEqual(map[gi], { clipIdx: 1, cueIdx: 0 });
+});
+
+test("cueClipIndexMap 空/非数组安全", () => {
+  assert.deepStrictEqual(Core.cueClipIndexMap([]), []);
+  assert.deepStrictEqual(Core.cueClipIndexMap(null), []);
+});
+
+/* ============ 5i. exportConfig / importConfig round-trip ============ */
+console.log("\n[配置导入/导出 round-trip]");
+
+test("exportConfig 导出含全部默认键且可 JSON.parse", () => {
+  const cfg = Object.assign({}, Core.DEFAULT_CONFIG, { apiKey: "sk-secret", fontSize: 30 });
+  const text = Core.exportConfig(cfg);
+  const obj = JSON.parse(text);
+  assert.strictEqual(obj.__dualsub, 1);
+  assert.ok(obj.config && typeof obj.config === "object");
+  // 导出应覆盖 DEFAULT_CONFIG 所有键
+  Object.keys(Core.DEFAULT_CONFIG).forEach((k) => {
+    assert.ok(k in obj.config, "导出应含键 " + k);
+  });
+  assert.strictEqual(obj.config.apiKey, "sk-secret");
+  assert.strictEqual(obj.config.fontSize, 30);
+});
+
+test("export→import round-trip 配置等价", () => {
+  const cfg = Object.assign({}, Core.DEFAULT_CONFIG, {
+    apiBaseUrl: "https://gw/v1",
+    apiKey: "sk-x",
+    apiModel: "gpt-4o-mini",
+    targetLang: "ja",
+    fontSize: 26,
+    transOnTop: false,
+    showLoading: false,
+  });
+  const text = Core.exportConfig(cfg);
+  const res = Core.importConfig(text);
+  assert.ok(res.ok, "导入应成功");
+  Object.keys(Core.DEFAULT_CONFIG).forEach((k) => {
+    assert.strictEqual(res.config[k], cfg[k], "键 " + k + " round-trip 应等价");
+  });
+});
+
+test("importConfig 接受扁平对象、忽略未知键、类型校验", () => {
+  const res = Core.importConfig(
+    JSON.stringify({ apiModel: "m", fontSize: "40", stroke: 0, junkKey: "x" })
+  );
+  assert.ok(res.ok);
+  assert.strictEqual(res.config.apiModel, "m");
+  assert.strictEqual(res.config.fontSize, 40, "字符串数字应转 int");
+  assert.strictEqual(res.config.stroke, false, "0 → false");
+  assert.ok(!("junkKey" in res.config), "未知键应被丢弃");
+  // 未提供的键回落默认
+  assert.strictEqual(res.config.targetLang, Core.DEFAULT_CONFIG.targetLang);
+});
+
+test("importConfig 坏 JSON / 空对象报错", () => {
+  assert.strictEqual(Core.importConfig("{not json").ok, false);
+  assert.strictEqual(Core.importConfig("null").ok, false);
+  assert.strictEqual(Core.importConfig("{}").ok, false, "无可识别字段应失败");
+});
+
+/* ============ 5j. 瘦身后的 system prompt ============ */
+console.log("\n[system prompt 瘦身校验]");
+
+test("DEFAULT_SYSTEM_PROMPT 已瘦身（填充后 < 254 字符，约砍半）", () => {
+  const filled = Core.buildSystemPrompt("zh-Hans");
+  assert.ok(filled.length < 254, "填充后应 < 254 字符，实际 " + filled.length);
+  // 仍含三条硬约束的关键词
+  assert.ok(/numbered/i.test(filled), "应保留行号约束");
+  assert.ok(/context/i.test(filled), "应保留结合上下文");
+  assert.ok(/zh-Hans/.test(filled), "应替换目标语言");
+});
+
 /* ============ 5f. normalizeColor ============ */
 console.log("\n[normalizeColor + DEFAULT_CONFIG]");
 
@@ -345,6 +488,8 @@ test("DEFAULT_CONFIG 含关键字段且颜色非空", () => {
   assert.ok(d && typeof d === "object");
   assert.ok(/^#/.test(d.fontColor) && /^#/.test(d.transColor), "默认颜色非空");
   assert.ok(d.clipSeconds > 0 && d.batchLines > 0);
+  assert.strictEqual(typeof d.showLoading, "boolean", "新增 showLoading 加载态开关");
+  assert.ok(d.batchLines >= 12 && d.batchLines <= 15, "batchLines 默认在 12–15（瘦身后调优）");
 });
 
 /* ============ 6. translateBatch（mock fetch 跑通整链路）============ */
@@ -463,6 +608,68 @@ async function main() {
   await asyncTest("translateBatch 空 cues 返回空数组", async () => {
     const out = await Core.translateBatch({ cues: [], apiBaseUrl: "x", apiModel: "m" });
     assert.deepStrictEqual(out, []);
+  });
+
+  await asyncTest("translateBatch 超时（AbortController）→ 抛超时错误", async () => {
+    // mock fetch 尊重 signal：触发 abort 时 reject 一个 AbortError
+    const mockFetch = (url, opts) =>
+      new Promise((resolve, reject) => {
+        const t = setTimeout(() => {
+          resolve({
+            ok: true,
+            status: 200,
+            async json() {
+              return { choices: [{ message: { content: "1. 慢" } }] };
+            },
+            async text() {
+              return "";
+            },
+          });
+        }, 200); // 200ms 后才返回，但超时设 30ms
+        if (opts && opts.signal) {
+          opts.signal.addEventListener("abort", () => {
+            clearTimeout(t);
+            const e = new Error("aborted");
+            e.name = "AbortError";
+            reject(e);
+          });
+        }
+      });
+    let threw = false;
+    try {
+      await Core.translateBatch({
+        cues: [{ content: "slow" }],
+        apiBaseUrl: "https://gw/v1",
+        apiModel: "m",
+        timeoutMs: 30,
+        fetchImpl: mockFetch,
+      });
+    } catch (e) {
+      threw = true;
+      assert.ok(/timeout/i.test(e.message), "应是超时错误，实际：" + e.message);
+    }
+    assert.ok(threw, "超时应抛错由调用方兜底");
+  });
+
+  await asyncTest("translateBatch timeoutMs<=0 关闭超时，正常返回", async () => {
+    const mockFetch = async () => ({
+      ok: true,
+      status: 200,
+      async json() {
+        return { choices: [{ message: { content: "1. 好" } }] };
+      },
+      async text() {
+        return "";
+      },
+    });
+    const out = await Core.translateBatch({
+      cues: [{ content: "ok" }],
+      apiBaseUrl: "https://gw/v1",
+      apiModel: "m",
+      timeoutMs: 0,
+      fetchImpl: mockFetch,
+    });
+    assert.deepStrictEqual(out, ["好"]);
   });
 
   /* ============ 6b. translateCues：首句优先 + 并发编排 ============ */

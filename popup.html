@@ -144,6 +144,17 @@
       <div class="inline"><input type="checkbox" id="background" /><label for="background">背景框</label></div>
       <div class="inline"><input type="checkbox" id="transOnTop" /><label for="transOnTop">译文在上（原文在下）</label></div>
       <div class="inline"><input type="checkbox" id="showOriginal" /><label for="showOriginal">显示原文行</label></div>
+      <div class="inline"><input type="checkbox" id="showLoading" /><label for="showLoading">译文未到时显示"翻译中…"</label></div>
+    </fieldset>
+
+    <fieldset>
+      <legend>配置备份</legend>
+      <div class="row">
+        <button id="exportBtn" class="secondary">导出配置</button>
+        <button id="importBtn" class="secondary">导入配置</button>
+      </div>
+      <input type="file" id="importFile" accept="application/json,.json" style="display:none" />
+      <div class="hint">导出文件含 API Key 等敏感信息，请妥善保管、勿分享。导入后点"保存设置"生效。</div>
     </fieldset>
 
     <button id="saveBtn">保存设置</button>
