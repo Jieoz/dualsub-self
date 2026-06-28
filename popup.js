@@ -1,17 +1,21 @@
 /*
  * popup.js — 设置 UI 逻辑（原生 JS，零依赖）
  * =============================================================
- * 与当前活动标签页里的 isolated.js 通过 chrome.tabs.sendMessage 通信：
- *  - get-state：拉当前配置 + 可用字幕轨道，填充表单。
- *  - set-config：保存配置（isolated.js 会即时生效并写 storage）。
- *  - test-connection：让 isolated.js 用当前表单的 API 三件套发测试请求
- *    （在内容脚本里发可借 <all_urls> host 权限跨域）。
- *
- * 注意：配置最终由 isolated.js 按 origin 存进 chrome.storage.local，
- * popup 不直接写 storage，避免两边 key 不一致。
+ * 配置读取链路（关键修复）：
+ *  - popup 直接从 chrome.storage.local 按当前 tab 的 origin 读配置回显，
+ *    不依赖内容脚本（isolated.js）是否已注入/运行。这样先开 popup、
+ *    非播放页、刚装扩展时也能正确回显已存配置，不会回落到 #000000。
+ *  - 颜色框初始化兜底到 DEFAULT_CONFIG 的颜色，绝不空值。
+ *  - 保存时：popup 自己写一次 storage（冗余保证一致），并通过
+ *    chrome.tabs.sendMessage(set-config) 让 isolated.js 即时生效。
+ *    两边 key 统一为 "dualsub:" + origin。
+ *  - 轨道清单仍向内容脚本要（get-state），拿不到就只填 auto。
  */
 (function () {
   "use strict";
+
+  var Core = window.DualsubCore || {};
+  var DEFAULT_CONFIG = Core.DEFAULT_CONFIG || {};
 
   // 表单字段 id 列表（与 DEFAULT_CONFIG 对应）
   var TEXT_FIELDS = ["apiBaseUrl", "apiKey", "apiModel", "targetLang"];
@@ -39,6 +43,54 @@
     });
   }
 
+  /** 从 tab.url 取 origin（用于拼 storage key） */
+  function originOf(url) {
+    try {
+      return new URL(url).origin;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /** 直接从 chrome.storage.local 读某 origin 的配置（与默认合并） */
+  function loadConfigFromStorage(origin) {
+    return new Promise(function (resolve) {
+      if (!origin) {
+        resolve(Object.assign({}, DEFAULT_CONFIG));
+        return;
+      }
+      var key = "dualsub:" + origin;
+      try {
+        chrome.storage.local.get([key], function (res) {
+          var saved = res && res[key];
+          var merged = Object.assign({}, DEFAULT_CONFIG, saved && typeof saved === "object" ? saved : {});
+          resolve(merged);
+        });
+      } catch (e) {
+        resolve(Object.assign({}, DEFAULT_CONFIG));
+      }
+    });
+  }
+
+  /** 直接把配置写回 storage（与 isolated.js 用同一 key，冗余一致） */
+  function saveConfigToStorage(origin, config) {
+    return new Promise(function (resolve) {
+      if (!origin) {
+        resolve(false);
+        return;
+      }
+      var obj = {};
+      obj["dualsub:" + origin] = config;
+      try {
+        chrome.storage.local.set(obj, function () {
+          resolve(true);
+        });
+      } catch (e) {
+        resolve(false);
+      }
+    });
+  }
+
   /** 给内容脚本发消息，封装成 Promise；标签页非 YouTube 时静默失败 */
   function sendToTab(tabId, msg) {
     return new Promise(function (resolve) {
@@ -59,8 +111,14 @@
   /** 用配置对象填充表单 */
   function fillForm(config) {
     if (!config) return;
-    TEXT_FIELDS.concat(COLOR_FIELDS).forEach(function (id) {
+    TEXT_FIELDS.forEach(function (id) {
       if ($(id) && config[id] != null) $(id).value = config[id];
+    });
+    // 颜色框：兜底到默认色，绝不留空（空值会显示成 #000000）
+    COLOR_FIELDS.forEach(function (id) {
+      if (!$(id)) return;
+      var dflt = DEFAULT_CONFIG[id] || "#ffffff";
+      $(id).value = normColor(config[id], dflt);
     });
     NUM_FIELDS.forEach(function (id) {
       if ($(id) && config[id] != null) $(id).value = config[id];
@@ -73,6 +131,13 @@
       $("sourceLang").dataset.want = config.sourceLang;
       trySetSelect("sourceLang", config.sourceLang);
     }
+  }
+
+  /** 颜色规整：优先用 Core.normalizeColor，无 Core 时本地兜底 */
+  function normColor(v, fallback) {
+    if (Core.normalizeColor) return Core.normalizeColor(v, fallback);
+    var s = String(v == null ? "" : v).trim();
+    return /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(s) ? s : fallback;
   }
 
   function trySetSelect(id, value) {
@@ -109,8 +174,12 @@
   /** 从表单读出配置对象 */
   function readForm() {
     var c = {};
-    TEXT_FIELDS.concat(COLOR_FIELDS).forEach(function (id) {
+    TEXT_FIELDS.forEach(function (id) {
       if ($(id)) c[id] = $(id).value.trim();
+    });
+    // 颜色：空值/非法值丢弃回落默认，绝不把空串存进配置
+    COLOR_FIELDS.forEach(function (id) {
+      if ($(id)) c[id] = normColor($(id).value, DEFAULT_CONFIG[id] || "#ffffff");
     });
     NUM_FIELDS.forEach(function (id) {
       if ($(id)) c[id] = parseInt($(id).value, 10) || 0;
@@ -126,20 +195,26 @@
 
   /* ---------------- 初始化 ---------------- */
   var currentTabId = null;
+  var currentOrigin = null;
 
   async function init() {
     var tab = await activeTab();
+    currentTabId = tab ? tab.id : null;
+    currentOrigin = tab ? originOf(tab.url || "") : null;
     if (!tab || !/youtube\.com/.test(tab.url || "")) {
       setStatus("请在 YouTube 页面打开本扩展。设置仍可填写并保存。", "");
     }
-    currentTabId = tab ? tab.id : null;
 
+    // 关键：直接从 storage 读配置回显，不依赖内容脚本是否在跑
+    var stored = await loadConfigFromStorage(currentOrigin);
+    fillForm(stored);
+
+    // 轨道清单仍向内容脚本要（拿不到就只有 auto）
     if (currentTabId != null) {
       var resp = await sendToTab(currentTabId, { type: "get-state" });
-      if (resp && resp.config) {
-        fillForm(resp.config);
+      if (resp && resp.tracks) {
         fillTracks(resp.tracks);
-        if (resp.config.sourceLang) trySetSelect("sourceLang", resp.config.sourceLang);
+        trySetSelect("sourceLang", stored.sourceLang || "auto");
       }
     }
   }
@@ -150,15 +225,16 @@
 
     $("saveBtn").addEventListener("click", async function () {
       var cfg = readForm();
-      if (currentTabId == null) {
-        setStatus("当前标签页不是 YouTube，配置未发送。请在 YouTube 页保存。", "err");
-        return;
-      }
-      var resp = await sendToTab(currentTabId, { type: "set-config", config: cfg });
+      // 先直接写 storage（冗余保证一致，内容脚本不在也能存住）
+      var wrote = await saveConfigToStorage(currentOrigin, cfg);
+      // 再通知内容脚本即时生效（在 YouTube 页时）
+      var resp = currentTabId != null ? await sendToTab(currentTabId, { type: "set-config", config: cfg }) : null;
       if (resp && resp.ok) {
-        setStatus("已保存 ✓", "ok");
+        setStatus("已保存 ✓（已即时生效）", "ok");
+      } else if (wrote) {
+        setStatus("已保存到本地 ✓（在 YouTube 播放页刷新后生效）", "ok");
       } else {
-        setStatus("保存失败：内容脚本无响应（刷新 YouTube 页后重试）", "err");
+        setStatus("保存失败：无法写入本地存储", "err");
       }
     });
 

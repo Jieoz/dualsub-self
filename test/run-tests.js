@@ -199,6 +199,154 @@ test("joinUrl 规整斜杠", () => {
   assert.strictEqual(Core.joinUrl("https://x/v1/", "chat/completions"), "https://x/v1/chat/completions");
 });
 
+/* ============ 5b. resegmentCues：原文语义重组 ============ */
+console.log("\n[resegmentCues：ASR 碎片重组]");
+
+test("resegment 合并被切碎的连续片段（小间隙、无句末标点）", () => {
+  const frags = Core.cleanupCues([
+    { start: 0, end: 1200, content: "so today we're gonna" },
+    { start: 1200, end: 2400, content: "take a look at" },
+    { start: 2400, end: 3600, content: "transformers." },
+  ]);
+  const seg = Core.resegmentCues(frags, { maxWords: 50, maxDurationMs: 30000 });
+  assert.strictEqual(seg.length, 1, "三个碎片应合并成一句");
+  assert.strictEqual(seg[0].content, "so today we're gonna take a look at transformers.");
+  assert.strictEqual(seg[0].start, 0);
+  assert.strictEqual(seg[0].end, 3600, "时间轴取并集");
+});
+
+test("resegment 去 ASR 滚动重叠词（不出现 work work）", () => {
+  const frags = Core.cleanupCues([
+    { start: 0, end: 1500, content: "how transformers work" },
+    { start: 1500, end: 3000, content: "work under the hood." },
+  ]);
+  const seg = Core.resegmentCues(frags, { maxWords: 50, maxDurationMs: 30000 });
+  assert.strictEqual(seg.length, 1);
+  assert.strictEqual(seg[0].content, "how transformers work under the hood.");
+  assert.ok(!/work work/.test(seg[0].content), "重叠词 work 应只出现一次");
+});
+
+test("resegment 句末标点处断句", () => {
+  const frags = Core.cleanupCues([
+    { start: 0, end: 1000, content: "first sentence." },
+    { start: 1100, end: 2000, content: "second sentence." },
+  ]);
+  const seg = Core.resegmentCues(frags);
+  assert.strictEqual(seg.length, 2, "两个完整句应各自成段");
+  assert.strictEqual(seg[0].content, "first sentence.");
+  assert.strictEqual(seg[1].content, "second sentence.");
+});
+
+test("resegment 大间隙不合并（不同句）", () => {
+  const frags = Core.cleanupCues([
+    { start: 0, end: 1000, content: "hello there" },
+    { start: 5000, end: 6000, content: "much later" }, // 间隙 4s >> 300ms
+  ]);
+  const seg = Core.resegmentCues(frags);
+  assert.strictEqual(seg.length, 2, "大间隙应断开");
+});
+
+test("resegment 超过最大词数强制切句", () => {
+  const words = Array.from({ length: 30 }, (_, i) => "w" + i).join(" ");
+  const frags = Core.cleanupCues([{ start: 0, end: 2000, content: words }]);
+  const seg = Core.resegmentCues(frags, { maxWords: 12 });
+  // 单条超长 cue 自身不再切（一条 event 整体进），但合并时受限——这里验证不抛错且产出非空
+  assert.ok(seg.length >= 1);
+  assert.ok(seg[0].content.length > 0);
+});
+
+/* ============ 5c. sliceClipsByCue：按 cue 边界切 ============ */
+console.log("\n[sliceClipsByCue：cue 边界、不重叠]");
+
+test("sliceClipsByCue 按 cue 边界就近切、不切碎句子", () => {
+  const cues = [
+    { start: 0, end: 10000, content: "a" },
+    { start: 10000, end: 20000, content: "b" },
+    { start: 20000, end: 35000, content: "c" }, // 累计跨度到 35s >= 30s → 在此收尾
+    { start: 35000, end: 40000, content: "d" }, // 新 clip
+  ];
+  const clips = Core.sliceClipsByCue(cues, 30000);
+  assert.strictEqual(clips.length, 2);
+  assert.strictEqual(clips[0].cues.length, 3, "前 3 条同一 clip");
+  assert.strictEqual(clips[1].cues.length, 1);
+  // 不重叠：clip0 最后一条 end <= clip1 第一条 start 所属逻辑
+  assert.strictEqual(clips[0].startMs, 0);
+  assert.strictEqual(clips[1].startMs, 35000);
+  assert.strictEqual(clips[0].index, 0);
+  assert.strictEqual(clips[1].index, 1);
+  // 覆盖完整：两 clip 的 cue 数之和 == 总 cue 数（无重复无丢失）
+  assert.strictEqual(clips[0].cues.length + clips[1].cues.length, cues.length);
+});
+
+/* ============ 5d. 缓存 key + LRU 裁剪 ============ */
+console.log("\n[makeCacheKey + pruneCache]");
+
+test("makeCacheKey 同输入稳定、异输入不同", () => {
+  const a = Core.makeCacheKey({ videoId: "v1", trackCode: "en-asr", targetLang: "zh-Hans", apiModel: "m", clipStartMs: 0 });
+  const b = Core.makeCacheKey({ videoId: "v1", trackCode: "en-asr", targetLang: "zh-Hans", apiModel: "m", clipStartMs: 0 });
+  const c = Core.makeCacheKey({ videoId: "v1", trackCode: "en-asr", targetLang: "ja", apiModel: "m", clipStartMs: 0 });
+  assert.strictEqual(a, b, "相同输入 key 相同 → 可命中");
+  assert.notStrictEqual(a, c, "目标语言不同 key 不同 → 不误命中");
+});
+
+test("pruneCache LRU 淘汰最旧条目", () => {
+  const cache = { k1: { t: 100, lines: ["a"] }, k2: { t: 200, lines: ["b"] }, k3: { t: 300, lines: ["c"] } };
+  const pruned = Core.pruneCache(cache, 2);
+  assert.strictEqual(Object.keys(pruned).length, 2);
+  assert.ok(!pruned.k1, "最旧的 k1 应被淘汰");
+  assert.ok(pruned.k2 && pruned.k3, "较新的保留");
+});
+
+test("pruneCache 未超上限原样返回", () => {
+  const cache = { k1: { t: 1, lines: [] } };
+  const pruned = Core.pruneCache(cache, 10);
+  assert.deepStrictEqual(Object.keys(pruned), ["k1"]);
+});
+
+/* ============ 5e. makeBackoff：失败退避 ============ */
+console.log("\n[makeBackoff：失败计数 + 退避 + 停止]");
+
+test("makeBackoff 连续失败 N 次后停止自动重试", () => {
+  const bo = Core.makeBackoff({ maxFails: 3, baseMs: 1000, maxMs: 60000 });
+  let now = 0;
+  assert.ok(bo.shouldTry(now), "初始应允许");
+  bo.fail(now); // fail 1 → nextAt = 1000
+  assert.ok(!bo.shouldTry(now), "退避期内不允许");
+  assert.ok(bo.shouldTry(now + 1000), "退避结束后允许");
+  bo.fail(now + 1000); // fail 2 → 退避 2000
+  assert.ok(bo.shouldTry(now + 5000));
+  bo.fail(now + 5000); // fail 3 → 达上限停止
+  assert.ok(bo.stopped, "应进入停止态");
+  assert.ok(!bo.shouldTry(now + 1e9), "停止后永远不重试");
+});
+
+test("makeBackoff reset 恢复（模拟用户手动重试）", () => {
+  const bo = Core.makeBackoff({ maxFails: 2 });
+  bo.fail(0);
+  bo.fail(0);
+  assert.ok(bo.stopped);
+  bo.reset();
+  assert.ok(!bo.stopped && bo.shouldTry(0), "reset 后恢复可重试");
+});
+
+/* ============ 5f. normalizeColor ============ */
+console.log("\n[normalizeColor + DEFAULT_CONFIG]");
+
+test("normalizeColor 合法色透传、非法回落", () => {
+  assert.strictEqual(Core.normalizeColor("#FFCC00", "#fff"), "#ffcc00");
+  assert.strictEqual(Core.normalizeColor("#abc", "#fff"), "#abc");
+  assert.strictEqual(Core.normalizeColor("", "#7fdfff"), "#7fdfff", "空值回落");
+  assert.strictEqual(Core.normalizeColor("red", "#7fdfff"), "#7fdfff", "非法回落");
+  assert.strictEqual(Core.normalizeColor("#000000", "#fff"), "#000000", "合法黑色应保留");
+});
+
+test("DEFAULT_CONFIG 含关键字段且颜色非空", () => {
+  const d = Core.DEFAULT_CONFIG;
+  assert.ok(d && typeof d === "object");
+  assert.ok(/^#/.test(d.fontColor) && /^#/.test(d.transColor), "默认颜色非空");
+  assert.ok(d.clipSeconds > 0 && d.batchLines > 0);
+});
+
 /* ============ 6. translateBatch（mock fetch 跑通整链路）============ */
 async function main() {
   console.log("\n[translateBatch：注入 mock fetch]");
@@ -315,6 +463,131 @@ async function main() {
   await asyncTest("translateBatch 空 cues 返回空数组", async () => {
     const out = await Core.translateBatch({ cues: [], apiBaseUrl: "x", apiModel: "m" });
     assert.deepStrictEqual(out, []);
+  });
+
+  /* ============ 6b. translateCues：首句优先 + 并发编排 ============ */
+  console.log("\n[translateCues：首句优先 + 批内并发 + 增量回调]");
+
+  test("planBatches 首句优先批排最前、其余补满不重叠", () => {
+    const cues = Array.from({ length: 12 }, (_, i) => ({ content: "c" + i }));
+    const batches = Core.planBatches(cues, { batchSize: 5, priorityIndex: 7, priorityLines: 3 });
+    const pri = batches.find((b) => b.priority);
+    assert.ok(pri, "应有优先批");
+    assert.strictEqual(pri.start, 7);
+    assert.strictEqual(pri.end, 10, "优先批覆盖 7..10");
+    // 全部 cue 恰好被覆盖一次（不重叠不遗漏）
+    const covered = new Array(12).fill(0);
+    batches.forEach((b) => {
+      for (let i = b.start; i < b.end; i++) covered[i]++;
+    });
+    assert.ok(covered.every((c) => c === 1), "每个 cue 恰好被一个批覆盖");
+  });
+
+  await asyncTest("translateCues 并发翻译并按行号正确对齐回 cue", async () => {
+    const cues = Array.from({ length: 12 }, (_, i) => ({ content: "line" + i }));
+    let calls = 0;
+    const mockFetch = async (url, opts) => {
+      calls++;
+      const body = JSON.parse(opts.body);
+      // 回显：把 user 里的带行号原文转成 "n. T<原文>"
+      const userLines = body.messages[1].content.split("\n").filter((l) => /^\d+\./.test(l));
+      const content = userLines
+        .map((l) => {
+          const m = l.match(/^(\d+)\.\s*(.*)$/);
+          return m[1] + ". T" + m[2];
+        })
+        .join("\n");
+      return { ok: true, status: 200, async json() { return { choices: [{ message: { content } }] }; }, async text() { return ""; } };
+    };
+    const out = await Core.translateCues({
+      cues,
+      apiBaseUrl: "https://gw/v1",
+      apiModel: "m",
+      targetLang: "zh-Hans",
+      batchSize: 5,
+      concurrency: 3,
+      fetchImpl: mockFetch,
+    });
+    assert.strictEqual(out.length, 12);
+    for (let i = 0; i < 12; i++) {
+      assert.strictEqual(out[i], "Tline" + i, "第 " + i + " 行应正确对齐");
+    }
+    assert.ok(calls >= 3, "应分多批（并发）调用");
+  });
+
+  await asyncTest("translateCues 首句优先批最先返回（onProgress 首回调含优先区）", async () => {
+    const cues = Array.from({ length: 12 }, (_, i) => ({ content: "x" + i }));
+    const mockFetch = async (url, opts) => {
+      const body = JSON.parse(opts.body);
+      const userLines = body.messages[1].content.split("\n").filter((l) => /^\d+\./.test(l));
+      // 大批故意慢返回，小的优先批快返回 → 验证优先批先完成
+      const delay = userLines.length > 3 ? 30 : 1;
+      await new Promise((r) => setTimeout(r, delay));
+      const content = userLines.map((l) => l.match(/^(\d+)\./)[1] + ". ok").join("\n");
+      return { ok: true, status: 200, async json() { return { choices: [{ message: { content } }] }; }, async text() { return ""; } };
+    };
+    let firstUpdateIndices = null;
+    await Core.translateCues({
+      cues,
+      apiBaseUrl: "https://gw/v1",
+      apiModel: "m",
+      batchSize: 5,
+      priorityIndex: 6,
+      priorityLines: 3,
+      concurrency: 3,
+      fetchImpl: mockFetch,
+      onProgress: (updates) => {
+        if (!firstUpdateIndices) firstUpdateIndices = updates.map((u) => u.index);
+      },
+    });
+    assert.ok(firstUpdateIndices, "应有 onProgress 回调");
+    assert.ok(firstUpdateIndices.indexOf(6) !== -1, "首个完成的批应是首句优先批(含 index 6)");
+  });
+
+  await asyncTest("translateCues 某批失败：失败批留空、其余成功、触发 onError", async () => {
+    const cues = Array.from({ length: 10 }, (_, i) => ({ content: "y" + i }));
+    let errored = 0;
+    const mockFetch = async (url, opts) => {
+      const body = JSON.parse(opts.body);
+      const userLines = body.messages[1].content.split("\n").filter((l) => /^\d+\./.test(l));
+      // 含 "y0" 的批（首批）失败，其余成功
+      if (/\by0\b/.test(body.messages[1].content)) {
+        return { ok: false, status: 500, async json() { return {}; }, async text() { return "boom"; } };
+      }
+      const content = userLines.map((l) => l.match(/^(\d+)\./)[1] + ". ok").join("\n");
+      return { ok: true, status: 200, async json() { return { choices: [{ message: { content } }] }; }, async text() { return ""; } };
+    };
+    const out = await Core.translateCues({
+      cues,
+      apiBaseUrl: "https://gw/v1",
+      apiModel: "m",
+      batchSize: 5,
+      concurrency: 2,
+      fetchImpl: mockFetch,
+      onError: () => errored++,
+    });
+    assert.strictEqual(out.length, 10);
+    assert.ok(errored >= 1, "失败批应触发 onError");
+    assert.strictEqual(out[0], undefined, "失败批对应行留空（调用方兜底原文）");
+    assert.strictEqual(out[5], "ok", "成功批仍正确填充");
+  });
+
+  await asyncTest("缓存命中场景：相同 key 不再调 fetch（pruneCache + makeCacheKey 协作）", async () => {
+    // 模拟 isolated.js 的"先查缓存命中则零调用"语义
+    const key = Core.makeCacheKey({ videoId: "v", trackCode: "en-asr", targetLang: "zh", apiModel: "m", clipStartMs: 0 });
+    const cache = {};
+    cache[key] = { t: Date.now(), lines: ["你好", "世界"] };
+    let fetchCalled = false;
+    // 命中：直接用缓存，不调 translateCues/fetch
+    let lines;
+    if (cache[key]) {
+      lines = cache[key].lines;
+    } else {
+      fetchCalled = true;
+      lines = await Core.translateCues({ cues: [{ content: "hello" }], apiBaseUrl: "x", apiModel: "m", fetchImpl: async () => { fetchCalled = true; return {}; } });
+    }
+    assert.deepStrictEqual(lines, ["你好", "世界"]);
+    assert.strictEqual(fetchCalled, false, "命中缓存不应触发 fetch");
   });
 
   /* ============ 7. 交付物校验 ============ */

@@ -1,53 +1,58 @@
 {
   "project": "dualsub-self",
-  "description": "仿 Dualsub 的双语字幕浏览器扩展（MV3），翻译直连用户自填的 OpenAI 兼容 API，不经过任何自建服务端/计费体系。",
-  "status": "delivered",
+  "description": "仿 Dualsub 的双语字幕浏览器扩展（MV3），翻译直连用户自填的 OpenAI 兼容 API。第二轮：修 5 类问题（颜色配置读取链路 / 原文 ASR 断句 / 译文加载慢 / 性能 / token）。",
+  "status": "delivered-round2",
   "date": "2026-06-28",
-  "deliverables": {
-    "manifest.json": "MV3 声明：MAIN(main.js) + ISOLATED(core.js,isolated.js) 双脚本，host_permissions 含 <all_urls> 以支持跨域翻译",
-    "main.js": "MAIN world：3 秒轮询 #movie_player，抓 captionTracks，等 pot 签名，设 fmt=json3/c=WEB|MWEB，RPC 推送 update-manifest",
-    "core.js": "纯逻辑模块（UMD）：parseJson3 / parseVtt / cleanupCues / translateBatch（分批+行号对齐+兜底）/ sliceClips。无浏览器依赖，可 Node 单测",
-    "isolated.js": "ISOLATED world：拉字幕→解析→clip 预取缓存翻译→渲染双语叠加层→chrome.storage 按 origin 存配置→与 popup 通信（get-state/set-config/test-connection）",
-    "popup.html + popup.js": "原生 JS 设置 UI：API 三件套(apiBaseUrl/apiKey/apiModel)、源/目标语言、显示样式开关、测试连接按钮",
-    "icons/16,48,128.png": "PIL 生成的真 PNG 占位图标（蓝底圆角 + 字母 D）",
-    "README.md": "中文：安装、配置、翻译策略、架构、安全说明、已知限制",
-    "LICENSE": "MIT",
-    ".gitignore": "排除 node_modules / __pycache__ / 密钥文件等",
-    "gen_icons.py": "图标生成脚本（构建辅助）",
-    "test/run-tests.js": "离线测试套件（零依赖）",
-    "FEEDBACK_TO_UPSTREAM.md": "构建中的决策与待确认项"
+  "round2_fixes": {
+    "fix1_color_config": "popup.js 改为直接从 chrome.storage.local 按 origin 读配置回显（不依赖内容脚本），颜色框初始化与 readForm 均经 Core.normalizeColor 兜底（非法/空值回落默认色，杜绝 #000000 空值污染）；保存时 popup 写一份 storage 冗余 + set-config 即时生效；popup.html 引入 core.js；isolated.applyStyleVars 也用 normalizeColor 兜底。",
+    "fix2_resegment": "core.js 新增 resegmentCues 纯函数：合并小间隙(<300ms)且未自然结束的连续 ASR 碎片、词级去滚动重叠(stripOverlap)、按句末标点/最大时长(~6s)/最大词数(~12)重新切句。isolated.loadTrack 在 cleanupCues 后调用。",
+    "fix3_4_perf": "core.js 新增 translateCues 编排器（首句优先批先返回 + 受控并发池(默认3) + 增量 onProgress 回调 + contextTail 仅跨句边界带1句）与 planBatches；isolated.js 接入：clip 改按 cue 边界切(sliceClipsByCue, 默认~30s 不切碎句子)、进入 clip 即预取下一个、onTick prefetch 加 1s 位移节流、边翻边填 clipCache 即时重渲染、首句优先以播放位置最近 cue 为起点。",
+    "fix5_token": "clip 按 cue 边界切不重叠不重翻；持久缓存 makeCacheKey(videoId|轨道|语言|模型|clip起点)+pruneCache(LRU 800)，命中零调用；makeBackoff 失败计数+指数退避，连续失败4次停止自动重试，改配置/重存即 reset；batchLines 默认 20→10；精简 DEFAULT_SYSTEM_PROMPT 省固定开销。"
+  },
+  "files_changed": {
+    "core.js": "新增 resegmentCues/stripOverlap/SENTENCE_END_RE、DEFAULT_CONFIG、normalizeColor、sliceClipsByCue、makeCacheKey、pruneCache、makeBackoff、planBatches、translateCues；精简 DEFAULT_SYSTEM_PROMPT；扩展 EXPORTS。",
+    "isolated.js": "复用 Core.DEFAULT_CONFIG；新增持久缓存读写(readCache/writeCache/clipCacheKey)；state 增 clipBackoff/lastPrefetchMs；loadTrack 加 resegment+按cue切；重写 prefetchAround(节流+预取下一clip)+translateClip(缓存命中/首句优先/并发/退避/边翻边填)；set-config 改配置清退避作手动重试；applyStyleVars 颜色兜底。",
+    "popup.js": "直接从 chrome.storage.local 按 origin 读配置(loadConfigFromStorage)回显；颜色 fillForm/readForm 经 normColor 兜底；保存写 storage 冗余+set-config；复用 Core.DEFAULT_CONFIG。",
+    "popup.html": "<script src=\"core.js\"> 先于 popup.js 引入。",
+    "test/run-tests.js": "新增 resegment/sliceClipsByCue/makeCacheKey/pruneCache/makeBackoff/normalizeColor/DEFAULT_CONFIG/planBatches/translateCues(对齐+首句优先+失败兜底)/缓存命中 共 18 个测试。",
+    "README.md": "更新：多语言(源语言不限英文)、ASR 语义重组、首句优先+并发+缓存、token 优化、配置读取说明、架构与已知限制。",
+    "FEEDBACK_TO_UPSTREAM.md": "追加第二轮 5 条决策/待确认（颜色链路/CJK去重叠/clip默认值/并发退避默认/缓存配额）。"
   },
   "verification": {
-    "node_check": "core.js / main.js / isolated.js / popup.js / test/run-tests.js 全部 node --check 通过",
-    "py_compile": "gen_icons.py 通过",
-    "manifest_parse": "manifest.json JSON.parse 通过，字段完整（mv3 / 双 world / <all_urls> / popup）",
-    "icons": "16/48/128 均为真 PNG 且 >0 字节（PNG 签名校验通过）",
-    "offline_tests": "node test/run-tests.js → 24 通过 / 0 失败",
-    "tests_cover": [
-      "json3 解析 + segs 拼接 + 空内容过滤",
-      "时间轴清洗：去重叠/排序/修正 end<start",
-      "WebVTT 解析（含无小时位、内联标签清理）",
-      "翻译行号对齐：正常/缺行/多行/乱序/多种行号写法/无行号兜底",
-      "translateBatch 用 mock fetch 验证请求构造+解析+对齐",
-      "HTTP 非 200 抛错、contextTail 上下文注入、空 cues",
-      "clip 切分、joinUrl、manifest/icons/popup 交付物校验"
-    ]
+    "node_check": "core.js / main.js / isolated.js / popup.js / test/run-tests.js 全部 node --check 通过（node v20）",
+    "manifest_parse": "manifest.json JSON.parse 通过",
+    "offline_tests": "node test/run-tests.js → 42 通过 / 0 失败（exit 0，多次运行结果一致）",
+    "new_tests_cover": [
+      "resegment：碎片合并/去滚动重叠词(无 work work)/句末标点断句/大间隙不合并/超词数切句",
+      "sliceClipsByCue：按 cue 边界就近切、不切碎句子、不重叠、覆盖完整",
+      "makeCacheKey 稳定且区分语言；pruneCache LRU 淘汰最旧",
+      "makeBackoff 连续失败 N 次停止、reset 恢复",
+      "normalizeColor 合法透传/非法回落/合法黑色保留；DEFAULT_CONFIG 字段完整",
+      "planBatches 首句优先排最前且全覆盖不重叠",
+      "translateCues 并发翻译按行号正确对齐回 cue / 首句优先批最先返回 / 某批失败留空其余成功触发 onError",
+      "缓存命中场景相同 key 不再调 fetch"
+    ],
+    "preexisting_tests": "既有 parseJson3/parseVtt/cleanupCues/alignTranslations/translateBatch/joinUrl/manifest/icons 测试仍全部通过"
   },
   "known_limitations": [
-    "m.youtube.com 移动端播放器对象结构未在容器内验证，按桌面端同套逻辑尽力支持，需端到端验证",
-    "真实 YouTube 端到端（轨道抓取、pot 签名、渲染叠加层）需在浏览器中用 playwright 验证，容器内无法跑浏览器",
-    "未做翻译请求全局限流/退避，严格 RPM 网关可能偶发 429（已做错误兜底：失败 clip 仅显示原文，不崩溃）",
+    "m.youtube.com 移动端播放器对象结构未在容器内验证，按桌面端同套逻辑尽力支持",
+    "真实 YouTube 端到端（颜色生效、ASR 断句质量、首句延迟、轨道抓取/pot/渲染）需浏览器 playwright 验证，容器内无法跑浏览器",
+    "resegment 滚动重叠去重为词级（空格分词），CJK 无空格语言按整条事件处理（其 ASR 重叠少见）",
+    "并发上限固定 3、退避 maxFails 固定 4，未做成用户可配项",
+    "持久缓存 LRU 上限 800 条，未做精确字节配额核算（set 失败已 try/catch 吞掉不影响主流程）",
     "仅支持 OpenAI 兼容 /chat/completions 接口"
   ],
   "needs_upstream_e2e": [
-    "在真实 www.youtube.com 验证：main.js 能否拿到带 pot 的 captionTracks 并成功推送",
-    "在 m.youtube.com 验证移动端播放器对象与 MWEB 字幕请求",
-    "配一个真实 OpenAI 兼容网关，验证 popup 测试连接 + 边播边翻的预取/缓存与渲染效果",
-    "确认是否接受 <all_urls> 权限，或改走 optional_host_permissions 最小权限路线（见 FEEDBACK_TO_UPSTREAM.md）"
+    "颜色：在真实 popup 改色保存后，叠加层 getComputedStyle 是否立即变、刷新后是否回显正确（不再回落 #000000）",
+    "断句：真实 ASR 视频上原文是否成相对完整语义单元、无 work work 重复词、断句接近 Dualsub 初版",
+    "首句延迟：进入新片段/拖动进度条后，附近 3-5 句是否快速先出译文，而非等满整批",
+    "token：重看/拖回/刷新是否命中持久缓存零重复调用；失败网关下连续失败是否停止自动重试",
+    "确认 clipSeconds=30 / batchLines=10 / 并发3 这组默认值是否符合预期，或需回调",
+    "确认是否接受 <all_urls> 权限（沿用初版，见 FEEDBACK_TO_UPSTREAM.md）"
   ],
   "git": {
     "repo": "/workspace/repos/dualsub-self",
     "pushed": false,
-    "note": "已 git init + 初始 commit，未 push（按 brief 由上游在 hermes 侧用 Jieoz token push）"
+    "note": "本轮做一个清晰中文 commit，未 push（按 brief 由上游 push）"
   }
 }

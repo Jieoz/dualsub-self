@@ -142,8 +142,155 @@
   }
 
   /* ---------------------------------------------------------------
-   * 3. 工具函数
+   * 2b. 原文语义重组（resegment）—— 修 ASR 断句
+   * -------------------------------------------------------------
+   * YouTube 自动字幕(ASR)的 event 是按滚动时间片切的：一句话常被切进
+   * 多个 event，相邻 event 文字还会重叠（后一个含前一个的尾词）。
+   * 直接每个 event 当一条 cue 会导致原文断句凌乱、出现 "work work under"
+   * 这种重复词。这里把碎片重组成相对完整的语义单元：
+   *  - 去相邻 cue 的滚动重叠词（按词比对，忽略大小写/标点）。
+   *  - 间隙很小且上一句没说完（无句末标点）就合并，时间轴取并集。
+   *  - 按句末标点 / 最大时长(~6s) / 最大词数(~12) 重新切句。
+   * 纯函数，可离线单测。入参应已 cleanupCues（有序、无负时长）。
+   */
+
+  // 句末标点（中英文）：命中则认为一句自然结束，适合断句
+  var SENTENCE_END_RE = /[.!?。！？…]+["'”’)\]]*$/;
+
+  // 把一个词规整为比较用 token：转小写、去首尾标点
+  function wordKey(w) {
+    return String(w || "")
+      .toLowerCase()
+      .replace(/^[^0-9a-z一-鿿]+|[^0-9a-z一-鿿]+$/g, "");
+  }
+
+  /**
+   * 去掉 next 开头与 prev 结尾重叠的词，返回 next 去重叠后的词数组。
+   * 例：prev="...how transformers work" next="work under the hood"
+   *     → next 去掉开头的 "work" → ["under","the","hood"]。
+   * 只在词级别比对（CJK 无空格的语言此重叠少见，按整体词处理即可）。
+   */
+  function stripOverlap(prevWords, nextWords) {
+    var maxK = Math.min(prevWords.length, nextWords.length, 8);
+    for (var k = maxK; k >= 1; k--) {
+      var match = true;
+      for (var i = 0; i < k; i++) {
+        if (wordKey(prevWords[prevWords.length - k + i]) !== wordKey(nextWords[i])) {
+          match = false;
+          break;
+        }
+      }
+      if (match) return nextWords.slice(k);
+    }
+    return nextWords;
+  }
+
+  function resegmentCues(cues, opts) {
+    opts = opts || {};
+    var maxGap = opts.maxGapMs != null ? opts.maxGapMs : 300; // 小于此间隙视为同句延续
+    var maxDur = opts.maxDurationMs != null ? opts.maxDurationMs : 6000; // 单句最长时长
+    var maxWords = opts.maxWords != null ? opts.maxWords : 12; // 单句最多词数
+    var list = (cues || []).filter(function (c) {
+      return c && c.content;
+    });
+    if (!list.length) return [];
+
+    var out = [];
+    var cur = null; // 当前累积段：{start,end,words:[]}
+
+    function flush() {
+      if (!cur) return;
+      var content = collapseWhitespace(cur.words.join(" "));
+      if (content) {
+        out.push({
+          start: cur.start,
+          end: cur.end,
+          duration: Math.max(0, cur.end - cur.start),
+          content: content,
+        });
+      }
+      cur = null;
+    }
+
+    for (var idx = 0; idx < list.length; idx++) {
+      var c = list[idx];
+      var words = collapseWhitespace(c.content).split(" ").filter(Boolean);
+      if (!words.length) continue;
+
+      if (!cur) {
+        cur = { start: c.start, end: c.end, words: words.slice() };
+      } else {
+        var gap = c.start - cur.end;
+        var added = stripOverlap(cur.words, words);
+        // 是否该与当前段合并：间隙小、当前段没自然结束、且合并后不超限
+        var prevText = cur.words.join(" ");
+        var ended = SENTENCE_END_RE.test(prevText);
+        var wouldWords = cur.words.length + added.length;
+        var wouldDur = c.end - cur.start;
+        var mergeable =
+          gap <= maxGap && !ended && wouldWords <= maxWords && wouldDur <= maxDur;
+        if (mergeable) {
+          for (var w = 0; w < added.length; w++) cur.words.push(added[w]);
+          cur.end = Math.max(cur.end, c.end);
+        } else {
+          flush();
+          cur = { start: c.start, end: c.end, words: words.slice() };
+        }
+      }
+
+      // 段已自然结束 / 到达上限 → 立即切句
+      var curText = cur.words.join(" ");
+      if (
+        SENTENCE_END_RE.test(curText) ||
+        cur.words.length >= maxWords ||
+        cur.end - cur.start >= maxDur
+      ) {
+        flush();
+      }
+    }
+    flush();
+    return out;
+  }
+
+  /* ---------------------------------------------------------------
+   * 3. 工具函数 + 默认配置
    * ------------------------------------------------------------- */
+
+  /**
+   * 默认配置（popup 与 isolated 共用同一份，避免两边漂移）。
+   * key 统一为 "dualsub:" + origin。
+   */
+  var DEFAULT_CONFIG = {
+    enabled: true,
+    apiBaseUrl: "",
+    apiKey: "",
+    apiModel: "gpt-4o-mini",
+    sourceLang: "auto", // auto = 用第一条 ASR / 第一条轨道
+    targetLang: "zh-Hans",
+    systemPrompt: "", // 空 = 用 core 默认
+    // 显示样式
+    fontSize: 22, // px
+    bottomOffset: 90, // px，距播放器底部
+    fontColor: "#ffffff",
+    transColor: "#7fdfff", // 译文颜色
+    stroke: true, // 描边
+    shadow: true, // 阴影
+    background: false, // 背景框
+    transOnTop: true, // true=译文在上，原文在下
+    showOriginal: true, // 是否显示原文行
+    clipSeconds: 30, // 每个翻译 clip 多少秒（按 cue 边界就近切）
+    batchLines: 10, // 每批最多多少行（clip 内再分批）
+  };
+
+  /**
+   * 规整颜色值：合法的 #rgb/#rrggbb 才接受，否则回落 fallback。
+   * 用于杜绝 <input type=color> 空值/默认 #000000 污染配置。
+   */
+  function normalizeColor(v, fallback) {
+    var s = String(v == null ? "" : v).trim();
+    if (/^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(s)) return s.toLowerCase();
+    return fallback;
+  }
 
   function toInt(v, dflt) {
     const n = parseInt(v, 10);
@@ -167,15 +314,13 @@
    */
 
   // 默认 system prompt（{TARGET_LANG} 会被替换为目标语言）
+  // 精简措辞、去冗余以省固定 token 开销，但保留三条硬约束：
+  // 结合上下文理解碎片语义 / 每个输入行号一行译文 / 行号与行数完全一致。
   var DEFAULT_SYSTEM_PROMPT =
-    "You are a professional subtitle translator. The input is auto-generated " +
-    "captions split into numbered fragments that may lack punctuation and " +
-    "capitalization. Translate them into {TARGET_LANG}. First mentally restore " +
-    "punctuation and merge fragments into coherent sentences to understand the " +
-    "meaning and context, but OUTPUT exactly one translated line per numbered " +
-    "input line, preserving the SAME numbering and the SAME number of lines. " +
-    "Use natural, spoken {TARGET_LANG}. Output ONLY the numbered translations, " +
-    "nothing else.";
+    "Translate these subtitle fragments into {TARGET_LANG}. They may lack " +
+    "punctuation or be split mid-sentence; use context to infer meaning. " +
+    "Output exactly one line per numbered input line, same numbers and same " +
+    "line count, natural spoken {TARGET_LANG}, numbered lines only, no extra text.";
 
   function buildSystemPrompt(targetLang, customPrompt) {
     var tpl = customPrompt && String(customPrompt).trim() ? customPrompt : DEFAULT_SYSTEM_PROMPT;
@@ -336,6 +481,8 @@
    * 把 cue 列表按时间切成 clip（默认 60 秒一个）。
    * 一条 cue 归属到它 start 所在的 clip。返回 clip 数组：
    * { index, startMs, endMs, cues: cue[] }。
+   * 注意：按硬时间格切会把跨边界的句子切到两个 clip 各翻一次，浪费 token。
+   * 推荐用 sliceClipsByCue（按 cue 边界就近切，不在句子中间断）。
    */
   function sliceClips(cues, clipMs) {
     var size = clipMs && clipMs > 0 ? clipMs : 60000;
@@ -351,18 +498,248 @@
     return clips.filter(Boolean);
   }
 
+  /**
+   * 按 cue 边界切 clip：累积 cue 直到时长达到 ~targetMs，就在当前 cue 之后断开。
+   * 绝不把一条 cue 切到两个 clip，clip 之间不重叠、不重复 → 省 token。
+   * 返回 clip 数组：{ index, startMs, endMs, cues, startIndex }（index 从 0 连续）。
+   * startMs 用该 clip 第一条 cue 的 start（稳定，可做缓存 key 的一部分）。
+   */
+  function sliceClipsByCue(cues, targetMs) {
+    var size = targetMs && targetMs > 0 ? targetMs : 30000;
+    var clips = [];
+    var i = 0;
+    var n = (cues || []).length;
+    while (i < n) {
+      var startMs = cues[i].start;
+      var group = [];
+      var startIndex = i;
+      while (i < n) {
+        group.push(cues[i]);
+        var spanned = cues[i].end - startMs;
+        i++;
+        // 达到目标时长就收尾（至少 1 条）；下一条另起 clip
+        if (spanned >= size) break;
+      }
+      clips.push({
+        index: clips.length,
+        startMs: startMs,
+        endMs: group[group.length - 1].end,
+        cues: group,
+        startIndex: startIndex,
+      });
+    }
+    return clips;
+  }
+
+  /* ---------------------------------------------------------------
+   * 6. 持久缓存 key + LRU 裁剪
+   * ------------------------------------------------------------- */
+
+  /**
+   * 生成缓存 key：videoId + 轨道 code + 目标语言 + model + clip 起始毫秒。
+   * 同一视频/轨道/语言/模型下，clip 起点稳定 → 重看/拖回/刷新可命中不重翻。
+   */
+  function makeCacheKey(parts) {
+    parts = parts || {};
+    return [
+      "dsc",
+      parts.videoId || "",
+      parts.trackCode || "",
+      parts.targetLang || "",
+      parts.apiModel || "",
+      parts.clipStartMs != null ? parts.clipStartMs : "",
+    ].join("|");
+  }
+
+  /**
+   * LRU 裁剪缓存对象（防止 chrome.storage.local 配额溢出）。
+   * cacheObj: { key: { t:写入时间戳, lines:string[] } }。
+   * 超过 maxEntries 时按 t 升序淘汰最旧的。返回新对象（不改入参）。
+   */
+  function pruneCache(cacheObj, maxEntries) {
+    var max = maxEntries && maxEntries > 0 ? maxEntries : 800;
+    var keys = Object.keys(cacheObj || {});
+    if (keys.length <= max) return Object.assign({}, cacheObj);
+    keys.sort(function (a, b) {
+      return (cacheObj[a].t || 0) - (cacheObj[b].t || 0);
+    });
+    var drop = keys.length - max;
+    var out = {};
+    for (var i = drop; i < keys.length; i++) out[keys[i]] = cacheObj[keys[i]];
+    return out;
+  }
+
+  /* ---------------------------------------------------------------
+   * 7. 失败退避：连续失败 N 次后停止自动重试
+   * ------------------------------------------------------------- */
+
+  /**
+   * 造一个退避控制器（每个 clip 一个）。
+   *  - shouldTry(now): 是否允许此刻发起翻译（未到下次允许时间且未超上限）。
+   *  - fail(now): 记一次失败，指数退避下次允许时间，超 maxFails 永久停。
+   *  - reset(): 用户改配置/手动重试时恢复。
+   */
+  function makeBackoff(opts) {
+    opts = opts || {};
+    var maxFails = opts.maxFails != null ? opts.maxFails : 4;
+    var baseMs = opts.baseMs != null ? opts.baseMs : 2000;
+    var maxMs = opts.maxMs != null ? opts.maxMs : 60000;
+    var fails = 0;
+    var nextAt = 0;
+    var stopped = false;
+    return {
+      shouldTry: function (now) {
+        now = now != null ? now : Date.now();
+        if (stopped) return false;
+        return now >= nextAt;
+      },
+      fail: function (now) {
+        now = now != null ? now : Date.now();
+        fails++;
+        if (fails >= maxFails) {
+          stopped = true;
+          return;
+        }
+        var delay = Math.min(maxMs, baseMs * Math.pow(2, fails - 1));
+        nextAt = now + delay;
+      },
+      reset: function () {
+        fails = 0;
+        nextAt = 0;
+        stopped = false;
+      },
+      get fails() {
+        return fails;
+      },
+      get stopped() {
+        return stopped;
+      },
+    };
+  }
+
+  /* ---------------------------------------------------------------
+   * 8. 翻译编排：首句优先 + 批内受控并发 + 增量回调
+   * -------------------------------------------------------------
+   * translateCues 把一个 clip 的 cue 切成多个 batch：
+   *  - 首句优先：把 priorityIndex 附近的一小批排到最前先翻先返回。
+   *  - 受控并发：用并发池（默认上限 3）替代串行 await。
+   *  - 增量：每批完成就回调 onProgress(updates)，让 UI 尽快显示。
+   *  - contextTail：仅当某批起点不在自然句首（上一条原文无句末标点）时，
+   *    带上一条原文 1 句；clip 第一批不带。省 token 又保连贯。
+   * 返回与 cues 等长的 string[]（全部批完成后）。fetch 注入便于测试。
+   */
+  function planBatches(cues, opts) {
+    opts = opts || {};
+    var batchSize = opts.batchSize > 0 ? opts.batchSize : 10;
+    var priLines = opts.priorityLines > 0 ? opts.priorityLines : 4;
+    var n = cues.length;
+    var pri = opts.priorityIndex;
+    var batches = [];
+    var covered = new Array(n).fill(false);
+
+    // 首句优先批：以 priorityIndex 为起点的一小批
+    if (pri != null && pri >= 0 && pri < n) {
+      var pEnd = Math.min(n, pri + priLines);
+      batches.push({ start: pri, end: pEnd, priority: true });
+      for (var x = pri; x < pEnd; x++) covered[x] = true;
+    }
+    // 其余按顺序补满（跳过已覆盖区间）
+    var i = 0;
+    while (i < n) {
+      if (covered[i]) {
+        i++;
+        continue;
+      }
+      var start = i;
+      var end = i;
+      while (end < n && !covered[end] && end - start < batchSize) end++;
+      batches.push({ start: start, end: end, priority: false });
+      i = end;
+    }
+    return batches;
+  }
+
+  async function translateCues(opts) {
+    var cues = opts.cues || [];
+    var n = cues.length;
+    var result = new Array(n);
+    if (!n) return result;
+    var concurrency = opts.concurrency > 0 ? opts.concurrency : 3;
+    var batches = planBatches(cues, {
+      batchSize: opts.batchSize,
+      priorityIndex: opts.priorityIndex,
+      priorityLines: opts.priorityLines,
+    });
+    // 首句优先批排最前，保证先被并发池取走
+    batches.sort(function (a, b) {
+      return (b.priority ? 1 : 0) - (a.priority ? 1 : 0) || a.start - b.start;
+    });
+
+    var bi = 0;
+    async function worker() {
+      while (bi < batches.length) {
+        var b = batches[bi++];
+        var sub = cues.slice(b.start, b.end);
+        // 仅当批起点不在自然句首时带 1 句上下文；clip 第一批(start=0)不带
+        var ctx = null;
+        if (b.start > 0) {
+          var prev = cues[b.start - 1];
+          if (prev && !SENTENCE_END_RE.test(prev.content)) ctx = [prev.content];
+        }
+        var lines;
+        try {
+          lines = await translateBatch({
+            cues: sub,
+            apiBaseUrl: opts.apiBaseUrl,
+            apiKey: opts.apiKey,
+            apiModel: opts.apiModel,
+            targetLang: opts.targetLang,
+            systemPrompt: opts.systemPrompt,
+            temperature: opts.temperature,
+            contextTail: ctx,
+            fetchImpl: opts.fetchImpl,
+          });
+        } catch (e) {
+          if (opts.onError) opts.onError(e, b);
+          if (opts.failFast) throw e;
+          continue; // 该批失败：留空，调用方兜底显示原文
+        }
+        var updates = [];
+        for (var k = 0; k < sub.length; k++) {
+          result[b.start + k] = lines[k];
+          updates.push({ index: b.start + k, text: lines[k] });
+        }
+        if (opts.onProgress) opts.onProgress(updates, b);
+      }
+    }
+
+    var pool = [];
+    for (var w = 0; w < Math.min(concurrency, batches.length); w++) pool.push(worker());
+    await Promise.all(pool);
+    return result;
+  }
+
   var EXPORTS = {
     parseJson3: parseJson3,
     parseVtt: parseVtt,
     cleanupCues: cleanupCues,
+    resegmentCues: resegmentCues,
     collapseWhitespace: collapseWhitespace,
+    normalizeColor: normalizeColor,
+    DEFAULT_CONFIG: DEFAULT_CONFIG,
     DEFAULT_SYSTEM_PROMPT: DEFAULT_SYSTEM_PROMPT,
     buildSystemPrompt: buildSystemPrompt,
     buildNumberedBatch: buildNumberedBatch,
     parseNumberedResponse: parseNumberedResponse,
     alignTranslations: alignTranslations,
     translateBatch: translateBatch,
+    translateCues: translateCues,
+    planBatches: planBatches,
     sliceClips: sliceClips,
+    sliceClipsByCue: sliceClipsByCue,
+    makeCacheKey: makeCacheKey,
+    pruneCache: pruneCache,
+    makeBackoff: makeBackoff,
     joinUrl: joinUrl,
   };
 

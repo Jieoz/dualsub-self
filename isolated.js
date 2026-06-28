@@ -26,27 +26,9 @@
 
   // ---- 配置 ----
   var STORAGE_KEY = "dualsub:" + location.origin; // 按 origin 存
-  var DEFAULT_CONFIG = {
-    enabled: true,
-    apiBaseUrl: "",
-    apiKey: "",
-    apiModel: "gpt-4o-mini",
-    sourceLang: "auto", // auto = 用第一条 ASR / 第一条轨道
-    targetLang: "zh-Hans",
-    systemPrompt: "", // 空 = 用 core 默认
-    // 显示样式
-    fontSize: 22, // px
-    bottomOffset: 90, // px，距播放器底部
-    fontColor: "#ffffff",
-    transColor: "#7fdfff", // 译文颜色
-    stroke: true, // 描边
-    shadow: true, // 阴影
-    background: false, // 背景框
-    transOnTop: true, // true=译文在上，原文在下
-    showOriginal: true, // 是否显示原文行
-    clipSeconds: 60, // 每个翻译 clip 多少秒
-    batchLines: 20, // 每批最多多少行（clip 内再分批）
-  };
+  var CACHE_KEY = "dualsub:cache"; // 翻译缓存（全 origin 共享，按 videoId/轨道/语言/model 区分）
+  var CACHE_MAX_ENTRIES = 800; // 缓存条目上限（LRU 裁剪，防配额溢出）
+  var DEFAULT_CONFIG = Core.DEFAULT_CONFIG;
 
   var config = Object.assign({}, DEFAULT_CONFIG);
 
@@ -55,13 +37,15 @@
     videoId: null,
     tracks: [], // main.js 推来的轨道清单
     activeTrack: null, // 当前选中的轨道
-    cues: [], // 清洗后的原文 cue
-    clips: [], // 按时间切的 clip
-    clipCache: {}, // clipIndex -> translated string[]（与该 clip cues 等长）
+    cues: [], // 清洗 + 语义重组后的原文 cue
+    clips: [], // 按 cue 边界切的 clip
+    clipCache: {}, // clipIndex -> translated string[]（与该 clip cues 等长，可含空洞，边翻边填）
     clipState: {}, // clipIndex -> 'pending'|'done'|'error'
+    clipBackoff: {}, // clipIndex -> backoff 控制器（失败退避）
     renderer: null, // 叠加层 DOM
     videoEl: null,
     rafBound: false,
+    lastPrefetchMs: -1e9, // 上次 prefetch 的播放位置（节流）
   };
 
   /* =====================================================
@@ -89,6 +73,47 @@
       obj[STORAGE_KEY] = config;
       chrome.storage.local.set(obj);
     } catch (e) {}
+  }
+
+  /* =====================================================
+   * 翻译持久缓存（chrome.storage.local，按 clip 维度）
+   * key = videoId|轨道code|targetLang|model|clipStartMs
+   * 命中直接用不重翻；写入时 LRU 裁剪防配额溢出。
+   * ===================================================== */
+  function clipCacheKey(clip) {
+    return Core.makeCacheKey({
+      videoId: state.videoId,
+      trackCode: state.activeTrack ? state.activeTrack.code : "",
+      targetLang: config.targetLang,
+      apiModel: config.apiModel,
+      clipStartMs: clip.startMs,
+    });
+  }
+
+  function readCache() {
+    return new Promise(function (resolve) {
+      try {
+        chrome.storage.local.get([CACHE_KEY], function (res) {
+          var c = res && res[CACHE_KEY];
+          resolve(c && typeof c === "object" ? c : {});
+        });
+      } catch (e) {
+        resolve({});
+      }
+    });
+  }
+
+  /** 把某 clip 的整段译文写进持久缓存（仅在全部行翻完时调用） */
+  function writeCache(key, lines) {
+    readCache().then(function (cacheObj) {
+      cacheObj[key] = { t: Date.now(), lines: lines };
+      var pruned = Core.pruneCache(cacheObj, CACHE_MAX_ENTRIES);
+      var obj = {};
+      obj[CACHE_KEY] = pruned;
+      try {
+        chrome.storage.local.set(obj);
+      } catch (e) {}
+    });
   }
 
   /* =====================================================
@@ -179,18 +204,22 @@
         cues = Core.parseVtt(text);
       }
       cues = Core.cleanupCues(cues);
+      // 语义重组：合并 ASR 碎片、去滚动重叠词、按标点/停顿重新切句
+      cues = Core.resegmentCues(cues);
       if (!cues.length) {
         console.warn("[dualsub] 解析后无有效字幕");
         return;
       }
       state.cues = cues;
-      state.clips = Core.sliceClips(cues, config.clipSeconds * 1000);
+      // 按 cue 边界切 clip（不在句子中间断、clip 间不重叠 → 省 token）
+      state.clips = Core.sliceClipsByCue(cues, config.clipSeconds * 1000);
       state.clipCache = {};
       state.clipState = {};
+      state.clipBackoff = {};
       ensureRenderer();
       bindVideo();
       // 立即预取当前播放位置所在的 clip
-      prefetchAround(currentTimeMs());
+      prefetchAround(currentTimeMs(), true);
     } catch (e) {
       console.warn("[dualsub] loadTrack 出错", e);
     }
@@ -214,24 +243,41 @@
   }
 
   /**
-   * 预取策略：翻当前 clip，并在接近 clip 尾部时提前翻下一个 clip。
-   * 已翻过 / 正在翻的 clip 跳过。
+   * 预取策略（带节流）：进入某 clip 立即翻当前 clip + 预取下一个 clip。
+   * force=true 时跳过节流（拖动进度条 / 刚加载）。
+   * 已翻 / 正在翻 / 退避中的 clip 由 translateClip 内部跳过。
    */
-  function prefetchAround(ms) {
+  function prefetchAround(ms, force) {
     if (!config.enabled || !state.clips.length) return;
+    // 节流：onTick 高频触发，位置没明显移动就不重复跑昂贵逻辑
+    if (!force && Math.abs(ms - state.lastPrefetchMs) < 1000) return;
+    state.lastPrefetchMs = ms;
+
     var idx = clipIdxAt(ms);
     if (idx === -1) idx = 0;
 
-    translateClip(idx);
-
-    // 接近当前 clip 尾部（剩余 < 15s）就预取下一个
-    var cur = state.clips[idx];
-    if (cur && ms >= cur.endMs - 15000 && idx + 1 < state.clips.length) {
-      translateClip(idx + 1);
-    }
+    // 当前 clip 首句优先：把播放位置附近的 cue 排到最前先翻先显示
+    translateClip(idx, priorityCueIndex(idx, ms));
+    // 进入某 clip 即预取下一个 clip（不等剩 15s）
+    if (idx + 1 < state.clips.length) translateClip(idx + 1, 0);
   }
 
-  async function translateClip(idx) {
+  /** 找播放位置 ms 在 clip 内最接近的 cue 下标（用作首句优先起点） */
+  function priorityCueIndex(idx, ms) {
+    var clip = state.clips[idx];
+    if (!clip) return 0;
+    for (var i = 0; i < clip.cues.length; i++) {
+      if (ms < clip.cues[i].end) return i;
+    }
+    return 0;
+  }
+
+  function getBackoff(idx) {
+    if (!state.clipBackoff[idx]) state.clipBackoff[idx] = Core.makeBackoff();
+    return state.clipBackoff[idx];
+  }
+
+  async function translateClip(idx, priorityIndex) {
     var clip = state.clips[idx];
     if (!clip) return;
     if (state.clipState[idx] === "done" || state.clipState[idx] === "pending") return;
@@ -241,37 +287,61 @@
       state.clipState[idx] = "error";
       return;
     }
+    // 失败退避：连续失败 N 次后停，不再无脑重试烧 token
+    var backoff = getBackoff(idx);
+    if (!backoff.shouldTry()) return;
+
+    // 先查持久缓存：命中直接用，零 API 调用
+    var key = clipCacheKey(clip);
+    var cached = await readCache();
+    if (cached[key] && Array.isArray(cached[key].lines)) {
+      state.clipCache[idx] = cached[key].lines.slice();
+      state.clipState[idx] = "done";
+      lastRenderedKey = ""; // 强制下次 onTick 重渲染
+      return;
+    }
 
     state.clipState[idx] = "pending";
+    // 边翻边填：clipCache[idx] 先建空数组，每批回调即时写入并触发重渲染
+    if (!state.clipCache[idx]) state.clipCache[idx] = new Array(clip.cues.length);
+    var hadError = false;
     try {
-      // clip 内再按 batchLines 分批，逐批翻译并拼回
-      var translated = new Array(clip.cues.length);
-      var batchSize = config.batchLines > 0 ? config.batchLines : 20;
-      var prevTail = null;
-      for (var off = 0; off < clip.cues.length; off += batchSize) {
-        var sub = clip.cues.slice(off, off + batchSize);
-        var lines = await Core.translateBatch({
-          cues: sub,
-          apiBaseUrl: config.apiBaseUrl,
-          apiKey: config.apiKey,
-          apiModel: config.apiModel,
-          targetLang: config.targetLang,
-          systemPrompt: config.systemPrompt,
-          contextTail: prevTail, // 上一批末尾作上下文，保证连贯
-        });
-        for (var k = 0; k < sub.length; k++) {
-          translated[off + k] = lines[k];
-        }
-        // 取本批最后 2 句原文作为下一批上下文
-        prevTail = sub.slice(-2).map(function (c) {
-          return c.content;
-        });
+      var lines = await Core.translateCues({
+        cues: clip.cues,
+        apiBaseUrl: config.apiBaseUrl,
+        apiKey: config.apiKey,
+        apiModel: config.apiModel,
+        targetLang: config.targetLang,
+        systemPrompt: config.systemPrompt,
+        batchSize: config.batchLines > 0 ? config.batchLines : 10,
+        priorityIndex: priorityIndex != null ? priorityIndex : 0,
+        concurrency: 3,
+        fetchImpl: function (u, o) {
+          return fetch(u, o);
+        },
+        onProgress: function (updates) {
+          var arr = state.clipCache[idx];
+          for (var i = 0; i < updates.length; i++) arr[updates[i].index] = updates[i].text;
+          lastRenderedKey = ""; // 让 onTick 立即把新译文刷上去
+        },
+        onError: function () {
+          hadError = true;
+        },
+      });
+      state.clipCache[idx] = lines;
+      if (hadError) {
+        // 部分批失败：标记 error 让退避接管，但已成功的行仍显示
+        state.clipState[idx] = "error";
+        backoff.fail();
+      } else {
+        state.clipState[idx] = "done";
+        backoff.reset();
+        writeCache(key, lines); // 整段成功才写持久缓存
       }
-      state.clipCache[idx] = translated;
-      state.clipState[idx] = "done";
     } catch (e) {
       console.warn("[dualsub] clip", idx, "翻译失败：", e.message);
       state.clipState[idx] = "error"; // 兜底：渲染时只显示原文
+      backoff.fail();
     }
   }
 
@@ -376,8 +446,15 @@
     if (!r) return;
     r.style.setProperty("--ds-fontsize", config.fontSize + "px");
     r.style.setProperty("--ds-bottom", config.bottomOffset + "px");
-    r.style.setProperty("--ds-orig-color", config.fontColor);
-    r.style.setProperty("--ds-trans-color", config.transColor);
+    // 颜色兜底：非法/空值回落默认色，绝不写空串导致 CSS 变量失效
+    r.style.setProperty(
+      "--ds-orig-color",
+      Core.normalizeColor(config.fontColor, DEFAULT_CONFIG.fontColor)
+    );
+    r.style.setProperty(
+      "--ds-trans-color",
+      Core.normalizeColor(config.transColor, DEFAULT_CONFIG.transColor)
+    );
     r.classList.toggle("dualsub-stroke", !!config.stroke);
     r.classList.toggle("dualsub-shadow", !!config.shadow);
     r.classList.toggle("dualsub-bg", !!config.background);
@@ -485,10 +562,33 @@
     if (msg.type === "set-config") {
       var prevSource = config.sourceLang;
       var prevEnabled = config.enabled;
+      var prevModel = config.apiModel;
+      var prevTarget = config.targetLang;
+      var prevBase = config.apiBaseUrl;
+      var prevKey = config.apiKey;
       config = Object.assign({}, config, msg.config || {});
       saveConfig();
       // 样式即时生效
       applyStyleVars();
+      // 用户改了 API/语言/模型 → 视为手动重试：清退避，让停掉的 clip 能重翻
+      var apiChanged =
+        config.apiBaseUrl !== prevBase ||
+        config.apiKey !== prevKey ||
+        config.apiModel !== prevModel ||
+        config.targetLang !== prevTarget;
+      if (apiChanged) {
+        state.clipBackoff = {};
+        // model/语言变了，旧译文已不适用 → 丢内存缓存重翻（持久缓存按新 key 自然不命中）
+        if (config.apiModel !== prevModel || config.targetLang !== prevTarget) {
+          state.clipCache = {};
+          state.clipState = {};
+        } else {
+          // 仅 base/key 变：把 error 态清掉以便重试，已成功的保留
+          for (var ci in state.clipState) {
+            if (state.clipState[ci] === "error") state.clipState[ci] = undefined;
+          }
+        }
+      }
       if (!config.enabled) {
         clearRenderer();
       } else {
@@ -500,8 +600,12 @@
             state.activeTrack = track;
             state.clipCache = {};
             state.clipState = {};
+            state.clipBackoff = {};
             loadTrack(track);
           }
+        } else if (apiChanged || !prevEnabled) {
+          // 配置变了但轨道没变：立即按当前播放位置重新预取
+          prefetchAround(currentTimeMs(), true);
         }
       }
       sendResponse({ ok: true });
