@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MyDualsub 设置</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+      }
+      body {
+        width: 340px;
+        margin: 0;
+        padding: 12px 14px;
+        font-family: -apple-system, "Segoe UI", Roboto, "PingFang SC",
+          "Microsoft YaHei", sans-serif;
+        font-size: 13px;
+        background: #fff;
+        color: #1a1a1a;
+      }
+      @media (prefers-color-scheme: dark) {
+        body { background: #1f1f1f; color: #eee; }
+        input, select, textarea { background: #2a2a2a; color: #eee; border-color: #444; }
+        fieldset { border-color: #3a3a3a; }
+      }
+      h1 {
+        font-size: 15px;
+        margin: 0 0 8px;
+      }
+      fieldset {
+        border: 1px solid #ddd;
+        border-radius: 6px;
+        margin: 0 0 10px;
+        padding: 8px 10px;
+      }
+      legend {
+        font-weight: 600;
+        padding: 0 4px;
+      }
+      label {
+        display: block;
+        margin: 6px 0 2px;
+      }
+      input[type="text"],
+      input[type="password"],
+      input[type="number"],
+      input[type="color"],
+      select,
+      textarea {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 4px 6px;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        font-size: 12px;
+      }
+      textarea { resize: vertical; min-height: 48px; }
+      .row {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+      .row > * { flex: 1; }
+      .inline { display: flex; align-items: center; gap: 6px; margin: 6px 0; }
+      .inline input[type="checkbox"] { width: auto; flex: 0; }
+      .inline label { margin: 0; flex: 1; }
+      button {
+        width: 100%;
+        padding: 7px;
+        border: none;
+        border-radius: 5px;
+        background: #1a73e8;
+        color: #fff;
+        font-size: 13px;
+        cursor: pointer;
+        margin-top: 4px;
+      }
+      button.secondary { background: #5f6368; }
+      button:active { opacity: 0.85; }
+      #status {
+        margin-top: 8px;
+        font-size: 12px;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .ok { color: #137333; }
+      .err { color: #c5221f; }
+      .hint { color: #888; font-size: 11px; margin-top: 2px; }
+      .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    </style>
+  </head>
+  <body>
+    <h1>MyDualsub · 双语字幕</h1>
+
+    <div class="inline">
+      <input type="checkbox" id="enabled" />
+      <label for="enabled">启用双语字幕</label>
+    </div>
+
+    <fieldset>
+      <legend>翻译 API（OpenAI 兼容）</legend>
+      <label for="apiBaseUrl">API Base URL</label>
+      <input type="text" id="apiBaseUrl" placeholder="https://api.openai.com/v1" />
+      <label for="apiKey">API Key</label>
+      <input type="password" id="apiKey" placeholder="sk-..." />
+      <label for="apiModel">模型</label>
+      <input type="text" id="apiModel" placeholder="gpt-4o-mini" />
+      <div class="hint">密钥仅存本地 chrome.storage，只发往你填写的端点。</div>
+      <button id="testBtn" class="secondary">测试连接</button>
+    </fieldset>
+
+    <fieldset>
+      <legend>语言</legend>
+      <label for="sourceLang">源语言（当前视频字幕轨道）</label>
+      <select id="sourceLang">
+        <option value="auto">自动（优先自动字幕 ASR）</option>
+      </select>
+      <label for="targetLang">译文语言</label>
+      <input type="text" id="targetLang" placeholder="zh-Hans" />
+    </fieldset>
+
+    <fieldset>
+      <legend>显示</legend>
+      <div class="grid2">
+        <div>
+          <label for="fontSize">字号 (px)</label>
+          <input type="number" id="fontSize" min="10" max="60" />
+        </div>
+        <div>
+          <label for="bottomOffset">底部间距 (px)</label>
+          <input type="number" id="bottomOffset" min="0" max="400" />
+        </div>
+        <div>
+          <label for="fontColor">原文颜色</label>
+          <input type="color" id="fontColor" />
+        </div>
+        <div>
+          <label for="transColor">译文颜色</label>
+          <input type="color" id="transColor" />
+        </div>
+      </div>
+      <div class="inline"><input type="checkbox" id="stroke" /><label for="stroke">文字描边</label></div>
+      <div class="inline"><input type="checkbox" id="shadow" /><label for="shadow">文字阴影</label></div>
+      <div class="inline"><input type="checkbox" id="background" /><label for="background">背景框</label></div>
+      <div class="inline"><input type="checkbox" id="transOnTop" /><label for="transOnTop">译文在上（原文在下）</label></div>
+      <div class="inline"><input type="checkbox" id="showOriginal" /><label for="showOriginal">显示原文行</label></div>
+    </fieldset>
+
+    <button id="saveBtn">保存设置</button>
+    <div id="status"></div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

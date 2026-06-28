@@ -1,0 +1,22 @@
+# 依赖 / 构建产物
+node_modules/
+dist/
+*.log
+__pycache__/
+*.pyc
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 本地实验
+*.local
+scratch/
+
+# 不要提交任何真实密钥
+*.key
+.env
+.env.*
+secrets.json

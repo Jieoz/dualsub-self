@@ -1,0 +1,53 @@
+{
+  "project": "dualsub-self",
+  "description": "仿 Dualsub 的双语字幕浏览器扩展（MV3），翻译直连用户自填的 OpenAI 兼容 API，不经过任何自建服务端/计费体系。",
+  "status": "delivered",
+  "date": "2026-06-28",
+  "deliverables": {
+    "manifest.json": "MV3 声明：MAIN(main.js) + ISOLATED(core.js,isolated.js) 双脚本，host_permissions 含 <all_urls> 以支持跨域翻译",
+    "main.js": "MAIN world：3 秒轮询 #movie_player，抓 captionTracks，等 pot 签名，设 fmt=json3/c=WEB|MWEB，RPC 推送 update-manifest",
+    "core.js": "纯逻辑模块（UMD）：parseJson3 / parseVtt / cleanupCues / translateBatch（分批+行号对齐+兜底）/ sliceClips。无浏览器依赖，可 Node 单测",
+    "isolated.js": "ISOLATED world：拉字幕→解析→clip 预取缓存翻译→渲染双语叠加层→chrome.storage 按 origin 存配置→与 popup 通信（get-state/set-config/test-connection）",
+    "popup.html + popup.js": "原生 JS 设置 UI：API 三件套(apiBaseUrl/apiKey/apiModel)、源/目标语言、显示样式开关、测试连接按钮",
+    "icons/16,48,128.png": "PIL 生成的真 PNG 占位图标（蓝底圆角 + 字母 D）",
+    "README.md": "中文：安装、配置、翻译策略、架构、安全说明、已知限制",
+    "LICENSE": "MIT",
+    ".gitignore": "排除 node_modules / __pycache__ / 密钥文件等",
+    "gen_icons.py": "图标生成脚本（构建辅助）",
+    "test/run-tests.js": "离线测试套件（零依赖）",
+    "FEEDBACK_TO_UPSTREAM.md": "构建中的决策与待确认项"
+  },
+  "verification": {
+    "node_check": "core.js / main.js / isolated.js / popup.js / test/run-tests.js 全部 node --check 通过",
+    "py_compile": "gen_icons.py 通过",
+    "manifest_parse": "manifest.json JSON.parse 通过，字段完整（mv3 / 双 world / <all_urls> / popup）",
+    "icons": "16/48/128 均为真 PNG 且 >0 字节（PNG 签名校验通过）",
+    "offline_tests": "node test/run-tests.js → 24 通过 / 0 失败",
+    "tests_cover": [
+      "json3 解析 + segs 拼接 + 空内容过滤",
+      "时间轴清洗：去重叠/排序/修正 end<start",
+      "WebVTT 解析（含无小时位、内联标签清理）",
+      "翻译行号对齐：正常/缺行/多行/乱序/多种行号写法/无行号兜底",
+      "translateBatch 用 mock fetch 验证请求构造+解析+对齐",
+      "HTTP 非 200 抛错、contextTail 上下文注入、空 cues",
+      "clip 切分、joinUrl、manifest/icons/popup 交付物校验"
+    ]
+  },
+  "known_limitations": [
+    "m.youtube.com 移动端播放器对象结构未在容器内验证，按桌面端同套逻辑尽力支持，需端到端验证",
+    "真实 YouTube 端到端（轨道抓取、pot 签名、渲染叠加层）需在浏览器中用 playwright 验证，容器内无法跑浏览器",
+    "未做翻译请求全局限流/退避，严格 RPM 网关可能偶发 429（已做错误兜底：失败 clip 仅显示原文，不崩溃）",
+    "仅支持 OpenAI 兼容 /chat/completions 接口"
+  ],
+  "needs_upstream_e2e": [
+    "在真实 www.youtube.com 验证：main.js 能否拿到带 pot 的 captionTracks 并成功推送",
+    "在 m.youtube.com 验证移动端播放器对象与 MWEB 字幕请求",
+    "配一个真实 OpenAI 兼容网关，验证 popup 测试连接 + 边播边翻的预取/缓存与渲染效果",
+    "确认是否接受 <all_urls> 权限，或改走 optional_host_permissions 最小权限路线（见 FEEDBACK_TO_UPSTREAM.md）"
+  ],
+  "git": {
+    "repo": "/workspace/repos/dualsub-self",
+    "pushed": false,
+    "note": "已 git init + 初始 commit，未 push（按 brief 由上游在 hermes 侧用 Jieoz token push）"
+  }
+}
