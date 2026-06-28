@@ -30,6 +30,24 @@
   var CACHE_MAX_ENTRIES = 800; // 缓存条目上限（LRU 裁剪，防配额溢出）
   var DEFAULT_CONFIG = Core.DEFAULT_CONFIG;
 
+  // 跨 clip 的全局 in-flight 翻译请求上限（每个内容脚本实例一个信号量）。
+  // 滑动窗口预取(planPrefetch depth=2)会让当前/下一个/下下个 clip 几乎同时发起翻译，
+  // 每个 clip 内部又有 concurrency=3 的批内并发。若不封顶，瞬时并发可达 ~9 → 网关 429
+  // → 退避 → 反而更卡。这里把所有 clip 的所有批请求收敛到一个全局上限下排队，
+  // 在 cap 内仍尽量保持最大领先，但绝不冲垮网关。可被 config.globalConcurrency 覆盖。
+  var GLOBAL_INFLIGHT_DEFAULT = 4;
+  var globalGate = Core.makeSemaphore(GLOBAL_INFLIGHT_DEFAULT);
+
+  /** 按配置（重）建全局信号量；并发数变了才换，避免丢弃在途令牌 */
+  function ensureGate() {
+    var want = parseInt(config.globalConcurrency, 10);
+    if (!Number.isFinite(want) || want < 1) want = GLOBAL_INFLIGHT_DEFAULT;
+    if (!globalGate || globalGate.max !== want) {
+      globalGate = Core.makeSemaphore(want);
+    }
+    return globalGate;
+  }
+
   var config = Object.assign({}, DEFAULT_CONFIG);
 
   // ---- 运行状态 ----
@@ -45,6 +63,7 @@
     clipBackoff: {}, // clipIndex -> backoff 控制器（失败退避）
     renderer: null, // 叠加层 DOM
     videoEl: null,
+    fontObserver: null, // ResizeObserver：观察播放器高度变化，同比缩放字号（全屏放大）
     // ---- 运行循环 / 生命周期（低配机占用优化）----
     renderTimer: null, // 单一节流渲染定时器 id
     prefetchTimer: null, // 预取定时器 id（与渲染解耦、降频）
@@ -262,8 +281,11 @@
   }
 
   /**
-   * 预取策略（带节流）：进入某 clip 立即翻当前 clip + 预取下一个 clip。
+   * 预取策略（带节流）：进入某 clip 立即翻当前 clip + 滑动窗口预取后续若干 clip。
    * force=true 时跳过节流（拖动进度条 / 刚加载）。
+   * 用 Core.planPrefetch 算出 [idx, idx+1, idx+2]（depth=2，已裁越界）；每个下标各自
+   * 独立发起 translateClip——"下下个"不被"下一个还 pending"阻塞。更深的窗口由全局信号量
+   * (ensureGate)封顶，避免多 clip × 批内并发叠加冲垮网关。
    * 已翻 / 正在翻 / 退避中的 clip 由 translateClip 内部跳过。
    */
   function prefetchAround(ms, force) {
@@ -275,10 +297,12 @@
     var idx = clipIdxAt(ms);
     if (idx === -1) idx = 0;
 
-    // 当前 clip 首句优先：把播放位置附近的 cue 排到最前先翻先显示
-    translateClip(idx, priorityCueIndex(idx, ms));
-    // 进入某 clip 即预取下一个 clip（不等剩 15s）
-    if (idx + 1 < state.clips.length) translateClip(idx + 1, 0);
+    // 滑动窗口下标列表（含当前段）。当前段用首句优先起点，后续段从头翻。
+    var plan = Core.planPrefetch(idx, state.clips.length);
+    for (var i = 0; i < plan.length; i++) {
+      var ci = plan[i];
+      translateClip(ci, ci === idx ? priorityCueIndex(idx, ms) : 0);
+    }
   }
 
   /** 找播放位置 ms 在 clip 内最接近的 cue 下标（用作首句优先起点） */
@@ -335,6 +359,7 @@
         batchSize: config.batchLines > 0 ? config.batchLines : 14,
         priorityIndex: priorityIndex != null ? priorityIndex : 0,
         concurrency: 3,
+        gate: ensureGate(), // 全局并发上限：所有 clip 共享，避免滑动窗口预取冲垮网关
         timeoutMs: 20000,
         fetchImpl: function (u, o) {
           return fetch(u, o);
@@ -428,6 +453,7 @@
   }
 
   function clearRenderer() {
+    teardownFontObserver();
     if (state.renderer && state.renderer.parentNode) {
       state.renderer.parentNode.removeChild(state.renderer);
     }
@@ -447,7 +473,8 @@
       ".dualsub-subtitle{",
       "  display:inline-block; max-width:96%; line-height:1.25;",
       "  font-size:var(--ds-fontsize,22px);",
-      "  font-family:'YouTube Noto',Roboto,Arial,sans-serif; font-weight:500;",
+      "  font-family:var(--ds-fontfamily,'YouTube Noto',Roboto,Arial,sans-serif);",
+      "  font-weight:var(--ds-fontweight,500);",
       "  white-space:pre-wrap; word-break:break-word;",
       "}",
       ".dualsub-orig{ color:var(--ds-orig-color,#fff); }",
@@ -474,7 +501,17 @@
   function applyStyleVars() {
     var r = state.renderer;
     if (!r) return;
-    r.style.setProperty("--ds-fontsize", config.fontSize + "px");
+    applyFontSize(); // 字号随播放器高度同比缩放（全屏放大），并(重)挂 ResizeObserver
+    // 字重：直接写 CSS（"400"|"500"|"700"…）。空/非法回落默认。
+    var fw = String(config.fontWeight == null ? "" : config.fontWeight).trim();
+    r.style.setProperty("--ds-fontweight", fw || DEFAULT_CONFIG.fontWeight);
+    // 字体族：空 = 用内置默认族（CSS 里 var 的 fallback 生效）；否则整串写入（仅本地/系统字体）。
+    var ff = String(config.fontFamily == null ? "" : config.fontFamily).trim();
+    if (ff) {
+      r.style.setProperty("--ds-fontfamily", ff);
+    } else {
+      r.style.removeProperty("--ds-fontfamily");
+    }
     r.style.setProperty("--ds-bottom", config.bottomOffset + "px");
     // 颜色兜底：非法/空值回落默认色，绝不写空串导致 CSS 变量失效
     r.style.setProperty(
@@ -495,6 +532,56 @@
       } else if (!config.transOnTop && r.firstChild !== r._orig) {
         r.insertBefore(r._orig, r._trans);
       }
+    }
+  }
+
+  /**
+   * 按当前播放器高度算实际字号写 CSS 变量（全屏放大、退出缩小）。
+   * fontSize 配置语义为"基准高度(480)下的字号"，Core.computeFontPx 同比缩放并 clamp。
+   * 取不到高度（加载早期）时回落基准字号。每次调用顺带确保 ResizeObserver 已挂在当前播放器。
+   */
+  function applyFontSize() {
+    var r = state.renderer;
+    if (!r) return;
+    var player = playerEl();
+    var h = player ? player.clientHeight : 0;
+    var px = Core.computeFontPx(h, config.fontSize);
+    r.style.setProperty("--ds-fontsize", px + "px");
+    setupFontObserver(player);
+  }
+
+  /**
+   * 在播放器上挂 ResizeObserver：尺寸变化（全屏/影院/窗口缩放）时重算字号。
+   * 幂等：已观察当前播放器则跳过；播放器换了先 disconnect 旧的再观察新的。
+   * 环境无 ResizeObserver 时静默降级（仍有 applyFontSize 在样式刷新/重挂时兜底）。
+   */
+  function setupFontObserver(player) {
+    if (typeof ResizeObserver === "undefined") return;
+    if (!player) return;
+    if (state.fontObserver) {
+      if (state.fontObserver._target === player) return; // 已在观察当前播放器
+      teardownFontObserver(); // 播放器换了 → 解绑旧的
+    }
+    var ro = new ResizeObserver(function () {
+      var rr = state.renderer;
+      if (!rr) return;
+      var p = playerEl();
+      var px = Core.computeFontPx(p ? p.clientHeight : 0, config.fontSize);
+      rr.style.setProperty("--ds-fontsize", px + "px");
+    });
+    try {
+      ro.observe(player);
+      ro._target = player;
+      state.fontObserver = ro;
+    } catch (e) {}
+  }
+
+  function teardownFontObserver() {
+    if (state.fontObserver) {
+      try {
+        state.fontObserver.disconnect();
+      } catch (e) {}
+      state.fontObserver = null;
     }
   }
 

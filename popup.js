@@ -18,11 +18,11 @@
   var DEFAULT_CONFIG = Core.DEFAULT_CONFIG || {};
 
   // 表单字段 id 列表（与 DEFAULT_CONFIG 对应）
-  var TEXT_FIELDS = ["apiBaseUrl", "apiKey", "apiModel", "targetLang"];
+  var TEXT_FIELDS = ["apiBaseUrl", "apiKey", "apiModel", "targetLang", "fontFamily"];
   var NUM_FIELDS = ["fontSize", "bottomOffset"];
   var COLOR_FIELDS = ["fontColor", "transColor"];
   var BOOL_FIELDS = ["enabled", "stroke", "shadow", "background", "transOnTop", "showOriginal", "showLoading"];
-  var SELECT_FIELDS = ["sourceLang"];
+  var SELECT_FIELDS = ["sourceLang", "fontWeight"];
 
   function $(id) {
     return document.getElementById(id);
@@ -126,6 +126,10 @@
     BOOL_FIELDS.forEach(function (id) {
       if ($(id)) $(id).checked = !!config[id];
     });
+    // 固定选项的下拉（如 fontWeight）：直接按值选中（sourceLang 选项动态填充，单独处理）
+    if ($("fontWeight") && config.fontWeight != null) {
+      trySetSelect("fontWeight", String(config.fontWeight));
+    }
     if ($("sourceLang") && config.sourceLang != null) {
       // 选项可能还没填充，先记下来，填充轨道后再设
       $("sourceLang").dataset.want = config.sourceLang;

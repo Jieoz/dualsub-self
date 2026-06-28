@@ -123,12 +123,25 @@
       <legend>显示</legend>
       <div class="grid2">
         <div>
-          <label for="fontSize">字号 (px)</label>
+          <label for="fontSize">字号 (px，全屏自动放大)</label>
           <input type="number" id="fontSize" min="10" max="60" />
         </div>
         <div>
           <label for="bottomOffset">底部间距 (px)</label>
           <input type="number" id="bottomOffset" min="0" max="400" />
+        </div>
+        <div>
+          <label for="fontWeight">字重</label>
+          <select id="fontWeight">
+            <option value="400">常规 (400)</option>
+            <option value="500">中等 (500)</option>
+            <option value="600">半粗 (600)</option>
+            <option value="700">粗体 (700)</option>
+          </select>
+        </div>
+        <div>
+          <label for="fontFamily">字体（留空=默认）</label>
+          <input type="text" id="fontFamily" placeholder="如 Noto Sans SC" />
         </div>
         <div>
           <label for="fontColor">原文颜色</label>
@@ -139,6 +152,7 @@
           <input type="color" id="transColor" />
         </div>
       </div>
+      <div class="hint">字号为常规窗口下的基准值，全屏/影院模式会按播放器高度同比放大。字体仅用本地/系统已安装字体，不远程加载。</div>
       <div class="inline"><input type="checkbox" id="stroke" /><label for="stroke">文字描边</label></div>
       <div class="inline"><input type="checkbox" id="shadow" /><label for="shadow">文字阴影</label></div>
       <div class="inline"><input type="checkbox" id="background" /><label for="background">背景框</label></div>

@@ -100,3 +100,29 @@ brief 要求 web + m.youtube.com 都做。manifest 已 match 两个域名，main
 
 `translateBatch` 加 `timeoutMs`（默认 20s，isolated.js 传 20000）。超时按失败抛错 → 调用方兜底显原文 + 退避。`timeoutMs<=0` 关闭。429/5xx 仍走 v2 已有的 HTTP 非 200 抛错 + `makeBackoff` 指数退避路径，未额外区分（统一退避足够，避免过度工程）。
 **[待确认]**：是否需要把 429 与普通 5xx 分开处理（如读 `Retry-After` 头）。当前未做，统一指数退避。
+
+---
+
+# 第四轮（v4：字号自适应 + 卡顿真根因）决策与待确认
+
+## 15. [已做] 字号随播放器高度同比缩放（问题一）
+
+`Core.computeFontPx(playerHeight, baseFontSize)` 纯函数：`fontSize` 配置语义改为"基准高度(480，常规非全屏)下的字号"，实际字号 = `clamp(10, baseFontSize × playerHeight/480, 96)`。isolated.js 用 **ResizeObserver** 观察播放器高度，全屏/影院/窗口缩放时重算写 CSS 变量；`teardownFontObserver` 在切 video / 禁用时 `disconnect`（无泄漏）；环境无 ResizeObserver 时静默降级（样式刷新/重挂时 `applyFontSize` 仍兜底）。新增 `fontWeight`（select）/`fontFamily`（文本框，仅本地/系统字体、不远程加载）配置 + popup UI。均有离线单测（全屏放大 2×、clamp 上下限、高度未知回落）。
+**[待确认]**：基准高度 480 / 上限 96px / 下限 10px 为经验值，真实 YouTube 各布局（默认/影院/全屏/迷你播放器）下的观感需端到端确认；`clientHeight` 取播放器容器，若某些布局更适合取 `<video>` 高度可再调。
+
+## 16. [已做] "卡在翻译中"真根因 = 单 clip 翻译延迟 > clip 播放时长（问题二）
+
+**修正原 brief 的误诊**：预取本就是 1.5s 循环持续在跑、clip0 在 t=0 就开翻——**不是**"跨 clip 才触发"，原 brief 那条已删。
+
+**真根因**：单 clip 的翻译延迟可能 > 单 clip 的播放时长(`clipSeconds`)。原 depth=1（只提前一段）时，一旦落后就**永远差一段**，播到第 2–3 个 clip 边界（≈1 分钟）正好暴露，与用户实测吻合。
+
+**已实现（全局并发上限变体）**：
+- `Core.planPrefetch(idx, count, ahead=2)`（可测、depth clamped、越界安全）：滑动窗口返回 `[idx, idx+1, idx+2]`，每个下标各自独立 `translateClip`，"下下个"不被"下一个还 pending"阻塞。
+- `Core.makeSemaphore(max)`：**跨 clip 的全局 in-flight 请求信号量**（每个内容脚本实例一个，默认 cap=4，可由 `config.globalConcurrency` 覆盖）。所有 clip 的所有批请求经 `gate.run()` 排队。避免 idx/idx+1/idx+2 各自 concurrency=3 → ~9 并发 → 429 → 退避 → 更卡。滑动窗口在全局 cap 下仍尽量保持最大领先。
+- 单测：信号量峰值并发严格 ≤ cap、抛错也 release 不泄漏、`translateCues` 接 gate 后多 clip 并行总在途 ≤ cap。
+
+**[残留限制 / 结构解]**：**若单 clip 翻译延迟 > `clipSeconds`，任何固定预取深度都无法完全消除卡顿**——窗口只是把"差一段"推后，延迟够大时仍会被追上。真正的结构解是二选一（或组合）：
+1. **更小的 clip**（调小 `clipSeconds`）：单段更快翻完，但 clip 数变多、system prompt 固定开销的批次增多（token 略升）。
+2. **更高的全局并发**（调大 `globalConcurrency`，带 cap）：让更深的窗口同时在翻，但受网关 RPM 限制，过高会 429。
+
+二者均已暴露为配置项（`clipSeconds` / `globalConcurrency`，后者目前仅经导入配置或代码改，未放进 popup，沿用"并发不放 popup"的既有克制决策）。**[待确认]**：是否要把这两项（尤其 `globalConcurrency`）也加进 popup 高级设置，或由扩展按网关 429 反馈自适应调整 cap（更复杂，当前未做）。

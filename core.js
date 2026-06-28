@@ -269,7 +269,10 @@
     targetLang: "zh-Hans",
     systemPrompt: "", // 空 = 用 core 默认
     // 显示样式
-    fontSize: 22, // px
+    fontSize: 22, // px —— 语义为"基准高度(FONT_BASE_HEIGHT=480，常规非全屏)下的字号"；
+    //               实际渲染字号随播放器高度由 computeFontPx 同比缩放（全屏放大、退出缩小）。
+    fontWeight: "500", // 字重："400"|"500"|"600"|"700"… 直接写入 CSS font-weight。
+    fontFamily: "", // 字体族：空 = 用扩展内置默认族；否则整串写入 CSS font-family（仅本地/系统字体，不远程加载）。
     bottomOffset: 90, // px，距播放器底部
     fontColor: "#ffffff",
     transColor: "#7fdfff", // 译文颜色
@@ -281,6 +284,8 @@
     showLoading: true, // 译文未到时显示轻量"翻译中…"指示（false=只显原文）
     clipSeconds: 30, // 每个翻译 clip 多少秒（按 cue 边界就近切）
     batchLines: 14, // 每批最多多少行（clip 内再分批）。瘦身 prompt 后调高省固定开销
+    globalConcurrency: 4, // 跨 clip 的全局 in-flight 翻译请求上限（信号量）。滑动窗口预取
+    //                       (depth=2)叠加批内并发(3)若不封顶会冲垮网关→429；此值统一封顶。
   };
 
   /**
@@ -302,6 +307,49 @@
     return String(s == null ? "" : s)
       .replace(/\s+/g, " ")
       .trim();
+  }
+
+  /* ---------------------------------------------------------------
+   * 3b. 字号随播放器尺寸自适应（纯函数，便于离线单测）
+   * -------------------------------------------------------------
+   * 固定 px 是绝对值：全屏后播放器变大但字幕不跟着放大，看着就变小了。
+   * 这里把 fontSize 配置语义定为"基准高度(FONT_BASE_HEIGHT，默认 480，
+   * 常规非全屏 16:9 约 360~480)下的字号"，实际字号按播放器当前高度同比缩放：
+   *   实际字号 = clamp(min, baseFontSize * playerHeight / baseHeight, max)
+   * 全屏（高度变大）→ 同比放大；退出全屏（高度变小）→ 同比缩小。
+   * isolated.js 用 ResizeObserver 观察播放器高度变化，调用本函数算字号写 CSS 变量。
+   */
+  var FONT_BASE_HEIGHT = 480; // 基准播放器高度（常规非全屏 16:9 约 360~480）
+  var FONT_MIN_PX = 10; // 字号下限（极小窗口也可读）
+  var FONT_MAX_PX = 96; // 字号上限（4K 全屏也不至于巨大到溢出）
+
+  /**
+   * 按播放器高度计算实际字号（px，四舍五入到整数）。
+   *  - playerHeight: 播放器容器当前像素高度。
+   *  - baseFontSize: 配置里的基准字号（FONT_BASE_HEIGHT 高度下的字号）。
+   *  - baseHeight/min/max: 可选覆盖，默认用上面常量。
+   * playerHeight 非正/非数时回落为 baseFontSize（仍 clamp）——加载早期取不到尺寸的兜底。
+   */
+  function computeFontPx(playerHeight, baseFontSize, baseHeight, min, max) {
+    var base = Number(baseFontSize);
+    if (!Number.isFinite(base) || base <= 0) base = DEFAULT_CONFIG.fontSize;
+    var bh = Number(baseHeight);
+    if (!Number.isFinite(bh) || bh <= 0) bh = FONT_BASE_HEIGHT;
+    var lo = Number(min);
+    if (!Number.isFinite(lo) || lo <= 0) lo = FONT_MIN_PX;
+    var hi = Number(max);
+    if (!Number.isFinite(hi) || hi <= 0) hi = FONT_MAX_PX;
+
+    var h = Number(playerHeight);
+    var px;
+    if (!Number.isFinite(h) || h <= 0) {
+      px = base; // 尺寸未知 → 用基准字号兜底
+    } else {
+      px = base * (h / bh);
+    }
+    if (px < lo) px = lo;
+    if (px > hi) px = hi;
+    return Math.round(px);
   }
 
   /* ---------------------------------------------------------------
@@ -557,6 +605,126 @@
   }
 
   /* ---------------------------------------------------------------
+   * 5b. 预取计划（纯函数）：从当前 clip 起预取 ahead 段（滑动窗口）
+   * -------------------------------------------------------------
+   * 真根因（修正原 brief 的误诊）：预取本就是 1.5s 循环持续在跑、clip0 在
+   * t=0 就开翻——不是"跨 clip 才触发"。真正卡顿在于：单 clip 的翻译延迟可能
+   * > 单 clip 的播放时长(clipSeconds)。只提前一段(depth=1)时，depth-1 的窗口
+   * 一旦落后就永远差一段——播到第 2-3 个 clip 边界(≈1 分钟)正好暴露，与用户
+   * 实测吻合。把预取做成"滑动窗口 depth=2(clamped)"：返回 [idx, idx+1, idx+2]，
+   * 调用方对每个下标各自独立发起 translateClip，"下下个"不被"下一个还 pending"阻塞。
+   * 注意：更深的窗口必须配合【全局 in-flight 信号量】(makeSemaphore)封顶，否则
+   * idx/idx+1/idx+2 各自 concurrency=3 → ~9 并发 → 429 → 退避 → 更卡。
+   */
+  var PREFETCH_AHEAD = 2; // 预取提前段数（当前段 + 后续 2 段）。再深需配合全局并发上限。
+
+  /**
+   * 计算从 currentIdx 起需要预取的 clip 下标列表（含 currentIdx 自身）。
+   *  - currentIdx: 当前播放位置所在 clip 下标。
+   *  - clipCount: clip 总数（用于裁越界）。
+   *  - ahead: 提前段数，默认 PREFETCH_AHEAD；负数/非法回落默认；0 表示只翻当前段。
+   * 返回升序、已裁越界的下标数组。currentIdx 越界/clipCount<=0 时返回 []。
+   */
+  function planPrefetch(currentIdx, clipCount, ahead) {
+    var n = Number(clipCount);
+    if (!Number.isFinite(n) || n <= 0) return [];
+    var idx = Number(currentIdx);
+    if (!Number.isFinite(idx)) idx = 0;
+    idx = Math.floor(idx);
+    if (idx < 0) idx = 0;
+    if (idx >= n) return []; // 当前下标越界 → 无可预取
+    var depth = Number(ahead);
+    if (!Number.isFinite(depth) || depth < 0) depth = PREFETCH_AHEAD;
+    depth = Math.floor(depth);
+    var out = [];
+    for (var i = idx; i <= idx + depth && i < n; i++) out.push(i);
+    return out;
+  }
+
+  /* ---------------------------------------------------------------
+   * 5c. 全局并发信号量（跨 clip 的 in-flight 请求上限）
+   * -------------------------------------------------------------
+   * 滑动窗口预取(depth=2)会让 idx/idx+1/idx+2 几乎同时各自发起翻译。每个
+   * translateCues 内部又有自己的批内并发池(默认 3)。若不封顶，瞬时并发可达
+   * ~9，足以触发网关 429 → 退避 → 反而更卡。这里提供一个进程级（每个内容脚本
+   * 实例一个）的小信号量：所有 clip 的所有批请求都先 acquire 一个令牌再发，
+   * 发完 release。在全局 cap 下，滑动窗口仍能尽量保持最大领先，但绝不冲垮网关。
+   * 纯逻辑、无定时器、可离线单测：用 Promise 队列实现"超额则排队等令牌"。
+   */
+
+  /**
+   * 造一个并发信号量。
+   *  - max: 同时允许的最大令牌数（<=0 视为 1）。
+   * 返回 { run(fn), acquire(), release(), get inFlight(), get max(), get queued() }。
+   *  - run(fn): 等到有令牌后执行 fn()（可返回 Promise），结束(成功/抛错)自动 release。
+   *            这是给 translateCues 用的入口——把单批请求包进来即受全局上限约束。
+   */
+  function makeSemaphore(max) {
+    var cap = Number(max);
+    if (!Number.isFinite(cap) || cap < 1) cap = 1;
+    cap = Math.floor(cap);
+    var inFlight = 0;
+    var waiters = []; // 等令牌的 resolve 队列（FIFO）
+
+    function acquire() {
+      if (inFlight < cap) {
+        inFlight++;
+        return Promise.resolve();
+      }
+      return new Promise(function (resolve) {
+        waiters.push(resolve);
+      });
+    }
+
+    function release() {
+      if (waiters.length > 0) {
+        // 把令牌直接转交给下一个等待者（inFlight 维持不变）
+        var next = waiters.shift();
+        next();
+      } else if (inFlight > 0) {
+        inFlight--;
+      }
+    }
+
+    function run(fn) {
+      return acquire().then(function () {
+        var p;
+        try {
+          p = Promise.resolve(fn());
+        } catch (e) {
+          release();
+          throw e;
+        }
+        return p.then(
+          function (v) {
+            release();
+            return v;
+          },
+          function (e) {
+            release();
+            throw e;
+          }
+        );
+      });
+    }
+
+    return {
+      run: run,
+      acquire: acquire,
+      release: release,
+      get inFlight() {
+        return inFlight;
+      },
+      get max() {
+        return cap;
+      },
+      get queued() {
+        return waiters.length;
+      },
+    };
+  }
+
+  /* ---------------------------------------------------------------
    * 6. 持久缓存 key + LRU 裁剪
    * ------------------------------------------------------------- */
 
@@ -713,18 +881,25 @@
         }
         var lines;
         try {
-          lines = await translateBatch({
-            cues: sub,
-            apiBaseUrl: opts.apiBaseUrl,
-            apiKey: opts.apiKey,
-            apiModel: opts.apiModel,
-            targetLang: opts.targetLang,
-            systemPrompt: opts.systemPrompt,
-            temperature: opts.temperature,
-            contextTail: ctx,
-            timeoutMs: opts.timeoutMs,
-            fetchImpl: opts.fetchImpl,
-          });
+          var doBatch = function () {
+            return translateBatch({
+              cues: sub,
+              apiBaseUrl: opts.apiBaseUrl,
+              apiKey: opts.apiKey,
+              apiModel: opts.apiModel,
+              targetLang: opts.targetLang,
+              systemPrompt: opts.systemPrompt,
+              temperature: opts.temperature,
+              contextTail: ctx,
+              timeoutMs: opts.timeoutMs,
+              fetchImpl: opts.fetchImpl,
+            });
+          };
+          // 全局并发信号量（可选）：所有 clip 的所有批共享一个上限，避免滑动窗口
+          // 预取(depth=2) × 批内并发(3) 叠加冲垮网关(~9 并发 → 429)。无 gate 时退化为旧行为。
+          lines = opts.gate && typeof opts.gate.run === "function"
+            ? await opts.gate.run(doBatch)
+            : await doBatch();
         } catch (e) {
           if (opts.onError) opts.onError(e, b);
           if (opts.failFast) throw e;
@@ -870,6 +1045,9 @@
     resegmentCues: resegmentCues,
     collapseWhitespace: collapseWhitespace,
     normalizeColor: normalizeColor,
+    computeFontPx: computeFontPx,
+    planPrefetch: planPrefetch,
+    makeSemaphore: makeSemaphore,
     DEFAULT_CONFIG: DEFAULT_CONFIG,
     DEFAULT_SYSTEM_PROMPT: DEFAULT_SYSTEM_PROMPT,
     buildSystemPrompt: buildSystemPrompt,

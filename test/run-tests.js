@@ -490,6 +490,113 @@ test("DEFAULT_CONFIG 含关键字段且颜色非空", () => {
   assert.ok(d.clipSeconds > 0 && d.batchLines > 0);
   assert.strictEqual(typeof d.showLoading, "boolean", "新增 showLoading 加载态开关");
   assert.ok(d.batchLines >= 12 && d.batchLines <= 15, "batchLines 默认在 12–15（瘦身后调优）");
+  // v4 新增显示字段
+  assert.strictEqual(typeof d.fontWeight, "string", "新增 fontWeight 字重");
+  assert.strictEqual(typeof d.fontFamily, "string", "新增 fontFamily 字体族（默认空串）");
+  assert.ok(d.globalConcurrency > 0, "新增 globalConcurrency 全局并发上限 > 0");
+});
+
+/* ============ 5k. computeFontPx：字号随播放器高度同比缩放 + clamp ============ */
+console.log("\n[computeFontPx：全屏放大 / clamp / 兜底]");
+
+test("computeFontPx 基准高度返回基准字号", () => {
+  // 默认基准高度 480：playerHeight=480 时应等于基准字号
+  assert.strictEqual(Core.computeFontPx(480, 22), 22);
+});
+
+test("computeFontPx 全屏（高度翻倍）字号同比放大", () => {
+  // 1080p 全屏（≈480 的 2.25 倍）→ 字号约 2.25 倍
+  assert.strictEqual(Core.computeFontPx(960, 22), 44, "高度 2× → 字号 2×");
+  assert.strictEqual(Core.computeFontPx(1080, 20), Math.round(20 * 1080 / 480));
+});
+
+test("computeFontPx 小窗口同比缩小", () => {
+  assert.strictEqual(Core.computeFontPx(240, 22), 11, "高度 0.5× → 字号 0.5×");
+});
+
+test("computeFontPx clamp 上下限（4K 不溢出 / 极小窗口可读）", () => {
+  // 极大高度 → 命中上限 96
+  assert.strictEqual(Core.computeFontPx(100000, 22), 96, "上限封顶 96");
+  // 极小基准 + 极小高度 → 命中下限 10
+  assert.strictEqual(Core.computeFontPx(1, 22), 10, "下限保底 10");
+  // 自定义 min/max 覆盖生效
+  assert.strictEqual(Core.computeFontPx(100000, 22, 480, 8, 40), 40, "自定义上限 40");
+});
+
+test("computeFontPx 高度未知/非法 → 回落基准字号（仍 clamp）", () => {
+  assert.strictEqual(Core.computeFontPx(0, 22), 22, "高度 0 → 基准字号");
+  assert.strictEqual(Core.computeFontPx(-100, 22), 22, "负高度 → 基准字号");
+  assert.strictEqual(Core.computeFontPx(NaN, 22), 22, "NaN → 基准字号");
+  assert.strictEqual(Core.computeFontPx(undefined, 22), 22, "undefined → 基准字号");
+});
+
+test("computeFontPx 非法基准字号回落 DEFAULT_CONFIG.fontSize", () => {
+  // baseFontSize 非法 → 用默认 22；基准高度下应得 22
+  assert.strictEqual(Core.computeFontPx(480, 0), Core.DEFAULT_CONFIG.fontSize);
+  assert.strictEqual(Core.computeFontPx(480, NaN), Core.DEFAULT_CONFIG.fontSize);
+});
+
+/* ============ 5l. planPrefetch：预取深度裁剪（滑动窗口 depth=2）============ */
+console.log("\n[planPrefetch：深度裁剪 + 越界安全]");
+
+test("planPrefetch 默认 depth=2 返回 [idx,idx+1,idx+2]", () => {
+  assert.deepStrictEqual(Core.planPrefetch(0, 10), [0, 1, 2]);
+  assert.deepStrictEqual(Core.planPrefetch(3, 10), [3, 4, 5]);
+});
+
+test("planPrefetch 末尾按 clipCount 裁越界", () => {
+  assert.deepStrictEqual(Core.planPrefetch(4, 5), [4], "最后一个 clip 无后续");
+  assert.deepStrictEqual(Core.planPrefetch(3, 5), [3, 4], "倒数第二个裁到末尾");
+});
+
+test("planPrefetch ahead 可调（0=只翻当前 / 大值裁到末尾）", () => {
+  assert.deepStrictEqual(Core.planPrefetch(2, 10, 0), [2], "depth=0 只翻当前");
+  assert.deepStrictEqual(Core.planPrefetch(2, 10, 4), [2, 3, 4, 5, 6], "depth=4");
+  assert.deepStrictEqual(Core.planPrefetch(8, 10, 5), [8, 9], "越界被裁");
+});
+
+test("planPrefetch 越界/非法输入安全返回 []", () => {
+  assert.deepStrictEqual(Core.planPrefetch(5, 5), [], "currentIdx 越界");
+  assert.deepStrictEqual(Core.planPrefetch(0, 0), [], "clipCount 0");
+  assert.deepStrictEqual(Core.planPrefetch(0, -1), [], "clipCount 负");
+  assert.deepStrictEqual(Core.planPrefetch(-3, 5), [0, 1, 2], "负 idx 夹到 0");
+});
+
+test("planPrefetch ahead 非法回落默认深度", () => {
+  assert.deepStrictEqual(Core.planPrefetch(0, 10, -1), [0, 1, 2], "负 ahead 回落默认 2");
+  assert.deepStrictEqual(Core.planPrefetch(0, 10, NaN), [0, 1, 2], "NaN 回落默认 2");
+});
+
+/* ============ 5m. export/import round-trip 含 v4 新字段 ============ */
+console.log("\n[配置 round-trip：含 fontWeight/fontFamily/globalConcurrency]");
+
+test("export→import round-trip 携带 v4 新字段", () => {
+  const cfg = Object.assign({}, Core.DEFAULT_CONFIG, {
+    fontWeight: "700",
+    fontFamily: "Noto Sans SC",
+    globalConcurrency: 6,
+    fontSize: 28,
+  });
+  const text = Core.exportConfig(cfg);
+  const obj = JSON.parse(text);
+  // 导出对象应含新键
+  assert.ok("fontWeight" in obj.config && "fontFamily" in obj.config && "globalConcurrency" in obj.config);
+  const res = Core.importConfig(text);
+  assert.ok(res.ok, "导入应成功");
+  assert.strictEqual(res.config.fontWeight, "700", "fontWeight round-trip");
+  assert.strictEqual(res.config.fontFamily, "Noto Sans SC", "fontFamily round-trip");
+  assert.strictEqual(res.config.globalConcurrency, 6, "globalConcurrency round-trip（数字）");
+  // 全键等价
+  Object.keys(Core.DEFAULT_CONFIG).forEach((k) => {
+    assert.strictEqual(res.config[k], cfg[k], "键 " + k + " round-trip 等价");
+  });
+});
+
+test("importConfig 空 fontFamily 字段保留为空串（默认族）", () => {
+  const text = Core.exportConfig(Object.assign({}, Core.DEFAULT_CONFIG, { fontFamily: "" }));
+  const res = Core.importConfig(text);
+  assert.ok(res.ok);
+  assert.strictEqual(res.config.fontFamily, "", "空字体族 round-trip 仍为空串");
 });
 
 /* ============ 6. translateBatch（mock fetch 跑通整链路）============ */
@@ -795,6 +902,101 @@ async function main() {
     }
     assert.deepStrictEqual(lines, ["你好", "世界"]);
     assert.strictEqual(fetchCalled, false, "命中缓存不应触发 fetch");
+  });
+
+  /* ============ 6c. makeSemaphore：全局 in-flight 并发不超限 ============ */
+  console.log("\n[makeSemaphore：全局并发上限不被突破]");
+
+  await asyncTest("makeSemaphore run() 峰值并发不超过 cap", async () => {
+    const cap = 3;
+    const sem = Core.makeSemaphore(cap);
+    let inFlight = 0;
+    let peak = 0;
+    // 20 个任务同时丢进信号量，每个任务体内停一会儿模拟在途请求
+    const task = () =>
+      sem.run(async () => {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        assert.ok(inFlight <= cap, "任意时刻在途数不应超过 cap=" + cap + "（实际 " + inFlight + "）");
+        await new Promise((r) => setTimeout(r, 5));
+        inFlight--;
+      });
+    await Promise.all(Array.from({ length: 20 }, task));
+    assert.strictEqual(inFlight, 0, "全部完成后在途归零");
+    assert.strictEqual(peak, cap, "峰值应恰好打满 cap（够忙才有意义）");
+    assert.strictEqual(sem.inFlight, 0, "信号量内部计数复位");
+    assert.strictEqual(sem.queued, 0, "无遗留排队");
+  });
+
+  await asyncTest("makeSemaphore 任务抛错也会 release（不泄漏令牌）", async () => {
+    const sem = Core.makeSemaphore(1);
+    let threw = false;
+    try {
+      await sem.run(async () => {
+        throw new Error("boom");
+      });
+    } catch (e) {
+      threw = true;
+    }
+    assert.ok(threw, "错误应向上抛");
+    assert.strictEqual(sem.inFlight, 0, "抛错后令牌应已释放");
+    // 释放后还能正常拿令牌
+    const ok = await sem.run(async () => 42);
+    assert.strictEqual(ok, 42);
+  });
+
+  await asyncTest("makeSemaphore cap<1 视为 1（串行）", async () => {
+    const sem = Core.makeSemaphore(0);
+    assert.strictEqual(sem.max, 1);
+    let inFlight = 0;
+    let peak = 0;
+    const task = () =>
+      sem.run(async () => {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        await new Promise((r) => setTimeout(r, 2));
+        inFlight--;
+      });
+    await Promise.all([task(), task(), task()]);
+    assert.strictEqual(peak, 1, "cap=0→1 应严格串行");
+  });
+
+  await asyncTest("translateCues 接 gate：多 clip 并行翻译总在途不超全局 cap", async () => {
+    // 模拟滑动窗口预取：3 个 clip 各自 concurrency=3 同时翻，但共享一个 cap=4 的全局信号量。
+    // 不封顶会瞬时 ~9 并发；封顶后任意时刻 fetch 在途 <= 4。
+    const cap = 4;
+    const gate = Core.makeSemaphore(cap);
+    let inFlight = 0;
+    let peak = 0;
+    const mockFetch = async (url, opts) => {
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      assert.ok(inFlight <= cap, "fetch 在途不应超过全局 cap=" + cap + "（实际 " + inFlight + "）");
+      await new Promise((r) => setTimeout(r, 5));
+      const body = JSON.parse(opts.body);
+      const userLines = body.messages[1].content.split("\n").filter((l) => /^\d+\./.test(l));
+      const content = userLines.map((l) => l.match(/^(\d+)\./)[1] + ". ok").join("\n");
+      inFlight--;
+      return { ok: true, status: 200, async json() { return { choices: [{ message: { content } }] }; }, async text() { return ""; } };
+    };
+    const mkCues = (p) => Array.from({ length: 12 }, (_, i) => ({ content: p + i }));
+    const runClip = (p) =>
+      Core.translateCues({
+        cues: mkCues(p),
+        apiBaseUrl: "https://gw/v1",
+        apiModel: "m",
+        batchSize: 4, // 12/4 = 3 批/clip
+        concurrency: 3, // 单 clip 批内并发 3
+        gate, // 全局上限 4
+        fetchImpl: mockFetch,
+      });
+    // 3 个 clip 同时翻（共 9 批） → 若无 gate 峰值可达 9
+    const [a, b, c] = await Promise.all([runClip("a"), runClip("b"), runClip("c")]);
+    assert.strictEqual(a.length, 12);
+    assert.strictEqual(b.length, 12);
+    assert.strictEqual(c.length, 12);
+    assert.ok(peak > 1 && peak <= cap, "应确有并发(>1)但被全局 cap 封顶(<=" + cap + ")，实际峰值 " + peak);
+    assert.strictEqual(inFlight, 0, "全部完成后在途归零");
   });
 
   /* ============ 7. 交付物校验 ============ */
