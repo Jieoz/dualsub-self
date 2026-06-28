@@ -227,14 +227,15 @@ test("resegment 去 ASR 滚动重叠词（不出现 work work）", () => {
 });
 
 test("resegment 句末标点处断句", () => {
+  // 两个都达 minWords(3) 的完整句应各自成段（句尾标点切句）
   const frags = Core.cleanupCues([
-    { start: 0, end: 1000, content: "first sentence." },
-    { start: 1100, end: 2000, content: "second sentence." },
+    { start: 0, end: 1000, content: "this is first sentence." },
+    { start: 1100, end: 2000, content: "this is second sentence." },
   ]);
   const seg = Core.resegmentCues(frags);
   assert.strictEqual(seg.length, 2, "两个完整句应各自成段");
-  assert.strictEqual(seg[0].content, "first sentence.");
-  assert.strictEqual(seg[1].content, "second sentence.");
+  assert.strictEqual(seg[0].content, "this is first sentence.");
+  assert.strictEqual(seg[1].content, "this is second sentence.");
 });
 
 test("resegment 大间隙不合并（不同句）", () => {
@@ -253,6 +254,31 @@ test("resegment 超过最大词数强制切句", () => {
   // 单条超长 cue 自身不再切（一条 event 整体进），但合并时受限——这里验证不抛错且产出非空
   assert.ok(seg.length >= 1);
   assert.ok(seg[0].content.length > 0);
+});
+
+test("resegment minWords：短句(<minWords)后接短句、小间隙 → 黏合成一段", () => {
+  // "ok." 只有 1 词 (< minWords=3)，虽自然结束也不立即切，应与下一条小间隙的短句黏合
+  const frags = Core.cleanupCues([
+    { start: 0, end: 800, content: "ok." },
+    { start: 900, end: 2000, content: "let us continue." }, // 间隙 100ms <= 300ms
+  ]);
+  const seg = Core.resegmentCues(frags, { minWords: 3 });
+  assert.strictEqual(seg.length, 1, "碎句应黏进相邻句，不单独成段");
+  assert.strictEqual(seg[0].content, "ok. let us continue.");
+  assert.strictEqual(seg[0].start, 0);
+  assert.strictEqual(seg[0].end, 2000, "时间轴取并集");
+});
+
+test("resegment minWords：短句后接大间隙 → 无法合并，碎句单独成段", () => {
+  // "ok." 太短想黏合，但下一条间隙 4s >> maxGap(300ms)，确实无法再合并 → 各自成段
+  const frags = Core.cleanupCues([
+    { start: 0, end: 800, content: "ok." },
+    { start: 5000, end: 6000, content: "much later text." },
+  ]);
+  const seg = Core.resegmentCues(frags, { minWords: 3 });
+  assert.strictEqual(seg.length, 2, "大间隙阻断黏合，碎句单独成段");
+  assert.strictEqual(seg[0].content, "ok.");
+  assert.strictEqual(seg[1].content, "much later text.");
 });
 
 /* ============ 5c. sliceClipsByCue：按 cue 边界切 ============ */
@@ -494,6 +520,71 @@ test("DEFAULT_CONFIG 含关键字段且颜色非空", () => {
   assert.strictEqual(typeof d.fontWeight, "string", "新增 fontWeight 字重");
   assert.strictEqual(typeof d.fontFamily, "string", "新增 fontFamily 字体族（默认空串）");
   assert.ok(d.globalConcurrency > 0, "新增 globalConcurrency 全局并发上限 > 0");
+  // v5 描边/阴影自定义字段
+  assert.strictEqual(d.strokeWidth, 1.2, "新增 strokeWidth 默认 1.2px");
+  assert.ok(/^#/.test(d.strokeColor), "新增 strokeColor 默认非空");
+  assert.strictEqual(d.shadowStrength, "medium", "新增 shadowStrength 默认 medium");
+});
+
+/* ============ 5f-2. 描边/阴影自定义：shadowCss + normalizeStrokeWidth + migrateConfig ============ */
+console.log("\n[描边/阴影：shadowCss + normalizeStrokeWidth + migrateConfig]");
+
+test("shadowCss 四档映射 + 非法回落 medium", () => {
+  assert.strictEqual(Core.shadowCss("none"), "none");
+  assert.strictEqual(Core.shadowCss("weak"), "0 1px 2px #000");
+  assert.strictEqual(Core.shadowCss("medium"), "0 0 4px #000, 0 1px 2px #000");
+  assert.strictEqual(Core.shadowCss("strong"), "0 0 6px #000, 0 1px 3px #000, 0 0 2px #000");
+  assert.strictEqual(Core.shadowCss("STRONG"), "0 0 6px #000, 0 1px 3px #000, 0 0 2px #000", "大小写不敏感");
+  assert.strictEqual(Core.shadowCss("bogus"), Core.shadowCss("medium"), "非法回落 medium");
+  assert.strictEqual(Core.shadowCss(null), Core.shadowCss("medium"), "空回落 medium");
+});
+
+test("normalizeStrokeWidth 合法透传 + clamp 0–3 + 非法回落", () => {
+  assert.strictEqual(Core.normalizeStrokeWidth(1.2, 1.2), 1.2);
+  assert.strictEqual(Core.normalizeStrokeWidth(0, 1.2), 0, "0=无描边合法");
+  assert.strictEqual(Core.normalizeStrokeWidth("2.5", 1.2), 2.5, "字符串数字");
+  assert.strictEqual(Core.normalizeStrokeWidth(-1, 1.2), 0, "负值夹到 0");
+  assert.strictEqual(Core.normalizeStrokeWidth(99, 1.2), 3, "超 3 夹到 3");
+  assert.strictEqual(Core.normalizeStrokeWidth("abc", 1.2), 1.2, "非法回落 fallback");
+  assert.strictEqual(Core.normalizeStrokeWidth(null, 0.8), 0.8, "空回落 fallback");
+});
+
+test("migrateConfig 老配置平滑迁移：stroke=false→strokeWidth=0；shadow=false→shadowStrength=none", () => {
+  // 老配置只有布尔 stroke/shadow，无新字段
+  const oldOff = Core.migrateConfig({ stroke: false, shadow: false });
+  assert.strictEqual(oldOff.strokeWidth, 0, "旧 stroke=false → 无描边");
+  assert.strictEqual(oldOff.shadowStrength, "none", "旧 shadow=false → 无阴影");
+  assert.strictEqual(oldOff.strokeColor, Core.DEFAULT_CONFIG.strokeColor, "补默认描边色");
+
+  const oldOn = Core.migrateConfig({ stroke: true, shadow: true });
+  assert.strictEqual(oldOn.strokeWidth, Core.DEFAULT_CONFIG.strokeWidth, "旧 stroke=true → 默认粗细");
+  assert.strictEqual(oldOn.shadowStrength, Core.DEFAULT_CONFIG.shadowStrength, "旧 shadow=true → 默认强度");
+});
+
+test("migrateConfig 已有新字段则尊重用户、不覆盖", () => {
+  const c = Core.migrateConfig({ stroke: false, shadow: false, strokeWidth: 2.0, shadowStrength: "strong" });
+  assert.strictEqual(c.strokeWidth, 2.0, "已显式设置 strokeWidth → 不被旧 stroke 覆盖");
+  assert.strictEqual(c.shadowStrength, "strong", "已显式设置 shadowStrength → 不被旧 shadow 覆盖");
+});
+
+test("migrateConfig 不改入参（纯函数）", () => {
+  const src = { stroke: false };
+  const out = Core.migrateConfig(src);
+  assert.ok(!("strokeWidth" in src), "入参不应被改写");
+  assert.strictEqual(out.strokeWidth, 0);
+});
+
+test("export→import round-trip 携带 v5 描边/阴影字段（strokeWidth 小数不被截断）", () => {
+  const cfg = Object.assign({}, Core.DEFAULT_CONFIG, {
+    strokeWidth: 1.7,
+    strokeColor: "#112233",
+    shadowStrength: "strong",
+  });
+  const res = Core.importConfig(Core.exportConfig(cfg));
+  assert.ok(res.ok, "导入应成功");
+  assert.strictEqual(res.config.strokeWidth, 1.7, "小数 strokeWidth 应 round-trip 不被截断");
+  assert.strictEqual(res.config.strokeColor, "#112233", "strokeColor round-trip");
+  assert.strictEqual(res.config.shadowStrength, "strong", "shadowStrength round-trip");
 });
 
 /* ============ 5k. computeFontPx：字号随播放器高度同比缩放 + clamp ============ */
@@ -536,12 +627,12 @@ test("computeFontPx 非法基准字号回落 DEFAULT_CONFIG.fontSize", () => {
   assert.strictEqual(Core.computeFontPx(480, NaN), Core.DEFAULT_CONFIG.fontSize);
 });
 
-/* ============ 5l. planPrefetch：预取深度裁剪（滑动窗口 depth=2）============ */
+/* ============ 5l. planPrefetch：预取深度裁剪（滑动窗口 depth=3）============ */
 console.log("\n[planPrefetch：深度裁剪 + 越界安全]");
 
-test("planPrefetch 默认 depth=2 返回 [idx,idx+1,idx+2]", () => {
-  assert.deepStrictEqual(Core.planPrefetch(0, 10), [0, 1, 2]);
-  assert.deepStrictEqual(Core.planPrefetch(3, 10), [3, 4, 5]);
+test("planPrefetch 默认 depth=3 返回 [idx..idx+3]", () => {
+  assert.deepStrictEqual(Core.planPrefetch(0, 10), [0, 1, 2, 3]);
+  assert.deepStrictEqual(Core.planPrefetch(3, 10), [3, 4, 5, 6]);
 });
 
 test("planPrefetch 末尾按 clipCount 裁越界", () => {
@@ -559,12 +650,41 @@ test("planPrefetch 越界/非法输入安全返回 []", () => {
   assert.deepStrictEqual(Core.planPrefetch(5, 5), [], "currentIdx 越界");
   assert.deepStrictEqual(Core.planPrefetch(0, 0), [], "clipCount 0");
   assert.deepStrictEqual(Core.planPrefetch(0, -1), [], "clipCount 负");
-  assert.deepStrictEqual(Core.planPrefetch(-3, 5), [0, 1, 2], "负 idx 夹到 0");
+  assert.deepStrictEqual(Core.planPrefetch(-3, 5), [0, 1, 2, 3], "负 idx 夹到 0");
 });
 
 test("planPrefetch ahead 非法回落默认深度", () => {
-  assert.deepStrictEqual(Core.planPrefetch(0, 10, -1), [0, 1, 2], "负 ahead 回落默认 2");
-  assert.deepStrictEqual(Core.planPrefetch(0, 10, NaN), [0, 1, 2], "NaN 回落默认 2");
+  assert.deepStrictEqual(Core.planPrefetch(0, 10, -1), [0, 1, 2, 3], "负 ahead 回落默认 3");
+  assert.deepStrictEqual(Core.planPrefetch(0, 10, NaN), [0, 1, 2, 3], "NaN 回落默认 3");
+});
+
+test("planPrefetch 动态加深：当前段剩余时间 < 15s → 多预取 1 段", () => {
+  // 不传 opts：默认深度（向后兼容）
+  assert.deepStrictEqual(Core.planPrefetch(0, 10), [0, 1, 2, 3], "无 opts 行为不变");
+  // remainMsInCurrent < 15000 → depth+1（默认 3 → 4 段后续，含当前共 5 个下标）
+  assert.deepStrictEqual(
+    Core.planPrefetch(0, 10, undefined, { remainMsInCurrent: 5000 }),
+    [0, 1, 2, 3, 4],
+    "接近段尾应多预取 1 段"
+  );
+  // 剩余时间充足（>= 15000）→ 不加深
+  assert.deepStrictEqual(
+    Core.planPrefetch(0, 10, undefined, { remainMsInCurrent: 20000 }),
+    [0, 1, 2, 3],
+    "剩余充足不加深"
+  );
+  // 加深也受 clipCount 上限裁剪：靠近末尾不会越界
+  assert.deepStrictEqual(
+    Core.planPrefetch(8, 10, undefined, { remainMsInCurrent: 1000 }),
+    [8, 9],
+    "加深仍裁到末尾不越界"
+  );
+  // 显式 ahead 叠加动态加深：ahead=1 + 加深 → depth=2
+  assert.deepStrictEqual(
+    Core.planPrefetch(0, 10, 1, { remainMsInCurrent: 1000 }),
+    [0, 1, 2],
+    "显式 ahead 也能叠加加深"
+  );
 });
 
 /* ============ 5m. export/import round-trip 含 v4 新字段 ============ */

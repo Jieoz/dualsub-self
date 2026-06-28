@@ -190,6 +190,7 @@
     var maxGap = opts.maxGapMs != null ? opts.maxGapMs : 300; // 小于此间隙视为同句延续
     var maxDur = opts.maxDurationMs != null ? opts.maxDurationMs : 6000; // 单句最长时长
     var maxWords = opts.maxWords != null ? opts.maxWords : 12; // 单句最多词数
+    var minWords = opts.minWords != null ? opts.minWords : 3; // 单句最少词数（碎句黏合下限）
     var list = (cues || []).filter(function (c) {
       return c && c.content;
     });
@@ -222,28 +223,36 @@
       } else {
         var gap = c.start - cur.end;
         var added = stripOverlap(cur.words, words);
-        // 是否该与当前段合并：间隙小、当前段没自然结束、且合并后不超限
         var prevText = cur.words.join(" ");
         var ended = SENTENCE_END_RE.test(prevText);
         var wouldWords = cur.words.length + added.length;
         var wouldDur = c.end - cur.start;
+        // 可并入下一条：续句(未自然结束) 或 自然结束但太短(< minWords，碎句黏合)；
+        // 两种都仍受「间隙小 + 不超 maxWords/maxDur」约束。这样 "OK." 这种孤立短句
+        // 会优先黏进相邻句，而不是句尾标点一到就立即单独成段。
+        var canMerge = !ended || cur.words.length < minWords;
         var mergeable =
-          gap <= maxGap && !ended && wouldWords <= maxWords && wouldDur <= maxDur;
+          gap <= maxGap && canMerge && wouldWords <= maxWords && wouldDur <= maxDur;
         if (mergeable) {
           for (var w = 0; w < added.length; w++) cur.words.push(added[w]);
           cur.end = Math.max(cur.end, c.end);
         } else {
+          // 确实无法再合并（间隙过大 / 会超上限）→ 当前段（含太短的碎句）单独成段
           flush();
           cur = { start: c.start, end: c.end, words: words.slice() };
         }
       }
 
-      // 段已自然结束 / 到达上限 → 立即切句
-      var curText = cur.words.join(" ");
+      // 切句时机：
+      //  - 超 maxWords / 超 maxDur → 立即切（防超长段，逻辑不变）。
+      //  - 自然结束(句尾标点)但仅当词数已达 minWords 才切；不足 minWords 先不切，
+      //    留待与下一条 cue 黏合（minWords 合并优先于句尾立即切）。
+      var curWords = cur.words.length;
+      var endedNow = SENTENCE_END_RE.test(cur.words.join(" "));
       if (
-        SENTENCE_END_RE.test(curText) ||
-        cur.words.length >= maxWords ||
-        cur.end - cur.start >= maxDur
+        curWords >= maxWords ||
+        cur.end - cur.start >= maxDur ||
+        (endedNow && curWords >= minWords)
       ) {
         flush();
       }
@@ -276,8 +285,11 @@
     bottomOffset: 90, // px，距播放器底部
     fontColor: "#ffffff",
     transColor: "#7fdfff", // 译文颜色
-    stroke: true, // 描边
-    shadow: true, // 阴影
+    stroke: true, // 描边（旧布尔开关，保留做向后兼容；新配置改用 strokeWidth）
+    shadow: true, // 阴影（旧布尔开关，保留做向后兼容；新配置改用 shadowStrength）
+    strokeWidth: 1.2, // px，描边粗细（范围 0–3，0=无描边）。0 即关闭描边，无需 class 开关
+    strokeColor: "#000000", // 描边颜色
+    shadowStrength: "medium", // 阴影强度："none"|"weak"|"medium"|"strong"
     background: false, // 背景框
     transOnTop: true, // true=译文在上，原文在下
     showOriginal: true, // 是否显示原文行
@@ -296,6 +308,54 @@
     var s = String(v == null ? "" : v).trim();
     if (/^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(s)) return s.toLowerCase();
     return fallback;
+  }
+
+  // 阴影强度 → text-shadow 预设串。none=无；逐级加重，strong 保证 1080p 亮背景可读。
+  var SHADOW_PRESETS = {
+    none: "none",
+    weak: "0 1px 2px #000",
+    medium: "0 0 4px #000, 0 1px 2px #000",
+    strong: "0 0 6px #000, 0 1px 3px #000, 0 0 2px #000",
+  };
+
+  /** 把 shadowStrength 取值映射到 text-shadow 串；非法值回落 medium。 */
+  function shadowCss(strength) {
+    var k = String(strength == null ? "" : strength).trim().toLowerCase();
+    return SHADOW_PRESETS[k] != null ? SHADOW_PRESETS[k] : SHADOW_PRESETS.medium;
+  }
+
+  /** 规整描边粗细：0–3 的有限数；非法回落 fallback；负数夹到 0、超 3 夹到 3。 */
+  function normalizeStrokeWidth(v, fallback) {
+    var f = Number(fallback);
+    if (!Number.isFinite(f)) f = DEFAULT_CONFIG.strokeWidth;
+    // null/undefined/空串(trim 后为空) = 缺失 → 回落 fallback；真数字 0 仍保留为 0。
+    if (v == null || (typeof v === "string" && v.trim() === "")) return f;
+    var n = Number(v);
+    if (!Number.isFinite(n)) return f;
+    if (n < 0) n = 0;
+    if (n > 3) n = 3;
+    return n;
+  }
+
+  /**
+   * 平滑迁移旧配置（向后兼容）：
+   *  - 老用户只有布尔 stroke/shadow，没有新字段 strokeWidth/strokeColor/shadowStrength。
+   *  - 迁移规则：旧 stroke===false → strokeWidth=0；旧 shadow===false → shadowStrength="none"。
+   *  - 仅在新字段缺失时迁移，已显式设置新字段的不动（用户改过就尊重）。
+   * 返回新对象，不改入参。读取/合并配置后调用一次即可，让老配置不会炸掉。
+   */
+  function migrateConfig(config) {
+    var c = Object.assign({}, config || {});
+    if (c.strokeWidth == null) {
+      // 旧 stroke 显式 false → 无描边(0)；否则用默认粗细
+      c.strokeWidth = c.stroke === false ? 0 : DEFAULT_CONFIG.strokeWidth;
+    }
+    if (c.strokeColor == null) c.strokeColor = DEFAULT_CONFIG.strokeColor;
+    if (c.shadowStrength == null) {
+      // 旧 shadow 显式 false → 无阴影；否则用默认强度
+      c.shadowStrength = c.shadow === false ? "none" : DEFAULT_CONFIG.shadowStrength;
+    }
+    return c;
   }
 
   function toInt(v, dflt) {
@@ -616,16 +676,22 @@
    * 注意：更深的窗口必须配合【全局 in-flight 信号量】(makeSemaphore)封顶，否则
    * idx/idx+1/idx+2 各自 concurrency=3 → ~9 并发 → 429 → 退避 → 更卡。
    */
-  var PREFETCH_AHEAD = 2; // 预取提前段数（当前段 + 后续 2 段）。再深需配合全局并发上限。
+  var PREFETCH_AHEAD = 3; // 预取提前段数（当前段 + 后续 3 段）。再深需配合全局并发上限。
+
+  // 当前段剩余播放时间低于此阈值时，动态多预取 1 段（追平被限速拖慢的窗口）。
+  var PREFETCH_DEEPEN_MS = 15000;
 
   /**
    * 计算从 currentIdx 起需要预取的 clip 下标列表（含 currentIdx 自身）。
    *  - currentIdx: 当前播放位置所在 clip 下标。
    *  - clipCount: clip 总数（用于裁越界）。
    *  - ahead: 提前段数，默认 PREFETCH_AHEAD；负数/非法回落默认；0 表示只翻当前段。
+   *  - opts: 可选。{ remainMsInCurrent } —— 当前段剩余播放时间（ms）。当其
+   *          < PREFETCH_DEEPEN_MS(15000) 时，额外多预取 1 段（depth+1，上限不超过
+   *          clipCount），让接近段尾时自动加深窗口。不传 opts 时行为与旧版完全一致。
    * 返回升序、已裁越界的下标数组。currentIdx 越界/clipCount<=0 时返回 []。
    */
-  function planPrefetch(currentIdx, clipCount, ahead) {
+  function planPrefetch(currentIdx, clipCount, ahead, opts) {
     var n = Number(clipCount);
     if (!Number.isFinite(n) || n <= 0) return [];
     var idx = Number(currentIdx);
@@ -636,6 +702,11 @@
     var depth = Number(ahead);
     if (!Number.isFinite(depth) || depth < 0) depth = PREFETCH_AHEAD;
     depth = Math.floor(depth);
+    // 动态加深：接近当前段段尾（剩余播放时间不足）时多预取 1 段。
+    if (opts && opts.remainMsInCurrent != null) {
+      var remain = Number(opts.remainMsInCurrent);
+      if (Number.isFinite(remain) && remain < PREFETCH_DEEPEN_MS) depth += 1;
+    }
     var out = [];
     for (var i = idx; i <= idx + depth && i < n; i++) out.push(i);
     return out;
@@ -1021,7 +1092,8 @@
       var def = DEFAULT_CONFIG[k];
       var v = src[k];
       if (typeof def === "number") {
-        var num = parseInt(v, 10);
+        // 用 Number 而非 parseInt：保留小数字段（如 strokeWidth=1.2）；整数字段不受影响。
+        var num = Number(v);
         if (Number.isFinite(num)) {
           out[k] = num;
           any = true;
@@ -1045,6 +1117,9 @@
     resegmentCues: resegmentCues,
     collapseWhitespace: collapseWhitespace,
     normalizeColor: normalizeColor,
+    shadowCss: shadowCss,
+    normalizeStrokeWidth: normalizeStrokeWidth,
+    migrateConfig: migrateConfig,
     computeFontPx: computeFontPx,
     planPrefetch: planPrefetch,
     makeSemaphore: makeSemaphore,

@@ -45,6 +45,7 @@
       input[type="password"],
       input[type="number"],
       input[type="color"],
+      input[type="range"],
       select,
       textarea {
         width: 100%;
@@ -153,8 +154,26 @@
         </div>
       </div>
       <div class="hint">字号为常规窗口下的基准值，全屏/影院模式会按播放器高度同比放大。字体仅用本地/系统已安装字体，不远程加载。</div>
-      <div class="inline"><input type="checkbox" id="stroke" /><label for="stroke">文字描边</label></div>
-      <div class="inline"><input type="checkbox" id="shadow" /><label for="shadow">文字阴影</label></div>
+      <div class="grid2">
+        <div>
+          <label for="strokeWidth">描边粗细 <span id="strokeWidthVal" class="hint" style="display:inline">1.2 px</span></label>
+          <input type="range" id="strokeWidth" min="0" max="3" step="0.1" />
+        </div>
+        <div>
+          <label for="strokeColor">描边颜色</label>
+          <input type="color" id="strokeColor" />
+        </div>
+        <div>
+          <label for="shadowStrength">阴影强度</label>
+          <select id="shadowStrength">
+            <option value="none">无</option>
+            <option value="weak">弱</option>
+            <option value="medium">中</option>
+            <option value="strong">强</option>
+          </select>
+        </div>
+      </div>
+      <div class="hint">描边粗细 0 = 关闭描边；阴影/描边均为提升亮背景下可读性。</div>
       <div class="inline"><input type="checkbox" id="background" /><label for="background">背景框</label></div>
       <div class="inline"><input type="checkbox" id="transOnTop" /><label for="transOnTop">译文在上（原文在下）</label></div>
       <div class="inline"><input type="checkbox" id="showOriginal" /><label for="showOriginal">显示原文行</label></div>

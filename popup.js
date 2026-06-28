@@ -20,9 +20,10 @@
   // 表单字段 id 列表（与 DEFAULT_CONFIG 对应）
   var TEXT_FIELDS = ["apiBaseUrl", "apiKey", "apiModel", "targetLang", "fontFamily"];
   var NUM_FIELDS = ["fontSize", "bottomOffset"];
-  var COLOR_FIELDS = ["fontColor", "transColor"];
-  var BOOL_FIELDS = ["enabled", "stroke", "shadow", "background", "transOnTop", "showOriginal", "showLoading"];
-  var SELECT_FIELDS = ["sourceLang", "fontWeight"];
+  var COLOR_FIELDS = ["fontColor", "transColor", "strokeColor"];
+  var BOOL_FIELDS = ["enabled", "background", "transOnTop", "showOriginal", "showLoading"];
+  var SELECT_FIELDS = ["sourceLang", "fontWeight", "shadowStrength"];
+  // strokeWidth 是 0–3 的小数滑块，单独处理（NUM_FIELDS 走 parseInt 会截断小数）。
 
   function $(id) {
     return document.getElementById(id);
@@ -64,6 +65,8 @@
         chrome.storage.local.get([key], function (res) {
           var saved = res && res[key];
           var merged = Object.assign({}, DEFAULT_CONFIG, saved && typeof saved === "object" ? saved : {});
+          // 平滑迁移旧配置（布尔 stroke/shadow → strokeWidth/shadowStrength），让老用户控件正确回显
+          if (Core.migrateConfig) merged = Core.migrateConfig(merged);
           resolve(merged);
         });
       } catch (e) {
@@ -126,7 +129,16 @@
     BOOL_FIELDS.forEach(function (id) {
       if ($(id)) $(id).checked = !!config[id];
     });
-    // 固定选项的下拉（如 fontWeight）：直接按值选中（sourceLang 选项动态填充，单独处理）
+    // 描边粗细滑块（0–3 小数）+ 旁边数值显示
+    if ($("strokeWidth")) {
+      var sw = config.strokeWidth != null ? config.strokeWidth : (DEFAULT_CONFIG.strokeWidth != null ? DEFAULT_CONFIG.strokeWidth : 1.2);
+      $("strokeWidth").value = sw;
+      updateStrokeWidthLabel();
+    }
+    // 固定选项的下拉（如 fontWeight / shadowStrength）：直接按值选中
+    if ($("shadowStrength") && config.shadowStrength != null) {
+      trySetSelect("shadowStrength", String(config.shadowStrength));
+    }
     if ($("fontWeight") && config.fontWeight != null) {
       trySetSelect("fontWeight", String(config.fontWeight));
     }
@@ -153,6 +165,13 @@
         return;
       }
     }
+  }
+
+  /** 实时刷新描边粗细旁的数值文本（拖动滑块时调用） */
+  function updateStrokeWidthLabel() {
+    var sl = $("strokeWidth");
+    var lbl = $("strokeWidthVal");
+    if (sl && lbl) lbl.textContent = Number(sl.value).toFixed(1) + " px";
   }
 
   /** 用轨道清单填充源语言下拉（保留 auto + 当前已选） */
@@ -194,6 +213,14 @@
     SELECT_FIELDS.forEach(function (id) {
       if ($(id)) c[id] = $(id).value;
     });
+    // 描边粗细：0–3 的小数（保留小数，不能 parseInt 截断）。非法回落默认。
+    if ($("strokeWidth")) {
+      var sw = Number($("strokeWidth").value);
+      if (!isFinite(sw)) sw = DEFAULT_CONFIG.strokeWidth != null ? DEFAULT_CONFIG.strokeWidth : 1.2;
+      if (sw < 0) sw = 0;
+      if (sw > 3) sw = 3;
+      c.strokeWidth = sw;
+    }
     return c;
   }
 
@@ -226,6 +253,11 @@
   /* ---------------- 事件 ---------------- */
   document.addEventListener("DOMContentLoaded", function () {
     init();
+
+    // 描边粗细滑块拖动时实时更新旁边数值文本
+    if ($("strokeWidth")) {
+      $("strokeWidth").addEventListener("input", updateStrokeWidthLabel);
+    }
 
     $("saveBtn").addEventListener("click", async function () {
       var cfg = readForm();

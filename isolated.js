@@ -74,9 +74,9 @@
     seeking: false, // 进度条拖动中（防抖期间不渲染/不预取目标外位置）
   };
 
-  // 渲染/预取节拍（ms）。渲染 250ms 人眼无感；预取降到 1.5s 一次，与渲染解耦。
+  // 渲染/预取节拍（ms）。渲染 250ms 人眼无感；预取 1s 一次（比渲染低频，但比旧 1.5s 更跟手），与渲染解耦。
   var RENDER_INTERVAL_MS = 250;
-  var PREFETCH_INTERVAL_MS = 1500;
+  var PREFETCH_INTERVAL_MS = 1000;
   var SEEK_SETTLE_MS = 350; // seek 停稳多少 ms 后才翻目标 clip
 
   /* =====================================================
@@ -88,7 +88,8 @@
         chrome.storage.local.get([STORAGE_KEY], function (res) {
           var saved = res && res[STORAGE_KEY];
           if (saved && typeof saved === "object") {
-            config = Object.assign({}, DEFAULT_CONFIG, saved);
+            // 平滑迁移旧配置（布尔 stroke/shadow → 新 strokeWidth/shadowStrength），老配置不炸
+            config = Core.migrateConfig(Object.assign({}, DEFAULT_CONFIG, saved));
           }
           resolve(config);
         });
@@ -297,8 +298,20 @@
     var idx = clipIdxAt(ms);
     if (idx === -1) idx = 0;
 
+    // 当前段剩余播放时间（段末 endMs - 当前播放位置）。接近段尾时 planPrefetch 自动多预取一段，
+    // 追平被网关限速拖慢的窗口。endMs 取不到时用 clip 末条 cue 的 end 兜算。
+    var curClip = state.clips[idx];
+    var endMs = curClip
+      ? (curClip.endMs != null
+          ? curClip.endMs
+          : (curClip.cues && curClip.cues.length ? curClip.cues[curClip.cues.length - 1].end : ms))
+      : ms;
+    var remainMsInCurrent = endMs - ms;
+
     // 滑动窗口下标列表（含当前段）。当前段用首句优先起点，后续段从头翻。
-    var plan = Core.planPrefetch(idx, state.clips.length);
+    var plan = Core.planPrefetch(idx, state.clips.length, undefined, {
+      remainMsInCurrent: remainMsInCurrent,
+    });
     for (var i = 0; i < plan.length; i++) {
       var ci = plan[i];
       translateClip(ci, ci === idx ? priorityCueIndex(idx, ms) : 0);
@@ -479,11 +492,12 @@
       "}",
       ".dualsub-orig{ color:var(--ds-orig-color,#fff); }",
       ".dualsub-trans{ color:var(--ds-trans-color,#7fdfff); }",
-      ".dualsub-stroke .dualsub-subtitle{",
-      "  -webkit-text-stroke:0.5px #000; paint-order:stroke fill;",
-      "}",
-      ".dualsub-shadow .dualsub-subtitle{",
-      "  text-shadow:0 0 4px #000,0 1px 2px #000;",
+      // 描边/阴影改为变量驱动（width=0 即无描边，无需 class 开关）。
+      // paint-order:stroke fill 让描边描在文字下方，不啃掉字形。
+      ".dualsub-subtitle{",
+      "  -webkit-text-stroke: var(--ds-stroke-width,1.2px) var(--ds-stroke-color,#000);",
+      "  paint-order:stroke fill;",
+      "  text-shadow: var(--ds-shadow, 0 0 4px #000,0 1px 2px #000);",
       "}",
       ".dualsub-bg .dualsub-subtitle{",
       "  background:rgba(0,0,0,0.6); padding:1px 8px; border-radius:4px;",
@@ -522,8 +536,15 @@
       "--ds-trans-color",
       Core.normalizeColor(config.transColor, DEFAULT_CONFIG.transColor)
     );
-    r.classList.toggle("dualsub-stroke", !!config.stroke);
-    r.classList.toggle("dualsub-shadow", !!config.shadow);
+    // 描边：粗细(px) + 颜色，变量驱动。strokeWidth=0 → 0px 即无描边（不再用 class 开关）。
+    var sw = Core.normalizeStrokeWidth(config.strokeWidth, DEFAULT_CONFIG.strokeWidth);
+    r.style.setProperty("--ds-stroke-width", sw + "px");
+    r.style.setProperty(
+      "--ds-stroke-color",
+      Core.normalizeColor(config.strokeColor, DEFAULT_CONFIG.strokeColor)
+    );
+    // 阴影：按 shadowStrength 查表注入整串 text-shadow（none→无阴影）。
+    r.style.setProperty("--ds-shadow", Core.shadowCss(config.shadowStrength));
     r.classList.toggle("dualsub-bg", !!config.background);
     // 重排译文/原文顺序
     if (r._trans && r._orig) {
