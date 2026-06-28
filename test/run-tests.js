@@ -1170,7 +1170,153 @@ async function main() {
     assert.strictEqual(out[5], "ok", "成功批仍正确填充");
   });
 
-  await asyncTest("缓存命中场景：相同 key 不再调 fetch（pruneCache + makeCacheKey 协作）", async () => {
+  /* ============ 句级语义重断（方案 A：句级对齐 + 覆盖性兜底） ============ */
+  console.log("\n[句级语义重断：parseSentenceResponse + alignSentences + translateSentences]");
+
+  // 6 条无标点 ASR 碎片样本，带时间轴，源行号 1..6
+  const SENT_CUES = [
+    { start: 0, end: 600, content: "so today we are gonna" },
+    { start: 600, end: 1200, content: "take a look at how" },
+    { start: 1250, end: 1800, content: "large language models work" },
+    { start: 2600, end: 3100, content: "they predict the next token" },
+    { start: 3150, end: 3700, content: "one step at a time" },
+    { start: 4600, end: 5200, content: "and that is basically it" },
+  ];
+
+  test("alignSentences 正常：3 句覆盖 [1-2][3-4][5-6]，时间区间=首行start→末行end", () => {
+    const model = [
+      "[1-2] ||| So today we are gonna take a look at how. ||| 那么今天我们来看看。",
+      "[3-4] ||| Large language models work, they predict the next token. ||| 大语言模型预测下一个 token。",
+      "[5-6] ||| One step at a time, and that is basically it. ||| 一次一步，基本就是这样。",
+    ].join("\n");
+    const r = Core.alignSentences(SENT_CUES, model);
+    assert.strictEqual(r.ok, true, "覆盖完整应 ok");
+    assert.strictEqual(r.sentences.length, 3);
+    // 时间轴：句 = [首源行.start, 末源行.end]
+    assert.deepStrictEqual([r.sentences[0].startMs, r.sentences[0].endMs], [0, 1200]);
+    assert.deepStrictEqual([r.sentences[1].startMs, r.sentences[1].endMs], [1250, 3100]);
+    assert.deepStrictEqual([r.sentences[2].startMs, r.sentences[2].endMs], [3150, 5200]);
+    assert.strictEqual(r.sentences[0].originalText, "So today we are gonna take a look at how.");
+    assert.strictEqual(r.sentences[2].translation, "一次一步，基本就是这样。");
+  });
+
+  test("alignSentences 时间轴：单行号句 [4] 区间=该 cue 的 start/end", () => {
+    const model = [
+      "[1-3] ||| A. ||| 甲。",
+      "[4] ||| B. ||| 乙。",
+      "[5-6] ||| C. ||| 丙。",
+    ].join("\n");
+    const r = Core.alignSentences(SENT_CUES, model);
+    assert.strictEqual(r.ok, true);
+    assert.deepStrictEqual([r.sentences[1].startMs, r.sentences[1].endMs], [2600, 3100], "第4行单行号句区间");
+  });
+
+  test("覆盖性兜底：漏掉第 5 行 → ok=false(gap)，调用方退回逐行", () => {
+    const model = "[1-3] ||| A ||| 甲\n[4] ||| B ||| 乙\n[6] ||| C ||| 丙"; // 缺 5
+    const r = Core.alignSentences(SENT_CUES, model);
+    assert.strictEqual(r.ok, false, "漏行应不通过覆盖性");
+    assert.strictEqual(r.reason, "gap");
+    assert.strictEqual(r.sentences.length, 0);
+  });
+
+  test("覆盖性兜底：范围重叠 [1-3][3-6] → ok=false(overlap)", () => {
+    const r = Core.alignSentences(SENT_CUES, "[1-3] ||| A ||| 甲\n[3-6] ||| B ||| 乙");
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.reason, "overlap");
+  });
+
+  test("覆盖性兜底：越界 [1-7] 超过输入行数 → ok=false(out-of-range)", () => {
+    const r = Core.alignSentences(SENT_CUES, "[1-7] ||| A ||| 甲");
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.reason, "out-of-range");
+  });
+
+  test("覆盖性兜底：末行未覆盖（只到 5）→ ok=false(uncovered)", () => {
+    const r = Core.alignSentences(SENT_CUES, "[1-3] ||| A ||| 甲\n[4-5] ||| B ||| 乙");
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.reason, "uncovered");
+  });
+
+  test("覆盖性兜底：解析为空（纯自由文本无 [范围]）→ ok=false(empty)", () => {
+    const r = Core.alignSentences(SENT_CUES, "这是一段没有任何行号范围的自由文本。");
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.reason, "empty");
+  });
+
+  test("parseSentenceResponse 容错：单行号 [3]、范围 [3-5]、多余空白都能解析", () => {
+    const txt = [
+      "  [ 3 - 5 ]   ||| Restored sentence.  |||   重组后的译文 ",
+      "[7]|||No spaces.|||无空格译文",
+      "[ 9 ] ||| trailing. ||| 末尾。   ",
+    ].join("\n");
+    const recs = Core.parseSentenceResponse(txt);
+    assert.strictEqual(recs.length, 3);
+    assert.deepStrictEqual([recs[0].srcStart, recs[0].srcEnd], [3, 5]);
+    assert.strictEqual(recs[0].originalText, "Restored sentence.");
+    assert.strictEqual(recs[0].translation, "重组后的译文");
+    assert.deepStrictEqual([recs[1].srcStart, recs[1].srcEnd], [7, 7], "单行号 srcStart=srcEnd");
+    assert.strictEqual(recs[2].translation, "末尾。");
+  });
+
+  test("parseSentenceResponse 跳过非法行：段数不足/无范围", () => {
+    const txt = [
+      "[1-2] ||| only two fields", // 缺第三段
+      "no bracket at all",
+      "[3] ||| ok ||| 好",
+    ].join("\n");
+    const recs = Core.parseSentenceResponse(txt);
+    assert.strictEqual(recs.length, 1, "只有合法一行");
+    assert.strictEqual(recs[0].srcStart, 3);
+  });
+
+  await asyncTest("translateSentences 正常：一次调用解析为句级时间轴(ok=true)", async () => {
+    let calls = 0;
+    const mockFetch = async (url, opts) => {
+      calls++;
+      const body = JSON.parse(opts.body);
+      // 校验：句级 user message 含带行号源碎片
+      assert.ok(/1\.\s+so today/.test(body.messages[1].content), "user 含编号源行");
+      const content = [
+        "[1-3] ||| So today we take a look at how large language models work. ||| 今天我们看看大语言模型怎么工作。",
+        "[4-6] ||| They predict the next token one step at a time, and that is basically it. ||| 它们一次预测一个 token，基本就这样。",
+      ].join("\n");
+      return { ok: true, status: 200, async json() { return { choices: [{ message: { content } }] }; }, async text() { return ""; } };
+    };
+    const r = await Core.translateSentences({
+      cues: SENT_CUES,
+      apiBaseUrl: "https://gw/v1",
+      apiModel: "m",
+      targetLang: "zh-Hans",
+      fetchImpl: mockFetch,
+    });
+    assert.strictEqual(calls, 1, "句级重断只一次调用");
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.sentences.length, 2);
+    assert.deepStrictEqual([r.sentences[0].startMs, r.sentences[0].endMs], [0, 1800]);
+    assert.deepStrictEqual([r.sentences[1].startMs, r.sentences[1].endMs], [2600, 5200]);
+  });
+
+  await asyncTest("translateSentences 覆盖性不过：返回 ok=false 让调用方退回逐行", async () => {
+    const mockFetch = async () => {
+      const content = "[1-3] ||| A ||| 甲\n[5-6] ||| B ||| 乙"; // 漏第 4 行
+      return { ok: true, status: 200, async json() { return { choices: [{ message: { content } }] }; }, async text() { return ""; } };
+    };
+    const r = await Core.translateSentences({
+      cues: SENT_CUES, apiBaseUrl: "https://gw/v1", apiModel: "m", targetLang: "zh-Hans", fetchImpl: mockFetch,
+    });
+    assert.strictEqual(r.ok, false, "漏行 → 不通过，调用方应退回逐行 fallback");
+    assert.strictEqual(r.sentences.length, 0);
+  });
+
+  test("句级 system prompt 含范围协议 + 目标语言填充 + 自定义覆盖", () => {
+    const sys = Core.buildSentenceSystemPrompt("zh-Hans");
+    assert.ok(/\|\|\|/.test(sys), "应说明 ||| 分隔协议");
+    assert.ok(/startLine-endLine/.test(sys), "应说明行号范围协议");
+    assert.ok(/zh-Hans/.test(sys) && !/\{TARGET_LANG\}/.test(sys), "目标语言已填充");
+    assert.strictEqual(Core.buildSentenceSystemPrompt("zh-Hans", "MY {TARGET_LANG}"), "MY zh-Hans", "自定义覆盖默认");
+  });
+
+  await asyncTest("缓存命中则零调用：命中缓存不触发 translateCues/fetch", async () => {
     // 模拟 isolated.js 的"先查缓存命中则零调用"语义
     const key = Core.makeCacheKey({ videoId: "v", trackCode: "en-asr", targetLang: "zh", apiModel: "m", clipStartMs: 0 });
     const cache = {};

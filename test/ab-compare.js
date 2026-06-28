@@ -182,8 +182,81 @@ async function main() {
   afterMsgs.forEach((m, i) => { console.log("\n  ▼ 批 " + i + " 的 user message:"); console.log(indent(m)); });
 
   console.log("\n  → 改后每个非首批都带最多 3 条上下文（编号区仍只含本批、行数不变 → 不破坏时间轴对齐）。");
+
+  /* ④ 断句根治：现状规则断句 vs 句级语义重断（方案 A） */
+  await sentenceReorgCompare();
+
   console.log("");
 }
+
+/* =============================================================
+ * ④ 断句根治对照：「现状规则断句(resegmentCues)」 vs 「句级语义重断(alignSentences)」
+ * 用同一份无标点 ASR 碎片样本：
+ *   - 左：规则断句——靠 maxWords/longPauseMs 切，可能从半句断、两句粘连。
+ *   - 右：句级语义重断——LLM(mock) 把碎片重组成完整句，告诉我们每句的源行范围，
+ *         时间区间 = [首源行.start, 末源行.end]，原文恢复标点、不再半句。
+ * 模型输出用 mock（不调网络），直观展示「一条重组句如何由多个源碎片合并」。
+ * ============================================================= */
+async function sentenceReorgCompare() {
+  hr("④ 断句根治：现状规则断句 vs 句级语义重断（方案 A）— 模型输出用 mock");
+
+  // 输入：带行号的无标点 ASR 碎片（直接用原始 SAMPLE，未经 resegment）
+  sub("输入：无标点 ASR 碎片（带源行号 1.." + SAMPLE.length + "，含滚动重叠、两处长停顿）");
+  SAMPLE.forEach((c, i) =>
+    console.log("  行" + (i + 1) + " (" + c.start + "→" + c.end + "ms) " + c.content)
+  );
+
+  // 左：现状规则断句（主路径之前的兜底分段器）
+  const ruleSegs = Core.resegmentCues(SAMPLE, { maxWords: 16, longPauseMs: 700 });
+  sub("【现状·规则断句】resegmentCues 切出 " + ruleSegs.length + " 段（靠词数/停顿，无标点、可能半句断）");
+  ruleSegs.forEach((s, i) =>
+    console.log(
+      "  [" + i + "] (" + s.start + "→" + s.end + "ms) " + s.content
+    )
+  );
+
+  // 右：句级语义重断。mock 模型把 7 行碎片重组为 3 个完整句，标注源行范围。
+  const mockModelOutput = [
+    "[1-3] ||| So today, we're gonna take a look at how large language models work. ||| 那么今天，我们来看看大语言模型是怎么工作的。",
+    "[4-5] ||| They predict the next token, one step at a time. ||| 它们一次预测一个词元，一步一步来。",
+    "[6-7] ||| And that's basically it — pretty simple, right? ||| 基本上就是这样，挺简单的，对吧？",
+  ].join("\n");
+  const aligned = Core.alignSentences(SAMPLE, mockModelOutput);
+
+  sub(
+    "【根治·句级语义重断】alignSentences → " +
+      (aligned.ok ? aligned.sentences.length + " 个完整句（覆盖性校验通过）" : "覆盖性未过(" + aligned.reason + ")→退回逐行")
+  );
+  if (aligned.ok) {
+    aligned.sentences.forEach((s, i) => {
+      const span = "源行 " + s.srcStart + (s.srcEnd > s.srcStart ? "-" + s.srcEnd : "");
+      console.log(
+        "  [" + i + "] (" + s.startMs + "→" + s.endMs + "ms, 由" + span + "合并) " + s.originalText
+      );
+      console.log("        译： " + s.translation);
+    });
+
+    sub("一条重组句如何由多个源碎片合并 + 时间区间怎么算（举句 [0]）");
+    const s0 = aligned.sentences[0];
+    console.log("  重组句 [0] 覆盖源行 " + s0.srcStart + "-" + s0.srcEnd + "：");
+    for (let r = s0.srcStart; r <= s0.srcEnd; r++) {
+      const cue = SAMPLE[r - 1];
+      console.log("    源行" + r + " (" + cue.start + "→" + cue.end + "ms) " + cue.content);
+    }
+    console.log(
+      "  → 句区间 startMs=首源行(" + s0.srcStart + ").start=" + s0.startMs +
+        "，endMs=末源行(" + s0.srcEnd + ").end=" + s0.endMs +
+        "（渲染层按此合并区间显示完整句，不再逐碎片闪）"
+    );
+  }
+
+  console.log(
+    "\n  → 对照：规则断句产出 " + ruleSegs.length + " 段（仍可能在半句处断/粘连）；" +
+      "句级重断产出 " + (aligned.ok ? aligned.sentences.length : "?") +
+      " 个语义完整句（恢复标点、合并时间轴）。覆盖性不过时自动退回规则/逐行兜底，不丢字幕。"
+  );
+}
+
 
 function indent(s) {
   return String(s).split("\n").map((l) => "      | " + l).join("\n");

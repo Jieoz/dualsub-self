@@ -281,7 +281,8 @@
     apiModel: "gpt-4o-mini",
     sourceLang: "auto", // auto = 用第一条 ASR / 第一条轨道
     targetLang: "zh-Hans",
-    systemPrompt: "", // 空 = 用 core 默认
+    systemPrompt: "", // 空 = 用 core 默认（逐行兜底路径的 prompt）
+    sentencePrompt: "", // 空 = 用 core 句级重断默认 prompt（主路径：句级语义重断 + 翻译）
     // 显示样式
     fontSize: 22, // px —— 语义为"基准高度(FONT_BASE_HEIGHT=480，常规非全屏)下的字号"；
     //               实际渲染字号随播放器高度由 computeFontPx 同比缩放（全屏放大、退出缩小）。
@@ -457,6 +458,147 @@
     return tpl.replace(/\{TARGET_LANG\}/g, targetLang || "the target language");
   }
 
+  /* ---------------------------------------------------------------
+   * 句级语义重断（主路径）：让 LLM 一次调用同时把无标点 ASR 碎片
+   * 重组成完整句子 + 翻译，并标注每句覆盖的源行号范围，供时间轴回映。
+   * 输出协议（每行一条，固定三段分隔）：
+   *   [3-5] ||| Restored full sentence. ||| 重组后的完整译文。
+   * 解析器（parseSentenceResponse）容忍单行号 [3]、范围 [3-5]、多余空白。
+   * 覆盖性校验（alignSentences）：源行号必须连续覆盖全部输入行、不重叠/不遗漏，
+   * 否则标记 fallback，由调用方退回逐行对齐路径（保留旧 alignTranslations）。
+   * ------------------------------------------------------------- */
+
+  // 在前置任务（口语/连贯/语序自由/术语约束）基础上扩展为「句级重断 + 翻译」。
+  var DEFAULT_SENTENCE_SYSTEM_PROMPT =
+    "You restore and translate auto-generated video subtitles. " +
+    "You will receive numbered subtitle fragments from speech recognition: they have NO punctuation " +
+    "and are often cut mid-sentence or merged across sentences.\n" +
+    "Your job, in ONE pass:\n" +
+    "1. Regroup the consecutive fragments into complete, natural sentences and restore punctuation.\n" +
+    "2. For each restored sentence, state which input line numbers it is built from, as a CONTIGUOUS range.\n" +
+    "3. Translate each complete sentence into natural, fluent, colloquial {TARGET_LANG} — " +
+    "the way a native speaker actually talks, never stiff word-for-word translationese.\n" +
+    "Use neighbouring fragments as context to resolve pronouns, references and keep the topic coherent. " +
+    "Keep proper nouns, names and technical terms sensible (preserve or use the common accepted translation).\n" +
+    "Output format (STRICT): one restored sentence per line, exactly:\n" +
+    "[startLine-endLine] ||| restored source sentence with punctuation ||| {TARGET_LANG} translation\n" +
+    "A single-line sentence uses [n] (e.g. [4]). The ranges MUST be contiguous, in order, cover EVERY " +
+    "input line exactly once, and never overlap or skip a line. Output ONLY these lines — no commentary, " +
+    "no blank lines, no source echo outside the middle field.";
+
+  function buildSentenceSystemPrompt(targetLang, customPrompt) {
+    var tpl =
+      customPrompt && String(customPrompt).trim() ? customPrompt : DEFAULT_SENTENCE_SYSTEM_PROMPT;
+    return tpl.replace(/\{TARGET_LANG\}/g, targetLang || "the target language");
+  }
+
+  /**
+   * 把碎片 cue 拼成带行号的 user message（句级重断用）。
+   * 与 buildNumberedBatch 同构（"1. xxx"），单独留一个函数便于将来差异化。
+   */
+  function buildNumberedSourceLines(lines) {
+    return (lines || [])
+      .map(function (t, i) {
+        return i + 1 + ". " + collapseWhitespace(t);
+      })
+      .join("\n");
+  }
+
+  /**
+   * 解析句级重断模型输出，返回记录数组：
+   *   [{ srcStart, srcEnd, originalText, translation }]
+   * 每行格式 `[范围] ||| 原文句 ||| 译文`，容忍：
+   *  - 单行号 [3] → srcStart=srcEnd=3；范围 [3-5] / [3 - 5]；
+   *  - 三段分隔可有多余空白；分隔符固定为 |||。
+   * 不做覆盖性校验（交给 alignSentences），只做语法解析。
+   * 行号非法 / 段数不足的行直接跳过。
+   */
+  function parseSentenceResponse(text) {
+    var out = [];
+    if (typeof text !== "string") return out;
+    var lines = text.replace(/\r/g, "").split("\n");
+    // [n] 或 [a-b]（容忍内部空白与全角连字符）
+    var rangeRe = /^\s*\[\s*(\d+)\s*(?:[-–—]\s*(\d+)\s*)?\]\s*(.*)$/;
+    for (var i = 0; i < lines.length; i++) {
+      var m = lines[i].match(rangeRe);
+      if (!m) continue;
+      var a = parseInt(m[1], 10);
+      var b = m[2] != null ? parseInt(m[2], 10) : a;
+      if (!(a >= 1) || !(b >= a)) continue;
+      // 范围已剥离，剩余形如「||| 原文 ||| 译文」（协议含范围后第一个分隔符）；
+      // 容忍模型省略前导分隔符的「原文 ||| 译文」。先去掉可能的前导 |||，再按 ||| 切两段。
+      var rest = (m[3] || "").replace(/^\s*\|\|\|\s*/, "");
+      var parts = rest.split("|||");
+      if (parts.length < 2) continue; // 至少要能切出 原文 + 译文
+      var originalText = collapseWhitespace(parts[0]);
+      // 译文取其后全部（极少数情况下译文自身含 ||| 时拼回分隔符）
+      var translation = collapseWhitespace(parts.slice(1).join("|||"));
+      if (!translation) continue;
+      out.push({ srcStart: a, srcEnd: b, originalText: originalText, translation: translation });
+    }
+    return out;
+  }
+
+  /**
+   * 句级对齐：解析模型输出 + 覆盖性校验 + 时间轴回映。
+   * 入参：
+   *  - originalCues: 本次输入的碎片 cue[]（顺序即源行号 1..N，需带 start/end）。
+   *  - modelText: 模型按句级协议输出的文本。
+   * 返回：
+   *   { ok, sentences, reason? }
+   *   - ok=true：sentences = [{ srcStart, srcEnd, originalText, translation, startMs, endMs }]
+   *     时间区间 = [首源行.start, 末源行.end]（按源 cue 推出）。
+   *   - ok=false：覆盖性校验未过（漏行/重叠/越界/行数对不上/解析空）→ 调用方退回逐行对齐。
+   *     reason 给出诊断（empty/gap/overlap/out-of-range/uncovered）。
+   * 覆盖性规则（必须连续、覆盖全部、不重叠、不遗漏）：
+   *   按 srcStart 排序后，第一条须从 1 开始，每条 srcStart == 上一条 srcEnd+1，
+   *   末条 srcEnd == N。任一不满足即 ok=false。
+   */
+  function alignSentences(originalCues, modelText) {
+    var cues = originalCues || [];
+    var n = cues.length;
+    if (!n) return { ok: false, sentences: [], reason: "empty-input" };
+
+    var recs = parseSentenceResponse(modelText);
+    if (!recs.length) return { ok: false, sentences: [], reason: "empty" };
+
+    // 越界检查 + 排序（按 srcStart 升序，稳定）
+    for (var i = 0; i < recs.length; i++) {
+      if (recs[i].srcStart < 1 || recs[i].srcEnd > n) {
+        return { ok: false, sentences: [], reason: "out-of-range" };
+      }
+    }
+    var sorted = recs.slice().sort(function (a, b) {
+      return a.srcStart - b.srcStart;
+    });
+
+    // 覆盖性：从 1 连续到 N，逐条衔接、不重叠不遗漏
+    var expect = 1;
+    for (var j = 0; j < sorted.length; j++) {
+      var r = sorted[j];
+      if (r.srcStart !== expect) {
+        return { ok: false, sentences: [], reason: r.srcStart < expect ? "overlap" : "gap" };
+      }
+      expect = r.srcEnd + 1;
+    }
+    if (expect !== n + 1) return { ok: false, sentences: [], reason: "uncovered" };
+
+    // 时间轴回映：句区间 = [首源 cue.start, 末源 cue.end]
+    var sentences = sorted.map(function (rec) {
+      var first = cues[rec.srcStart - 1];
+      var last = cues[rec.srcEnd - 1];
+      return {
+        srcStart: rec.srcStart,
+        srcEnd: rec.srcEnd,
+        originalText: rec.originalText,
+        translation: rec.translation,
+        startMs: first.start,
+        endMs: last.end,
+      };
+    });
+    return { ok: true, sentences: sentences };
+  }
+
   /**
    * 把一批文本拼成带行号的 user message。
    * 输入 lines: string[]；返回 "1. ...\n2. ...\n"。
@@ -548,9 +690,6 @@
     });
     if (originals.length === 0) return [];
 
-    var fetchImpl = opts.fetchImpl || (typeof fetch !== "undefined" ? fetch : null);
-    if (!fetchImpl) throw new Error("no fetch implementation available");
-
     var sys = buildSystemPrompt(opts.targetLang, opts.systemPrompt);
     var userContent = "";
     if (opts.contextTail && opts.contextTail.length) {
@@ -562,13 +701,36 @@
     }
     userContent += buildNumberedBatch(originals);
 
+    var content = await chatCompletion({
+      apiBaseUrl: opts.apiBaseUrl,
+      apiKey: opts.apiKey,
+      apiModel: opts.apiModel,
+      temperature: opts.temperature,
+      systemContent: sys,
+      userContent: userContent,
+      timeoutMs: opts.timeoutMs,
+      fetchImpl: opts.fetchImpl,
+    });
+    return alignTranslations(originals, content);
+  }
+
+  /**
+   * 发一次 chat/completions 并返回 message.content 字符串。
+   * 抽出 translateBatch / translateSentences 共用：构造请求、AbortController 超时、
+   * HTTP/网络错误归一化抛出。纯 I/O，不做任何对齐/解析（交给调用方）。
+   * 出错（HTTP 非 200、网络异常、超时）抛 Error，调用方决定兜底。
+   */
+  async function chatCompletion(opts) {
+    var fetchImpl = opts.fetchImpl || (typeof fetch !== "undefined" ? fetch : null);
+    if (!fetchImpl) throw new Error("no fetch implementation available");
+
     var url = joinUrl(opts.apiBaseUrl, "/chat/completions");
     var body = {
       model: opts.apiModel,
       temperature: typeof opts.temperature === "number" ? opts.temperature : 0.3,
       messages: [
-        { role: "system", content: sys },
-        { role: "user", content: userContent },
+        { role: "system", content: opts.systemContent },
+        { role: "user", content: opts.userContent },
       ],
     };
 
@@ -614,11 +776,49 @@
     }
 
     var data = await resp.json();
-    var content =
-      data && data.choices && data.choices[0] && data.choices[0].message
-        ? data.choices[0].message.content
-        : "";
-    return alignTranslations(originals, content);
+    return data && data.choices && data.choices[0] && data.choices[0].message
+      ? data.choices[0].message.content
+      : "";
+  }
+
+  /**
+   * 句级语义重断 + 翻译（主路径）。一次 chat 调用同时重组断句与翻译，
+   * 然后用 alignSentences 解析 + 覆盖性校验 + 时间轴回映。
+   * 入参（opts）：
+   *  - cues: 本次输入的碎片 cue[]（带 start/end，顺序即源行号）
+   *  - apiBaseUrl, apiKey, apiModel, targetLang
+   *  - systemPrompt: 可选自定义（覆盖句级默认 prompt）
+   *  - temperature, timeoutMs, fetchImpl
+   * 返回：
+   *   { ok, sentences, reason? }（直接转发 alignSentences 结果）
+   *   - ok=true：句级时间轴可用，渲染层按完整句显示；
+   *   - ok=false：覆盖性校验未过 → 调用方退回逐行 translateCues 兜底（reason 便于诊断）。
+   * 网络/HTTP/超时错误向上抛出（与 translateBatch 一致），调用方兜底。
+   */
+  async function translateSentences(opts) {
+    var cues = opts.cues || [];
+    if (!cues.length) return { ok: false, sentences: [], reason: "empty-input" };
+
+    var sys = buildSentenceSystemPrompt(opts.targetLang, opts.systemPrompt);
+    var userContent =
+      "Regroup, restore punctuation and translate these numbered fragments:\n" +
+      buildNumberedSourceLines(
+        cues.map(function (c) {
+          return c.content;
+        })
+      );
+
+    var content = await chatCompletion({
+      apiBaseUrl: opts.apiBaseUrl,
+      apiKey: opts.apiKey,
+      apiModel: opts.apiModel,
+      temperature: opts.temperature,
+      systemContent: sys,
+      userContent: userContent,
+      timeoutMs: opts.timeoutMs,
+      fetchImpl: opts.fetchImpl,
+    });
+    return alignSentences(cues, content);
   }
 
   /** 拼接 base 和 path，避免重复/缺失斜杠 */
@@ -1164,6 +1364,13 @@
     DEFAULT_CONFIG: DEFAULT_CONFIG,
     DEFAULT_SYSTEM_PROMPT: DEFAULT_SYSTEM_PROMPT,
     buildSystemPrompt: buildSystemPrompt,
+    DEFAULT_SENTENCE_SYSTEM_PROMPT: DEFAULT_SENTENCE_SYSTEM_PROMPT,
+    buildSentenceSystemPrompt: buildSentenceSystemPrompt,
+    buildNumberedSourceLines: buildNumberedSourceLines,
+    parseSentenceResponse: parseSentenceResponse,
+    alignSentences: alignSentences,
+    translateSentences: translateSentences,
+    chatCompletion: chatCompletion,
     buildNumberedBatch: buildNumberedBatch,
     parseNumberedResponse: parseNumberedResponse,
     alignTranslations: alignTranslations,

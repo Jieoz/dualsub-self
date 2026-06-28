@@ -55,10 +55,12 @@
     videoId: null,
     tracks: [], // main.js 推来的轨道清单
     activeTrack: null, // 当前选中的轨道
-    cues: [], // 清洗 + 语义重组后的原文 cue（全局，按 start 升序）
+    cues: [], // 清洗 + 启发式重组后的原文 cue（全局，按 start 升序）—— 句级重断失败时的兜底分段器产物
     clips: [], // 按 cue 边界切的 clip
     cueMap: [], // 全局 cue 下标 -> {clipIdx,cueIdx}（cueClipIndexMap 建表）
-    clipCache: {}, // clipIndex -> translated string[]（与该 clip cues 等长，可含空洞，边翻边填）
+    clipCache: {}, // clipIndex -> translated string[]（逐行兜底路径：与该 clip cues 等长，可含空洞）
+    clipSentences: {}, // clipIndex -> 句级重断结果 [{startMs,endMs,originalText,translation}]（主路径，成功才有）
+    renderUnits: [], // 全局渲染时间轴（句级优先、逐行兜底），按 start 升序。findCueIndexAt 在此上查当前句
     clipState: {}, // clipIndex -> 'pending'|'done'|'error'
     clipBackoff: {}, // clipIndex -> backoff 控制器（失败退避）
     renderer: null, // 叠加层 DOM
@@ -135,10 +137,11 @@
     });
   }
 
-  /** 把某 clip 的整段译文写进持久缓存（仅在全部行翻完时调用） */
-  function writeCache(key, lines) {
+  /** 把某 clip 的整段译文写进持久缓存（仅在全部翻完时调用）。
+   *  payload 为 { sent: [...] }（句级）或 { lines: [...] }（逐行兜底）。 */
+  function writeCache(key, payload) {
     readCache().then(function (cacheObj) {
-      cacheObj[key] = { t: Date.now(), lines: lines };
+      cacheObj[key] = Object.assign({ t: Date.now() }, payload);
       var pruned = Core.pruneCache(cacheObj, CACHE_MAX_ENTRIES);
       var obj = {};
       obj[CACHE_KEY] = pruned;
@@ -189,6 +192,8 @@
     state.clips = [];
     state.cueMap = [];
     state.clipCache = {};
+    state.clipSentences = {};
+    state.renderUnits = [];
     state.clipState = {};
     state.lastHitCueIdx = -1;
     state.lastPrefetchMs = -1e9;
@@ -251,9 +256,14 @@
       // 建全局 cue→clip 映射表，渲染时 O(1) 反查所属 clip
       state.cueMap = Core.cueClipIndexMap(state.clips);
       state.clipCache = {};
+      state.clipSentences = {};
+      state.renderUnits = [];
       state.clipState = {};
       state.clipBackoff = {};
       state.lastHitCueIdx = -1;
+      // 先用 resegment 分段铺一条「原文时间轴」(译文留空)，译文未到也能立刻显原文；
+      // 句级重断成功后由 rebuildRenderTimeline 用合并句替换对应 clip 的单元。
+      rebuildRenderTimeline();
       ensureRenderer();
       bindVideo();
       // 立即预取当前播放位置所在的 clip
@@ -347,19 +357,79 @@
     var backoff = getBackoff(idx);
     if (!backoff.shouldTry()) return;
 
-    // 先查持久缓存：命中直接用，零 API 调用
+    // 先查持久缓存：命中直接用，零 API 调用。
+    // 缓存可能是句级（sent）或逐行兜底（lines）两种形态，按存的形态恢复。
     var key = clipCacheKey(clip);
     var cached = await readCache();
-    if (cached[key] && Array.isArray(cached[key].lines)) {
-      state.clipCache[idx] = cached[key].lines.slice();
-      state.clipState[idx] = "done";
-      requestRender(); // 命中缓存：强制刷新把译文显示上去
-      return;
+    if (cached[key]) {
+      if (Array.isArray(cached[key].sent)) {
+        state.clipSentences[idx] = cached[key].sent.slice();
+        state.clipState[idx] = "done";
+        rebuildRenderTimeline();
+        requestRender();
+        return;
+      }
+      if (Array.isArray(cached[key].lines)) {
+        state.clipCache[idx] = cached[key].lines.slice();
+        state.clipState[idx] = "done";
+        rebuildRenderTimeline();
+        requestRender(); // 命中缓存：强制刷新把译文显示上去
+        return;
+      }
     }
 
     state.clipState[idx] = "pending";
+
+    // ① 主路径：句级语义重断（一次调用同时重组断句 + 翻译），覆盖性校验通过即用。
+    try {
+      var res = await ensureGate().run(function () {
+        return Core.translateSentences({
+          cues: clip.cues,
+          apiBaseUrl: config.apiBaseUrl,
+          apiKey: config.apiKey,
+          apiModel: config.apiModel,
+          targetLang: config.targetLang,
+          systemPrompt: config.sentencePrompt || "", // 句级 prompt 自定义（空=核心默认）
+          timeoutMs: 20000,
+          fetchImpl: function (u, o) {
+            return fetch(u, o);
+          },
+        });
+      });
+      if (res && res.ok && res.sentences.length) {
+        state.clipSentences[idx] = res.sentences;
+        delete state.clipCache[idx]; // 句级成功：清掉可能存在的逐行残留
+        state.clipState[idx] = "done";
+        backoff.reset();
+        rebuildRenderTimeline();
+        requestRender();
+        writeCache(key, { sent: res.sentences });
+        return;
+      }
+      // 覆盖性校验未过 → 落到逐行兜底，留诊断日志
+      console.warn(
+        "[dualsub] clip", idx, "句级重断覆盖性校验未过(",
+        (res && res.reason) || "unknown", ") → 退回逐行对齐 fallback"
+      );
+    } catch (e) {
+      // 句级调用本身失败（网络/超时/HTTP）→ 同样退回逐行兜底
+      console.warn("[dualsub] clip", idx, "句级重断调用失败：", e && e.message, "→ 退回逐行 fallback");
+    }
+
+    // ② 兜底路径：保留原有逐行翻译（resegment 分段 + alignTranslations），不丢字幕。
+    await translateClipPerLine(idx, clip, key, priorityIndex);
+  }
+
+  /**
+   * 逐行翻译兜底（fallback）：句级语义重断失败/覆盖性不过时走这里。
+   * 沿用前置任务的 translateCues（批内并发 + 上下文窗口 + 首句优先），
+   * 译文按行号对齐回 clip.cues，渲染时退化为「一条 resegment 段 = 一条译文」。
+   */
+  async function translateClipPerLine(idx, clip, key, priorityIndex) {
+    var backoff = getBackoff(idx);
     // 边翻边填：clipCache[idx] 先建空数组，每批回调即时写入并触发重渲染
     if (!state.clipCache[idx]) state.clipCache[idx] = new Array(clip.cues.length);
+    delete state.clipSentences[idx]; // 走逐行：清掉句级残留
     var hadError = false;
     try {
       var lines = await Core.translateCues({
@@ -381,6 +451,7 @@
         onProgress: function (updates) {
           var arr = state.clipCache[idx];
           for (var i = 0; i < updates.length; i++) arr[updates[i].index] = updates[i].text;
+          rebuildRenderTimeline();
           requestRender(); // 新译文到 → 立即把当前 cue 刷新（暂停/隐藏时也补一帧）
         },
         onError: function () {
@@ -388,6 +459,7 @@
         },
       });
       state.clipCache[idx] = lines;
+      rebuildRenderTimeline();
       if (hadError) {
         // 部分批失败：标记 error 让退避接管，但已成功的行仍显示
         state.clipState[idx] = "error";
@@ -395,19 +467,56 @@
       } else {
         state.clipState[idx] = "done";
         backoff.reset();
-        writeCache(key, lines); // 整段成功才写持久缓存
+        writeCache(key, { lines: lines }); // 整段成功才写持久缓存（逐行形态）
       }
     } catch (e) {
-      console.warn("[dualsub] clip", idx, "翻译失败：", e.message);
+      console.warn("[dualsub] clip", idx, "逐行兜底也失败：", e.message);
       state.clipState[idx] = "error"; // 兜底：渲染时只显示原文
       backoff.fail();
     }
   }
 
-  /** 取某条 cue 的译文（命中缓存才有，否则 null） */
-  function translationFor(clipIdx, cueIdxInClip) {
-    var arr = state.clipCache[clipIdx];
-    return arr && arr[cueIdxInClip] != null ? arr[cueIdxInClip] : null;
+  /**
+   * 重建全局渲染时间轴 state.renderUnits（句级优先、逐行兜底）。
+   * 按 clip 顺序遍历，每个 clip：
+   *  - 有句级重断结果(clipSentences[idx]) → 直接用其句单元（含合并后时间区间 + 完整原文 + 译文）；
+   *  - 否则退回逐行：每条 cue 一个单元，译文取 clipCache（可能为空=未翻/翻译中）。
+   * 产出按 start 升序的单元数组，渲染 tick 用 findCueIndexAt 在其上二分查当前句。
+   * 每个单元：{ start, end, originalText, translation }（与 cue 同构 start/end，便于复用查找）。
+   */
+  function rebuildRenderTimeline() {
+    var units = [];
+    for (var ci = 0; ci < state.clips.length; ci++) {
+      var sents = state.clipSentences[ci];
+      if (sents && sents.length) {
+        for (var s = 0; s < sents.length; s++) {
+          units.push({
+            start: sents[s].startMs,
+            end: sents[s].endMs,
+            originalText: sents[s].originalText,
+            translation: sents[s].translation != null ? sents[s].translation : null,
+            clipIdx: ci,
+          });
+        }
+        continue;
+      }
+      // 逐行兜底：clip 的每条 cue 一个单元，原文用 cue.content，译文取 clipCache
+      var clip = state.clips[ci];
+      var arr = state.clipCache[ci];
+      for (var k = 0; k < clip.cues.length; k++) {
+        var cue = clip.cues[k];
+        units.push({
+          start: cue.start,
+          end: cue.end,
+          originalText: cue.content,
+          translation: arr && arr[k] != null ? arr[k] : null,
+          clipIdx: ci,
+        });
+      }
+    }
+    state.renderUnits = units;
+    // 时间轴重建后旧的命中下标失效（单元数/边界变了）
+    state.lastHitCueIdx = -1;
   }
 
   /* =====================================================
@@ -755,7 +864,7 @@
    * 不在这里做预取（预取已解耦到独立低频循环）。
    */
   function onRenderTick() {
-    if (!config.enabled || !state.renderer || !state.cues.length) return;
+    if (!config.enabled || !state.renderer || !state.renderUnits.length) return;
     if (state.seeking) return; // 拖动中不渲染，停稳后统一刷
     // 渲染器被播放器重建踢出 DOM（全屏/影院/SPA）→ 重挂（isConnected 是 O(1)）
     if (!state.renderer.isConnected) {
@@ -764,10 +873,10 @@
     }
     var ms = currentTimeMs();
 
-    // 二分 + 上次命中提示：大多数相邻 tick O(1)
-    var cueIdx = Core.findCueIndexAt(state.cues, ms, state.lastHitCueIdx);
+    // 二分 + 上次命中提示：在「句级合并后时间轴」(renderUnits)上查当前句，大多数相邻 tick O(1)
+    var unitIdx = Core.findCueIndexAt(state.renderUnits, ms, state.lastHitCueIdx);
 
-    if (cueIdx === -1) {
+    if (unitIdx === -1) {
       // 落在间隙/越界：仅当之前有字幕时才清一次（避免每 tick 重复写 DOM）
       if (state.lastHitCueIdx !== -1 || lastRenderedKey !== "") {
         state.lastHitCueIdx = -1;
@@ -776,19 +885,18 @@
       }
       return;
     }
-    state.lastHitCueIdx = cueIdx;
+    state.lastHitCueIdx = unitIdx;
 
-    var loc = state.cueMap[cueIdx];
-    if (!loc) return;
-    var hitCue = state.cues[cueIdx];
-    var trans = translationFor(loc.clipIdx, loc.cueIdx);
-    var pending = trans == null && state.clipState[loc.clipIdx] !== "error";
+    var unit = state.renderUnits[unitIdx];
+    var trans = unit.translation;
+    // 未翻好且该 clip 不是 error 态 → pending（显示「翻译中…」）；error 态不显示，只留原文
+    var pending = trans == null && state.clipState[unit.clipIdx] !== "error";
 
-    // 命中键：cue 下标 + 译文 + 是否 pending。键未变 → 不动 DOM（idle 零开销）
-    var key = cueIdx + ":" + (trans || "") + ":" + (pending ? "p" : "");
+    // 命中键：单元下标 + 译文 + 是否 pending。键未变 → 不动 DOM（idle 零开销）
+    var key = unitIdx + ":" + (trans || "") + ":" + (pending ? "p" : "");
     if (key === lastRenderedKey) return;
     lastRenderedKey = key;
-    setRendererText(hitCue.content, trans, pending);
+    setRendererText(unit.originalText, trans, pending);
   }
 
   /**
@@ -892,6 +1000,8 @@
         // model/语言变了，旧译文已不适用 → 丢内存缓存重翻（持久缓存按新 key 自然不命中）
         if (config.apiModel !== prevModel || config.targetLang !== prevTarget) {
           state.clipCache = {};
+          state.clipSentences = {};
+          state.renderUnits = [];
           state.clipState = {};
         } else {
           // 仅 base/key 变：把 error 态清掉以便重试，已成功的保留
@@ -911,6 +1021,8 @@
           if (track) {
             state.activeTrack = track;
             state.clipCache = {};
+            state.clipSentences = {};
+            state.renderUnits = [];
             state.clipState = {};
             state.clipBackoff = {};
             loadTrack(track); // 内部会 bindVideo + 起循环 + 预取
