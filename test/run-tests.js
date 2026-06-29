@@ -2017,6 +2017,233 @@ async function main() {
     assert.strictEqual(inFlight, 0, "全部完成后在途归零");
   });
 
+  /* ============ 6z. v0.3.1 端到端回归：真实风格 ASR → 句级/逐行翻译 → 渲染时间轴 ============
+   * 这是 v0.3.0 三层重构引入的两个回归（症状1永久「翻译中」、症状2英文断句被中文节奏切碎 +
+   * 无句间间隙）一直没被挡住的根本原因——之前全是纯函数单测，没有端到端路径。
+   * 下面用一段真实风格英文 ASR(多条无句中标点碎 cue + 长句) 喂进 resegment → 句级重断(mock
+   * fetch 可控译文) → rebuildRenderTimeline 等价逻辑，断言三件事：
+   *   (a) 英文原文按自己边界分段、不被按中文字数切碎；(b) 渲染单元之间有时间间隙；
+   *   (c) mock 译文正确落到渲染单元、不残留 pending。 */
+  console.log("\n[v0.3.1 端到端回归：ASR → 翻译 → 渲染时间轴]");
+
+  // 真实风格 ASR：YouTube 滚动字幕——碎、无句中标点、相邻时间重叠。
+  const ASR_RAW = [
+    { start: 1000, end: 3200, content: "so today we are going to talk about" },
+    { start: 3000, end: 5400, content: "going to talk about how neural networks" },
+    { start: 5200, end: 7600, content: "how neural networks actually learn from" },
+    { start: 7400, end: 9800, content: "actually learn from data and why it" },
+    { start: 9600, end: 12000, content: "and why it matters so much" },
+    { start: 12200, end: 14000, content: "let's start with a simple example" },
+    { start: 13800, end: 16400, content: "a simple example of a single neuron" },
+  ];
+
+  // 把 isolated.js 的 rebuildRenderTimeline 渲染逻辑抽成等价纯函数（不依赖 DOM/chrome）：
+  // 句级优先(clipSentences) → 逐行兜底(clipCache)，每单元经 segmentSentenceUnit 展开。
+  function buildRenderUnits(clips, clipSentences, clipCache, segOpts) {
+    const units = [];
+    function pushSegmented(unit, clipIdx) {
+      const segs = Core.segmentSentenceUnit(unit, segOpts);
+      for (const s of segs) {
+        units.push({
+          start: s.startMs,
+          end: s.endMs,
+          originalText: s.originalText,
+          translation: s.translation != null && s.translation !== "" ? s.translation : null,
+          clipIdx: clipIdx,
+        });
+      }
+    }
+    for (let ci = 0; ci < clips.length; ci++) {
+      const sents = clipSentences[ci];
+      if (sents && sents.length) {
+        for (const se of sents) {
+          pushSegmented(
+            { startMs: se.startMs, endMs: se.endMs, originalText: se.originalText, translation: se.translation != null ? se.translation : "" },
+            ci
+          );
+        }
+        continue;
+      }
+      const clip = clips[ci];
+      const arr = clipCache[ci];
+      for (let k = 0; k < clip.cues.length; k++) {
+        const cue = clip.cues[k];
+        pushSegmented({ startMs: cue.start, endMs: cue.end, originalText: cue.content, translation: arr && arr[k] != null ? arr[k] : "" }, ci);
+      }
+    }
+    return units;
+  }
+
+  // 症状2(a)：英文原文按自己边界分段，不被中文字数节奏切碎；短英文在多屏间 hold 不被拦腰切。
+  test("e2e 症状2(a)：短英文/长中文——英文保持自然边界，不被中文字数切碎", () => {
+    // 一个真实句单元：英文短(无句中标点)、中文长(需多屏)。
+    const unit = {
+      startMs: 1000,
+      endMs: 5080,
+      originalText: "and why it matters",
+      translation: "以及为什么它如此重要这关系到我们后面要讲的所有内容的根基",
+    };
+    const out = Core.segmentSentenceUnit(unit, { maxCharsPerScreen: 20, maxDurPerScreen: 4000 });
+    assert.ok(out.length >= 2, "长中文应被切成多屏，实际 " + out.length);
+    // 关键回归：英文 18 字 < origCap(40)，应作为「一个整体」在多屏间 hold——
+    // 各屏去重后只剩 1 个 distinct 英文片段；旧实现按中文份数切成 >=2 个互不相同的碎片。
+    const distinct = [];
+    for (const u of out) if (!distinct.length || distinct[distinct.length - 1] !== u.originalText) distinct.push(u.originalText);
+    assert.strictEqual(distinct.length, 1, "短英文应整体 hold 不被切碎，实际 distinct 片段=" + JSON.stringify(distinct));
+    assert.strictEqual(distinct[0], "and why it matters", "英文应完整保留，不被按中文节奏切开");
+  });
+
+  test("e2e 症状2(a)：长英文按自己词边界分屏(不斩词)，与中文份数解耦", () => {
+    const unit = {
+      startMs: 0,
+      endMs: 8000,
+      originalText: "so today we are going to talk about how neural networks actually learn from data",
+      translation: "所以今天我们要聊聊神经网络究竟如何从数据中学习以及为什么这件事情如此重要值得深入",
+    };
+    const out = Core.segmentSentenceUnit(unit, { maxCharsPerScreen: 20, maxDurPerScreen: 4000 });
+    assert.ok(out.length >= 2, "应被切成多屏");
+    // 英文按 origCap(40) 自己的边界切，绝不在词中间断开。
+    const distinct = [];
+    for (const u of out) if (!distinct.length || distinct[distinct.length - 1] !== u.originalText) distinct.push(u.originalText);
+    for (const piece of distinct) {
+      const words = piece.split(/\s+/).filter(Boolean);
+      for (const w of words) {
+        // 每个英文「词」都应是完整词（拼回原文里能找到），不被拦腰斩开。
+        assert.ok(unit.originalText.indexOf(w) !== -1, "英文词不应被斩断: '" + w + "' in " + JSON.stringify(piece));
+      }
+      assert.ok(piece.length <= 40, "英文每屏 <= origCap(40)，实际 " + piece.length + ": " + piece);
+    }
+    // 去重拼回无丢字(hold 重复不计)。
+    const joined = distinct.join(" ").replace(/\s+/g, "");
+    const expect = unit.originalText.replace(/\s+/g, "");
+    assert.strictEqual(joined, expect, "英文去重拼回应无丢字");
+  });
+
+  // 症状2(b)：端到端整条渲染时间轴上，渲染单元之间确有时间间隙(不首尾相接一直显示)。
+  await asyncTest("e2e 症状2(b)：整条渲染时间轴存在句间/屏间间隙", async () => {
+    const cues = Core.resegmentCues(Core.cleanupCues(ASR_RAW), { tailTrimMs: 120 });
+    const clips = Core.sliceClipsByCue(cues, 30000);
+    // 给每个 clip 造句级译文(长中文，触发多屏分段)。
+    const clipSentences = {};
+    for (let ci = 0; ci < clips.length; ci++) {
+      clipSentences[ci] = clips[ci].cues.map(() => null); // 占位，下面用整 clip 句级单元替换
+    }
+    // 用句单元(每个 resegment 句 = 一个句级单元) + 长中文译文。
+    const sents = cues.map((c) => ({
+      startMs: c.start,
+      endMs: c.end,
+      originalText: c.content,
+      translation: "这是一段刻意写得比较长的中文译文用来触发多屏分段从而检验屏间是否留白",
+    }));
+    // 按 clip 分组句级单元。
+    const map = Core.cueClipIndexMap(clips);
+    const byClip = {};
+    let gi = 0;
+    for (let ci = 0; ci < clips.length; ci++) byClip[ci] = [];
+    // resegment 后 cues 与 clips[].cues 同源同序，直接按 clip 累计。
+    let cursor = 0;
+    for (let ci = 0; ci < clips.length; ci++) {
+      const cnt = clips[ci].cues.length;
+      byClip[ci] = sents.slice(cursor, cursor + cnt);
+      cursor += cnt;
+    }
+    const renderUnits = buildRenderUnits(clips, byClip, {}, { maxCharsPerScreen: 20, maxDurPerScreen: 4000 });
+    assert.ok(renderUnits.length >= 2, "应有多个渲染单元");
+    // 单调不重叠 + 至少存在一处正间隙(屏间/句间留白)。
+    let anyGap = false;
+    for (let i = 1; i < renderUnits.length; i++) {
+      assert.ok(renderUnits[i].start >= renderUnits[i - 1].end, "渲染单元单调不重叠: " + JSON.stringify([renderUnits[i - 1], renderUnits[i]]));
+      if (renderUnits[i].start > renderUnits[i - 1].end) anyGap = true;
+    }
+    assert.ok(anyGap, "整条时间轴必须存在句间/屏间间隙，不能首尾相接一直显示");
+  });
+
+  // 症状2(b) 强化：单个多屏句单元内部，屏与屏之间必须有 INTER_SEG_GAP 间隙(治「无间隙一直显示」)。
+  // 旧 layoutTimeline 在语音密(idealMs >= slotDur)时屏间间隙塌成 0，字幕首尾相接永不消隐。
+  test("e2e 症状2(b)：多屏句单元内部屏间有间隙(密集语音也不首尾相接)", () => {
+    // 密集：6s 内塞长中文 → 多屏，且每屏 idealMs 接近 slotDur(旧实现间隙会塌成 0)。
+    const unit = {
+      startMs: 0,
+      endMs: 6000,
+      originalText: "this is a fairly long english sentence spoken quickly without much pause",
+      translation: "这是一段语速很快几乎没有停顿的中文译文需要被切成好几屏滚动显示出来给观众看",
+    };
+    const out = Core.segmentSentenceUnit(unit, { maxCharsPerScreen: 20, maxDurPerScreen: 4000 });
+    assert.ok(out.length >= 2, "应被切成多屏，实际 " + out.length);
+    // 至少一处屏间正间隙(非末屏 endMs < 下屏 startMs)；旧实现密集时全为 0。
+    let anyInnerGap = false;
+    for (let i = 1; i < out.length; i++) {
+      assert.ok(out[i].startMs >= out[i - 1].endMs, "屏间单调不重叠");
+      if (out[i].startMs > out[i - 1].endMs) anyInnerGap = true;
+    }
+    assert.ok(anyInnerGap, "多屏句单元内部必须有屏间间隙，不能首尾相接(out=" + JSON.stringify(out.map((u) => [u.startMs, u.endMs])) + ")");
+  });
+
+  // 症状1(c) 纯函数核心：clipDisplayFlags——done 但某行无译文不再永久「翻译中」。
+  test("e2e 症状1(c)：clipDisplayFlags——done 但缺译文的行优雅显原文，不永久 pending", () => {
+    assert.deepStrictEqual(Core.clipDisplayFlags("你好", "done"), { pending: false, failed: false });
+    assert.deepStrictEqual(Core.clipDisplayFlags(null, undefined), { pending: true, failed: false });
+    assert.deepStrictEqual(Core.clipDisplayFlags(null, "pending"), { pending: true, failed: false });
+    assert.deepStrictEqual(Core.clipDisplayFlags(null, "failed"), { pending: false, failed: true });
+    // 关键回归：done/error 已结案但该行无译文(覆盖缺口/降级) → 都 false(优雅显原文)。
+    // 旧逻辑 `trans==null && st!=="error" && st!=="failed"` 会让 done 缺译文行永久 pending。
+    assert.deepStrictEqual(Core.clipDisplayFlags(null, "done"), { pending: false, failed: false });
+    assert.deepStrictEqual(Core.clipDisplayFlags("", "done"), { pending: false, failed: false });
+  });
+
+  // 症状1(c) 端到端：句级覆盖不全 → 逐行补 → 译文真正落到渲染单元、clip 收敛 done、无 pending 残留。
+  await asyncTest("e2e 症状1(c)：句级部分覆盖 → 逐行补齐 → 译文上屏、无永久 pending", async () => {
+    const cues = Core.resegmentCues(Core.cleanupCues(ASR_RAW), { tailTrimMs: 120 });
+    const clips = Core.sliceClipsByCue(cues, 30000);
+    const clip = clips[0];
+    const N = clip.cues.length;
+    const half = Math.max(1, Math.floor(N / 2));
+    function mockFetch(url, optsArg) {
+      const body = JSON.parse(optsArg.body);
+      const user = body.messages[1].content;
+      let content;
+      if (/Regroup/.test(user)) {
+        // 句级：只覆盖 [1-half]，故意漏掉 half+1..N（真实「覆盖不全」失败模式）。
+        content = "[1-" + half + "] ||| restored sentence ||| 这是被句级覆盖的前半段完整中文译文。\n";
+      } else {
+        const lines = user.split("\n").filter((l) => /^\d+\.\s/.test(l));
+        content = lines.map((l, i) => (i + 1) + ". 补译第" + (i + 1) + "行内容").join("\n");
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) });
+    }
+    const apiCfg = { apiBaseUrl: "http://x", apiKey: "", apiModel: "m", targetLang: "zh-Hans" };
+    const clipState = {};
+    const clipSentences = {};
+    clipState[0] = "pending";
+    const res = await Core.translateSentences(Object.assign({ cues: clip.cues, splitFill: true, fetchImpl: mockFetch }, apiCfg));
+    const part = Core.alignSentencesPartial(clip.cues, res.rawText, { splitFill: true });
+    let units = part.sentences.slice();
+    let stillMissing = false;
+    for (const [a, b] of part.gaps) {
+      const gapCues = clip.cues.slice(a - 1, b);
+      const lines = await Core.translateCues(Object.assign({ cues: gapCues, batchSize: 14, contextLines: 3, concurrency: 3, fetchImpl: mockFetch }, apiCfg));
+      for (let k = 0; k < gapCues.length; k++) {
+        if (lines[k] != null && lines[k] !== "") {
+          units.push({ srcStart: a + k, srcEnd: a + k, originalText: gapCues[k].content, translation: lines[k], startMs: gapCues[k].start, endMs: gapCues[k].end });
+        } else stillMissing = true;
+      }
+    }
+    units.sort((x, y) => x.srcStart - y.srcStart);
+    clipSentences[0] = units;
+    clipState[0] = !stillMissing && units.length ? "done" : "error";
+    assert.ok(part.gaps.length > 0, "本用例应制造句级缺口(覆盖不全)");
+    assert.strictEqual(clipState[0], "done", "逐行补齐后应收敛 done，而非永久 error/pending");
+    assert.strictEqual(units.length, N, "每个源行都应有句级单元(覆盖 + 补齐)，实际 " + units.length + "/" + N);
+    const renderUnits = buildRenderUnits(clips, clipSentences, {}, { maxCharsPerScreen: 20, maxDurPerScreen: 4000 });
+    let pendingCount = 0;
+    for (const u of renderUnits) {
+      const flags = Core.clipDisplayFlags(u.translation, clipState[u.clipIdx]);
+      if (flags.pending) pendingCount++;
+      assert.ok(u.translation != null && u.translation !== "", "每个渲染单元都应带译文，缺译文单元: " + JSON.stringify(u));
+    }
+    assert.strictEqual(pendingCount, 0, "不应残留任何「翻译中…」pending 单元，实际 " + pendingCount);
+  });
+
   /* ============ 7. 交付物校验 ============ */
   console.log("\n[交付物校验]");
 

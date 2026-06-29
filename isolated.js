@@ -356,9 +356,13 @@
   async function translateClip(idx, priorityIndex) {
     var clip = state.clips[idx];
     if (!clip) return;
-    if (state.clipState[idx] === "done" || state.clipState[idx] === "pending") return;
+    if (state.clipState[idx] === "done") return;
     if (state.clipState[idx] === "failed") return; // 达 maxFails 的终态，不再自动重试
-    if (state.clipInflight[idx]) return; // 重入互斥：同一 clip 不并发跑两个 translateClip
+    // 重入互斥：同一 clip 不并发跑两个 translateClip。clipInflight 是唯一的互斥源；
+    // 不再用 clipState==="pending" 当门禁——否则一旦某次跑动抛在 applySentenceResult
+    // （pending 已置但 done/error 未写）就永久卡 pending，retryTick 只重试 error 永远救不回来
+    // → UI 永久「翻译中…」(症状1根因)。改由下方 finally 兜底把残留 pending 降级为 error 可重试。
+    if (state.clipInflight[idx]) return;
 
     // 没配置 API：不翻，只显示原文（非瞬态错误，不进重试调度）
     if (!config.apiBaseUrl || !config.apiModel) {
@@ -424,8 +428,21 @@
       }
 
       await applySentenceResult(idx, clip, key, res, priorityIndex);
+    } catch (e) {
+      // applySentenceResult / readCache / rebuildRenderTimeline 等意外抛出：绝不让 clip 卡死。
+      // 降级为 error + 退避，交后台调度器重试（达 maxFails 才 failed），不再永久 pending。
+      console.warn("[dualsub] clip", idx, "translateClip 意外异常 → 降级 error 重试：", e && e.message);
+      state.clipState[idx] = "error";
+      getBackoff(idx).fail();
+      ensureRetryScheduler();
     } finally {
       state.clipInflight[idx] = false;
+      // 兜底：跑完后仍残留 pending（任何路径漏写终态）→ 当作可重试 error，杜绝永久「翻译中…」。
+      if (state.clipState[idx] === "pending") {
+        state.clipState[idx] = "error";
+        getBackoff(idx).fail();
+        ensureRetryScheduler();
+      }
     }
   }
 
@@ -994,9 +1011,14 @@
     var unit = state.renderUnits[unitIdx];
     var trans = unit.translation;
     var st = state.clipState[unit.clipIdx];
-    // 未翻好：error/failed 区分——failed(达 maxFails) 显「翻译失败」标记，其余显「翻译中…」。
-    var failed = trans == null && st === "failed";
-    var pending = trans == null && st !== "error" && st !== "failed";
+    // 未翻好时的指示标记（纯函数，见 core.clipDisplayFlags，便于单测）：
+    //  - 有译文 → 都 false。
+    //  - 无译文 + failed(达 maxFails) → 显「翻译失败」。
+    //  - 无译文 + 未结案(undefined=未翻 / pending=在翻) → 显「翻译中…」。
+    //  - 无译文 + 已结案(done/error 但该行无译文=覆盖缺口/降级) → 优雅显原文，不再永久转圈(症状1)。
+    var flags = Core.clipDisplayFlags(trans, st);
+    var failed = flags.failed;
+    var pending = flags.pending;
 
     // 命中键：单元下标 + 译文 + 状态标记。键未变 → 不动 DOM（idle 零开销）
     var stTag = pending ? "p" : failed ? "f" : "";

@@ -871,6 +871,10 @@
   // 时长维度只在「不破坏这两个下限」时才提高段数；短句宁可静止显示也不切碎。
   var SEG_MIN_VISIBLE_MS = 800;
   var TARGET_CPS = 7;
+  // v0.3.1：句单元内分屏之间的最小可见间隙(ms)。修「无间隙一直显示」——多屏长句
+  // 各屏终点往回扣此值，使屏与屏之间露出一个停顿（与跨句单元 tailTrimMs 节奏一致）。
+  // 让位于 SEG_MIN_VISIBLE_MS 可视地板：slot 太短放不下断点时优先保可视、不闪现。
+  var INTER_SEG_GAP_MS = 120;
   function segMinChars(cap) {
     return cap > 0 ? Math.max(2, Math.ceil(cap / 4)) : 2;
   }
@@ -1158,6 +1162,8 @@
       }
     }
     // 每段终点提前到 起点+idealMs，剩余留白（缺陷5）。语音密则顶到 slotEnd。
+    // v0.3.1：非末屏强制保留 INTER_SEG_GAP_MS 句间断点（治「无间隙一直显示」），
+    // 但句间断点让位于可视地板——slot 太短放不下断点时优先保 SEG_MIN_VISIBLE_MS，不闪现。
     var out = [];
     for (var p = 0; p < n; p++) {
       var sStart = slotStart[p];
@@ -1166,6 +1172,15 @@
       var ideal = Math.max(minVisible, Math.ceil(((lens[p] || 1) / targetCps) * 1000));
       // idealMs 不得超过本 slot 可用时长（不能挤占下一屏语音位置）。
       var dispEnd = sStart + Math.min(ideal, slotDur);
+      if (p < n - 1) {
+        // 非末屏：从 slotEnd 往回扣一个断点，使本屏与下屏之间出现可见间隙。
+        // 优先级：不超 slotEnd > 可视地板(minVisible) > 句间断点。
+        var gapped = sEnd - INTER_SEG_GAP_MS;
+        var floorEnd = sStart + minVisible;
+        var want = Math.max(floorEnd, Math.min(dispEnd, gapped));
+        if (want < dispEnd) dispEnd = want;
+      }
+      if (dispEnd > sEnd) dispEnd = sEnd;
       if (dispEnd < sStart) dispEnd = sStart;
       out.push({ startMs: sStart, endMs: dispEnd });
     }
@@ -1263,14 +1278,15 @@
       if (n <= 1) return passthrough();
     }
 
-    // 原文同步切成 n 段（数量对齐译文）：标点足够按标点均衡聚组，否则按原子占比均分；
-    // 每段都带对应原文片段（不再后段全空），拼回（去空格）无丢字。
-    var origGroups = splitOriginalIntoN(orig, n);
+    // 原文按自己的自然边界独立分段后对齐到 n 个译文屏（v0.3.1，修「英文被中文节奏切碎」）：
+    // 不再 splitOriginalIntoN 强切成正好 n 段；origCap 用译文 cap 的 2 倍（拉丁可读字数约 CJK 两倍）。
+    var lens = [];
+    for (var i = 0; i < n; i++) lens.push(transGroups[i].length || 1);
+    var origCap = maxChars > 0 ? maxChars * 2 : 0;
+    var origGroups = alignOriginalToScreens(orig, n, lens, origCap);
 
     // 时间轴（缺陷5+7）：屏起点按字数占比贴语音，屏终点提前到 起点+idealMs 留白成句间停顿，
     // 每屏可视有 SEG_MIN_VISIBLE_MS 地板（整段太短放不下时地板让步）。详见 layoutTimeline。
-    var lens = [];
-    for (var i = 0; i < n; i++) lens.push(transGroups[i].length || 1);
     var times = layoutTimeline(lens, startMs, endMs, SEG_MIN_VISIBLE_MS, TARGET_CPS);
     var units = [];
     for (var j = 0; j < n; j++) {
@@ -1302,6 +1318,69 @@
     if (pieces.length >= n) return groupPiecesIntoN(pieces, n);
     // 标点不足 → 按原子占比均分，保证每段尽量非空、不斩词。
     return splitAtomsIntoN(s, n);
+  }
+
+  /**
+   * v0.3.1 修「英文原文被中文字数节奏切碎」：原文按它自己的自然边界独立分段，
+   * 再对齐到译文的 n 个分屏时间窗（而非被强行切成正好 n 段）。
+   *  - 原文用自己的 cap（origCap，默认译文 cap 的 2 倍——拉丁文每屏可读字数约为 CJK 两倍）
+   *    经 segmentTextByCap 切成「不斩词、标点优选切点」的自然片段 origGroups（数量与 n 无关）。
+   *  - 把 origGroups 与译文段都摊到「字符占比」轴上：第 i 个原文片段落在它占比中点所在的
+   *    译文屏，append 到该屏。一个译文屏可承载 0..多 个原文片段。
+   *  - 没分到原文片段的屏「沿用上一屏原文」（hold）：短英文一句话稳定显示、中文在其下滚动，
+   *    不再把 "talk about" 这种短语拦腰切给不同屏。前导空屏回填首个非空原文。
+   * 返回长度 == n 的原文字符串数组；相邻屏可重复（hold），拼接去重后无丢字。
+   * transLens: 各译文段长度（占比权重，与 layoutTimeline 同源，保证时间窗对齐一致）。
+   */
+  function alignOriginalToScreens(orig, n, transLens, origCap) {
+    var s = collapseWhitespace(orig);
+    if (n <= 1) return [s];
+    if (!s) return new Array(n).fill("");
+    var origGroups = origCap > 0 ? segmentTextByCap(s, origCap) : [s];
+    var out = new Array(n).fill("");
+
+    // 译文屏在占比轴 [0,1) 上的边界（与 layoutTimeline 的 slot 占比一致）。
+    var transTotal = 0;
+    for (var t = 0; t < n; t++) transTotal += (transLens && transLens[t]) || 1;
+    var bounds = new Array(n + 1);
+    bounds[0] = 0;
+    var accT = 0;
+    for (var b = 0; b < n; b++) {
+      accT += (transLens && transLens[b]) || 1;
+      bounds[b + 1] = accT / transTotal;
+    }
+
+    // 原文片段在占比轴上的中点 → 落在哪个译文屏（按 bounds 二分式线性查找）。
+    var origTotal = 0;
+    for (var g = 0; g < origGroups.length; g++) origTotal += origGroups[g].length || 1;
+    var accO = 0;
+    for (var k = 0; k < origGroups.length; k++) {
+      var len = origGroups[k].length || 1;
+      var mid = (accO + len / 2) / origTotal;
+      accO += len;
+      var screen = n - 1;
+      for (var sc = 0; sc < n; sc++) {
+        if (mid < bounds[sc + 1]) { screen = sc; break; }
+      }
+      if (out[screen]) {
+        var join = (/[A-Za-z0-9]$/.test(out[screen]) && /^[A-Za-z0-9]/.test(origGroups[k])) ? " " : "";
+        out[screen] = out[screen] + join + origGroups[k];
+      } else {
+        out[screen] = origGroups[k];
+      }
+    }
+    // 空屏 hold：前向继承上一屏（原文稳定显示），再回填前导空屏为首个非空原文。
+    var lastSeen = "";
+    for (var f = 0; f < n; f++) {
+      if (out[f]) lastSeen = out[f];
+      else out[f] = lastSeen;
+    }
+    if (!out[0]) {
+      var firstNonEmpty = "";
+      for (var e = 0; e < n; e++) { if (out[e]) { firstNonEmpty = out[e]; break; } }
+      for (var z = 0; z < n && !out[z]; z++) out[z] = firstNonEmpty;
+    }
+    return out;
   }
 
   /** 贪心把标点片段按累计长度均衡聚成正好 n 组（每组 collapse 后非空，不足补空）。 */
@@ -2143,6 +2222,25 @@
    *          不中再二分。
    * 返回命中下标；ms 落在两条 cue 的间隙（无字幕）或越界时返回 -1。
    */
+  /**
+   * 渲染一个单元时的「译文未到」指示标记（纯函数，v0.3.1 治症状1「永久翻译中」）。
+   * 入参：translation（该渲染单元译文，null/"" = 无译文）、clipState（所属 clip 状态）。
+   * 返回 { pending, failed }：
+   *  - 有译文 → 都 false（正常显示译文）。
+   *  - 无译文 + clipState==="failed"(达 maxFails 终态) → failed=true（显「翻译失败」）。
+   *  - 无译文 + 未结案(clipState 为 undefined=尚未翻 / "pending"=正在翻) → pending=true（显「翻译中…」）。
+   *  - 无译文 + 已结案("done"/"error"：该行属覆盖缺口或降级，译文确实没有) → 都 false（优雅显原文）。
+   *    这是关键：旧逻辑 `trans==null && st!=="error" && st!=="failed"` 会让一个 done 但某行缺译文的
+   *    clip 永久 pending（UI 永久「翻译中…」）。"done" 已结案 → 不再转圈。
+   */
+  function clipDisplayFlags(translation, clipState) {
+    var hasTrans = translation != null && translation !== "";
+    if (hasTrans) return { pending: false, failed: false };
+    if (clipState === "failed") return { pending: false, failed: true };
+    if (clipState == null || clipState === "pending") return { pending: true, failed: false };
+    return { pending: false, failed: false };
+  }
+
   function findCueIndexAt(cues, ms, hint) {
     var n = (cues || []).length;
     if (!n) return -1;
@@ -2360,6 +2458,7 @@
     alignSentencesPartial: alignSentencesPartial,
     buildSentenceUnits: buildSentenceUnits,
     segmentSentenceUnit: segmentSentenceUnit,
+    alignOriginalToScreens: alignOriginalToScreens,
     splitTranslation: splitTranslation,
     translateSentences: translateSentences,
     chatCompletion: chatCompletion,
@@ -2376,6 +2475,7 @@
     makeBackoff: makeBackoff,
     joinUrl: joinUrl,
     findCueIndexAt: findCueIndexAt,
+    clipDisplayFlags: clipDisplayFlags,
     cueClipIndexMap: cueClipIndexMap,
     exportConfig: exportConfig,
     importConfig: importConfig,
