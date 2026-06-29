@@ -1642,7 +1642,211 @@ async function main() {
     assert.deepStrictEqual([r.sentences[5].startMs, r.sentences[5].endMs], [4600, 5200]);
   });
 
-  /* ============ B1：导出双语 SRT（formatSrtTime + buildSrt） ============ */
+  /* ============ 第1层：alignSentencesPartial 部分接受 + 缺口 ============ */
+  console.log("\n[第1层 句级部分接受：alignSentencesPartial]");
+
+  // 5 行专用样本（缺口测试更直观）
+  const P_CUES = [
+    { start: 0, end: 500, content: "line one here" },
+    { start: 500, end: 1000, content: "line two here" },
+    { start: 1000, end: 1500, content: "line three here" },
+    { start: 1500, end: 2000, content: "line four here" },
+    { start: 2000, end: 2500, content: "line five here" },
+  ];
+
+  test("alignSentencesPartial 中间漏一段：覆盖[1-2]+[4-5]，gaps==[[3,3]]", () => {
+    const model = [
+      "[1-2] ||| One two. ||| 一二。",
+      "[4-5] ||| Four five. ||| 四五。",
+    ].join("\n");
+    const r = Core.alignSentencesPartial(P_CUES, model, { splitFill: false });
+    assert.deepStrictEqual(r.gaps, [[3, 3]], "第3行未覆盖 → 缺口[3,3]");
+    // sentences 覆盖 [1-2] 和 [4-5]
+    const covered = r.sentences.map((s) => [s.srcStart, s.srcEnd]);
+    assert.deepStrictEqual(covered, [[1, 2], [4, 5]]);
+    assert.deepStrictEqual([r.sentences[0].startMs, r.sentences[0].endMs], [0, 1000]);
+    assert.deepStrictEqual([r.sentences[1].startMs, r.sentences[1].endMs], [1500, 2500]);
+  });
+
+  test("alignSentencesPartial 全废(空字符串) → gaps==[[1,n]], sentences==[]", () => {
+    const r = Core.alignSentencesPartial(P_CUES, "", { splitFill: false });
+    assert.deepStrictEqual(r.gaps, [[1, 5]], "整段当缺口");
+    assert.strictEqual(r.sentences.length, 0);
+  });
+
+  test("alignSentencesPartial 完美覆盖 → gaps==[]，等价 alignSentences ok=true", () => {
+    const model = [
+      "[1-2] ||| One two. ||| 一二。",
+      "[3-3] ||| Three. ||| 三。",
+      "[4-5] ||| Four five. ||| 四五。",
+    ].join("\n");
+    const r = Core.alignSentencesPartial(P_CUES, model, { splitFill: false });
+    assert.deepStrictEqual(r.gaps, [], "全覆盖无缺口");
+    const ref = Core.alignSentences(P_CUES, model);
+    assert.strictEqual(ref.ok, true, "对照 alignSentences 应 ok");
+    assert.strictEqual(r.sentences.length, ref.sentences.length, "句单元数与 alignSentences 一致");
+    for (let i = 0; i < ref.sentences.length; i++) {
+      assert.deepStrictEqual(
+        [r.sentences[i].srcStart, r.sentences[i].srcEnd, r.sentences[i].startMs, r.sentences[i].endMs, r.sentences[i].translation],
+        [ref.sentences[i].srcStart, ref.sentences[i].srcEnd, ref.sentences[i].startMs, ref.sentences[i].endMs, ref.sentences[i].translation],
+        "句单元与 alignSentences 完全等价"
+      );
+    }
+  });
+
+  test("alignSentencesPartial 重叠回退条被跳过：[1-2][2-3] → 接受[1-2]，缺口[3,5]", () => {
+    const model = "[1-2] ||| A. ||| 甲。\n[2-3] ||| B. ||| 乙。";
+    const r = Core.alignSentencesPartial(P_CUES, model, { splitFill: false });
+    const covered = r.sentences.map((s) => [s.srcStart, s.srcEnd]);
+    assert.deepStrictEqual(covered, [[1, 2]], "重叠的[2-3]被跳过");
+    assert.deepStrictEqual(r.gaps, [[3, 5]]);
+  });
+
+  test("alignSentencesPartial 越界条被丢弃：[1-2][4-9] → 接受[1-2]，缺口[3,5]", () => {
+    const model = "[1-2] ||| A. ||| 甲。\n[4-9] ||| B. ||| 乙。";
+    const r = Core.alignSentencesPartial(P_CUES, model, { splitFill: false });
+    const covered = r.sentences.map((s) => [s.srcStart, s.srcEnd]);
+    assert.deepStrictEqual(covered, [[1, 2]], "越界[4-9]丢弃");
+    assert.deepStrictEqual(r.gaps, [[3, 5]]);
+  });
+
+  test("alignSentencesPartial splitFill：多源行合并 → 逐行单元，无缺口", () => {
+    const model = "[1-3] ||| a. b. c. ||| 甲。乙。丙。\n[4-5] ||| d. e. ||| 丁。戊。";
+    const r = Core.alignSentencesPartial(P_CUES, model, { splitFill: true });
+    assert.deepStrictEqual(r.gaps, []);
+    assert.strictEqual(r.sentences.length, 5, "splitFill 下 5 行各 1 单元");
+    assert.deepStrictEqual([r.sentences[0].srcStart, r.sentences[0].srcEnd], [1, 1]);
+  });
+
+  /* ============ 第3层：makeAdaptiveGate 自适应降并发 ============ */
+  console.log("\n[第3层 自适应 gate：makeAdaptiveGate]");
+
+  test("makeAdaptiveGate 429×2 → cap 4→2→1；之后 8 次成功 → 回升到 2", () => {
+    const gate = Core.makeAdaptiveGate({ max: 4, min: 1, recoverAfter: 8, cooldownMs: 0 });
+    assert.strictEqual(gate.cap(), 4, "初始 cap=max=4");
+    gate.reportError("429", 0);
+    assert.strictEqual(gate.cap(), 2, "第1次429: 4→2");
+    gate.reportError("429", 0);
+    assert.strictEqual(gate.cap(), 1, "第2次429: 2→1");
+    // cooldownMs=0 → 成功立刻计入恢复。连续 8 次成功后 cap+1
+    for (let i = 0; i < 7; i++) gate.recordSuccess(1);
+    assert.strictEqual(gate.cap(), 1, "7次成功还不够(<8)");
+    gate.recordSuccess(1);
+    assert.strictEqual(gate.cap(), 2, "第8次成功: cap 回升 1→2");
+  });
+
+  test("makeAdaptiveGate cap 永不低于 min、永不高于 max", () => {
+    const gate = Core.makeAdaptiveGate({ max: 4, min: 1, recoverAfter: 2, cooldownMs: 0 });
+    // 狂报错：cap 应卡在 min=1，不会到 0
+    for (let i = 0; i < 10; i++) gate.reportError("429", 0);
+    assert.strictEqual(gate.cap(), 1, "cap 下限 = min = 1");
+    // 狂成功：cap 应卡在 max=4，不会超
+    for (let i = 0; i < 100; i++) gate.recordSuccess(1);
+    assert.strictEqual(gate.cap(), 4, "cap 上限 = max = 4");
+  });
+
+  test("makeAdaptiveGate timeout 也降并发，other 不降", () => {
+    const gate = Core.makeAdaptiveGate({ max: 4, min: 1, cooldownMs: 0 });
+    gate.reportError("timeout", 0);
+    assert.strictEqual(gate.cap(), 2, "timeout 触发降并发");
+    gate.reportError("other", 0);
+    assert.strictEqual(gate.cap(), 2, "other 不降并发");
+  });
+
+  test("errorKind 归类：429 / timeout / other", () => {
+    assert.strictEqual(Core.errorKind({ code: "429", message: "translate HTTP 429" }), "429");
+    assert.strictEqual(Core.errorKind(new Error("translate HTTP 429 rate limit")), "429");
+    assert.strictEqual(Core.errorKind(new Error("translate timeout (20000ms)")), "timeout");
+    assert.strictEqual(Core.errorKind(new Error("translate network error: boom")), "other");
+    assert.strictEqual(Core.errorKind(null), "other");
+  });
+
+  await asyncTest("makeAdaptiveGate run 受 cap 约束：429 后在途峰值下降", async () => {
+    const gate = Core.makeAdaptiveGate({ max: 4, min: 1, cooldownMs: 0 });
+    let inFlight = 0, peakBefore = 0, peakAfter = 0;
+    let phase = "before";
+    const task = () =>
+      gate.run(async () => {
+        inFlight++;
+        if (phase === "before") peakBefore = Math.max(peakBefore, inFlight);
+        else peakAfter = Math.max(peakAfter, inFlight);
+        await new Promise((r) => setTimeout(r, 5));
+        inFlight--;
+      });
+    await Promise.all([task(), task(), task(), task()]);
+    assert.ok(peakBefore > 1 && peakBefore <= 4, "降并发前峰值 " + peakBefore + " 在 (1,4]");
+    gate.reportError("429", 0); // 4→2
+    phase = "after";
+    await Promise.all([task(), task(), task(), task()]);
+    assert.ok(peakAfter <= 2, "降并发后峰值 " + peakAfter + " <= 2");
+  });
+
+  /* ============ 第2层逻辑自验：error clip 重试 + 429 降并发 + 全 done ============ */
+  console.log("\n[第2层 逻辑自验：前段成功/后段429恢复 → 重试到全 done]");
+
+  await asyncTest("逻辑自验：后段持续429然后恢复，重试调度补齐到全 done，期间 cap 下降", async () => {
+    // 模拟 isolated 的 clip 状态机最小闭环：句级失败→error→backoff→后台调度重试。
+    // fetchImpl: 前 N 次调用对"后段 clip"返回 429，之后恢复 200。
+    const cap0 = 4;
+    const gate = Core.makeAdaptiveGate({ max: cap0, min: 1, cooldownMs: 0, recoverAfter: 8 });
+    let now = 0;
+    const backoffs = {
+      0: Core.makeBackoff({ maxFails: 6, baseMs: 2000, maxMs: 30000 }),
+      1: Core.makeBackoff({ maxFails: 6, baseMs: 2000, maxMs: 30000 }),
+    };
+    const clipState = { 0: undefined, 1: undefined };
+    let n429Seen = 0;
+    let capMin = cap0;
+    let block429 = true; // 后段(clip1)前期持续 429
+
+    // 一个 clip 的翻译：clip0 永远成功；clip1 在 block429 期间抛 429，否则成功。
+    async function translateOne(idx) {
+      try {
+        await gate.run(async () => {
+          if (idx === 1 && block429) {
+            n429Seen++;
+            const e = new Error("translate HTTP 429"); e.code = "429";
+            throw e;
+          }
+          return "ok";
+        });
+        clipState[idx] = "done";
+        backoffs[idx].reset();
+      } catch (e) {
+        gate.reportError(Core.errorKind(e), now);
+        capMin = Math.min(capMin, gate.cap());
+        clipState[idx] = "error";
+        backoffs[idx].fail(now);
+      }
+    }
+
+    // 初翻：clip0 成功，clip1 429 → error
+    await translateOne(0);
+    await translateOne(1);
+    assert.strictEqual(clipState[0], "done", "前段 clip0 立即 done");
+    assert.strictEqual(clipState[1], "error", "后段 clip1 429 → error");
+    assert.ok(gate.cap() < cap0, "429 期间 cap 已下降，实测 cap=" + gate.cap());
+
+    // 后台重试调度器：推进时间，到点重试 clip1。前 2 轮仍 429，第 3 轮恢复。
+    let rounds = 0;
+    let retryCalls = 0;
+    while (clipState[1] !== "done" && rounds < 20) {
+      now += 31000; // 跨过最大退避，保证 shouldTry 为真
+      rounds++;
+      if (rounds >= 3) block429 = false; // 第3轮起网关恢复
+      if (clipState[1] === "error" && backoffs[1].shouldTry(now) && !backoffs[1].stopped) {
+        retryCalls++;
+        await translateOne(1);
+      }
+    }
+    assert.strictEqual(clipState[1], "done", "重试调度最终把 clip1 补齐到 done");
+    assert.strictEqual(clipState[0], "done", "全部 clip 到 done");
+    assert.ok(retryCalls >= 1, "error clip 确被重试调度重新翻译，重试次数=" + retryCalls);
+    assert.ok(capMin <= 2, "429 期间 cap 最低降到 " + capMin + " (<=2)");
+    assert.ok(n429Seen >= 2, "后段确经历多次429后才恢复，429次数=" + n429Seen);
+  });
+
+
   console.log("\n[B1 导出双语 SRT：formatSrtTime + buildSrt]");
 
   const SRT_UNITS = [

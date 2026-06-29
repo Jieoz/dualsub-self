@@ -36,14 +36,16 @@
   // → 退避 → 反而更卡。这里把所有 clip 的所有批请求收敛到一个全局上限下排队，
   // 在 cap 内仍尽量保持最大领先，但绝不冲垮网关。可被 config.globalConcurrency 覆盖。
   var GLOBAL_INFLIGHT_DEFAULT = 4;
-  var globalGate = Core.makeSemaphore(GLOBAL_INFLIGHT_DEFAULT);
+  var gateMax = GLOBAL_INFLIGHT_DEFAULT; // 当前 gate 的配置上限（cap 会随 429/超时自适应回缩，故单独记配置值）
+  var globalGate = Core.makeAdaptiveGate({ max: GLOBAL_INFLIGHT_DEFAULT, min: 1 });
 
-  /** 按配置（重）建全局信号量；并发数变了才换，避免丢弃在途令牌 */
+  /** 按配置（重）建自适应 gate；仅当配置上限变了才换，避免丢弃在途令牌（cap 自适应不触发重建） */
   function ensureGate() {
     var want = parseInt(config.globalConcurrency, 10);
     if (!Number.isFinite(want) || want < 1) want = GLOBAL_INFLIGHT_DEFAULT;
-    if (!globalGate || globalGate.max !== want) {
-      globalGate = Core.makeSemaphore(want);
+    if (!globalGate || gateMax !== want) {
+      gateMax = want;
+      globalGate = Core.makeAdaptiveGate({ max: want, min: 1 });
     }
     return globalGate;
   }
@@ -61,8 +63,10 @@
     clipCache: {}, // clipIndex -> translated string[]（逐行兜底路径：与该 clip cues 等长，可含空洞）
     clipSentences: {}, // clipIndex -> 句级重断结果 [{startMs,endMs,originalText,translation}]（主路径，成功才有）
     renderUnits: [], // 全局渲染时间轴（句级优先、逐行兜底），按 start 升序。findCueIndexAt 在此上查当前句
-    clipState: {}, // clipIndex -> 'pending'|'done'|'error'
+    clipState: {}, // clipIndex -> 'pending'|'done'|'error'|'failed'（error=可重试；failed=达 maxFails 终态）
     clipBackoff: {}, // clipIndex -> backoff 控制器（失败退避）
+    clipInflight: {}, // clipIndex -> bool：translateClip 进行中（重入互斥，防同 clip 并发）
+    retryTimer: null, // 后台失败重试调度器 id（第2层；只在有 error clip 时活跃）
     renderer: null, // 叠加层 DOM
     videoEl: null,
     fontObserver: null, // ResizeObserver：观察播放器高度变化，同比缩放字号（全屏放大）
@@ -80,6 +84,7 @@
   var RENDER_INTERVAL_MS = 250;
   var PREFETCH_INTERVAL_MS = 1000;
   var SEEK_SETTLE_MS = 350; // seek 停稳多少 ms 后才翻目标 clip
+  var RETRY_INTERVAL_MS = 3000; // 失败 clip 后台重试调度节拍（第2层）
 
   /* =====================================================
    * 配置存取
@@ -195,6 +200,7 @@
     state.clipSentences = {};
     state.renderUnits = [];
     state.clipState = {};
+    state.clipInflight = {};
     state.lastHitCueIdx = -1;
     state.lastPrefetchMs = -1e9;
     clearRenderer();
@@ -261,6 +267,7 @@
       state.renderUnits = [];
       state.clipState = {};
       state.clipBackoff = {};
+      state.clipInflight = {};
       state.lastHitCueIdx = -1;
       // 先用 resegment 分段铺一条「原文时间轴」(译文留空)，译文未到也能立刻显原文；
       // 句级重断成功后由 rebuildRenderTimeline 用合并句替换对应 clip 的单元。
@@ -340,7 +347,9 @@
   }
 
   function getBackoff(idx) {
-    if (!state.clipBackoff[idx]) state.clipBackoff[idx] = Core.makeBackoff();
+    // maxFails 6 / base 2s / max 30s：失败 clip 由后台调度器(startRetryScheduler)按此退避反复重翻，
+    // 达 maxFails 才真正放弃(clipState=failed 终态，UI 可见标「翻译失败」)。
+    if (!state.clipBackoff[idx]) state.clipBackoff[idx] = Core.makeBackoff({ maxFails: 6, baseMs: 2000, maxMs: 30000 });
     return state.clipBackoff[idx];
   }
 
@@ -348,133 +357,202 @@
     var clip = state.clips[idx];
     if (!clip) return;
     if (state.clipState[idx] === "done" || state.clipState[idx] === "pending") return;
+    if (state.clipState[idx] === "failed") return; // 达 maxFails 的终态，不再自动重试
+    if (state.clipInflight[idx]) return; // 重入互斥：同一 clip 不并发跑两个 translateClip
 
-    // 没配置 API：不翻，只显示原文（避免静默失败）
+    // 没配置 API：不翻，只显示原文（非瞬态错误，不进重试调度）
     if (!config.apiBaseUrl || !config.apiModel) {
       state.clipState[idx] = "error";
       return;
     }
-    // 失败退避：连续失败 N 次后停，不再无脑重试烧 token
+    // 失败退避：未到下次允许时间就跳过（由后台调度器到点再来）
     var backoff = getBackoff(idx);
     if (!backoff.shouldTry()) return;
 
-    // 先查持久缓存：命中直接用，零 API 调用。
-    // 缓存可能是句级（sent）或逐行兜底（lines）两种形态，按存的形态恢复。
-    var key = clipCacheKey(clip);
-    var cached = await readCache();
-    if (cached[key]) {
-      if (Array.isArray(cached[key].sent)) {
-        state.clipSentences[idx] = cached[key].sent.slice();
-        state.clipState[idx] = "done";
-        rebuildRenderTimeline();
-        requestRender();
-        return;
-      }
-      if (Array.isArray(cached[key].lines)) {
-        state.clipCache[idx] = cached[key].lines.slice();
-        state.clipState[idx] = "done";
-        rebuildRenderTimeline();
-        requestRender(); // 命中缓存：强制刷新把译文显示上去
-        return;
-      }
-    }
-
-    state.clipState[idx] = "pending";
-
-    // ① 主路径：句级语义重断（一次调用同时重组断句 + 翻译），覆盖性校验通过即用。
+    state.clipInflight[idx] = true;
     try {
-      var res = await ensureGate().run(function () {
-        return Core.translateSentences({
-          cues: clip.cues,
+      // 先查持久缓存：命中直接用，零 API 调用。
+      var key = clipCacheKey(clip);
+      var cached = await readCache();
+      if (cached[key]) {
+        if (Array.isArray(cached[key].sent)) {
+          state.clipSentences[idx] = cached[key].sent.slice();
+          state.clipState[idx] = "done";
+          backoff.reset();
+          rebuildRenderTimeline();
+          requestRender();
+          return;
+        }
+        if (Array.isArray(cached[key].lines)) {
+          state.clipCache[idx] = cached[key].lines.slice();
+          state.clipState[idx] = "done";
+          backoff.reset();
+          rebuildRenderTimeline();
+          requestRender();
+          return;
+        }
+      }
+
+      state.clipState[idx] = "pending";
+
+      // ① 主路径：句级语义重断。覆盖性全过 → 直接用；部分覆盖 → 部分接受 + 缺口逐行补（第1层）。
+      var res;
+      try {
+        res = await ensureGate().run(function () {
+          return Core.translateSentences({
+            cues: clip.cues,
+            apiBaseUrl: config.apiBaseUrl,
+            apiKey: config.apiKey,
+            apiModel: config.apiModel,
+            targetLang: config.targetLang,
+            systemPrompt: config.sentencePrompt || "",
+            splitFill: true,
+            timeoutMs: 20000,
+            fetchImpl: function (u, o) {
+              return fetch(u, o);
+            },
+          });
+        });
+      } catch (e) {
+        // 句级调用本身失败（网络/超时/HTTP）→ 回报 gate 降并发 + 退避，交后台调度器重试。
+        ensureGate().reportError(Core.errorKind(e));
+        console.warn("[dualsub] clip", idx, "句级重断调用失败：", e && e.message, "→ 退避重试");
+        state.clipState[idx] = "error";
+        backoff.fail();
+        ensureRetryScheduler();
+        return;
+      }
+
+      await applySentenceResult(idx, clip, key, res, priorityIndex);
+    } finally {
+      state.clipInflight[idx] = false;
+    }
+  }
+
+  /**
+   * 处理句级模型结果：部分接受 + 缺口逐行补（第1层核心编排）。
+   *  - 用 alignSentencesPartial 切出已覆盖句单元 sentences + 未覆盖源行缺口 gaps。
+   *  - gaps 为空 → 全覆盖，等价旧 ok=true：直接存句级结果、done、写缓存。
+   *  - 有 gaps → 对每个 gap 逐行补翻（走 gate），补出的逐行结果转句级单元插回。
+   *  - 仅当补翻后仍有缺口未填 → 标 error + 退避，交后台调度器重试（第2层）。
+   */
+  async function applySentenceResult(idx, clip, key, res, priorityIndex) {
+    var raw = res && res.rawText != null ? res.rawText : "";
+    var part = Core.alignSentencesPartial(clip.cues, raw, { splitFill: true });
+    var units = part.sentences.slice();
+    var gaps = part.gaps;
+
+    // 逐个缺口补翻（逐行）。补出的每行 → 一个句级单元（时间轴用该 cue 的 start/end）。
+    var stillMissing = false;
+    for (var g = 0; g < gaps.length; g++) {
+      var a = gaps[g][0];
+      var b = gaps[g][1];
+      var gapCues = clip.cues.slice(a - 1, b);
+      var lines;
+      try {
+        lines = await Core.translateCues({
+          cues: gapCues,
           apiBaseUrl: config.apiBaseUrl,
           apiKey: config.apiKey,
           apiModel: config.apiModel,
           targetLang: config.targetLang,
-          systemPrompt: config.sentencePrompt || "", // 句级 prompt 自定义（空=核心默认）
-          splitFill: true, // A1：模型把多源行合并成一条译文时，本地拆分回填到每行，时间轴更细
+          systemPrompt: config.systemPrompt,
+          batchSize: config.batchLines > 0 ? config.batchLines : 14,
+          contextLines: config.contextLines != null ? config.contextLines : 3,
+          priorityIndex: 0,
+          concurrency: 3,
+          gate: ensureGate(),
           timeoutMs: 20000,
           fetchImpl: function (u, o) {
             return fetch(u, o);
           },
         });
-      });
-      if (res && res.ok && res.sentences.length) {
-        state.clipSentences[idx] = res.sentences;
-        delete state.clipCache[idx]; // 句级成功：清掉可能存在的逐行残留
-        state.clipState[idx] = "done";
-        backoff.reset();
-        rebuildRenderTimeline();
-        requestRender();
-        writeCache(key, { sent: res.sentences });
-        return;
+      } catch (e) {
+        ensureGate().reportError(Core.errorKind(e));
+        stillMissing = true;
+        continue; // 整个缺口补翻失败：留待重试
       }
-      // 覆盖性校验未过 → 落到逐行兜底，留诊断日志
-      console.warn(
-        "[dualsub] clip", idx, "句级重断覆盖性校验未过(",
-        (res && res.reason) || "unknown", ") → 退回逐行对齐 fallback"
-      );
-    } catch (e) {
-      // 句级调用本身失败（网络/超时/HTTP）→ 同样退回逐行兜底
-      console.warn("[dualsub] clip", idx, "句级重断调用失败：", e && e.message, "→ 退回逐行 fallback");
+      for (var k = 0; k < gapCues.length; k++) {
+        var cue = gapCues[k];
+        var lineNo = a + k;
+        if (lines[k] != null && lines[k] !== "") {
+          units.push({
+            srcStart: lineNo,
+            srcEnd: lineNo,
+            originalText: cue.content,
+            translation: lines[k],
+            startMs: cue.start,
+            endMs: cue.end,
+          });
+        } else {
+          stillMissing = true; // 该行没补出 → 仍缺，交重试
+        }
+      }
     }
 
-    // ② 兜底路径：保留原有逐行翻译（resegment 分段 + alignTranslations），不丢字幕。
-    await translateClipPerLine(idx, clip, key, priorityIndex);
+    units.sort(function (x, y) {
+      return x.srcStart - y.srcStart;
+    });
+    var backoff = getBackoff(idx);
+
+    if (units.length) {
+      state.clipSentences[idx] = units;
+      delete state.clipCache[idx];
+      rebuildRenderTimeline();
+      requestRender();
+    }
+
+    if (!stillMissing && units.length) {
+      // 全段已覆盖：done + 写缓存
+      state.clipState[idx] = "done";
+      backoff.reset();
+      writeCache(key, { sent: units });
+    } else {
+      // 仍有缺口（或整段全废）→ error + 退避，后台调度器到点重翻补齐（第2层）
+      console.warn("[dualsub] clip", idx, "句级部分覆盖，仍有缺口 → 退避重试补齐");
+      state.clipState[idx] = "error";
+      backoff.fail();
+      ensureRetryScheduler();
+    }
   }
 
-  /**
-   * 逐行翻译兜底（fallback）：句级语义重断失败/覆盖性不过时走这里。
-   * 沿用前置任务的 translateCues（批内并发 + 上下文窗口 + 首句优先），
-   * 译文按行号对齐回 clip.cues，渲染时退化为「一条 resegment 段 = 一条译文」。
+  /* =====================================================
+   * 第2层：失败 clip 后台重试调度器
+   * =====================================================
+   * clipState==="error" 的 clip 不能永久停摆。一个低频循环按 backoff 时间反复重翻，
+   * 直到成功(done)或达 maxFails(failed 终态)。只在有 error clip 时活跃，全 done 时停。
    */
-  async function translateClipPerLine(idx, clip, key, priorityIndex) {
-    var backoff = getBackoff(idx);
-    // 边翻边填：clipCache[idx] 先建空数组，每批回调即时写入并触发重渲染
-    if (!state.clipCache[idx]) state.clipCache[idx] = new Array(clip.cues.length);
-    delete state.clipSentences[idx]; // 走逐行：清掉句级残留
-    var hadError = false;
-    try {
-      var lines = await Core.translateCues({
-        cues: clip.cues,
-        apiBaseUrl: config.apiBaseUrl,
-        apiKey: config.apiKey,
-        apiModel: config.apiModel,
-        targetLang: config.targetLang,
-        systemPrompt: config.systemPrompt,
-        batchSize: config.batchLines > 0 ? config.batchLines : 14,
-        contextLines: config.contextLines != null ? config.contextLines : 3,
-        priorityIndex: priorityIndex != null ? priorityIndex : 0,
-        concurrency: 3,
-        gate: ensureGate(), // 全局并发上限：所有 clip 共享，避免滑动窗口预取冲垮网关
-        timeoutMs: 20000,
-        fetchImpl: function (u, o) {
-          return fetch(u, o);
-        },
-        onProgress: function (updates) {
-          var arr = state.clipCache[idx];
-          for (var i = 0; i < updates.length; i++) arr[updates[i].index] = updates[i].text;
-          rebuildRenderTimeline();
-          requestRender(); // 新译文到 → 立即把当前 cue 刷新（暂停/隐藏时也补一帧）
-        },
-        onError: function () {
-          hadError = true;
-        },
-      });
-      state.clipCache[idx] = lines;
-      rebuildRenderTimeline();
-      if (hadError) {
-        // 部分批失败：标记 error 让退避接管，但已成功的行仍显示
-        state.clipState[idx] = "error";
-        backoff.fail();
-      } else {
-        state.clipState[idx] = "done";
-        backoff.reset();
-        writeCache(key, { lines: lines }); // 整段成功才写持久缓存（逐行形态）
+  function retryTick() {
+    var anyError = false;
+    for (var ci in state.clipState) {
+      if (state.clipState[ci] !== "error") continue;
+      var idx = parseInt(ci, 10);
+      // 没配 API 的 error 不是瞬态错误，不重试也不让调度器为它空转
+      if (!config.apiBaseUrl || !config.apiModel) continue;
+      var backoff = getBackoff(idx);
+      if (backoff.stopped) {
+        state.clipState[idx] = "failed"; // 达 maxFails：终态，UI 标「翻译失败」
+        rebuildRenderTimeline();
+        requestRender();
+        continue;
       }
-    } catch (e) {
-      console.warn("[dualsub] clip", idx, "逐行兜底也失败：", e.message);
-      state.clipState[idx] = "error"; // 兜底：渲染时只显示原文
-      backoff.fail();
+      anyError = true;
+      if (backoff.shouldTry() && !state.clipInflight[idx]) {
+        translateClip(idx, 0); // 异步，不 await；重入由 clipInflight 互斥
+      }
+    }
+    if (!anyError) stopRetryScheduler(); // 没有可重试的 error clip → 停循环省 CPU
+  }
+
+  function ensureRetryScheduler() {
+    if (state.retryTimer != null) return;
+    if (!config.enabled) return;
+    state.retryTimer = setInterval(retryTick, RETRY_INTERVAL_MS);
+  }
+  function stopRetryScheduler() {
+    if (state.retryTimer != null) {
+      clearInterval(state.retryTimer);
+      state.retryTimer = null;
     }
   }
 
@@ -638,6 +716,7 @@
       "  background:rgba(0,0,0,0.6); padding:1px 8px; border-radius:4px;",
       "}",
       ".dualsub-trans.dualsub-pending{ opacity:0.55; font-style:italic; }",
+      ".dualsub-trans.dualsub-failed{ opacity:0.6; font-style:italic; color:#ff8a8a; }",
       ".dualsub-hidden{ display:none !important; }",
     ].join("\n");
     var styleEl = document.createElement("style");
@@ -914,39 +993,47 @@
 
     var unit = state.renderUnits[unitIdx];
     var trans = unit.translation;
-    // 未翻好且该 clip 不是 error 态 → pending（显示「翻译中…」）；error 态不显示，只留原文
-    var pending = trans == null && state.clipState[unit.clipIdx] !== "error";
+    var st = state.clipState[unit.clipIdx];
+    // 未翻好：error/failed 区分——failed(达 maxFails) 显「翻译失败」标记，其余显「翻译中…」。
+    var failed = trans == null && st === "failed";
+    var pending = trans == null && st !== "error" && st !== "failed";
 
-    // 命中键：单元下标 + 译文 + 是否 pending。键未变 → 不动 DOM（idle 零开销）
-    var key = unitIdx + ":" + (trans || "") + ":" + (pending ? "p" : "");
+    // 命中键：单元下标 + 译文 + 状态标记。键未变 → 不动 DOM（idle 零开销）
+    var stTag = pending ? "p" : failed ? "f" : "";
+    var key = unitIdx + ":" + (trans || "") + ":" + stTag;
     if (key === lastRenderedKey) return;
     lastRenderedKey = key;
-    setRendererText(unit.originalText, trans, pending);
+    setRendererText(unit.originalText, trans, pending, failed);
   }
 
   /**
    * 写字幕文本。
    *  - orig/trans 为当前 cue 的原文/译文。
    *  - pending=true 且无译文时，按配置显示轻量"翻译中…"指示（不闪烁）。
+   *  - failed=true 且无译文时，显示「翻译失败」标记（不静默当原文）。
    */
-  function setRendererText(orig, trans, pending) {
+  function setRendererText(orig, trans, pending, failed) {
     var r = state.renderer;
     if (!r) return;
     // 原文行
     r._orig.textContent = config.showOriginal ? orig || "" : "";
     r._orig.classList.toggle("dualsub-hidden", !config.showOriginal || !orig);
-    // 译文行：有译文显译文；没翻好时按 showLoading 显"翻译中…"，否则留空
+    // 译文行：有译文显译文；翻译中显「翻译中…」；失败显「翻译失败」；否则留空
     if (trans) {
       r._trans.textContent = trans;
-      r._trans.classList.remove("dualsub-hidden", "dualsub-pending");
+      r._trans.classList.remove("dualsub-hidden", "dualsub-pending", "dualsub-failed");
     } else if (pending && config.showLoading && orig) {
       r._trans.textContent = "翻译中…";
-      r._trans.classList.remove("dualsub-hidden");
+      r._trans.classList.remove("dualsub-hidden", "dualsub-failed");
       r._trans.classList.add("dualsub-pending");
+    } else if (failed && config.showLoading && orig) {
+      r._trans.textContent = "翻译失败";
+      r._trans.classList.remove("dualsub-hidden", "dualsub-pending");
+      r._trans.classList.add("dualsub-failed");
     } else {
       r._trans.textContent = "";
       r._trans.classList.add("dualsub-hidden");
-      r._trans.classList.remove("dualsub-pending");
+      r._trans.classList.remove("dualsub-pending", "dualsub-failed");
     }
   }
 
@@ -957,6 +1044,7 @@
   function teardownRuntime(full) {
     stopRenderLoop();
     stopPrefetchLoop();
+    stopRetryScheduler();
     if (state.seekTimer != null) {
       clearTimeout(state.seekTimer);
       state.seekTimer = null;
@@ -1022,6 +1110,7 @@
         config.targetLang !== prevTarget;
       if (apiChanged) {
         state.clipBackoff = {};
+        state.clipInflight = {};
         // model/语言变了，旧译文已不适用 → 丢内存缓存重翻（持久缓存按新 key 自然不命中）
         if (config.apiModel !== prevModel || config.targetLang !== prevTarget) {
           state.clipCache = {};
@@ -1029,9 +1118,9 @@
           state.renderUnits = [];
           state.clipState = {};
         } else {
-          // 仅 base/key 变：把 error 态清掉以便重试，已成功的保留
+          // 仅 base/key 变：把 error/failed 态清掉以便重试，已成功的保留
           for (var ci in state.clipState) {
-            if (state.clipState[ci] === "error") state.clipState[ci] = undefined;
+            if (state.clipState[ci] === "error" || state.clipState[ci] === "failed") state.clipState[ci] = undefined;
           }
         }
       }
@@ -1050,6 +1139,7 @@
             state.renderUnits = [];
             state.clipState = {};
             state.clipBackoff = {};
+            state.clipInflight = {};
             loadTrack(track); // 内部会 bindVideo + 起循环 + 预取
           } else {
             // 没轨道也要把循环按当前状态接起来

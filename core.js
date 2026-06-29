@@ -757,8 +757,97 @@
     return { ok: true, sentences: units };
   }
 
-  /* ---------------------------------------------------------------
-   * 长句智能分段（修「整句一屏堆 3-4 行 / splitFill 拦腰斩词」）
+  /**
+   * 句级「部分接受 + 缺口逐行补」(第1层，治中英错位)。
+   * 与 alignSentences 不同：不要求模型全覆盖。校验失败时不整段退回逐行硬切，
+   * 而是接受模型已正确覆盖的连续句段，把没被任何有效 rec 覆盖的源行返回为 gaps，
+   * 由调用方对 gaps 逐行补翻，错位面积从「整段」缩到「个别缺口」。
+   * 入参同 alignSentences；opts.splitFill 透传（多源行合并译文本地拆分回填到每行）。
+   * 返回：{ sentences:[...句级单元...], gaps:[[a,b],...] }
+   *  - sentences: 被有效 rec 覆盖的句级单元（含 startMs/endMs/originalText/translation/srcStart/srcEnd），按 srcStart 升序。
+   *  - gaps: 没被任何有效 rec 覆盖的源行闭区间列表（1-based，升序、互不相邻）。
+   * 贪心策略：recs 按 srcStart 排序后，从左到右挑互不重叠的记录（srcStart > 上一条已接受的 srcEnd）；
+   *   越界 / 回退重叠的记录跳过。splitFill 下某条拆不出对应份数 → 该条降级为缺口（不整段废）。
+   * 边界：recs 全废(空/全越界) → sentences=[], gaps=[[1,n]]（整段当缺口，等价旧 fallback）。
+   */
+  function alignSentencesPartial(originalCues, modelText, opts) {
+    opts = opts || {};
+    var cues = originalCues || [];
+    var n = cues.length;
+    if (!n) return { sentences: [], gaps: [] };
+
+    var recs = parseSentenceResponse(modelText);
+    // 排序 + 贪心取互不重叠的极大连续段（保留覆盖到的源行）
+    var sorted = recs.slice().sort(function (a, b) {
+      return a.srcStart - b.srcStart;
+    });
+    var covered = new Array(n + 1).fill(false); // 1-based 命中标记
+    var units = [];
+    var lastEnd = 0; // 已接受记录的最大 srcEnd
+    for (var i = 0; i < sorted.length; i++) {
+      var rec = sorted[i];
+      // 越界 / 与已接受段重叠（回退）→ 跳过该条
+      if (rec.srcStart < 1 || rec.srcEnd > n || rec.srcStart <= lastEnd) continue;
+      var built = buildSentenceUnits(rec, cues, !!opts.splitFill);
+      if (!built) continue; // splitFill 拆分失败：该条降级为缺口
+      for (var u = 0; u < built.length; u++) units.push(built[u]);
+      for (var ln = rec.srcStart; ln <= rec.srcEnd; ln++) covered[ln] = true;
+      lastEnd = rec.srcEnd;
+    }
+
+    // 缺口：把连续未覆盖的源行聚成闭区间
+    var gaps = [];
+    var gs = 0;
+    for (var p = 1; p <= n + 1; p++) {
+      if (p <= n && !covered[p]) {
+        if (gs === 0) gs = p;
+      } else if (gs !== 0) {
+        gaps.push([gs, p - 1]);
+        gs = 0;
+      }
+    }
+    return { sentences: units, gaps: gaps };
+  }
+
+  /**
+   * 把一条句级 rec 回填成句级单元数组（alignSentences splitFill 分支抽出来共用）。
+   *  - splitFill=false 或单行号：1 个单元，时间区间 = [首源行.start, 末源行.end]。
+   *  - splitFill=true 且多源行：用 splitTranslation 把合并译文拆成 (span) 份逐行回填；
+   *    拆不出对应份数 → 返回 null（调用方决定降级为缺口或退兜底）。
+   */
+  function buildSentenceUnits(rec, cues, splitFill) {
+    var span = rec.srcEnd - rec.srcStart + 1;
+    if (!splitFill || span === 1) {
+      var first = cues[rec.srcStart - 1];
+      var last = cues[rec.srcEnd - 1];
+      return [{
+        srcStart: rec.srcStart,
+        srcEnd: rec.srcEnd,
+        originalText: rec.originalText,
+        translation: rec.translation,
+        startMs: first.start,
+        endMs: last.end,
+      }];
+    }
+    var parts = splitTranslation(rec.translation, span);
+    if (!parts) return null;
+    var out = [];
+    for (var p = 0; p < span; p++) {
+      var lineNo = rec.srcStart + p;
+      var cue = cues[lineNo - 1];
+      out.push({
+        srcStart: lineNo,
+        srcEnd: lineNo,
+        originalText: cue.content != null ? cue.content : rec.originalText,
+        translation: parts[p],
+        startMs: cue.start,
+        endMs: cue.end,
+      });
+    }
+    return out;
+  }
+
+  /**
    * -------------------------------------------------------------
    * 句级重断后 LLM 常把多行 ASR 合并成一个很长的完整句（如 78 字、占屏 5.4s），
    * 整句一个渲染单元 → 软换行堆满画面、长时间不动；旧 splitFill 按字符数硬切又会把
@@ -1446,7 +1535,10 @@
       try {
         errText = await resp.text();
       } catch (e) {}
-      throw new Error("translate HTTP " + resp.status + " " + (errText || "").slice(0, 200));
+      // HTTP 429（限流）单独打标，便于自适应 gate 识别并降并发（第3层）。
+      var httpErr = new Error("translate HTTP " + resp.status + " " + (errText || "").slice(0, 200));
+      if (resp.status === 429) httpErr.code = "429";
+      throw httpErr;
     }
 
     var data = await resp.json();
@@ -1493,7 +1585,11 @@
       timeoutMs: opts.timeoutMs,
       fetchImpl: opts.fetchImpl,
     });
-    return alignSentences(cues, content, { splitFill: !!opts.splitFill });
+    var res = alignSentences(cues, content, { splitFill: !!opts.splitFill });
+    // 把模型原始输出一并带回：覆盖性校验未过(ok=false)时，调用方可用 rawText
+    // 走 alignSentencesPartial 做「部分接受 + 缺口逐行补」，而不是整段退回逐行（第1层）。
+    res.rawText = content;
+    return res;
   }
 
   /** 拼接 base 和 path，避免重复/缺失斜杠 */
@@ -1685,6 +1781,130 @@
       },
       get max() {
         return cap;
+      },
+      get queued() {
+        return waiters.length;
+      },
+    };
+  }
+
+  /**
+   * 把一个翻译错误归类为 gate 可消费的种类（第3层）。
+   *  - "429"：HTTP 限流（chatCompletion 已在 err.code 或 message 打标）。
+   *  - "timeout"：AbortController 超时（message 含 "timeout"）。
+   *  - "other"：其余网络/HTTP 错误（不触发降并发）。
+   */
+  function errorKind(err) {
+    if (!err) return "other";
+    var msg = String(err.code || "") + " " + String(err.message || err);
+    if (/\b429\b/.test(msg)) return "429";
+    if (/timeout/i.test(msg)) return "timeout";
+    return "other";
+  }
+
+  /**
+   * 自适应并发 gate（第3层，治根因诱因）：在 makeSemaphore 基础上让 cap 可变。
+   *  - 初始 cap = max；下限 min（>=1）。
+   *  - run(fn)：同信号量，acquire 时若 inFlight 已达当前 cap 则排队。
+   *  - reportError("429"|"timeout")：cap 减半(向下取整，不低于 min)，并进入冷却窗口
+   *    （冷却期内成功不计入恢复，避免抖动）。其余 kind 不降并发。
+   *  - 连续 N 次成功(默认 8)且不在冷却 → cap +1（不超过 max），并清零成功计数。
+   *  - cap 缩小时不强杀在途请求；只是 acquire 处用当前 cap 卡新令牌，多出的自然 drain。
+   * 暴露 cap() 只读当前上限，便于单测同步断言。
+   */
+  function makeAdaptiveGate(opts) {
+    opts = opts || {};
+    var max = toInt(opts.max, 4);
+    if (max < 1) max = 1;
+    var min = toInt(opts.min, 1);
+    if (min < 1) min = 1;
+    if (min > max) min = max;
+    var recoverAfter = opts.recoverAfter > 0 ? Math.floor(opts.recoverAfter) : 8;
+    var cooldownMs = opts.cooldownMs != null ? opts.cooldownMs : 5000;
+
+    var cap = max;
+    var inFlight = 0;
+    var waiters = [];
+    var okStreak = 0;
+    var coolUntil = 0;
+
+    function pump() {
+      // 有空位且有等待者 → 放行
+      while (inFlight < cap && waiters.length > 0) {
+        var next = waiters.shift();
+        inFlight++;
+        next();
+      }
+    }
+    function acquire() {
+      if (inFlight < cap) {
+        inFlight++;
+        return Promise.resolve();
+      }
+      return new Promise(function (resolve) {
+        waiters.push(resolve);
+      });
+    }
+    function release() {
+      if (inFlight > 0) inFlight--;
+      pump();
+    }
+    function recordSuccess(now) {
+      now = now != null ? now : Date.now();
+      if (now < coolUntil) return; // 冷却期内不计入恢复
+      okStreak++;
+      if (okStreak >= recoverAfter) {
+        okStreak = 0;
+        if (cap < max) {
+          cap++;
+          pump();
+        }
+      }
+    }
+    function reportError(kind, now) {
+      now = now != null ? now : Date.now();
+      if (kind !== "429" && kind !== "timeout") return;
+      okStreak = 0;
+      coolUntil = now + cooldownMs;
+      var next = Math.floor(cap / 2);
+      if (next < min) next = min;
+      cap = next;
+      // cap 缩小不主动放行；在途 release 时按新 cap 自然收敛
+    }
+    function run(fn) {
+      return acquire().then(function () {
+        var p;
+        try {
+          p = Promise.resolve(fn());
+        } catch (e) {
+          release();
+          throw e;
+        }
+        return p.then(
+          function (v) {
+            recordSuccess();
+            release();
+            return v;
+          },
+          function (e) {
+            release();
+            throw e;
+          }
+        );
+      });
+    }
+    return {
+      run: run,
+      reportError: reportError,
+      recordSuccess: recordSuccess,
+      cap: function () {
+        return cap;
+      },
+      get max() {
+        return cap;
+      },
+      get inFlight() {
+        return inFlight;
       },
       get queued() {
         return waiters.length;
@@ -1885,6 +2105,10 @@
             ? await opts.gate.run(doBatch)
             : await doBatch();
         } catch (e) {
+          // 自适应 gate：把 429/超时回报给 gate 以动态降并发（第3层）
+          if (opts.gate && typeof opts.gate.reportError === "function") {
+            opts.gate.reportError(errorKind(e));
+          }
           if (opts.onError) opts.onError(e, b);
           if (opts.failFast) throw e;
           continue; // 该批失败：留空，调用方兜底显示原文
@@ -2123,6 +2347,8 @@
     computeFontPx: computeFontPx,
     planPrefetch: planPrefetch,
     makeSemaphore: makeSemaphore,
+    makeAdaptiveGate: makeAdaptiveGate,
+    errorKind: errorKind,
     DEFAULT_CONFIG: DEFAULT_CONFIG,
     DEFAULT_SYSTEM_PROMPT: DEFAULT_SYSTEM_PROMPT,
     buildSystemPrompt: buildSystemPrompt,
@@ -2131,6 +2357,8 @@
     buildNumberedSourceLines: buildNumberedSourceLines,
     parseSentenceResponse: parseSentenceResponse,
     alignSentences: alignSentences,
+    alignSentencesPartial: alignSentencesPartial,
+    buildSentenceUnits: buildSentenceUnits,
     segmentSentenceUnit: segmentSentenceUnit,
     splitTranslation: splitTranslation,
     translateSentences: translateSentences,
