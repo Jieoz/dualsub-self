@@ -773,10 +773,15 @@
   var SEGMENT_PUNCT_RE = /[^。！？．\.!?；;，,、…]+[。！？．\.!?；;，,、…]+/g;
 
   // 时长维度切分的下限保护（修「短句被切成单字闪烁」）：
-  //  - SEG_MIN_VISIBLE_MS：每段至少可视这么久（ms），低于此不为凑时长再切。
+  //  - SEG_MIN_VISIBLE_MS：每段至少可视这么久（ms），低于此不为凑时长再切；也是「一屏可视
+  //    时长地板」（缺陷7）：除「整段太短放不下」的退化情形外，任何一屏 endMs-startMs >= 此值。
   //  - segMinChars()：每段译文最小字符数 = max(2, ceil(cap/4))，随单屏上限自适应。
+  //  - TARGET_CPS：目标阅读速度（字/秒，缺陷5）。每屏「该显示多久」= ceil(字数/TARGET_CPS*1000)，
+  //    取此与地板的较大值为 idealMs；屏起点贴语音、终点提前到 起点+idealMs，剩余时间留白成
+  //    句间停顿，而非把字幕拖满到下一屏（单纯多切并不能提高 cps，留白才是正解）。
   // 时长维度只在「不破坏这两个下限」时才提高段数；短句宁可静止显示也不切碎。
   var SEG_MIN_VISIBLE_MS = 800;
+  var TARGET_CPS = 7;
   function segMinChars(cap) {
     return cap > 0 ? Math.max(2, Math.ceil(cap / 4)) : 2;
   }
@@ -927,7 +932,160 @@
   }
 
   /**
-   * 长句分段（纯函数，必导出）。
+   * 把整段译文「尽量均摊」成正好 n 段（缺陷6：消灭「前满后碎」的尾巴）。
+   * 思路：先按标点切片，贪心聚成 n 组使各组累计长度尽量接近 total/n（只在标点/原子边界落点，
+   * 不斩词）；标点不足时退化到原子级均分（CJK 按字、拉丁/数字成原子）。每组仍 <= cap。
+   * 单原子本身 > cap 的极端串由 hardSplitPiece 在原子内按 cap 硬截兜底（保证 <= cap）。
+   * 返回 n 个非空段（内容不足时末段可能更短，但不会出现「20 vs 5」式悬殊）。
+   */
+  function splitTransIntoN(trans, n, cap) {
+    var s = collapseWhitespace(trans);
+    if (n <= 1) return [s];
+    // 先确保每段 <= cap：用「均摊等效 cap」= max(ceil(len/n), 最长不可分原子, segMinChars) 但不超 cap。
+    var atoms = tokenizeAtoms(s);
+    var maxAtom = 0;
+    for (var a = 0; a < atoms.length; a++) if (atoms[a].length > maxAtom) maxAtom = atoms[a].length;
+    var evenCap = Math.ceil(s.length / n);
+    evenCap = Math.max(evenCap, Math.min(maxAtom, cap > 0 ? cap : maxAtom));
+    if (cap > 0) evenCap = Math.min(evenCap, cap);
+    // 用均摊 cap 把原子贪心聚组（标点不再是唯一约束，目标是各组长度接近）。
+    var target = s.length / n;
+    var groups = [];
+    var buf = "";
+    var acc = 0;
+    for (var j = 0; j < atoms.length; j++) {
+      var atom = atoms[j];
+      var sep = (buf && /[A-Za-z0-9]$/.test(buf) && /^[A-Za-z0-9]/.test(atom)) ? " " : "";
+      var cand = buf + sep + atom;
+      var remainAtom = atoms.length - j;
+      var remainGrp = n - groups.length;
+      var forceSingle = remainAtom <= remainGrp; // 必须给后面每组各留一原子
+      // 单原子超 cap：在原子内按 cap 硬截，每块单独成段（极端串兜底）。
+      if (cap > 0 && atom.length > cap) {
+        if (buf) { groups.push(buf); buf = ""; }
+        for (var off = 0; off < atom.length; off += cap) groups.push(atom.slice(off, off + cap));
+        acc += atom.length;
+        continue;
+      }
+      // 加上这片会超均摊 cap 且当前组非空 → 先封组（保证 <= evenCap <= cap）。
+      if (buf && collapseWhitespace(cand).length > evenCap && groups.length < n - 1) {
+        groups.push(buf);
+        buf = atom; // 新组从该原子起
+        acc += atom.length;
+        continue;
+      }
+      buf = cand;
+      acc += atom.length;
+      // 达到累计目标且还需留组给后续 → 封组（均摊落点）。
+      var enough = acc >= target * (groups.length + 1);
+      if ((enough || forceSingle) && groups.length < n - 1 && collapseWhitespace(buf)) {
+        groups.push(buf);
+        buf = "";
+      }
+    }
+    if (collapseWhitespace(buf)) groups.push(buf);
+    // 段数兜底：多于 n 则把尾部回粘到 <= n，但绝不突破 cap（不超 maxCharsPerScreen 优先于正好 n 段）。
+    while (groups.length > n) {
+      var last = groups.pop();
+      var merged = collapseWhitespace(groups[groups.length - 1] + last);
+      if (cap > 0 && merged.length > cap) { groups.push(last); break; } // 回粘会超硬上限 → 宁可多于 n 段
+      groups[groups.length - 1] = merged;
+    }
+    if (groups.length < n) {
+      var re = segmentTextByCap(s, Math.max(1, Math.min(evenCap, cap > 0 ? cap : evenCap)));
+      if (re.length >= n) groups = re.slice(0, n - 1).concat([collapseWhitespace(re.slice(n - 1).join(""))]);
+    }
+    // 最终硬上限保证（缺陷3 不回归）：均摊/回粘后仍 > cap 的段（超长不可分原子残留）按 cap 硬截，单屏字数无例外。
+    if (cap > 0) {
+      var capped = [];
+      for (var h = 0; h < groups.length; h++) {
+        var hs = hardSplitPiece(groups[h], cap);
+        for (var hi = 0; hi < hs.length; hi++) if (hs[hi]) capped.push(hs[hi]);
+      }
+      groups = capped;
+    }
+    var out = [];
+    for (var g = 0; g < groups.length; g++) {
+      var c = collapseWhitespace(groups[g]);
+      if (c) out.push(c);
+    }
+    return out.length ? out : [s];
+  }
+
+  /**
+   * 给定各段字数 lens 与时间区间，算出每段 { startMs, endMs }（缺陷5+7）。
+   *  - 屏起点：按字数占比线性排布的「时隙边界」(slotStart)，贴合语音、不漏过、单调不回退。
+   *  - 屏终点：endMs = min(slotStart + idealMs, slotEnd)，idealMs = max(地板, ceil(字数/CPS*1000))。
+   *    剩余 slot 时间留白成句间停顿（缺陷5：不慢飘）。语音密(slot 比 ideal 还短)则顶到 slotEnd。
+   *  - 地板兜底（缺陷7）：若某 slot 本身 < 地板，向后顺移借时间补足；整段总时长太短放不下时
+   *    （sum(地板) > span）按比例缩放地板让步——优先级：不丢字 > 不超cap > 可视地板 > 目标速度。
+   */
+  function layoutTimeline(lens, startMs, endMs, minVisible, targetCps) {
+    var n = lens.length;
+    var span = Math.max(0, endMs - startMs);
+    var total = 0;
+    for (var i = 0; i < n; i++) total += lens[i] || 1;
+    // slot 边界（字数占比），单调不回退、首=startMs、末=endMs。
+    var slotStart = new Array(n);
+    var slotEnd = new Array(n);
+    var acc = 0;
+    var prev = startMs;
+    for (var j = 0; j < n; j++) {
+      slotStart[j] = prev;
+      acc += lens[j] || 1;
+      var e = j === n - 1 ? endMs : startMs + Math.round((span * acc) / total);
+      if (e < prev) e = prev;
+      slotEnd[j] = e;
+      prev = e;
+    }
+    // 地板兜底：保证每个 slot 时长 >= minVisible（最后一个 slot 终点固定为 endMs）。
+    // 若 n*minVisible > span（整段太短放不下）→ 缩放地板让步（可视地板让位给不丢字/不超cap）。
+    var floor = minVisible;
+    if (n * floor > span && n > 0) floor = Math.floor(span / n);
+    if (floor > 0) {
+      // 从前往后：若 slot 太短，向后推它的终点（顺移后续 slotStart），保持单调全覆盖。
+      for (var k = 0; k < n; k++) {
+        var dur = slotEnd[k] - slotStart[k];
+        if (dur < floor) {
+          var want = slotStart[k] + floor;
+          if (k === n - 1) want = endMs; // 末段终点锁死
+          if (want > slotEnd[k]) {
+            slotEnd[k] = Math.min(want, endMs);
+            if (k < n - 1 && slotEnd[k] > slotStart[k + 1]) slotStart[k + 1] = slotEnd[k];
+          }
+        }
+      }
+      // 反向兜底：末段可能被压短，向前借（把前一段终点提前）。
+      for (var m = n - 1; m > 0; m--) {
+        var d2 = slotEnd[m] - slotStart[m];
+        if (d2 < floor) {
+          var need = floor - d2;
+          var newStart = Math.max(slotEnd[m - 1] - need, slotStart[m - 1] + Math.max(1, floor));
+          if (newStart < slotStart[m]) {
+            slotStart[m] = Math.max(newStart, slotStart[m - 1] + Math.min(floor, slotEnd[m - 1] - slotStart[m - 1]));
+            slotEnd[m - 1] = slotStart[m];
+          }
+        }
+      }
+    }
+    // 每段终点提前到 起点+idealMs，剩余留白（缺陷5）。语音密则顶到 slotEnd。
+    var out = [];
+    for (var p = 0; p < n; p++) {
+      var sStart = slotStart[p];
+      var sEnd = slotEnd[p];
+      var slotDur = sEnd - sStart;
+      var ideal = Math.max(minVisible, Math.ceil(((lens[p] || 1) / targetCps) * 1000));
+      // idealMs 不得超过本 slot 可用时长（不能挤占下一屏语音位置）。
+      var dispEnd = sStart + Math.min(ideal, slotDur);
+      if (dispEnd < sStart) dispEnd = sStart;
+      out.push({ startMs: sStart, endMs: dispEnd });
+    }
+    return out;
+  }
+
+  /**
+   * 长句分段（纯函数，必导出）。基线 v0.2.2 硬上限语义 + v0.2.3 原文对齐/最小段长/超长原子，
+   * 本版(v0.2.4)再加：目标阅读速度留白(缺陷5)、段长均摊(缺陷6)、每屏可视时长地板(缺陷7)。
    * 入参：
    *  - unit: { startMs, endMs, originalText, translation, ... }（额外字段透传/忽略）
    *  - opts: { maxCharsPerScreen (默认 20，CJK 约 20 字), maxDurPerScreen (默认 4000ms) }
@@ -939,10 +1097,17 @@
    *    原子按 cap 硬截）；无句中标点的长句也切。每段 <= maxCharsPerScreen（无例外）。
    *  - 时长维度：段数不足以满足单屏最长时长时按时长提段数，但有下限保护——每段不短于
    *    segMinChars(cap) 字、不短于 SEG_MIN_VISIBLE_MS 可视，短句宁可静止显示也不切成单字。
+   *  - 段长均摊（缺陷6）：确定 N 段后用 splitTransIntoN 把译文尽量均摊（消灭「20 vs 5」碎尾），
+   *    每段仍 <= maxCharsPerScreen。
    *  - originalText 同步切成同段数：标点足够按标点均衡聚组，否则按原子占比均分，每段都带
    *    对应原文片段（不再后段全空），拼回（去空格）无丢字。
-   *  - 时间轴 [startMs,endMs] 按各译文段字符占比线性分配，段间连续、不重叠、覆盖整个区间。
+   *  - 时间轴（缺陷5+7）：屏起点按字数占比贴语音排布；屏终点提前到 起点+idealMs（按目标阅读
+   *    速度 TARGET_CPS 该显示多久就显示多久），剩余时间留白成句间停顿（不慢飘）；每屏可视有
+   *    SEG_MIN_VISIBLE_MS 地板（不闪现）。语音密时退化顶满。
+   *  优先级（冲突时）：不丢字 > 不超 maxCharsPerScreen > 可视时长地板 > 目标阅读速度均匀。
    * 返回：[{ startMs, endMs, originalText, translation }, ...]，N>=1，拼接无丢字。
+   * 注意：屏终点可能早于下一屏起点（句间留白），故时间轴不再要求「全覆盖到下屏起点」，
+   * 但起点仍单调贴语音、各屏不重叠、首屏 start=原 start、末屏 end<=原 end。
    */
   function segmentSentenceUnit(unit, opts) {
     opts = opts || {};
@@ -1001,33 +1166,31 @@
     var n = transGroups.length;
     if (n <= 1) return passthrough(); // 切不动（整段是单个不可分原子或已够短）→ 原样返回
 
+    // 段长均摊（缺陷6）：确定 N 段后把译文尽量均摊，消灭「前满后碎」尾巴；每段仍 <= maxChars。
+    if (maxChars > 0) {
+      var even = splitTransIntoN(trans, n, maxChars);
+      if (even.length) transGroups = even;
+      n = transGroups.length;
+      if (n <= 1) return passthrough();
+    }
+
     // 原文同步切成 n 段（数量对齐译文）：标点足够按标点均衡聚组，否则按原子占比均分；
     // 每段都带对应原文片段（不再后段全空），拼回（去空格）无丢字。
     var origGroups = splitOriginalIntoN(orig, n);
 
-    // 时间轴：按各译文段字符占比线性分配 [startMs,endMs]，段间连续、不重叠、全覆盖。
+    // 时间轴（缺陷5+7）：屏起点按字数占比贴语音，屏终点提前到 起点+idealMs 留白成句间停顿，
+    // 每屏可视有 SEG_MIN_VISIBLE_MS 地板（整段太短放不下时地板让步）。详见 layoutTimeline。
     var lens = [];
-    var total = 0;
-    for (var i = 0; i < n; i++) {
-      var L = transGroups[i].length || 1;
-      lens.push(L);
-      total += L;
-    }
+    for (var i = 0; i < n; i++) lens.push(transGroups[i].length || 1);
+    var times = layoutTimeline(lens, startMs, endMs, SEG_MIN_VISIBLE_MS, TARGET_CPS);
     var units = [];
-    var acc = 0;
-    var prevEnd = startMs;
-    var span = endMs - startMs;
     for (var j = 0; j < n; j++) {
-      acc += lens[j];
-      var segEnd = j === n - 1 ? endMs : startMs + Math.round((span * acc) / total);
-      if (segEnd < prevEnd) segEnd = prevEnd; // 单调不回退（防 round 抖动）
       units.push({
-        startMs: prevEnd,
-        endMs: segEnd,
+        startMs: times[j].startMs,
+        endMs: times[j].endMs,
         originalText: origGroups[j] != null ? origGroups[j] : "",
         translation: transGroups[j],
       });
-      prevEnd = segEnd;
     }
     return units;
   }
