@@ -762,13 +762,24 @@
    * -------------------------------------------------------------
    * 句级重断后 LLM 常把多行 ASR 合并成一个很长的完整句（如 78 字、占屏 5.4s），
    * 整句一个渲染单元 → 软换行堆满画面、长时间不动；旧 splitFill 按字符数硬切又会把
-   * 单词/数字拦腰斩断。这里按「标点优先 + 可读长度」把长句切成 2-3 个可读片段，
-   * 每段按字符占比线性分到它覆盖的时间窗，做成分屏滚动（到点切下一段）。
-   * 切点只落在标点处，绝不切断词/token/数字。
+   * 单词/数字拦腰斩断。这里按「单屏最多字数」硬上限把长句切成可读段，每段 <= cap，
+   * 按字符占比线性分到它覆盖的时间窗，做成分屏滚动（到点切下一段）。
+   * 切分语义（v0.2.2 起硬上限，非「只落标点」）：标点是优选切点；超长片段在内部按
+   * 可读边界硬切（CJK 按字、拉丁词与数字成整体不斩断、实在超长的不可分原子按 cap 硬截）；
+   * 每段 <= maxCharsPerScreen；无句中标点的长句也切；时长维度有最小段长/可视时长保护。
    */
 
   // 切点标点（句末 + 句中），命中处可断句；用于把长译文按可读片段切分。
   var SEGMENT_PUNCT_RE = /[^。！？．\.!?；;，,、…]+[。！？．\.!?；;，,、…]+/g;
+
+  // 时长维度切分的下限保护（修「短句被切成单字闪烁」）：
+  //  - SEG_MIN_VISIBLE_MS：每段至少可视这么久（ms），低于此不为凑时长再切。
+  //  - segMinChars()：每段译文最小字符数 = max(2, ceil(cap/4))，随单屏上限自适应。
+  // 时长维度只在「不破坏这两个下限」时才提高段数；短句宁可静止显示也不切碎。
+  var SEG_MIN_VISIBLE_MS = 800;
+  function segMinChars(cap) {
+    return cap > 0 ? Math.max(2, Math.ceil(cap / 4)) : 2;
+  }
 
   /**
    * 把一段文本按标点切成「原始片段」数组（保留标点在片尾、保留原字符不折叠）。
@@ -808,13 +819,11 @@
   }
 
   /**
-   * 把一个「超过 cap」的标点片段在内部按可读边界硬切成多块（每块 <= cap）。
-   * 规则：CJK 按字可断；拉丁/数字串视为原子（绝不斩断词/数字/小数 1.8/版本 v2.0），
-   * 拉丁原子之间用空格重连。仅当单个不可分原子本身 > cap 时该块才会超 cap（无法再分）。
+   * 把一段文本切成「原子」数组：CJK 单字成一原子；拉丁/数字串（含词内 . , :，
+   * 保住 1.8 / 3,000 / v2.0）成一原子。空格不入原子（拉丁原子间重连时再补）。
+   * 供 hardSplitPiece（硬切）与 splitOriginalIntoN（原文按占比均分）共用。
    */
-  function hardSplitPiece(piece, cap) {
-    var s = collapseWhitespace(piece);
-    if (cap <= 0 || s.length <= cap) return [s];
+  function tokenizeAtoms(s) {
     var atoms = [];
     var i = 0;
     while (i < s.length) {
@@ -833,10 +842,30 @@
       if (j > i) { atoms.push(s.slice(i, j)); i = j; }
       else { atoms.push(s[i]); i++; }
     }
+    return atoms;
+  }
+
+  /**
+   * 把一个「超过 cap」的标点片段在内部按可读边界硬切成多块（每块 <= cap，无例外）。
+   * 规则：CJK 按字可断；拉丁/数字串视为原子（绝不斩断词/数字/小数 1.8/版本 v2.0），
+   * 拉丁原子之间用空格重连。单个不可分原子本身 > cap（URL/连写串）时降级：在原子内部
+   * 按 cap 硬截成多块（字幕可读性 > 词完整性），保证每块 <= cap。
+   */
+  function hardSplitPiece(piece, cap) {
+    var s = collapseWhitespace(piece);
+    if (cap <= 0 || s.length <= cap) return [s];
+    var atoms = tokenizeAtoms(s);
     var out = [];
     var buf = "";
     for (var k = 0; k < atoms.length; k++) {
       var a = atoms[k];
+      // 单个原子本身就 > cap（实在切不动的 URL/连写串）→ 在原子内部按 cap 硬截。
+      // 字幕可读性优先于词完整性：保证每段 <= cap，无例外。
+      if (a.length > cap) {
+        if (buf) { out.push(buf); buf = ""; }
+        for (var off = 0; off < a.length; off += cap) out.push(a.slice(off, off + cap));
+        continue;
+      }
       var sep = (buf && /[A-Za-z0-9]$/.test(buf) && /^[A-Za-z0-9]/.test(a)) ? " " : "";
       var cand = buf + sep + a;
       if (buf && cand.length > cap) { out.push(buf); buf = a; }
@@ -902,12 +931,17 @@
    * 入参：
    *  - unit: { startMs, endMs, originalText, translation, ... }（额外字段透传/忽略）
    *  - opts: { maxCharsPerScreen (默认 20，CJK 约 20 字), maxDurPerScreen (默认 4000ms) }
-   * 行为：
+   * 行为（硬上限语义，v0.2.2 起；非旧版「只落标点」）：
    *  - translation 长度 <= maxCharsPerScreen 且 时长 <= maxDurPerScreen → 原样返回 [unit]（不分段）。
    *    maxCharsPerScreen<=0 或极大值 = 关闭分段（向后兼容）。
-   *  - 否则按标点把 translation 切成 N 段（N 由可读长度 + 时长共同决定），originalText 同理；
-   *    切点只落标点，绝不切断词/token/数字。时间轴 [startMs,endMs] 按各段字符占比线性分配，
-   *    段间连续、不重叠、覆盖整个区间。
+   *  - 否则把 translation 切成每段 <= maxCharsPerScreen 的可读段：标点是优选切点；超长片段
+   *    在内部按可读边界硬切（CJK 按字、拉丁词与数字 1.8/v2.0 成整体不斩断、实在超长的不可分
+   *    原子按 cap 硬截）；无句中标点的长句也切。每段 <= maxCharsPerScreen（无例外）。
+   *  - 时长维度：段数不足以满足单屏最长时长时按时长提段数，但有下限保护——每段不短于
+   *    segMinChars(cap) 字、不短于 SEG_MIN_VISIBLE_MS 可视，短句宁可静止显示也不切成单字。
+   *  - originalText 同步切成同段数：标点足够按标点均衡聚组，否则按原子占比均分，每段都带
+   *    对应原文片段（不再后段全空），拼回（去空格）无丢字。
+   *  - 时间轴 [startMs,endMs] 按各译文段字符占比线性分配，段间连续、不重叠、覆盖整个区间。
    * 返回：[{ startMs, endMs, originalText, translation }, ...]，N>=1，拼接无丢字。
    */
   function segmentSentenceUnit(unit, opts) {
@@ -948,17 +982,27 @@
     var transGroups = maxChars > 0 ? segmentTextByCap(trans, maxChars) : [trans];
 
     // 时长维度：若按字数切完段数仍不足以满足「单屏最长时长」，按时长把段数提上来。
+    // 但有下限保护，绝不为凑时长把短句切成单字闪烁：
+    //  - 每段不短于 segMinChars(cap) 字 → 段数 <= floor(trans.length / minChars)。
+    //  - 每段不短于 SEG_MIN_VISIBLE_MS 可视 → 段数 <= floor(durMs / minVisible)。
     var byDur = maxDur > 0 ? Math.ceil(durMs / maxDur) : 1;
     if (byDur > transGroups.length && maxChars > 0) {
-      // 用更小的等效 cap 重切，逼出更多段（不低于按时长所需段数）。
-      var tighterCap = Math.max(1, Math.min(maxChars, Math.ceil(trans.length / byDur)));
-      if (tighterCap < maxChars) transGroups = segmentTextByCap(trans, tighterCap);
+      var minChars = segMinChars(maxChars);
+      var capByChars = Math.floor(trans.length / minChars); // 字数下限决定的最大段数
+      var capByVisible = Math.floor(durMs / SEG_MIN_VISIBLE_MS); // 可视时长下限决定的最大段数
+      var maxSegs = Math.min(byDur, capByChars, capByVisible);
+      if (maxSegs > transGroups.length) {
+        // 用更小的等效 cap 重切，逼出更多段（但不超过下限允许的 maxSegs）。
+        var tighterCap = Math.max(minChars, Math.ceil(trans.length / maxSegs));
+        if (tighterCap < maxChars) transGroups = segmentTextByCap(trans, tighterCap);
+      }
     }
 
     var n = transGroups.length;
     if (n <= 1) return passthrough(); // 切不动（整段是单个不可分原子或已够短）→ 原样返回
 
-    // 原文同理按标点聚成 n 段（数量对齐译文）；标点不足时退化为整段放第一段、其余空。
+    // 原文同步切成 n 段（数量对齐译文）：标点足够按标点均衡聚组，否则按原子占比均分；
+    // 每段都带对应原文片段（不再后段全空），拼回（去空格）无丢字。
     var origGroups = splitOriginalIntoN(orig, n);
 
     // 时间轴：按各译文段字符占比线性分配 [startMs,endMs]，段间连续、不重叠、全覆盖。
@@ -989,19 +1033,27 @@
   }
 
   /**
-   * 把原文按标点聚成正好 n 段（数量与译文对齐）。
-   * 标点片段 >= n → 贪心按累计长度均衡聚成 n 组；标点不足 → 整段放第 1 段、其余空串。
-   * 只在标点处切，绝不切断词；拼回（去空段）无丢字。
+   * 把原文切成正好 n 段（数量与译文对齐），每段尽量非空、落在可读边界。
+   * 两级策略：
+   *  1. 句中标点片段 >= n → 贪心按累计长度均衡聚成 n 组（只在标点处切，绝不斩词）。
+   *  2. 标点不足（英文 ASR 几乎无句中标点）→ 退化按「原子占比」均分：把原文切成原子
+   *     （CJK 按字、拉丁词/数字成整体不斩断），再按字符占比线性均分到 n 组。
+   * 这样每段都带对应原文片段（不再后段全空）；拼回（去空格）无丢字。
+   * 原文原子数 < n（极短原文 + 多译文段）才会出现末尾若干空段——无可分内容，属合理。
    */
   function splitOriginalIntoN(orig, n) {
     var s = collapseWhitespace(orig);
     if (n <= 1) return [s];
+    if (!s) return new Array(n).fill("");
     var pieces = splitByPunctPieces(s);
-    if (pieces.length < n) {
-      var arr = new Array(n).fill("");
-      arr[0] = s;
-      return arr;
-    }
+    // 标点片段足够 → 沿用按标点均衡聚组（可读切点优先）。
+    if (pieces.length >= n) return groupPiecesIntoN(pieces, n);
+    // 标点不足 → 按原子占比均分，保证每段尽量非空、不斩词。
+    return splitAtomsIntoN(s, n);
+  }
+
+  /** 贪心把标点片段按累计长度均衡聚成正好 n 组（每组 collapse 后非空，不足补空）。 */
+  function groupPiecesIntoN(pieces, n) {
     var total = 0;
     for (var i = 0; i < pieces.length; i++) total += collapseWhitespace(pieces[i]).length;
     var target = total / n;
@@ -1022,6 +1074,39 @@
     }
     if (buf) groups.push(collapseWhitespace(buf));
     while (groups.length < n) groups.push(""); // 不足补空（不硬切词）
+    return groups.slice(0, n);
+  }
+
+  /**
+   * 把原文按「原子占比」均分成 n 组（标点不足时的退化路径）。
+   * 原子：CJK 单字 / 拉丁词 / 数字串（成整体不斩断）。按字符占比贪心聚组，
+   * 拉丁原子间用空格重连。原子数 >= n 时每组非空；原子数 < n 时末尾补空段。
+   */
+  function splitAtomsIntoN(s, n) {
+    var atoms = tokenizeAtoms(s);
+    if (!atoms.length) return new Array(n).fill("");
+    var total = 0;
+    for (var i = 0; i < atoms.length; i++) total += atoms[i].length;
+    var target = total / n;
+    var groups = [];
+    var buf = "";
+    var acc = 0;
+    for (var j = 0; j < atoms.length; j++) {
+      var a = atoms[j];
+      var remainAtom = atoms.length - j;
+      var remainGrp = n - groups.length;
+      var sep = (buf && /[A-Za-z0-9]$/.test(buf) && /^[A-Za-z0-9]/.test(a)) ? " " : "";
+      buf += sep + a;
+      acc += a.length;
+      var enough = acc >= target * (groups.length + 1);
+      var forceSingle = remainAtom <= remainGrp; // 必须给后面每组各留一原子
+      if ((enough || forceSingle) && groups.length < n - 1) {
+        groups.push(buf);
+        buf = "";
+      }
+    }
+    if (buf) groups.push(buf);
+    while (groups.length < n) groups.push(""); // 原子数 < n：末尾补空（无可分内容）
     return groups.slice(0, n);
   }
 

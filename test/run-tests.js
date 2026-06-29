@@ -532,6 +532,60 @@ test("segment：小数/版本号不被斩断（1.8 / v2.0 保持完整）", () =
   assert.ok(joined.indexOf("1.8") !== -1, "1.8 应完整保留");
 });
 
+test("segment：原文分段——每段 originalText 非空(无句中标点也对齐)", () => {
+  // 缺陷1：英文 ASR 几乎无句中标点，旧实现把整句原文塞进第 0 段、后段 originalText 全空。
+  // 修复后原文按原子占比均分到每段，每段都带对应原文片段。
+  const unit = {
+    startMs: 0,
+    endMs: 6000,
+    originalText: "so transformer architecture is the foundation of all modern large language models today",
+    translation: "所以说Transformer架构其实是所有现代大语言模型最核心的底层基础技术框架支撑啊",
+  };
+  const out = Core.segmentSentenceUnit(unit, { maxCharsPerScreen: 20, maxDurPerScreen: 4000 });
+  assert.ok(out.length >= 2, "应被切成多段，实际 " + out.length);
+  for (const u of out) {
+    assert.ok(u.translation.length <= 20, "每段译文 <= 20，实际 " + u.translation.length);
+    assert.ok(u.originalText && u.originalText.length > 0, "每段 originalText 必须非空: " + JSON.stringify(out.map((x) => x.originalText)));
+  }
+  // 原文拼回（去空格）无丢字
+  const joinedOrig = out.map((u) => u.originalText).join("").replace(/\s+/g, "");
+  const expectOrig = Core.collapseWhitespace(unit.originalText).replace(/\s+/g, "");
+  assert.strictEqual(joinedOrig, expectOrig, "原文拼回（去空格）应无丢字");
+});
+
+test("segment：短句不被时长维度切碎成单字(每段≥最小段长)", () => {
+  // 缺陷2：8 字短译文因 12 秒被时长维度切成 嗯对就/是这样/吧(末段1字)闪烁。
+  // 修复后时长维度有 segMinChars / SEG_MIN_VISIBLE_MS 下限保护，短句宁可静止显示。
+  const unit = { startMs: 0, endMs: 12000, originalText: "um yeah right ok", translation: "嗯对就是这样吧" };
+  const out = Core.segmentSentenceUnit(unit, { maxCharsPerScreen: 20, maxDurPerScreen: 4000 });
+  const minChars = Math.max(2, Math.ceil(20 / 4)); // segMinChars(20) = 5
+  for (const u of out) {
+    assert.ok(u.translation.length >= minChars || out.length === 1, "每段译文应 >= 最小段长 " + minChars + "，实际 " + u.translation.length + ": " + u.translation);
+  }
+  // 拼回无丢字（即便不切也成立）
+  const joined = out.map((u) => u.translation).join("");
+  assert.strictEqual(joined, unit.translation, "拼回无丢字");
+});
+
+test("segment：超长不可分原子按 cap 硬截，每段≤cap", () => {
+  // 缺陷3：42 字连写 URL 单独成段远超 cap=10；旧实现静默突破上限。
+  // 修复后实在切不动的超长原子在内部按 cap 硬截，保证每段 <= cap（无例外）。
+  const unit = {
+    startMs: 0,
+    endMs: 6000,
+    originalText: "see link",
+    translation: "请访问thisisaveryveryverylongurlwithoutanyspaces看看",
+  };
+  const out = Core.segmentSentenceUnit(unit, { maxCharsPerScreen: 10, maxDurPerScreen: 4000 });
+  assert.ok(out.length >= 2, "应被切成多段");
+  for (const u of out) {
+    assert.ok(u.translation.length <= 10, "每段必须 <= cap(10)，实际 " + u.translation.length + ": " + u.translation);
+  }
+  // 译文拼回无丢字
+  const joined = out.map((u) => u.translation).join("");
+  assert.strictEqual(joined, unit.translation, "译文拼回无丢字");
+});
+
 /* ============ 5c. sliceClipsByCue：按 cue 边界切 ============ */
 console.log("\n[sliceClipsByCue：cue 边界、不重叠]");
 
