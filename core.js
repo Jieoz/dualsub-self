@@ -782,8 +782,14 @@
     var re = new RegExp(SEGMENT_PUNCT_RE.source, "g");
     var m;
     while ((m = re.exec(s)) !== null) {
-      pieces.push(s.slice(lastEnd, re.lastIndex));
-      lastEnd = re.lastIndex;
+      var end = re.lastIndex;
+      // 不把数字间的小数点当切点（避免把 1.8 / v2.0 拦腰斩开）。
+      var pc = s[end - 1];
+      if ((pc === "." || pc === "．") && /[0-9]/.test(s[end - 2] || "") && /[0-9]/.test(s[end] || "")) {
+        continue;
+      }
+      pieces.push(s.slice(lastEnd, end));
+      lastEnd = end;
     }
     if (lastEnd < s.length) pieces.push(s.slice(lastEnd)); // 末尾无标点残尾
     if (!pieces.length) pieces.push(s);
@@ -794,6 +800,80 @@
    * 贪心把「标点片段」聚成若干组，使每组折叠后长度尽量 <= maxChars（至少 1 片/组，
    * 单片超长也不再切——绝不拦腰斩词）。返回折叠后的非空组字符串数组（>=1）。
    */
+  /**
+   * 判断单字符是否 CJK（中日韩，含假名/全角）。用于硬切时按字断行。
+   */
+  function isCJK(ch) {
+    return /[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uff66-\uff9f]/.test(ch);
+  }
+
+  /**
+   * 把一个「超过 cap」的标点片段在内部按可读边界硬切成多块（每块 <= cap）。
+   * 规则：CJK 按字可断；拉丁/数字串视为原子（绝不斩断词/数字/小数 1.8/版本 v2.0），
+   * 拉丁原子之间用空格重连。仅当单个不可分原子本身 > cap 时该块才会超 cap（无法再分）。
+   */
+  function hardSplitPiece(piece, cap) {
+    var s = collapseWhitespace(piece);
+    if (cap <= 0 || s.length <= cap) return [s];
+    var atoms = [];
+    var i = 0;
+    while (i < s.length) {
+      var ch = s[i];
+      if (ch === " ") { i++; continue; }
+      if (isCJK(ch)) { atoms.push(ch); i++; continue; }
+      // 拉丁/数字串：含数字/字母间的 . , : （保住 1.8 / 3,000 / v2.0）
+      var j = i;
+      while (j < s.length) {
+        var c = s[j];
+        if (c === " " || isCJK(c)) break;
+        if ((c === "." || c === "," || c === ":") &&
+            !(/[0-9A-Za-z]/.test(s[j - 1] || "") && /[0-9A-Za-z]/.test(s[j + 1] || ""))) break;
+        j++;
+      }
+      if (j > i) { atoms.push(s.slice(i, j)); i = j; }
+      else { atoms.push(s[i]); i++; }
+    }
+    var out = [];
+    var buf = "";
+    for (var k = 0; k < atoms.length; k++) {
+      var a = atoms[k];
+      var sep = (buf && /[A-Za-z0-9]$/.test(buf) && /^[A-Za-z0-9]/.test(a)) ? " " : "";
+      var cand = buf + sep + a;
+      if (buf && cand.length > cap) { out.push(buf); buf = a; }
+      else { buf = cand; }
+    }
+    if (buf) out.push(buf);
+    return out;
+  }
+
+  /**
+   * 把整段译文切成「每段 <= cap」的可读段：先按标点切，再对超长片段硬切，
+   * 最后把相邻小块在不超 cap 的前提下回粘（保可读）。cap<=0 = 不切。
+   * 这是「单屏最多字数」的硬上限实现（标点是优选切点，不是唯一约束）。
+   */
+  function segmentTextByCap(trans, cap) {
+    var s = collapseWhitespace(trans);
+    if (cap <= 0 || s.length <= cap) return [s];
+    var pieces = splitByPunctPieces(s);
+    var segs = [];
+    var buf = "";
+    for (var p = 0; p < pieces.length; p++) {
+      var sub = hardSplitPiece(pieces[p], cap);
+      for (var q = 0; q < sub.length; q++) {
+        var chunk = sub[q];
+        var cand = buf ? buf + chunk : chunk;
+        if (buf && collapseWhitespace(cand).length > cap) {
+          segs.push(collapseWhitespace(buf));
+          buf = chunk;
+        } else {
+          buf = cand;
+        }
+      }
+    }
+    if (collapseWhitespace(buf)) segs.push(collapseWhitespace(buf));
+    return segs.length ? segs : [s];
+  }
+
   function groupPiecesByLen(pieces, maxChars) {
     var cap = maxChars > 0 ? maxChars : Infinity;
     var groups = [];
@@ -863,17 +943,20 @@
     if (charOk && durOk) return passthrough();
     if (!trans) return passthrough(); // 无译文不分（原文兜底单元，已够短）
 
-    // 目标段数：按可读长度 与 时长 两个维度各算一个，取较大者（再夹到片段上限）。
-    var byChars = maxChars > 0 ? Math.ceil(trans.length / maxChars) : 1;
-    var byDur = maxDur > 0 ? Math.ceil(durMs / maxDur) : 1;
-    var want = Math.max(1, byChars, byDur);
-    if (want <= 1) return passthrough();
+    // 译文按「单屏最多字数」硬上限切成可读段（标点优选切点；超长片段在内部按可读边界硬切，
+    // CJK 按字、拉丁/数字成词不斩断；每段 <= maxChars）。再按时长需求决定是否进一步细分。
+    var transGroups = maxChars > 0 ? segmentTextByCap(trans, maxChars) : [trans];
 
-    // 按标点切译文 → 贪心聚成「每组 <= 目标长度」的可读片段（切点只在标点处）。
-    var targetLen = Math.max(1, Math.ceil(trans.length / want));
-    var transGroups = groupPiecesByLen(splitByPunctPieces(trans), targetLen);
+    // 时长维度：若按字数切完段数仍不足以满足「单屏最长时长」，按时长把段数提上来。
+    var byDur = maxDur > 0 ? Math.ceil(durMs / maxDur) : 1;
+    if (byDur > transGroups.length && maxChars > 0) {
+      // 用更小的等效 cap 重切，逼出更多段（不低于按时长所需段数）。
+      var tighterCap = Math.max(1, Math.min(maxChars, Math.ceil(trans.length / byDur)));
+      if (tighterCap < maxChars) transGroups = segmentTextByCap(trans, tighterCap);
+    }
+
     var n = transGroups.length;
-    if (n <= 1) return passthrough(); // 标点不足以切（整段无标点）→ 不硬切词，原样返回
+    if (n <= 1) return passthrough(); // 切不动（整段是单个不可分原子或已够短）→ 原样返回
 
     // 原文同理按标点聚成 n 段（数量对齐译文）；标点不足时退化为整段放第一段、其余空。
     var origGroups = splitOriginalIntoN(orig, n);
