@@ -181,6 +181,25 @@
     </fieldset>
 
     <fieldset>
+      <legend>字幕节奏</legend>
+      <div class="grid2">
+        <div>
+          <label for="tailTrimMs">句间空隙 (ms)</label>
+          <input type="number" id="tailTrimMs" min="0" max="500" />
+        </div>
+        <div>
+          <label for="maxCharsPerScreen">单屏最多字数</label>
+          <input type="number" id="maxCharsPerScreen" min="0" max="200" />
+        </div>
+        <div>
+          <label for="maxDurPerScreen">单屏最长时长 (ms)</label>
+          <input type="number" id="maxDurPerScreen" min="0" max="20000" />
+        </div>
+      </div>
+      <div class="hint">句间空隙：连续语流相邻句之间的视觉断点(0=关闭，消除字幕墙)。单屏字数/时长：超过即按标点把长句切成多段分屏滚动(字数 0 或极大=关闭分段)。</div>
+    </fieldset>
+
+    <fieldset>
       <legend>配置备份</legend>
       <div class="row">
         <button id="exportBtn" class="secondary">导出配置</button>

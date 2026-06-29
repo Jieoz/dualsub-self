@@ -244,8 +244,9 @@
         cues = Core.parseVtt(text);
       }
       cues = Core.cleanupCues(cues);
-      // 语义重组：合并 ASR 碎片、去滚动重叠词、按标点/停顿重新切句
-      cues = Core.resegmentCues(cues);
+      // 语义重组：合并 ASR 碎片、去滚动重叠词、按标点/停顿重新切句；
+      // 句间视觉尾缩(tailTrimMs)制造句间断点，避免连续语流字幕墙。
+      cues = Core.resegmentCues(cues, { tailTrimMs: config.tailTrimMs });
       if (!cues.length) {
         console.warn("[dualsub] 解析后无有效字幕");
         return;
@@ -487,32 +488,55 @@
    */
   function rebuildRenderTimeline() {
     var units = [];
+    // 长句分段配置（按目标语可读长度 + 时长把长句切成多段分屏滚动；切点只落标点）。
+    var segOpts = {
+      maxCharsPerScreen: config.maxCharsPerScreen,
+      maxDurPerScreen: config.maxDurPerScreen,
+    };
+    // 把一个句单元经 segmentSentenceUnit 展开成 1..N 个渲染单元后 push（保留 clipIdx）。
+    function pushSegmented(unit, clipIdx) {
+      var segs = Core.segmentSentenceUnit(unit, segOpts);
+      for (var q = 0; q < segs.length; q++) {
+        units.push({
+          start: segs[q].startMs,
+          end: segs[q].endMs,
+          originalText: segs[q].originalText,
+          translation: segs[q].translation != null && segs[q].translation !== "" ? segs[q].translation : null,
+          clipIdx: clipIdx,
+        });
+      }
+    }
     for (var ci = 0; ci < state.clips.length; ci++) {
       var sents = state.clipSentences[ci];
       if (sents && sents.length) {
         for (var s = 0; s < sents.length; s++) {
-          units.push({
-            start: sents[s].startMs,
-            end: sents[s].endMs,
-            originalText: sents[s].originalText,
-            translation: sents[s].translation != null ? sents[s].translation : null,
-            clipIdx: ci,
-          });
+          pushSegmented(
+            {
+              startMs: sents[s].startMs,
+              endMs: sents[s].endMs,
+              originalText: sents[s].originalText,
+              translation: sents[s].translation != null ? sents[s].translation : "",
+            },
+            ci
+          );
         }
         continue;
       }
-      // 逐行兜底：clip 的每条 cue 一个单元，原文用 cue.content，译文取 clipCache
+      // 逐行兜底：clip 的每条 cue 一个单元，原文用 cue.content，译文取 clipCache。
+      // 短 cue 经 segmentSentenceUnit 会原样返回（安全），无需特判。
       var clip = state.clips[ci];
       var arr = state.clipCache[ci];
       for (var k = 0; k < clip.cues.length; k++) {
         var cue = clip.cues[k];
-        units.push({
-          start: cue.start,
-          end: cue.end,
-          originalText: cue.content,
-          translation: arr && arr[k] != null ? arr[k] : null,
-          clipIdx: ci,
-        });
+        pushSegmented(
+          {
+            startMs: cue.start,
+            endMs: cue.end,
+            originalText: cue.content,
+            translation: arr && arr[k] != null ? arr[k] : "",
+          },
+          ci
+        );
       }
     }
     state.renderUnits = units;

@@ -194,6 +194,17 @@
     // 硬切会断在半句；一个超过 longPauseMs 的间隙本身就是自然停顿边界，即使没标点也在此切句。
     // 间隙 < longPauseMs 视为同一语流可继续合并（含正常换气停顿），>= 即断。
     var longPauseMs = opts.longPauseMs != null ? opts.longPauseMs : 700;
+    // 句间视觉尾缩（修「字幕墙」）：YouTube 滚动 ASR 几乎每条都与下一条时间重叠，
+    // cleanupCues 去重叠后前句 end 被精确压到后句 start → 连续语流内句单元首尾相接、
+    // gap 恒为 0，字幕永不消隐。这里在产出句单元时把 end 往回缩一点点，制造句间断点，
+    // 但绝不侵蚀真实停顿、绝不让 end < start：
+    //  - 仅当该句 duration > tailTrimMs*2 才缩（短句不缩，避免缩没）。
+    //  - 缩后保证 end-start >= TAIL_TRIM_MIN_VISIBLE_MS（下限 300ms，仍可读）。
+    //  - 真停顿（下一句 start 与本句原始 end 间本就有间隙）天然不受影响——尾缩只是让
+    //    「原本紧贴」的句子之间也出现 ~tailTrimMs 断点。tailTrimMs=0 完全关闭（向后兼容）。
+    var tailTrimMs = opts.tailTrimMs != null ? opts.tailTrimMs : 120;
+    if (!(tailTrimMs > 0)) tailTrimMs = 0;
+    var TAIL_TRIM_MIN_VISIBLE_MS = 300;
     var list = (cues || []).filter(function (c) {
       return c && c.content;
     });
@@ -206,10 +217,19 @@
       if (!cur) return;
       var content = collapseWhitespace(cur.words.join(" "));
       if (content) {
+        var endMs = cur.end;
+        // 视觉尾缩：仅长句缩（duration > tailTrimMs*2），缩后保证 >= 最小可视时长。
+        if (tailTrimMs > 0 && cur.end - cur.start > tailTrimMs * 2) {
+          var trimmed = cur.end - tailTrimMs;
+          if (trimmed - cur.start < TAIL_TRIM_MIN_VISIBLE_MS) {
+            trimmed = cur.start + TAIL_TRIM_MIN_VISIBLE_MS;
+          }
+          if (trimmed < endMs) endMs = trimmed; // 绝不放大，只回缩
+        }
         out.push({
           start: cur.start,
-          end: cur.end,
-          duration: Math.max(0, cur.end - cur.start),
+          end: endMs,
+          duration: Math.max(0, endMs - cur.start),
           content: content,
         });
       }
@@ -306,6 +326,11 @@
     //                  跨批不再孤立翻译：模型可借上下文理解碎片/指代/话题连贯。0=关闭。
     globalConcurrency: 4, // 跨 clip 的全局 in-flight 翻译请求上限（信号量）。滑动窗口预取
     //                       (depth=2)叠加批内并发(3)若不封顶会冲垮网关→429；此值统一封顶。
+    tailTrimMs: 120, // 句间视觉尾缩(ms)：连续语流句单元 end 回缩此值制造句间断点(修字幕墙)。
+    //                  0=关闭。仅长句(duration>2×)缩，缩后保留 >=300ms 可视；真停顿不受影响。
+    maxCharsPerScreen: 20, // 长句分段：单屏最多译文字符数(CJK 约 20)。超过按标点切成多段分屏滚动。
+    //                       0 或极大值=关闭分段（向后兼容）。
+    maxDurPerScreen: 4000, // 长句分段：单屏最长时长(ms)。超过即使字数不多也按标点切分，避免久不动。
   };
 
   /**
@@ -730,6 +755,191 @@
       }
     }
     return { ok: true, sentences: units };
+  }
+
+  /* ---------------------------------------------------------------
+   * 长句智能分段（修「整句一屏堆 3-4 行 / splitFill 拦腰斩词」）
+   * -------------------------------------------------------------
+   * 句级重断后 LLM 常把多行 ASR 合并成一个很长的完整句（如 78 字、占屏 5.4s），
+   * 整句一个渲染单元 → 软换行堆满画面、长时间不动；旧 splitFill 按字符数硬切又会把
+   * 单词/数字拦腰斩断。这里按「标点优先 + 可读长度」把长句切成 2-3 个可读片段，
+   * 每段按字符占比线性分到它覆盖的时间窗，做成分屏滚动（到点切下一段）。
+   * 切点只落在标点处，绝不切断词/token/数字。
+   */
+
+  // 切点标点（句末 + 句中），命中处可断句；用于把长译文按可读片段切分。
+  var SEGMENT_PUNCT_RE = /[^。！？．\.!?；;，,、…]+[。！？．\.!?；;，,、…]+/g;
+
+  /**
+   * 把一段文本按标点切成「原始片段」数组（保留标点在片尾、保留原字符不折叠）。
+   * 末尾若有不带标点的残尾也作为一片。拼回所有片 === 原串（无丢字）。
+   * 标点不足（整段无可切标点）→ 返回 [text]（单片，由上层决定是否退化按长度）。
+   */
+  function splitByPunctPieces(text) {
+    var s = String(text == null ? "" : text);
+    var pieces = [];
+    var lastEnd = 0;
+    var re = new RegExp(SEGMENT_PUNCT_RE.source, "g");
+    var m;
+    while ((m = re.exec(s)) !== null) {
+      pieces.push(s.slice(lastEnd, re.lastIndex));
+      lastEnd = re.lastIndex;
+    }
+    if (lastEnd < s.length) pieces.push(s.slice(lastEnd)); // 末尾无标点残尾
+    if (!pieces.length) pieces.push(s);
+    return pieces;
+  }
+
+  /**
+   * 贪心把「标点片段」聚成若干组，使每组折叠后长度尽量 <= maxChars（至少 1 片/组，
+   * 单片超长也不再切——绝不拦腰斩词）。返回折叠后的非空组字符串数组（>=1）。
+   */
+  function groupPiecesByLen(pieces, maxChars) {
+    var cap = maxChars > 0 ? maxChars : Infinity;
+    var groups = [];
+    var buf = "";
+    for (var i = 0; i < pieces.length; i++) {
+      var pieceLen = collapseWhitespace(pieces[i]).length;
+      var bufLen = collapseWhitespace(buf).length;
+      // 当前组已非空、再加这片会超 cap → 先封一组
+      if (buf && bufLen + pieceLen > cap) {
+        groups.push(buf);
+        buf = "";
+      }
+      buf += pieces[i];
+    }
+    if (collapseWhitespace(buf)) groups.push(buf);
+    var out = [];
+    for (var g = 0; g < groups.length; g++) {
+      var c = collapseWhitespace(groups[g]);
+      if (c) out.push(c);
+    }
+    return out.length ? out : [collapseWhitespace(pieces.join("")) || ""];
+  }
+
+  /**
+   * 长句分段（纯函数，必导出）。
+   * 入参：
+   *  - unit: { startMs, endMs, originalText, translation, ... }（额外字段透传/忽略）
+   *  - opts: { maxCharsPerScreen (默认 20，CJK 约 20 字), maxDurPerScreen (默认 4000ms) }
+   * 行为：
+   *  - translation 长度 <= maxCharsPerScreen 且 时长 <= maxDurPerScreen → 原样返回 [unit]（不分段）。
+   *    maxCharsPerScreen<=0 或极大值 = 关闭分段（向后兼容）。
+   *  - 否则按标点把 translation 切成 N 段（N 由可读长度 + 时长共同决定），originalText 同理；
+   *    切点只落标点，绝不切断词/token/数字。时间轴 [startMs,endMs] 按各段字符占比线性分配，
+   *    段间连续、不重叠、覆盖整个区间。
+   * 返回：[{ startMs, endMs, originalText, translation }, ...]，N>=1，拼接无丢字。
+   */
+  function segmentSentenceUnit(unit, opts) {
+    opts = opts || {};
+    unit = unit || {};
+    var maxChars = opts.maxCharsPerScreen != null ? opts.maxCharsPerScreen : 20;
+    var maxDur = opts.maxDurPerScreen != null ? opts.maxDurPerScreen : 4000;
+    var startMs = unit.startMs != null ? unit.startMs : unit.start;
+    var endMs = unit.endMs != null ? unit.endMs : unit.end;
+    startMs = Number(startMs) || 0;
+    endMs = Number(endMs);
+    if (!Number.isFinite(endMs)) endMs = startMs;
+    var origRaw = unit.originalText != null ? unit.originalText : "";
+    var transRaw = unit.translation != null ? unit.translation : "";
+    var trans = collapseWhitespace(transRaw);
+    var orig = collapseWhitespace(origRaw);
+
+    function passthrough() {
+      return [
+        {
+          startMs: startMs,
+          endMs: endMs,
+          originalText: orig,
+          translation: trans,
+        },
+      ];
+    }
+
+    // 关闭分段（maxChars<=0）或本就够短够快 → 原样返回。
+    var durMs = endMs - startMs;
+    var charOk = !(maxChars > 0) || trans.length <= maxChars;
+    var durOk = !(maxDur > 0) || durMs <= maxDur;
+    if (charOk && durOk) return passthrough();
+    if (!trans) return passthrough(); // 无译文不分（原文兜底单元，已够短）
+
+    // 目标段数：按可读长度 与 时长 两个维度各算一个，取较大者（再夹到片段上限）。
+    var byChars = maxChars > 0 ? Math.ceil(trans.length / maxChars) : 1;
+    var byDur = maxDur > 0 ? Math.ceil(durMs / maxDur) : 1;
+    var want = Math.max(1, byChars, byDur);
+    if (want <= 1) return passthrough();
+
+    // 按标点切译文 → 贪心聚成「每组 <= 目标长度」的可读片段（切点只在标点处）。
+    var targetLen = Math.max(1, Math.ceil(trans.length / want));
+    var transGroups = groupPiecesByLen(splitByPunctPieces(trans), targetLen);
+    var n = transGroups.length;
+    if (n <= 1) return passthrough(); // 标点不足以切（整段无标点）→ 不硬切词，原样返回
+
+    // 原文同理按标点聚成 n 段（数量对齐译文）；标点不足时退化为整段放第一段、其余空。
+    var origGroups = splitOriginalIntoN(orig, n);
+
+    // 时间轴：按各译文段字符占比线性分配 [startMs,endMs]，段间连续、不重叠、全覆盖。
+    var lens = [];
+    var total = 0;
+    for (var i = 0; i < n; i++) {
+      var L = transGroups[i].length || 1;
+      lens.push(L);
+      total += L;
+    }
+    var units = [];
+    var acc = 0;
+    var prevEnd = startMs;
+    var span = endMs - startMs;
+    for (var j = 0; j < n; j++) {
+      acc += lens[j];
+      var segEnd = j === n - 1 ? endMs : startMs + Math.round((span * acc) / total);
+      if (segEnd < prevEnd) segEnd = prevEnd; // 单调不回退（防 round 抖动）
+      units.push({
+        startMs: prevEnd,
+        endMs: segEnd,
+        originalText: origGroups[j] != null ? origGroups[j] : "",
+        translation: transGroups[j],
+      });
+      prevEnd = segEnd;
+    }
+    return units;
+  }
+
+  /**
+   * 把原文按标点聚成正好 n 段（数量与译文对齐）。
+   * 标点片段 >= n → 贪心按累计长度均衡聚成 n 组；标点不足 → 整段放第 1 段、其余空串。
+   * 只在标点处切，绝不切断词；拼回（去空段）无丢字。
+   */
+  function splitOriginalIntoN(orig, n) {
+    var s = collapseWhitespace(orig);
+    if (n <= 1) return [s];
+    var pieces = splitByPunctPieces(s);
+    if (pieces.length < n) {
+      var arr = new Array(n).fill("");
+      arr[0] = s;
+      return arr;
+    }
+    var total = 0;
+    for (var i = 0; i < pieces.length; i++) total += collapseWhitespace(pieces[i]).length;
+    var target = total / n;
+    var groups = [];
+    var buf = "";
+    var acc = 0;
+    for (var j = 0; j < pieces.length; j++) {
+      var remainPiece = pieces.length - j;
+      var remainGrp = n - groups.length;
+      buf += pieces[j];
+      acc += collapseWhitespace(pieces[j]).length;
+      var enough = acc >= target * (groups.length + 1);
+      var forceSingle = remainPiece <= remainGrp; // 必须给后面每组各留一片
+      if ((enough || forceSingle) && groups.length < n - 1) {
+        groups.push(collapseWhitespace(buf));
+        buf = "";
+      }
+    }
+    if (buf) groups.push(collapseWhitespace(buf));
+    while (groups.length < n) groups.push(""); // 不足补空（不硬切词）
+    return groups.slice(0, n);
   }
 
   /**
@@ -1590,6 +1800,7 @@
     buildNumberedSourceLines: buildNumberedSourceLines,
     parseSentenceResponse: parseSentenceResponse,
     alignSentences: alignSentences,
+    segmentSentenceUnit: segmentSentenceUnit,
     splitTranslation: splitTranslation,
     translateSentences: translateSentences,
     chatCompletion: chatCompletion,

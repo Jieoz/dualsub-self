@@ -19,7 +19,7 @@
 
   // 表单字段 id 列表（与 DEFAULT_CONFIG 对应）
   var TEXT_FIELDS = ["apiBaseUrl", "apiKey", "apiModel", "targetLang", "fontFamily"];
-  var NUM_FIELDS = ["fontSize", "bottomOffset"];
+  var NUM_FIELDS = ["fontSize", "bottomOffset", "tailTrimMs", "maxCharsPerScreen", "maxDurPerScreen"];
   var COLOR_FIELDS = ["fontColor", "transColor", "strokeColor"];
   var BOOL_FIELDS = ["enabled", "background", "transOnTop", "showOriginal", "showLoading"];
   var SELECT_FIELDS = ["sourceLang", "fontWeight", "shadowStrength"];
