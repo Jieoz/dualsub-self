@@ -1316,6 +1316,148 @@ async function main() {
     assert.strictEqual(Core.buildSentenceSystemPrompt("zh-Hans", "MY {TARGET_LANG}"), "MY zh-Hans", "自定义覆盖默认");
   });
 
+  test("句级 prompt(A2)：含「为每个源行号都给/分配到每行」强化措辞", () => {
+    const sys = Core.buildSentenceSystemPrompt("zh-Hans");
+    assert.ok(/EACH/.test(sys), "应含 EACH（强调每个源行）");
+    assert.ok(/distribute/i.test(sys), "应含 distribute（把整句译文分配到各行）");
+    assert.ok(/account for/i.test(sys) || /every line/i.test(sys), "应强调覆盖每一行");
+  });
+
+  /* ============ A1：二次拆分回填（splitTranslation + alignSentences splitFill） ============ */
+  console.log("\n[A1 二次拆分回填：splitTranslation + alignSentences(splitFill)]");
+
+  test("splitTranslation：按标点把一条译文拆成 3 份（各非空）", () => {
+    const parts = Core.splitTranslation("今天我们来看。它预测下一个词。基本就这样。", 3);
+    assert.ok(Array.isArray(parts) && parts.length === 3, "应拆成 3 份");
+    parts.forEach((p) => assert.ok(p && p.length > 0, "每份非空"));
+    assert.ok(/今天/.test(parts[0]) && /基本/.test(parts[2]), "顺序保持");
+  });
+
+  test("splitTranslation：标点不足时按字符近似等分仍得 n 份", () => {
+    const parts = Core.splitTranslation("这是一段没有标点的连续中文译文内容", 3);
+    assert.ok(Array.isArray(parts) && parts.length === 3, "无标点也能拆成 3 份");
+    parts.forEach((p) => assert.ok(p && p.length > 0));
+    assert.strictEqual(parts.join(""), "这是一段没有标点的连续中文译文内容", "拼回无丢字");
+  });
+
+  test("splitTranslation：n=1 原样返回；太短拆不出 n 份返回 null", () => {
+    assert.deepStrictEqual(Core.splitTranslation("整句", 1), ["整句"]);
+    assert.strictEqual(Core.splitTranslation("短", 3), null, "1 字拆 3 份不可能 → null");
+  });
+
+  test("alignSentences(splitFill)：[1-3] 一条合并译文 → 本地拆 3 份回填，3 个单元、时间轴按各源行", () => {
+    const model = "[1-3] ||| Today we look at how models work. ||| 今天我们来看。模型怎么工作。基本如此。";
+    const r = Core.alignSentences(SENT_CUES.slice(0, 3), model, { splitFill: true });
+    assert.strictEqual(r.ok, true, "覆盖通过 + 拆分成功");
+    assert.strictEqual(r.sentences.length, 3, "渲染单元数 == 源行数 3");
+    // 时间轴：逐行回到各源 cue 的 start/end
+    assert.deepStrictEqual([r.sentences[0].startMs, r.sentences[0].endMs], [0, 600]);
+    assert.deepStrictEqual([r.sentences[1].startMs, r.sentences[1].endMs], [600, 1200]);
+    assert.deepStrictEqual([r.sentences[2].startMs, r.sentences[2].endMs], [1250, 1800]);
+    // 各行有译文片段
+    r.sentences.forEach((u) => assert.ok(u.translation && u.translation.length, "每行有译文"));
+    // 原文回填为源行碎片
+    assert.strictEqual(r.sentences[0].originalText, "so today we are gonna");
+  });
+
+  test("alignSentences(splitFill)：拆不出对应份数 → ok=false(split-fail) 退逐行", () => {
+    // [1-3] 覆盖 3 行，但译文只 1 个字符，无法拆出 3 份非空
+    const r = Core.alignSentences(SENT_CUES, "[1-3] ||| x. ||| 好\n[4-6] ||| y. ||| 也好啊朋友们", {
+      splitFill: true,
+    });
+    assert.strictEqual(r.ok, false, "拆不出 → 整体不通过");
+    assert.strictEqual(r.reason, "split-fail");
+    assert.strictEqual(r.sentences.length, 0);
+  });
+
+  test("alignSentences(splitFill)：单行号句 [4] 不拆，区间=该 cue", () => {
+    const model = "[1-3] ||| A. ||| 甲一。甲二。甲三。\n[4] ||| B. ||| 乙。\n[5-6] ||| C. ||| 丙一。丙二。";
+    const r = Core.alignSentences(SENT_CUES, model, { splitFill: true });
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.sentences.length, 6, "3+1+2 → 6 个逐行单元");
+    assert.deepStrictEqual([r.sentences[3].startMs, r.sentences[3].endMs], [2600, 3100], "第4行单行号区间");
+    assert.strictEqual(r.sentences[3].translation, "乙。");
+  });
+
+  test("alignSentences 默认(无 splitFill)：[1-3] 仍合并成 1 个句单元（不回归）", () => {
+    const r = Core.alignSentences(SENT_CUES, "[1-3] ||| A. ||| 甲。\n[4-6] ||| B. ||| 乙。");
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.sentences.length, 2, "默认仍按句合并");
+    assert.deepStrictEqual([r.sentences[0].startMs, r.sentences[0].endMs], [0, 1800]);
+  });
+
+  await asyncTest("translateSentences(splitFill) 透传：合并译文 → 逐行单元", async () => {
+    const mockFetch = async () => {
+      const content = "[1-6] ||| One long restored sentence here. ||| 第一句。第二句。第三句。第四句。第五句。第六句。";
+      return { ok: true, status: 200, async json() { return { choices: [{ message: { content } }] }; }, async text() { return ""; } };
+    };
+    const r = await Core.translateSentences({
+      cues: SENT_CUES, apiBaseUrl: "https://gw/v1", apiModel: "m", targetLang: "zh-Hans",
+      splitFill: true, fetchImpl: mockFetch,
+    });
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.sentences.length, 6, "[1-6] 合并译文 splitFill → 6 个逐行单元");
+    assert.deepStrictEqual([r.sentences[5].startMs, r.sentences[5].endMs], [4600, 5200]);
+  });
+
+  /* ============ B1：导出双语 SRT（formatSrtTime + buildSrt） ============ */
+  console.log("\n[B1 导出双语 SRT：formatSrtTime + buildSrt]");
+
+  const SRT_UNITS = [
+    { startMs: 0, endMs: 2000, originalText: "hello world", translation: "你好世界" },
+    { startMs: 2000, endMs: 3661000 + 5, originalText: "second line", translation: "第二行" }, // 测大时间戳补零
+    { startMs: 4000, endMs: 6000, originalText: "third", translation: "" }, // 空译文
+  ];
+
+  test("formatSrtTime：毫秒 → HH:MM:SS,mmm 补零", () => {
+    assert.strictEqual(Core.formatSrtTime(0), "00:00:00,000");
+    assert.strictEqual(Core.formatSrtTime(5), "00:00:00,005");
+    assert.strictEqual(Core.formatSrtTime(61234), "00:01:01,234");
+    assert.strictEqual(Core.formatSrtTime(3661005), "01:01:01,005");
+  });
+
+  test("buildSrt bilingual_orig_top：3 块、序号递增、原文在上译文在下", () => {
+    const srt = Core.buildSrt(SRT_UNITS, { mode: "bilingual_orig_top" });
+    const blocks = srt.trim().split("\n\n");
+    assert.strictEqual(blocks.length, 3, "3 个字幕块");
+    assert.ok(/^1\n00:00:00,000 --> 00:00:02,000\nhello world\n你好世界$/.test(blocks[0]), "块1 原文在上");
+    assert.ok(/^2\n/.test(blocks[1]) && /^3\n/.test(blocks[2]), "序号递增");
+    assert.ok(/third$/.test(blocks[2]) && !/\n\n/.test(blocks[2]), "空译文块只剩原文，不留空行");
+  });
+
+  test("buildSrt bilingual_trans_top：译文在上、原文在下", () => {
+    const srt = Core.buildSrt(SRT_UNITS, { mode: "bilingual_trans_top" });
+    const b0 = srt.trim().split("\n\n")[0];
+    assert.ok(/你好世界\nhello world$/.test(b0), "译文在上原文在下");
+  });
+
+  test("buildSrt only_translated：仅译文；空译文回退原文", () => {
+    const srt = Core.buildSrt(SRT_UNITS, { mode: "only_translated" });
+    const blocks = srt.trim().split("\n\n");
+    assert.ok(/\n你好世界$/.test(blocks[0]) && !/hello world/.test(blocks[0]), "块1 仅译文");
+    assert.ok(/\nthird$/.test(blocks[2]), "块3 空译文回退原文");
+  });
+
+  test("buildSrt：按 startMs 升序排序、空单元(原文译文都空)跳过", () => {
+    const unsorted = [
+      { startMs: 5000, endMs: 6000, originalText: "B", translation: "乙" },
+      { startMs: 1000, endMs: 2000, originalText: "A", translation: "甲" },
+      { startMs: 3000, endMs: 4000, originalText: "", translation: "" }, // 应跳过
+    ];
+    const srt = Core.buildSrt(unsorted, { mode: "only_translated" });
+    const blocks = srt.trim().split("\n\n");
+    assert.strictEqual(blocks.length, 2, "空单元被跳过");
+    assert.ok(/\n甲$/.test(blocks[0]), "A 在前（startMs 小）");
+    assert.ok(/^2\n/.test(blocks[1]) && /\n乙$/.test(blocks[1]), "B 在后、序号连续");
+  });
+
+  test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
+    const srt = Core.buildSrt([{ start: 0, end: 1000, originalText: "x", translation: "叉" }], {
+      mode: "bilingual_orig_top",
+    });
+    assert.ok(/00:00:00,000 --> 00:00:01,000/.test(srt), "start/end 也能取到时间");
+  });
+
   await asyncTest("缓存命中则零调用：命中缓存不触发 translateCues/fetch", async () => {
     // 模拟 isolated.js 的"先查缓存命中则零调用"语义
     const key = Core.makeCacheKey({ videoId: "v", trackCode: "en-asr", targetLang: "zh", apiModel: "m", clipStartMs: 0 });

@@ -343,5 +343,55 @@
       };
       reader.readAsText(file);
     });
+
+    /* ---------------- 导出双语 SRT ---------------- */
+    // 向当前 tab 的 isolated.js 取已翻译的渲染单元，用 Core.buildSrt 生成 SRT，
+    // 走 a[download] + Blob 下载（不依赖 chrome.downloads，免加 manifest 权限）。
+    $("exportSrtBtn").addEventListener("click", async function () {
+      if (currentTabId == null) {
+        setStatus("请在 YouTube 播放页导出（字幕数据来自内容脚本）", "err");
+        return;
+      }
+      var mode = $("srtMode") ? $("srtMode").value : "bilingual_orig_top";
+      var resp = await sendToTab(currentTabId, { type: "export-srt" });
+      if (!resp) {
+        setStatus("无响应：请在 YouTube 标签页打开并刷新后重试", "err");
+        return;
+      }
+      if (!resp.ok || !resp.units || !resp.units.length) {
+        setStatus("当前视频还没有可导出的译文，请先播放并等待翻译出现", "err");
+        return;
+      }
+      var srt = Core.buildSrt ? Core.buildSrt(resp.units, { mode: mode }) : "";
+      if (!srt) {
+        setStatus("生成 SRT 为空（无有效字幕单元）", "err");
+        return;
+      }
+      try {
+        var blob = new Blob([srt], { type: "text/plain;charset=utf-8" });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement("a");
+        a.href = url;
+        a.download = makeSrtFilename(resp.videoId, resp.targetLang);
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(function () {
+          URL.revokeObjectURL(url);
+        }, 1000);
+        setStatus("已导出 SRT ✓（" + (a.download) + "）", "ok");
+      } catch (e) {
+        setStatus("导出失败：" + (e && e.message ? e.message : e), "err");
+      }
+    });
   });
+
+  /** 生成 ASCII 安全文件名：dualsub-<videoId>-<lang>.srt（非法字符替换为 _） */
+  function makeSrtFilename(videoId, lang) {
+    function safe(s, dflt) {
+      var v = String(s == null ? "" : s).replace(/[^A-Za-z0-9_.-]/g, "_");
+      return v || dflt;
+    }
+    return "dualsub-" + safe(videoId, "video") + "-" + safe(lang, "trans") + ".srt";
+  }
 })();

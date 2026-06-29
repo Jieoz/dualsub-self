@@ -483,8 +483,12 @@
     "Output format (STRICT): one restored sentence per line, exactly:\n" +
     "[startLine-endLine] ||| restored source sentence with punctuation ||| {TARGET_LANG} translation\n" +
     "A single-line sentence uses [n] (e.g. [4]). The ranges MUST be contiguous, in order, cover EVERY " +
-    "input line exactly once, and never overlap or skip a line. Output ONLY these lines — no commentary, " +
-    "no blank lines, no source echo outside the middle field.";
+    "input line exactly once, and never overlap or skip a line. " +
+    "You MUST account for EACH input line number — every line from the first to the last must fall inside " +
+    "exactly one range. Do NOT drop, merge away or ignore any line. Intelligently distribute the full " +
+    "restored sentence and its translation across all the original line numbers it spans, so each source " +
+    "line is represented; never collapse the whole input into one giant range when it is really several " +
+    "sentences. Output ONLY these lines — no commentary, no blank lines, no source echo outside the middle field.";
 
   function buildSentenceSystemPrompt(targetLang, customPrompt) {
     var tpl =
@@ -540,6 +544,92 @@
   }
 
   /**
+   * 本地轻量「按 n 份拆分一条译文」(借鉴 srt 程序 split_text_simple 思路，但纯本地不再调 API)。
+   * 用途（A1 二次拆分回填）：句级模型把多个源行合并成 [a-b] 的一条长译文时，
+   * 不立即整段退回逐行，先把这条译文近似拆成 (b-a+1) 份回填到各源行，时间轴更细。
+   * 策略：优先按句末/逗号等标点切成片段；片段够则贪心按累计长度均衡聚成 n 组；
+   *      标点不足则退化按字符长度近似等分（CJK 无空格也可切）。
+   * 返回：长度 == n 的字符串数组；无法切出 n 份非空片段时返回 null（调用方退逐行兜底）。
+   */
+  function splitTranslation(text, n) {
+    var s = collapseWhitespace(text);
+    if (!s || !(n >= 1)) return null;
+    if (n === 1) return [s];
+
+    // 1) 先按标点（句末 / 逗号 / 顿号 / 分号，含中英）切片，保留标点在片尾。
+    var segs = [];
+    var re = /[^。！？\.!?；;，,、]+[。！？\.!?；;，,、]?/g;
+    var m;
+    while ((m = re.exec(s)) !== null) {
+      var piece = collapseWhitespace(m[0]);
+      if (piece) segs.push(piece);
+    }
+    if (segs.length === 0) segs = [s];
+
+    // 2) 标点片段数 < n：再退化按字符近似等分（CJK 无空格场景）。
+    if (segs.length < n) {
+      segs = splitByLength(s, n);
+      if (!segs) return null;
+    }
+
+    // 3) 片段数 >= n：贪心按累计长度把 segs 聚成正好 n 组（每组至少 1 片）。
+    var total = 0;
+    for (var i = 0; i < segs.length; i++) total += segs[i].length;
+    var target = total / n;
+    var groups = [];
+    var buf = "";
+    var acc = 0;
+    for (var j = 0; j < segs.length; j++) {
+      var remainSeg = segs.length - j;
+      var remainGrp = n - groups.length;
+      buf += segs[j];
+      acc += segs[j].length;
+      // 累计长度过半数边界，或必须给后面每组各留一片时，封一组（最多封 n-1 组，末组收尾）。
+      var enough = acc >= target * (groups.length + 1);
+      var forceSingle = remainSeg <= remainGrp;
+      if ((enough || forceSingle) && groups.length < n - 1) {
+        groups.push(buf);
+        buf = "";
+      }
+    }
+    if (buf) groups.push(buf);
+    // 收尾对齐：若聚少了（最后一组吞太多），按需把最长组再砍；聚多了不可能(受 n-1 限制)。
+    while (groups.length < n) {
+      // 找最长组从中间按长度二分一次
+      var idx = 0;
+      for (var g = 1; g < groups.length; g++) if (groups[g].length > groups[idx].length) idx = g;
+      var two = splitByLength(groups[idx], 2);
+      if (!two) break;
+      groups.splice(idx, 1, two[0], two[1]);
+    }
+    if (groups.length !== n) return null;
+    for (var k = 0; k < groups.length; k++) {
+      groups[k] = collapseWhitespace(groups[k]);
+      if (!groups[k]) return null;
+    }
+    return groups;
+  }
+
+  /** 按字符长度把字符串近似等分成 n 份（每份非空）；不足以切出 n 份非空时返回 null。 */
+  function splitByLength(text, n) {
+    var s = collapseWhitespace(text);
+    if (!s || s.length < n) return null;
+    var out = [];
+    var per = Math.floor(s.length / n);
+    var pos = 0;
+    for (var i = 0; i < n; i++) {
+      var len = i === n - 1 ? s.length - pos : per;
+      out.push(s.slice(pos, pos + len));
+      pos += len;
+    }
+    for (var k = 0; k < out.length; k++) {
+      out[k] = collapseWhitespace(out[k]);
+      if (!out[k]) return null;
+    }
+    return out;
+  }
+
+  /**
    * 句级对齐：解析模型输出 + 覆盖性校验 + 时间轴回映。
    * 入参：
    *  - originalCues: 本次输入的碎片 cue[]（顺序即源行号 1..N，需带 start/end）。
@@ -553,8 +643,14 @@
    * 覆盖性规则（必须连续、覆盖全部、不重叠、不遗漏）：
    *   按 srcStart 排序后，第一条须从 1 开始，每条 srcStart == 上一条 srcEnd+1，
    *   末条 srcEnd == N。任一不满足即 ok=false。
+   * A1 二次拆分回填（opts.splitFill=true 开启，默认关）：
+   *   覆盖性通过后，对覆盖多源行的 [a-b] 记录（模型把多行合并成一条译文），
+   *   不直接整段当一个粗时间轴单元，而是用 splitTranslation 把这条译文本地拆成
+   *   (b-a+1) 份，逐份回填到各源行 → 渲染单元数 == 源行数，时间轴更细。
+   *   任一记录拆不出对应份数 → 整体 ok=false(reason=split-fail)，调用方退逐行 fallback。
    */
-  function alignSentences(originalCues, modelText) {
+  function alignSentences(originalCues, modelText, opts) {
+    opts = opts || {};
     var cues = originalCues || [];
     var n = cues.length;
     if (!n) return { ok: false, sentences: [], reason: "empty-input" };
@@ -584,19 +680,56 @@
     if (expect !== n + 1) return { ok: false, sentences: [], reason: "uncovered" };
 
     // 时间轴回映：句区间 = [首源 cue.start, 末源 cue.end]
-    var sentences = sorted.map(function (rec) {
-      var first = cues[rec.srcStart - 1];
-      var last = cues[rec.srcEnd - 1];
-      return {
-        srcStart: rec.srcStart,
-        srcEnd: rec.srcEnd,
-        originalText: rec.originalText,
-        translation: rec.translation,
-        startMs: first.start,
-        endMs: last.end,
-      };
-    });
-    return { ok: true, sentences: sentences };
+    if (!opts.splitFill) {
+      var sentences = sorted.map(function (rec) {
+        var first = cues[rec.srcStart - 1];
+        var last = cues[rec.srcEnd - 1];
+        return {
+          srcStart: rec.srcStart,
+          srcEnd: rec.srcEnd,
+          originalText: rec.originalText,
+          translation: rec.translation,
+          startMs: first.start,
+          endMs: last.end,
+        };
+      });
+      return { ok: true, sentences: sentences };
+    }
+
+    // A1 二次拆分回填：把多源行 [a-b] 记录的合并译文本地拆成每行一份，回填到各源行。
+    var units = [];
+    for (var s = 0; s < sorted.length; s++) {
+      var rec = sorted[s];
+      var span = rec.srcEnd - rec.srcStart + 1;
+      if (span === 1) {
+        var c = cues[rec.srcStart - 1];
+        units.push({
+          srcStart: rec.srcStart,
+          srcEnd: rec.srcStart,
+          originalText: rec.originalText,
+          translation: rec.translation,
+          startMs: c.start,
+          endMs: c.end,
+        });
+        continue;
+      }
+      var parts = splitTranslation(rec.translation, span);
+      if (!parts) return { ok: false, sentences: [], reason: "split-fail" };
+      for (var p = 0; p < span; p++) {
+        var lineNo = rec.srcStart + p;
+        var cue = cues[lineNo - 1];
+        units.push({
+          srcStart: lineNo,
+          srcEnd: lineNo,
+          // 回填后单位是源行：原文用该源行碎片，译文用拆出的对应份
+          originalText: cue.content != null ? cue.content : rec.originalText,
+          translation: parts[p],
+          startMs: cue.start,
+          endMs: cue.end,
+        });
+      }
+    }
+    return { ok: true, sentences: units };
   }
 
   /**
@@ -789,6 +922,7 @@
    *  - apiBaseUrl, apiKey, apiModel, targetLang
    *  - systemPrompt: 可选自定义（覆盖句级默认 prompt）
    *  - temperature, timeoutMs, fetchImpl
+   *  - splitFill: 透传给 alignSentences（true=多源行合并译文本地拆分回填到每行，时间轴更细）
    * 返回：
    *   { ok, sentences, reason? }（直接转发 alignSentences 结果）
    *   - ok=true：句级时间轴可用，渲染层按完整句显示；
@@ -818,7 +952,7 @@
       timeoutMs: opts.timeoutMs,
       fetchImpl: opts.fetchImpl,
     });
-    return alignSentences(cues, content);
+    return alignSentences(cues, content, { splitFill: !!opts.splitFill });
   }
 
   /** 拼接 base 和 path，避免重复/缺失斜杠 */
@@ -1348,6 +1482,93 @@
     return { ok: true, config: out };
   }
 
+  /* ---------------------------------------------------------------
+   * 导出双语 .srt（任务 B1）：复用实时翻译已产出的渲染单元，离线纯函数生成。
+   * ------------------------------------------------------------- */
+
+  /** 毫秒 → SRT 时间戳 `HH:MM:SS,mmm`（借鉴 srt 程序 srt_utils.format_time，补零）。 */
+  function formatSrtTime(ms) {
+    var t = Math.max(0, Math.round(Number(ms) || 0));
+    var msPart = t % 1000;
+    var totalSec = Math.floor(t / 1000);
+    var sec = totalSec % 60;
+    var totalMin = Math.floor(totalSec / 60);
+    var min = totalMin % 60;
+    var hr = Math.floor(totalMin / 60);
+    function p2(x) { return (x < 10 ? "0" : "") + x; }
+    function p3(x) { return (x < 10 ? "00" : x < 100 ? "0" : "") + x; }
+    return p2(hr) + ":" + p2(min) + ":" + p2(sec) + "," + p3(msPart);
+  }
+
+  /**
+   * 由渲染单元生成合法 SRT 字符串（任务 B1）。
+   * 入参：
+   *  - renderUnits: [{ startMs|start, endMs|end, originalText, translation }]
+   *    （兼容 isolated.js 的 start/end 命名与句级的 startMs/endMs）
+   *  - opts.mode: "bilingual_orig_top" | "bilingual_trans_top" | "only_translated"
+   *      默认 bilingual_orig_top（原文在上、译文在下）。
+   * 行为：
+   *  - 按 startMs 升序稳定排序；序号从 1 递增；时间 `HH:MM:SS,mmm --> ...`。
+   *  - 译文为空：bilingual 两种 mode 只输出原文（不重复空行）；only_translated 回退原文。
+   *  - 原文与译文都空的单元跳过（不产出空块）。
+   * 返回：SRT 文本字符串（块间空行分隔，末尾换行）。
+   */
+  function buildSrt(renderUnits, opts) {
+    opts = opts || {};
+    var mode = opts.mode || "bilingual_orig_top";
+    var units = (renderUnits || [])
+      .map(function (u, i) {
+        return {
+          startMs: u.startMs != null ? u.startMs : u.start,
+          endMs: u.endMs != null ? u.endMs : u.end,
+          originalText: collapseWhitespace(u.originalText || ""),
+          translation: collapseWhitespace(u.translation || ""),
+          _i: i, // 稳定排序的兜底键（startMs 相等时保持原序）
+        };
+      })
+      .filter(function (u) {
+        return u.originalText || u.translation;
+      });
+
+    units.sort(function (a, b) {
+      var d = (a.startMs || 0) - (b.startMs || 0);
+      return d !== 0 ? d : a._i - b._i;
+    });
+
+    var blocks = [];
+    var seq = 0;
+    for (var k = 0; k < units.length; k++) {
+      var u = units[k];
+      var orig = u.originalText;
+      var trans = u.translation;
+      var textLines;
+      if (mode === "only_translated") {
+        // 仅译文；译文空回退原文（不丢内容）
+        textLines = [trans || orig];
+      } else if (mode === "bilingual_trans_top") {
+        textLines = trans ? [trans, orig].filter(Boolean) : [orig];
+      } else {
+        // bilingual_orig_top（默认）
+        textLines = trans ? [orig, trans].filter(Boolean) : [orig];
+      }
+      textLines = textLines.filter(function (l) {
+        return l && l.length;
+      });
+      if (!textLines.length) continue;
+      seq++;
+      blocks.push(
+        seq +
+          "\n" +
+          formatSrtTime(u.startMs) +
+          " --> " +
+          formatSrtTime(u.endMs) +
+          "\n" +
+          textLines.join("\n")
+      );
+    }
+    return blocks.length ? blocks.join("\n\n") + "\n" : "";
+  }
+
   var EXPORTS = {
     parseJson3: parseJson3,
     parseVtt: parseVtt,
@@ -1369,6 +1590,7 @@
     buildNumberedSourceLines: buildNumberedSourceLines,
     parseSentenceResponse: parseSentenceResponse,
     alignSentences: alignSentences,
+    splitTranslation: splitTranslation,
     translateSentences: translateSentences,
     chatCompletion: chatCompletion,
     buildNumberedBatch: buildNumberedBatch,
@@ -1387,6 +1609,8 @@
     cueClipIndexMap: cueClipIndexMap,
     exportConfig: exportConfig,
     importConfig: importConfig,
+    formatSrtTime: formatSrtTime,
+    buildSrt: buildSrt,
   };
 
   return EXPORTS;

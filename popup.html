@@ -190,6 +190,19 @@
       <div class="hint">导出文件含 API Key 等敏感信息，请妥善保管、勿分享。导入后点"保存设置"生效。</div>
     </fieldset>
 
+    <fieldset>
+      <legend>导出字幕</legend>
+      <div class="row">
+        <select id="srtMode">
+          <option value="bilingual_orig_top">双语（原文在上）</option>
+          <option value="bilingual_trans_top">双语（译文在上）</option>
+          <option value="only_translated">仅译文</option>
+        </select>
+        <button id="exportSrtBtn" class="secondary">导出双语 SRT</button>
+      </div>
+      <div class="hint">导出当前视频已翻译并缓存的字幕为 .srt。请先在 YouTube 播放页等待翻译出现再导出。</div>
+    </fieldset>
+
     <button id="saveBtn">保存设置</button>
     <div id="status"></div>
 

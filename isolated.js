@@ -390,6 +390,7 @@
           apiModel: config.apiModel,
           targetLang: config.targetLang,
           systemPrompt: config.sentencePrompt || "", // 句级 prompt 自定义（空=核心默认）
+          splitFill: true, // A1：模型把多源行合并成一条译文时，本地拆分回填到每行，时间轴更细
           timeoutMs: 20000,
           fetchImpl: function (u, o) {
             return fetch(u, o);
@@ -1041,6 +1042,29 @@
         }
       }
       sendResponse({ ok: true });
+      return true;
+    }
+
+    if (msg.type === "export-srt") {
+      // popup 请求导出当前视频双语 SRT：返回已翻译的渲染单元（句级优先、逐行兜底）+ 元信息。
+      // 时间轴重建一次确保最新；renderUnits 内部用 start/end，转成 startMs/endMs 供 Core.buildSrt。
+      rebuildRenderTimeline();
+      var hasTrans = state.renderUnits.some(function (u) {
+        return u.translation != null && String(u.translation).trim() !== "";
+      });
+      sendResponse({
+        ok: state.renderUnits.length > 0 && hasTrans,
+        videoId: state.videoId,
+        targetLang: config.targetLang,
+        units: state.renderUnits.map(function (u) {
+          return {
+            startMs: u.start,
+            endMs: u.end,
+            originalText: u.originalText,
+            translation: u.translation,
+          };
+        }),
+      });
       return true;
     }
 
