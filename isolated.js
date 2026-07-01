@@ -4,7 +4,8 @@
  * 职责：
  *  1. 接收 main.js 推来的字幕轨道清单（RPC）。
  *  2. 拉取并解析字幕（json3 / vtt），清洗时间轴。
- *  3. 调用用户配置的 OpenAI 兼容翻译 API（分批 + 行号对齐 + 预取缓存）。
+ *  3. 调用用户配置的 OpenAI 兼容翻译 API：每个 clip 一次 translateClipLines（模型一步到位
+ *     直接吐自然分行的中文字幕行）→ buildClipUnits 配时间轴；预取 + 缓存 + 失败退避重试。
  *  4. 渲染双语叠加层，跟随 <video> 的 timeupdate 显示当前 cue。
  *  5. 读写 chrome.storage.local（按 origin 存配置）。
  *  6. 与 popup 通信（chrome.runtime.onMessage）：配置变更、测试连接。
@@ -31,9 +32,9 @@
   var DEFAULT_CONFIG = Core.DEFAULT_CONFIG;
 
   // 跨 clip 的全局 in-flight 翻译请求上限（每个内容脚本实例一个信号量）。
-  // 滑动窗口预取(planPrefetch depth=2)会让当前/下一个/下下个 clip 几乎同时发起翻译，
-  // 每个 clip 内部又有 concurrency=3 的批内并发。若不封顶，瞬时并发可达 ~9 → 网关 429
-  // → 退避 → 反而更卡。这里把所有 clip 的所有批请求收敛到一个全局上限下排队，
+  // 滑动窗口预取(planPrefetch)会让当前/下一个/下下个… clip 几乎同时各发起一次
+  // translateClipLines（v0.4.0：一个 clip = 一次请求）。若不封顶，瞬时并发可达窗口深度
+  // → 网关 429 → 退避 → 反而更卡。这里把所有 clip 的请求收敛到一个全局上限下排队，
   // 在 cap 内仍尽量保持最大领先，但绝不冲垮网关。可被 config.globalConcurrency 覆盖。
   var GLOBAL_INFLIGHT_DEFAULT = 4;
   var gateMax = GLOBAL_INFLIGHT_DEFAULT; // 当前 gate 的配置上限（cap 会随 429/超时自适应回缩，故单独记配置值）
@@ -57,12 +58,14 @@
     videoId: null,
     tracks: [], // main.js 推来的轨道清单
     activeTrack: null, // 当前选中的轨道
-    cues: [], // 清洗 + 启发式重组后的原文 cue（全局，按 start 升序）—— 句级重断失败时的兜底分段器产物
+    cues: [], // 清洗 + 语义重组(resegmentCues)后的原文 cue（全局，按 start 升序）
     clips: [], // 按 cue 边界切的 clip
     cueMap: [], // 全局 cue 下标 -> {clipIdx,cueIdx}（cueClipIndexMap 建表）
-    clipCache: {}, // clipIndex -> translated string[]（逐行兜底路径：与该 clip cues 等长，可含空洞）
-    clipSentences: {}, // clipIndex -> 句级重断结果 [{startMs,endMs,originalText,translation}]（主路径，成功才有）
-    renderUnits: [], // 全局渲染时间轴（句级优先、逐行兜底），按 start 升序。findCueIndexAt 在此上查当前句
+    // v0.4.0：每个 clip 一次 translateClipLines → buildClipUnits 得到渲染单元，按 clip 存这里。
+    // 单元结构 [{srcStart,srcEnd,originalText,translation,startMs,endMs}]（buildClipUnits 产物）。
+    // 统一了旧的 clipCache(逐行)/clipSentences(句级) 两套语义 —— 新架构只有这一种。
+    clipUnits: {}, // clipIndex -> 渲染单元数组（成功翻译才有；缺失=未翻/翻译中→回退显原文）
+    renderUnits: [], // 全局渲染时间轴（各 clip 的渲染单元按 start 升序拼接）。findCueIndexAt 在此上查当前行
     clipState: {}, // clipIndex -> 'pending'|'done'|'error'|'failed'（error=可重试；failed=达 maxFails 终态）
     clipBackoff: {}, // clipIndex -> backoff 控制器（失败退避）
     clipInflight: {}, // clipIndex -> bool：translateClip 进行中（重入互斥，防同 clip 并发）
@@ -142,8 +145,8 @@
     });
   }
 
-  /** 把某 clip 的整段译文写进持久缓存（仅在全部翻完时调用）。
-   *  payload 为 { sent: [...] }（句级）或 { lines: [...] }（逐行兜底）。 */
+  /** 把某 clip 的译文写进持久缓存（仅在翻译成功时调用）。
+   *  payload 为 { lines: string[] }（模型直接吐的自然中文字幕行；命中后重跑 buildClipUnits 配时间轴）。 */
   function writeCache(key, payload) {
     readCache().then(function (cacheObj) {
       cacheObj[key] = Object.assign({ t: Date.now() }, payload);
@@ -196,8 +199,7 @@
     state.cues = [];
     state.clips = [];
     state.cueMap = [];
-    state.clipCache = {};
-    state.clipSentences = {};
+    state.clipUnits = {};
     state.renderUnits = [];
     state.clipState = {};
     state.clipInflight = {};
@@ -262,15 +264,14 @@
       state.clips = Core.sliceClipsByCue(cues, config.clipSeconds * 1000);
       // 建全局 cue→clip 映射表，渲染时 O(1) 反查所属 clip
       state.cueMap = Core.cueClipIndexMap(state.clips);
-      state.clipCache = {};
-      state.clipSentences = {};
+      state.clipUnits = {};
       state.renderUnits = [];
       state.clipState = {};
       state.clipBackoff = {};
       state.clipInflight = {};
       state.lastHitCueIdx = -1;
       // 先用 resegment 分段铺一条「原文时间轴」(译文留空)，译文未到也能立刻显原文；
-      // 句级重断成功后由 rebuildRenderTimeline 用合并句替换对应 clip 的单元。
+      // 某 clip 翻好后由 rebuildRenderTimeline 用 buildClipUnits 的渲染单元替换该 clip 的单元。
       rebuildRenderTimeline();
       ensureRenderer();
       bindVideo();
@@ -302,10 +303,11 @@
   /**
    * 预取策略（带节流）：进入某 clip 立即翻当前 clip + 滑动窗口预取后续若干 clip。
    * force=true 时跳过节流（拖动进度条 / 刚加载）。
-   * 用 Core.planPrefetch 算出 [idx, idx+1, idx+2]（depth=2，已裁越界）；每个下标各自
-   * 独立发起 translateClip——"下下个"不被"下一个还 pending"阻塞。更深的窗口由全局信号量
-   * (ensureGate)封顶，避免多 clip × 批内并发叠加冲垮网关。
+   * 用 Core.planPrefetch 算出 [idx, idx+1, idx+2...]（已裁越界）；每个下标各自
+   * 独立发起 translateClip——"下下个"不被"下一个还 pending"阻塞。窗口由全局信号量
+   * (ensureGate)封顶，避免多 clip 并发冲垮网关。
    * 已翻 / 正在翻 / 退避中的 clip 由 translateClip 内部跳过。
+   * v0.4.0：一个 clip = 一次 translateClipLines，整段一起翻，无 clip 内首句优先起点。
    */
   function prefetchAround(ms, force) {
     if (!config.enabled || !state.clips.length) return;
@@ -326,24 +328,13 @@
       : ms;
     var remainMsInCurrent = endMs - ms;
 
-    // 滑动窗口下标列表（含当前段）。当前段用首句优先起点，后续段从头翻。
+    // 滑动窗口下标列表（含当前段）。每段整段一起翻。
     var plan = Core.planPrefetch(idx, state.clips.length, undefined, {
       remainMsInCurrent: remainMsInCurrent,
     });
     for (var i = 0; i < plan.length; i++) {
-      var ci = plan[i];
-      translateClip(ci, ci === idx ? priorityCueIndex(idx, ms) : 0);
+      translateClip(plan[i]);
     }
-  }
-
-  /** 找播放位置 ms 在 clip 内最接近的 cue 下标（用作首句优先起点） */
-  function priorityCueIndex(idx, ms) {
-    var clip = state.clips[idx];
-    if (!clip) return 0;
-    for (var i = 0; i < clip.cues.length; i++) {
-      if (ms < clip.cues[i].end) return i;
-    }
-    return 0;
   }
 
   function getBackoff(idx) {
@@ -353,13 +344,13 @@
     return state.clipBackoff[idx];
   }
 
-  async function translateClip(idx, priorityIndex) {
+  async function translateClip(idx) {
     var clip = state.clips[idx];
     if (!clip) return;
     if (state.clipState[idx] === "done") return;
     if (state.clipState[idx] === "failed") return; // 达 maxFails 的终态，不再自动重试
     // 重入互斥：同一 clip 不并发跑两个 translateClip。clipInflight 是唯一的互斥源；
-    // 不再用 clipState==="pending" 当门禁——否则一旦某次跑动抛在 applySentenceResult
+    // 不再用 clipState==="pending" 当门禁——否则一旦某次跑动抛在 applyClipLines
     // （pending 已置但 done/error 未写）就永久卡 pending，retryTick 只重试 error 永远救不回来
     // → UI 永久「翻译中…」(症状1根因)。改由下方 finally 兜底把残留 pending 降级为 error 可重试。
     if (state.clipInflight[idx]) return;
@@ -375,42 +366,40 @@
 
     state.clipInflight[idx] = true;
     try {
-      // 先查持久缓存：命中直接用，零 API 调用。
+      // 先查持久缓存：命中直接用，零 API 调用。缓存存的是模型吐的自然中文行(lines)，
+      // 命中后重跑 buildClipUnits 按当前 clip 时间窗配时间轴（时间轴不入缓存，避免跨会话漂移）。
       var key = clipCacheKey(clip);
       var cached = await readCache();
-      if (cached[key]) {
-        if (Array.isArray(cached[key].sent)) {
-          state.clipSentences[idx] = cached[key].sent.slice();
-          state.clipState[idx] = "done";
-          backoff.reset();
-          rebuildRenderTimeline();
-          requestRender();
-          return;
-        }
-        if (Array.isArray(cached[key].lines)) {
-          state.clipCache[idx] = cached[key].lines.slice();
-          state.clipState[idx] = "done";
-          backoff.reset();
-          rebuildRenderTimeline();
-          requestRender();
-          return;
-        }
+      if (cached[key] && Array.isArray(cached[key].lines)) {
+        state.clipUnits[idx] = Core.buildClipUnits(
+          cached[key].lines,
+          clip.startMs,
+          clip.endMs,
+          clip.cues
+        );
+        state.clipState[idx] = "done";
+        backoff.reset();
+        rebuildRenderTimeline();
+        requestRender();
+        return;
       }
 
       state.clipState[idx] = "pending";
 
-      // ① 主路径：句级语义重断。覆盖性全过 → 直接用；部分覆盖 → 部分接受 + 缺口逐行补（第1层）。
-      var res;
+      // 主路径（v0.4.0）：一次 translateClipLines，模型直接吐「自然分行的中文字幕行」。
+      // 代码只用 buildClipUnits 按字符占比配时间轴，绝不切译文（切词 bug 根治）。
+      var lines;
       try {
-        res = await ensureGate().run(function () {
-          return Core.translateSentences({
+        lines = await ensureGate().run(function () {
+          return Core.translateClipLines({
             cues: clip.cues,
             apiBaseUrl: config.apiBaseUrl,
             apiKey: config.apiKey,
             apiModel: config.apiModel,
             targetLang: config.targetLang,
-            systemPrompt: config.sentencePrompt || "",
-            splitFill: true,
+            systemPrompt: config.systemPrompt || "",
+            reasoningEffort: config.reasoningEffort,
+            minLineChars: config.minLineChars,
             timeoutMs: 20000,
             fetchImpl: function (u, o) {
               return fetch(u, o);
@@ -418,18 +407,18 @@
           });
         });
       } catch (e) {
-        // 句级调用本身失败（网络/超时/HTTP）→ 回报 gate 降并发 + 退避，交后台调度器重试。
+        // 翻译调用失败（网络/超时/HTTP）→ 回报 gate 降并发 + 退避，交后台调度器重试。
         ensureGate().reportError(Core.errorKind(e));
-        console.warn("[dualsub] clip", idx, "句级重断调用失败：", e && e.message, "→ 退避重试");
+        console.warn("[dualsub] clip", idx, "翻译调用失败：", e && e.message, "→ 退避重试");
         state.clipState[idx] = "error";
         backoff.fail();
         ensureRetryScheduler();
         return;
       }
 
-      await applySentenceResult(idx, clip, key, res, priorityIndex);
+      applyClipLines(idx, clip, key, lines);
     } catch (e) {
-      // applySentenceResult / readCache / rebuildRenderTimeline 等意外抛出：绝不让 clip 卡死。
+      // applyClipLines / readCache / rebuildRenderTimeline 等意外抛出：绝不让 clip 卡死。
       // 降级为 error + 退避，交后台调度器重试（达 maxFails 才 failed），不再永久 pending。
       console.warn("[dualsub] clip", idx, "translateClip 意外异常 → 降级 error 重试：", e && e.message);
       state.clipState[idx] = "error";
@@ -447,88 +436,29 @@
   }
 
   /**
-   * 处理句级模型结果：部分接受 + 缺口逐行补（第1层核心编排）。
-   *  - 用 alignSentencesPartial 切出已覆盖句单元 sentences + 未覆盖源行缺口 gaps。
-   *  - gaps 为空 → 全覆盖，等价旧 ok=true：直接存句级结果、done、写缓存。
-   *  - 有 gaps → 对每个 gap 逐行补翻（走 gate），补出的逐行结果转句级单元插回。
-   *  - 仅当补翻后仍有缺口未填 → 标 error + 退避，交后台调度器重试（第2层）。
+   * 处理 translateClipLines 的产出（v0.4.0 主路径收尾）。
+   *  - lines 非空：buildClipUnits 按字符占比配时间轴 → 存 clipUnits[idx] → done + 写缓存(lines)。
+   *  - lines 空（模型空响应）：不算硬失败但也没内容 → error + 退避，交后台调度器重试；
+   *    渲染层此时对该 clip 回退显原文（rebuildRenderTimeline 用 cue 铺空译文单元）。
+   * 不再有「部分接受 / 缺口逐行补翻」—— 模型一步到位直接分行，代码只配时间轴。
    */
-  async function applySentenceResult(idx, clip, key, res, priorityIndex) {
-    var raw = res && res.rawText != null ? res.rawText : "";
-    var part = Core.alignSentencesPartial(clip.cues, raw, { splitFill: true });
-    var units = part.sentences.slice();
-    var gaps = part.gaps;
-
-    // 逐个缺口补翻（逐行）。补出的每行 → 一个句级单元（时间轴用该 cue 的 start/end）。
-    var stillMissing = false;
-    for (var g = 0; g < gaps.length; g++) {
-      var a = gaps[g][0];
-      var b = gaps[g][1];
-      var gapCues = clip.cues.slice(a - 1, b);
-      var lines;
-      try {
-        lines = await Core.translateCues({
-          cues: gapCues,
-          apiBaseUrl: config.apiBaseUrl,
-          apiKey: config.apiKey,
-          apiModel: config.apiModel,
-          targetLang: config.targetLang,
-          systemPrompt: config.systemPrompt,
-          batchSize: config.batchLines > 0 ? config.batchLines : 14,
-          contextLines: config.contextLines != null ? config.contextLines : 3,
-          priorityIndex: 0,
-          concurrency: 3,
-          gate: ensureGate(),
-          timeoutMs: 20000,
-          fetchImpl: function (u, o) {
-            return fetch(u, o);
-          },
-        });
-      } catch (e) {
-        ensureGate().reportError(Core.errorKind(e));
-        stillMissing = true;
-        continue; // 整个缺口补翻失败：留待重试
-      }
-      for (var k = 0; k < gapCues.length; k++) {
-        var cue = gapCues[k];
-        var lineNo = a + k;
-        if (lines[k] != null && lines[k] !== "") {
-          units.push({
-            srcStart: lineNo,
-            srcEnd: lineNo,
-            originalText: cue.content,
-            translation: lines[k],
-            startMs: cue.start,
-            endMs: cue.end,
-          });
-        } else {
-          stillMissing = true; // 该行没补出 → 仍缺，交重试
-        }
-      }
-    }
-
-    units.sort(function (x, y) {
-      return x.srcStart - y.srcStart;
-    });
+  function applyClipLines(idx, clip, key, lines) {
     var backoff = getBackoff(idx);
-
-    if (units.length) {
-      state.clipSentences[idx] = units;
-      delete state.clipCache[idx];
-      rebuildRenderTimeline();
-      requestRender();
-    }
-
-    if (!stillMissing && units.length) {
-      // 全段已覆盖：done + 写缓存
+    if (lines && lines.length) {
+      state.clipUnits[idx] = Core.buildClipUnits(lines, clip.startMs, clip.endMs, clip.cues);
       state.clipState[idx] = "done";
       backoff.reset();
-      writeCache(key, { sent: units });
+      writeCache(key, { lines: lines });
+      rebuildRenderTimeline();
+      requestRender();
     } else {
-      // 仍有缺口（或整段全废）→ error + 退避，后台调度器到点重翻补齐（第2层）
-      console.warn("[dualsub] clip", idx, "句级部分覆盖，仍有缺口 → 退避重试补齐");
+      // 模型空响应：无译文 → 退避重试（不写缓存，避免把空结果固化）。
+      console.warn("[dualsub] clip", idx, "模型空响应（无字幕行）→ 退避重试");
+      delete state.clipUnits[idx];
       state.clipState[idx] = "error";
       backoff.fail();
+      rebuildRenderTimeline();
+      requestRender();
       ensureRetryScheduler();
     }
   }
@@ -555,7 +485,7 @@
       }
       anyError = true;
       if (backoff.shouldTry() && !state.clipInflight[idx]) {
-        translateClip(idx, 0); // 异步，不 await；重入由 clipInflight 互斥
+        translateClip(idx); // 异步，不 await；重入由 clipInflight 互斥
       }
     }
     if (!anyError) stopRetryScheduler(); // 没有可重试的 error clip → 停循环省 CPU
@@ -574,64 +504,41 @@
   }
 
   /**
-   * 重建全局渲染时间轴 state.renderUnits（句级优先、逐行兜底）。
+   * 重建全局渲染时间轴 state.renderUnits（v0.4.0：clip 渲染单元优先、原文兜底）。
    * 按 clip 顺序遍历，每个 clip：
-   *  - 有句级重断结果(clipSentences[idx]) → 直接用其句单元（含合并后时间区间 + 完整原文 + 译文）；
-   *  - 否则退回逐行：每条 cue 一个单元，译文取 clipCache（可能为空=未翻/翻译中）。
-   * 产出按 start 升序的单元数组，渲染 tick 用 findCueIndexAt 在其上二分查当前句。
-   * 每个单元：{ start, end, originalText, translation }（与 cue 同构 start/end，便于复用查找）。
+   *  - 已翻好(clipUnits[idx]) → 直接用其渲染单元（buildClipUnits 已配好时间轴 + 就近归并原文 + 译文）；
+   *  - 未翻好 → 逐条 cue 铺一个单元，原文用 cue.content、译文留空（未到时显原文 / 转「翻译中…」）。
+   * 产出按 start 升序的单元数组，渲染 tick 用 findCueIndexAt 在其上二分查当前行。
+   * 每个单元：{ start, end, originalText, translation, clipIdx }。
    */
   function rebuildRenderTimeline() {
     var units = [];
-    // 长句分段配置（按目标语可读长度 + 时长把长句切成多段分屏滚动；切点只落标点）。
-    var segOpts = {
-      maxCharsPerScreen: config.maxCharsPerScreen,
-      maxDurPerScreen: config.maxDurPerScreen,
-    };
-    // 把一个句单元经 segmentSentenceUnit 展开成 1..N 个渲染单元后 push（保留 clipIdx）。
-    function pushSegmented(unit, clipIdx) {
-      var segs = Core.segmentSentenceUnit(unit, segOpts);
-      for (var q = 0; q < segs.length; q++) {
-        units.push({
-          start: segs[q].startMs,
-          end: segs[q].endMs,
-          originalText: segs[q].originalText,
-          translation: segs[q].translation != null && segs[q].translation !== "" ? segs[q].translation : null,
-          clipIdx: clipIdx,
-        });
-      }
-    }
     for (var ci = 0; ci < state.clips.length; ci++) {
-      var sents = state.clipSentences[ci];
-      if (sents && sents.length) {
-        for (var s = 0; s < sents.length; s++) {
-          pushSegmented(
-            {
-              startMs: sents[s].startMs,
-              endMs: sents[s].endMs,
-              originalText: sents[s].originalText,
-              translation: sents[s].translation != null ? sents[s].translation : "",
-            },
-            ci
-          );
+      var clipUnits = state.clipUnits[ci];
+      if (clipUnits && clipUnits.length) {
+        for (var s = 0; s < clipUnits.length; s++) {
+          var u = clipUnits[s];
+          units.push({
+            start: u.startMs,
+            end: u.endMs,
+            originalText: u.originalText,
+            translation: u.translation != null && u.translation !== "" ? u.translation : null,
+            clipIdx: ci,
+          });
         }
         continue;
       }
-      // 逐行兜底：clip 的每条 cue 一个单元，原文用 cue.content，译文取 clipCache。
-      // 短 cue 经 segmentSentenceUnit 会原样返回（安全），无需特判。
+      // 原文兜底：clip 的每条 cue 一个单元，原文用 cue.content，译文留空（未翻/翻译中/失败）。
       var clip = state.clips[ci];
-      var arr = state.clipCache[ci];
       for (var k = 0; k < clip.cues.length; k++) {
         var cue = clip.cues[k];
-        pushSegmented(
-          {
-            startMs: cue.start,
-            endMs: cue.end,
-            originalText: cue.content,
-            translation: arr && arr[k] != null ? arr[k] : "",
-          },
-          ci
-        );
+        units.push({
+          start: cue.start,
+          end: cue.end,
+          originalText: cue.content,
+          translation: null,
+          clipIdx: ci,
+        });
       }
     }
     state.renderUnits = units;
@@ -994,7 +901,7 @@
     }
     var ms = currentTimeMs();
 
-    // 二分 + 上次命中提示：在「句级合并后时间轴」(renderUnits)上查当前句，大多数相邻 tick O(1)
+    // 二分 + 上次命中提示：在渲染时间轴(renderUnits)上查当前行，大多数相邻 tick O(1)
     var unitIdx = Core.findCueIndexAt(state.renderUnits, ms, state.lastHitCueIdx);
 
     if (unitIdx === -1) {
@@ -1135,8 +1042,7 @@
         state.clipInflight = {};
         // model/语言变了，旧译文已不适用 → 丢内存缓存重翻（持久缓存按新 key 自然不命中）
         if (config.apiModel !== prevModel || config.targetLang !== prevTarget) {
-          state.clipCache = {};
-          state.clipSentences = {};
+          state.clipUnits = {};
           state.renderUnits = [];
           state.clipState = {};
         } else {
@@ -1156,8 +1062,7 @@
           var track = pickTrack(state.tracks, config.sourceLang);
           if (track) {
             state.activeTrack = track;
-            state.clipCache = {};
-            state.clipSentences = {};
+            state.clipUnits = {};
             state.renderUnits = [];
             state.clipState = {};
             state.clipBackoff = {};
@@ -1182,7 +1087,7 @@
     }
 
     if (msg.type === "export-srt") {
-      // popup 请求导出当前视频双语 SRT：返回已翻译的渲染单元（句级优先、逐行兜底）+ 元信息。
+      // popup 请求导出当前视频双语 SRT：返回已翻译的渲染单元（clip 渲染单元优先、原文兜底）+ 元信息。
       // 时间轴重建一次确保最新；renderUnits 内部用 start/end，转成 startMs/endMs 供 Core.buildSrt。
       rebuildRenderTimeline();
       var hasTrans = state.renderUnits.some(function (u) {
@@ -1226,13 +1131,14 @@
       return { ok: false, error: "请先填写 apiBaseUrl 和 apiModel" };
     }
     try {
-      var lines = await Core.translateBatch({
+      var lines = await Core.translateClipLines({
         cues: [{ content: "hello world" }],
         apiBaseUrl: cfg.apiBaseUrl,
         apiKey: cfg.apiKey,
         apiModel: cfg.apiModel,
         targetLang: cfg.targetLang || "zh-Hans",
         systemPrompt: cfg.systemPrompt,
+        reasoningEffort: cfg.reasoningEffort,
       });
       return { ok: true, sample: lines && lines[0] ? lines[0] : "(空响应)" };
     } catch (e) {

@@ -117,82 +117,6 @@ test("parseVtt 支持无小时位 mm:ss.mmm", () => {
   assert.strictEqual(cues[0].end, 65000);
 });
 
-/* ============ 3. 翻译行号对齐 ============ */
-console.log("\n[翻译：行号对齐 + 兜底]");
-
-test("buildNumberedBatch 生成带行号文本", () => {
-  const s = Core.buildNumberedBatch(["foo", "bar"]);
-  assert.strictEqual(s, "1. foo\n2. bar");
-});
-
-test("alignTranslations 正常对齐", () => {
-  const originals = ["line one", "line two", "line three"];
-  const model = "1. 第一行\n2. 第二行\n3. 第三行";
-  const out = Core.alignTranslations(originals, model);
-  assert.deepStrictEqual(out, ["第一行", "第二行", "第三行"]);
-});
-
-test("alignTranslations 行号缺失 → 该行留原文", () => {
-  const originals = ["a", "b", "c"];
-  const model = "1. AA\n3. CC"; // 缺第 2 行
-  const out = Core.alignTranslations(originals, model);
-  assert.deepStrictEqual(out, ["AA", "b", "CC"], "缺的行应保留原文");
-});
-
-test("alignTranslations 行数不匹配（模型多给）只取对应行号", () => {
-  const originals = ["a", "b"];
-  const model = "1. AA\n2. BB\n3. CC\n4. DD";
-  const out = Core.alignTranslations(originals, model);
-  assert.deepStrictEqual(out, ["AA", "BB"], "多出的行号忽略");
-});
-
-test("alignTranslations 行号错位（乱序）仍按号对齐", () => {
-  const originals = ["a", "b", "c"];
-  const model = "3. CC\n1. AA\n2. BB";
-  const out = Core.alignTranslations(originals, model);
-  assert.deepStrictEqual(out, ["AA", "BB", "CC"]);
-});
-
-test("alignTranslations 容忍多种行号写法", () => {
-  const originals = ["a", "b", "c"];
-  const model = "1、甲\n2) 乙\n3 - 丙";
-  const out = Core.alignTranslations(originals, model);
-  assert.deepStrictEqual(out, ["甲", "乙", "丙"]);
-});
-
-test("alignTranslations 无行号 → 按顺序对齐兜底", () => {
-  const originals = ["a", "b", "c"];
-  const model = "甲\n乙\n丙";
-  const out = Core.alignTranslations(originals, model);
-  assert.deepStrictEqual(out, ["甲", "乙", "丙"]);
-});
-
-test("alignTranslations 无行号且行数不足 → 缺的留原文", () => {
-  const originals = ["a", "b", "c"];
-  const model = "甲\n乙";
-  const out = Core.alignTranslations(originals, model);
-  assert.deepStrictEqual(out, ["甲", "乙", "c"]);
-});
-
-test("alignTranslations 语序自由/措辞改写（长度差异大）仍按行号就位（P0-b）", () => {
-  // 放宽语序后模型会为自然度大幅改写、调整行内语序，译文长度与原文差异很大；
-  // 只要行号顺序正确、行数一致，对齐结果仍每行精确就位（不破坏时间轴对齐）。
-  const originals = [
-    "so the thing about transformers",
-    "is that they use attention",
-    "to look at the whole sequence at once",
-  ];
-  const model =
-    "1. 关于 Transformer 这个东西呢\n" +
-    "2. 它的精髓在于用上了注意力机制\n" +
-    "3. 一次性地纵观整个序列，而不是逐个去看";
-  const out = Core.alignTranslations(originals, model);
-  assert.strictEqual(out.length, 3, "行数与输入一致");
-  assert.strictEqual(out[0], "关于 Transformer 这个东西呢");
-  assert.strictEqual(out[1], "它的精髓在于用上了注意力机制");
-  assert.strictEqual(out[2], "一次性地纵观整个序列，而不是逐个去看");
-});
-
 /* ============ 4. clip 切分 ============ */
 console.log("\n[clip 切分]");
 
@@ -409,186 +333,6 @@ test("tailTrim：tailTrimMs=0 完全关闭，与旧行为一致(end 不回缩)",
   assert.strictEqual(seg[1].start - seg[0].end, 0, "仍首尾相接(旧行为)");
 });
 
-/* ============ 5b-3. segmentSentenceUnit：长句智能分段 ============ */
-console.log("\n[segmentSentenceUnit：长句按标点分屏]");
-
-test("segment：长译文(>maxChars)切成 N>=2 段，每段不以半个词/数字结尾(切点在标点)", () => {
-  const unit = {
-    startMs: 0,
-    endMs: 6000,
-    originalText: "so Transformer architecture changed everything, and then attention became all you need.",
-    translation: "所以 Transformer 架构改变了一切，注意力机制成了关键，后来一切都围绕它展开，这就是全部要点。",
-  };
-  const out = Core.segmentSentenceUnit(unit, { maxCharsPerScreen: 20, maxDurPerScreen: 4000 });
-  assert.ok(out.length >= 2, "长译文应被切成多段，实际 " + out.length);
-  // 硬上限：每段译文长度 <= maxCharsPerScreen（标点是优选切点，超长片段在内部按可读边界硬切）
-  for (const u of out) {
-    assert.ok(u.translation.length <= 20, "每段必须 <= 单屏上限20，实际 " + u.translation.length + ": " + u.translation);
-  }
-  // 绝不切断 "Transformer"：不应有任何段把这个词拦腰斩开
-  const joined = out.map((u) => u.translation).join("");
-  assert.ok(joined.indexOf("Transformer") !== -1, "Transformer 应完整保留，不被斩断");
-  for (const u of out) {
-    assert.ok(!/Transforme$/.test(u.translation) && !/^r[^a-zA-Z]/.test(u.translation), "不应把 Transformer 拦腰斩断");
-  }
-});
-
-test("segment：时间轴单调不重叠、首屏贴语音、末屏不超原区间（允许句间留白）", () => {
-  const unit = {
-    startMs: 1000,
-    endMs: 7000,
-    originalText: "one two three. four five six. seven eight nine.",
-    translation: "第一句话在这里结束。第二句话也到这里。第三句话同样收尾完成。",
-  };
-  const out = Core.segmentSentenceUnit(unit, { maxCharsPerScreen: 10, maxDurPerScreen: 3000 });
-  assert.ok(out.length >= 2);
-  // 缺陷5「句间留白」：每屏终点提前到 起点+idealMs，剩余时间留白；故末屏 end 可早于原 end，段间可有 gap。
-  assert.strictEqual(out[0].startMs, 1000, "首屏 start = 原 start（贴语音）");
-  assert.ok(out[out.length - 1].endMs <= 7000, "末屏 end 不超过原 end（允许留白早于）");
-  for (let i = 0; i < out.length; i++) {
-    assert.ok(out[i].endMs >= out[i].startMs, "每段 end >= start");
-    if (i > 0) {
-      // 单调不重叠（允许 gap，不再要求 start === 上段 end）
-      assert.ok(out[i].startMs >= out[i - 1].endMs, "段间单调不重叠（允许句间留白）");
-      assert.ok(out[i].startMs >= out[i - 1].startMs, "起点单调不回退");
-    }
-  }
-});
-
-test("segment：各段译文拼回无丢字", () => {
-  const trans = "所以 Transformer 架构改变了一切，注意力机制成了关键，后来一切都围绕它展开，这就是全部要点。";
-  const unit = { startMs: 0, endMs: 6000, originalText: "x.", translation: trans };
-  const out = Core.segmentSentenceUnit(unit, { maxCharsPerScreen: 20, maxDurPerScreen: 4000 });
-  // 硬切重组时 CJK↔拉丁间空格可能规整化（不影响可读性），按「去空格」校验不丢任何字符。
-  const joined = out.map((u) => u.translation).join("").replace(/\s+/g, "");
-  const expect = Core.collapseWhitespace(trans).replace(/\s+/g, "");
-  assert.strictEqual(joined, expect, "拼接译文应等于原译文（去空格无丢字）");
-});
-
-test("segment：短译文(<=maxChars 且时长够短)原样返回 [unit]（N=1）", () => {
-  const unit = { startMs: 0, endMs: 2000, originalText: "short.", translation: "很短的一句话。" };
-  const out = Core.segmentSentenceUnit(unit, { maxCharsPerScreen: 20, maxDurPerScreen: 4000 });
-  assert.strictEqual(out.length, 1, "短句不分段");
-  assert.strictEqual(out[0].translation, "很短的一句话。");
-  assert.strictEqual(out[0].startMs, 0);
-  assert.strictEqual(out[0].endMs, 2000);
-});
-
-test("segment：maxCharsPerScreen 极大 = 关闭分段(向后兼容)", () => {
-  const unit = {
-    startMs: 0,
-    endMs: 3000, // 时长够短，避免被时长维度触发
-    originalText: "a long original text here.",
-    translation: "这是一段很长很长的译文，包含很多很多字符，本来应该被切分成好几段。",
-  };
-  const out = Core.segmentSentenceUnit(unit, { maxCharsPerScreen: 99999, maxDurPerScreen: 4000 });
-  assert.strictEqual(out.length, 1, "极大 maxChars 应关闭分段");
-});
-
-test("segment：无句中标点的长译文也按硬上限切（CJK 按字断），每段 <= cap", () => {
-  // 中文口语 ASR 翻译常无句中标点；旧实现整段不切 → 字幕墙。修复后必须切。
-  const unit = {
-    startMs: 0,
-    endMs: 6000,
-    originalText: "nopunct",
-    translation: "这是一段完全没有任何标点符号的超长中文译文本来很想被切开但是没有切点",
-  };
-  const out = Core.segmentSentenceUnit(unit, { maxCharsPerScreen: 10, maxDurPerScreen: 4000 });
-  assert.ok(out.length >= 2, "无标点长句必须被切开，实际 " + out.length);
-  for (const u of out) {
-    assert.ok(u.translation.length <= 10, "每段 <= cap(10)，实际 " + u.translation.length);
-  }
-  const joined = out.map((u) => u.translation).join("");
-  assert.strictEqual(joined, unit.translation, "拼回无丢字");
-});
-
-test("segment：回归——第一句不再过长（标点稀疏时第一段也 <= cap）", () => {
-  // Jay 报的 bug：调整字幕节奏后第一句过长。根因是旧实现只按标点聚组，
-  // 单个长标点片段（逗号前 30+ 字）整块塞进第一段，远超单屏上限。
-  const unit = {
-    startMs: 0,
-    endMs: 5400,
-    originalText: "this is the very first sentence and it is way too long for one screen.",
-    translation: "而这是你需要理解的关于这些模型在实际中究竟如何运作的第一件最重要的事情，记住它",
-  };
-  const out = Core.segmentSentenceUnit(unit, { maxCharsPerScreen: 20, maxDurPerScreen: 4000 });
-  assert.ok(out.length >= 2, "应被切分");
-  assert.ok(out[0].translation.length <= 20, "第一段不得超上限20，实际 " + out[0].translation.length + ": " + out[0].translation);
-  for (const u of out) {
-    assert.ok(u.translation.length <= 20, "所有段 <= 20，实际 " + u.translation.length);
-  }
-});
-
-test("segment：小数/版本号不被斩断（1.8 / v2.0 保持完整）", () => {
-  const unit = {
-    startMs: 0,
-    endMs: 5000,
-    originalText: "GPT4 has 1.8 trillion params.",
-    translation: "GPT4有1.8万亿参数据说是这样训练出来的一个超大规模的语言模型系统",
-  };
-  const out = Core.segmentSentenceUnit(unit, { maxCharsPerScreen: 20, maxDurPerScreen: 4000 });
-  for (const u of out) {
-    assert.ok(u.translation.length <= 20, "每段 <= 20");
-    assert.ok(!/1\.$/.test(u.translation) && !/^8/.test(u.translation), "不应把 1.8 斩成 1. / 8");
-  }
-  const joined = out.map((u) => u.translation).join("");
-  assert.ok(joined.indexOf("1.8") !== -1, "1.8 应完整保留");
-});
-
-test("segment：原文分段——每段 originalText 非空(无句中标点也对齐)", () => {
-  // 缺陷1：英文 ASR 几乎无句中标点，旧实现把整句原文塞进第 0 段、后段 originalText 全空。
-  // 修复后原文按原子占比均分到每段，每段都带对应原文片段。
-  const unit = {
-    startMs: 0,
-    endMs: 6000,
-    originalText: "so transformer architecture is the foundation of all modern large language models today",
-    translation: "所以说Transformer架构其实是所有现代大语言模型最核心的底层基础技术框架支撑啊",
-  };
-  const out = Core.segmentSentenceUnit(unit, { maxCharsPerScreen: 20, maxDurPerScreen: 4000 });
-  assert.ok(out.length >= 2, "应被切成多段，实际 " + out.length);
-  for (const u of out) {
-    assert.ok(u.translation.length <= 20, "每段译文 <= 20，实际 " + u.translation.length);
-    assert.ok(u.originalText && u.originalText.length > 0, "每段 originalText 必须非空: " + JSON.stringify(out.map((x) => x.originalText)));
-  }
-  // 原文拼回（去空格）无丢字
-  const joinedOrig = out.map((u) => u.originalText).join("").replace(/\s+/g, "");
-  const expectOrig = Core.collapseWhitespace(unit.originalText).replace(/\s+/g, "");
-  assert.strictEqual(joinedOrig, expectOrig, "原文拼回（去空格）应无丢字");
-});
-
-test("segment：短句不被时长维度切碎成单字(每段≥最小段长)", () => {
-  // 缺陷2：8 字短译文因 12 秒被时长维度切成 嗯对就/是这样/吧(末段1字)闪烁。
-  // 修复后时长维度有 segMinChars / SEG_MIN_VISIBLE_MS 下限保护，短句宁可静止显示。
-  const unit = { startMs: 0, endMs: 12000, originalText: "um yeah right ok", translation: "嗯对就是这样吧" };
-  const out = Core.segmentSentenceUnit(unit, { maxCharsPerScreen: 20, maxDurPerScreen: 4000 });
-  const minChars = Math.max(2, Math.ceil(20 / 4)); // segMinChars(20) = 5
-  for (const u of out) {
-    assert.ok(u.translation.length >= minChars || out.length === 1, "每段译文应 >= 最小段长 " + minChars + "，实际 " + u.translation.length + ": " + u.translation);
-  }
-  // 拼回无丢字（即便不切也成立）
-  const joined = out.map((u) => u.translation).join("");
-  assert.strictEqual(joined, unit.translation, "拼回无丢字");
-});
-
-test("segment：超长不可分原子按 cap 硬截，每段≤cap", () => {
-  // 缺陷3：42 字连写 URL 单独成段远超 cap=10；旧实现静默突破上限。
-  // 修复后实在切不动的超长原子在内部按 cap 硬截，保证每段 <= cap（无例外）。
-  const unit = {
-    startMs: 0,
-    endMs: 6000,
-    originalText: "see link",
-    translation: "请访问thisisaveryveryverylongurlwithoutanyspaces看看",
-  };
-  const out = Core.segmentSentenceUnit(unit, { maxCharsPerScreen: 10, maxDurPerScreen: 4000 });
-  assert.ok(out.length >= 2, "应被切成多段");
-  for (const u of out) {
-    assert.ok(u.translation.length <= 10, "每段必须 <= cap(10)，实际 " + u.translation.length + ": " + u.translation);
-  }
-  // 译文拼回无丢字
-  const joined = out.map((u) => u.translation).join("");
-  assert.strictEqual(joined, unit.translation, "译文拼回无丢字");
-});
-
 /* ============ 5c. sliceClipsByCue：按 cue 边界切 ============ */
 console.log("\n[sliceClipsByCue：cue 边界、不重叠]");
 
@@ -794,25 +538,26 @@ test("importConfig 坏 JSON / 空对象报错", () => {
   assert.strictEqual(Core.importConfig("{}").ok, false, "无可识别字段应失败");
 });
 
-/* ============ 5j. 升级后的 system prompt（P0-a：加料换质量）============ */
-console.log("\n[system prompt 升级校验]");
+/* ============ 5j. DEFAULT_SYSTEM_PROMPT：v0.4.0「一步到位分行」契约 ============ */
+console.log("\n[system prompt v0.4.0 分行契约校验]");
 
-test("DEFAULT_SYSTEM_PROMPT 升级：覆盖口语/连贯/语序自由/术语 + 保留硬约束", () => {
+test("DEFAULT_SYSTEM_PROMPT v0.4.0：中文一步到位分行规则（不切词/8-16字/去行尾标点/只输出中文行/无行号）", () => {
   const filled = Core.buildSystemPrompt("zh-Hans");
-  // 有意加回固定开销换质量：比瘦身版长很多（推翻 509→3 句的省 token 决策）
-  assert.ok(filled.length > 400, "升级后应是有料的长 prompt，实际 " + filled.length);
-  // 质量引导关键词
-  assert.ok(/natural|fluent|colloquial/i.test(filled), "应含口语/自然引导");
-  assert.ok(/context/i.test(filled), "应含结合上下文");
-  assert.ok(/reorder|rephrase/i.test(filled), "应含行内语序自由");
-  assert.ok(/proper noun|term/i.test(filled), "应含术语/专名约束");
-  // 硬约束（不能破坏逐行对齐）
-  assert.ok(/line number/i.test(filled), "应保留行号硬约束");
-  assert.ok(/same number|identical/i.test(filled), "应要求行号/行数一致");
-  assert.ok(/only/i.test(filled), "应要求只输出译文");
-  // 目标语言占位符被替换
-  assert.ok(/zh-Hans/.test(filled), "应替换目标语言");
-  assert.ok(!/\{TARGET_LANG\}/.test(filled), "占位符应被全部替换");
+  // v0.4.0 契约：模型直接吐「自然分行的中文字幕行」，代码不再逐行对齐/切割。
+  // 规则1：在语义/短语边界断行，绝不把词切成两半（切词 bug 的根治）。
+  assert.ok(/不把一个词语切成两半|绝不.*切成两半/.test(filled), "应含「不切词」规则");
+  // 规则2：每行 8-16 汉字，不要过分短碎。
+  assert.ok(/8-16|8\s*-\s*16/.test(filled), "应含每行 8-16 汉字的长度规则");
+  // 规则3：去掉每行行尾的逗号/句号。
+  assert.ok(/行尾/.test(filled) && /(逗号|句号)/.test(filled), "应含去行尾标点规则");
+  // 规则4：只输出中文字幕行、每行一条、不要行号/英文/解释。
+  assert.ok(/只输出中文/.test(filled), "应要求只输出中文字幕行");
+  assert.ok(/不要行号|不.*行号/.test(filled), "应明确不要行号（新契约与旧逐行对齐相反）");
+  // 反契约断言：v0.4.0 不再是旧的逐行对齐 prompt（不得含 line number / same number / identical）。
+  assert.ok(!/line number/i.test(filled), "v0.4.0 不应再含旧的英文 line number 逐行对齐约束");
+  assert.ok(!/same number|identical/i.test(filled), "v0.4.0 不应再要求行号/行数逐行一致");
+  // 目标语言占位符：默认中文 prompt 无占位符（替换为 no-op），不应残留 {TARGET_LANG}。
+  assert.ok(!/\{TARGET_LANG\}/.test(filled), "占位符应被全部替换（默认中文 prompt 无占位符）");
 });
 
 test("自定义 systemPrompt 仍覆盖默认（现有逻辑不变）", () => {
@@ -1044,681 +789,6 @@ test("importConfig 空 fontFamily 字段保留为空串（默认族）", () => {
 
 /* ============ 6. translateBatch（mock fetch 跑通整链路）============ */
 async function main() {
-  console.log("\n[translateBatch：注入 mock fetch]");
-
-  await asyncTest("translateBatch 正常：构造请求 + 解析 + 对齐", async () => {
-    let capturedUrl = null;
-    let capturedBody = null;
-    const mockFetch = async (url, opts) => {
-      capturedUrl = url;
-      capturedBody = JSON.parse(opts.body);
-      return {
-        ok: true,
-        status: 200,
-        async json() {
-          return { choices: [{ message: { content: "1. 你好\n2. 世界" } }] };
-        },
-        async text() {
-          return "";
-        },
-      };
-    };
-    const out = await Core.translateBatch({
-      cues: [{ content: "hello" }, { content: "world" }],
-      apiBaseUrl: "https://gw.example/v1",
-      apiKey: "sk-test",
-      apiModel: "gpt-4o-mini",
-      targetLang: "zh-Hans",
-      fetchImpl: mockFetch,
-    });
-    assert.deepStrictEqual(out, ["你好", "世界"]);
-    assert.strictEqual(capturedUrl, "https://gw.example/v1/chat/completions");
-    assert.strictEqual(capturedBody.model, "gpt-4o-mini");
-    assert.strictEqual(capturedBody.temperature, 0.3);
-    assert.strictEqual(capturedBody.messages.length, 2);
-    assert.strictEqual(capturedBody.messages[0].role, "system");
-    assert.ok(/zh-Hans/.test(capturedBody.messages[0].content), "system prompt 含目标语言");
-    assert.ok(/1\. hello/.test(capturedBody.messages[1].content), "user 含带行号原文");
-  });
-
-  await asyncTest("translateBatch 行数不匹配 → 缺的留原文", async () => {
-    const mockFetch = async () => ({
-      ok: true,
-      status: 200,
-      async json() {
-        return { choices: [{ message: { content: "1. 你好" } }] };
-      },
-      async text() {
-        return "";
-      },
-    });
-    const out = await Core.translateBatch({
-      cues: [{ content: "hello" }, { content: "world" }],
-      apiBaseUrl: "https://gw/v1",
-      apiModel: "m",
-      fetchImpl: mockFetch,
-    });
-    assert.deepStrictEqual(out, ["你好", "world"]);
-  });
-
-  await asyncTest("translateBatch HTTP 非 200 → 抛错（调用方兜底原文）", async () => {
-    const mockFetch = async () => ({
-      ok: false,
-      status: 429,
-      async json() {
-        return {};
-      },
-      async text() {
-        return "rate limited";
-      },
-    });
-    let threw = false;
-    try {
-      await Core.translateBatch({
-        cues: [{ content: "hello" }],
-        apiBaseUrl: "https://gw/v1",
-        apiModel: "m",
-        fetchImpl: mockFetch,
-      });
-    } catch (e) {
-      threw = true;
-      assert.ok(/429/.test(e.message), "错误信息应含状态码");
-    }
-    assert.ok(threw, "非 200 应抛错");
-  });
-
-  await asyncTest("translateBatch 带 contextTail 时 user message 含上下文标记", async () => {
-    let body = null;
-    const mockFetch = async (url, opts) => {
-      body = JSON.parse(opts.body);
-      return {
-        ok: true,
-        status: 200,
-        async json() {
-          return { choices: [{ message: { content: "1. 译文" } }] };
-        },
-        async text() {
-          return "";
-        },
-      };
-    };
-    await Core.translateBatch({
-      cues: [{ content: "next sentence" }],
-      apiBaseUrl: "https://gw/v1",
-      apiModel: "m",
-      contextTail: ["previous sentence"],
-      fetchImpl: mockFetch,
-    });
-    const userMsg = body.messages[1].content;
-    assert.ok(/context/i.test(userMsg), "应含 context 标记");
-    assert.ok(/previous sentence/.test(userMsg), "应含上一批上下文");
-    assert.ok(/1\. next sentence/.test(userMsg), "应含本批带行号原文");
-  });
-
-  await asyncTest("translateBatch 空 cues 返回空数组", async () => {
-    const out = await Core.translateBatch({ cues: [], apiBaseUrl: "x", apiModel: "m" });
-    assert.deepStrictEqual(out, []);
-  });
-
-  await asyncTest("translateBatch 超时（AbortController）→ 抛超时错误", async () => {
-    // mock fetch 尊重 signal：触发 abort 时 reject 一个 AbortError
-    const mockFetch = (url, opts) =>
-      new Promise((resolve, reject) => {
-        const t = setTimeout(() => {
-          resolve({
-            ok: true,
-            status: 200,
-            async json() {
-              return { choices: [{ message: { content: "1. 慢" } }] };
-            },
-            async text() {
-              return "";
-            },
-          });
-        }, 200); // 200ms 后才返回，但超时设 30ms
-        if (opts && opts.signal) {
-          opts.signal.addEventListener("abort", () => {
-            clearTimeout(t);
-            const e = new Error("aborted");
-            e.name = "AbortError";
-            reject(e);
-          });
-        }
-      });
-    let threw = false;
-    try {
-      await Core.translateBatch({
-        cues: [{ content: "slow" }],
-        apiBaseUrl: "https://gw/v1",
-        apiModel: "m",
-        timeoutMs: 30,
-        fetchImpl: mockFetch,
-      });
-    } catch (e) {
-      threw = true;
-      assert.ok(/timeout/i.test(e.message), "应是超时错误，实际：" + e.message);
-    }
-    assert.ok(threw, "超时应抛错由调用方兜底");
-  });
-
-  await asyncTest("translateBatch timeoutMs<=0 关闭超时，正常返回", async () => {
-    const mockFetch = async () => ({
-      ok: true,
-      status: 200,
-      async json() {
-        return { choices: [{ message: { content: "1. 好" } }] };
-      },
-      async text() {
-        return "";
-      },
-    });
-    const out = await Core.translateBatch({
-      cues: [{ content: "ok" }],
-      apiBaseUrl: "https://gw/v1",
-      apiModel: "m",
-      timeoutMs: 0,
-      fetchImpl: mockFetch,
-    });
-    assert.deepStrictEqual(out, ["好"]);
-  });
-
-  /* ============ 6b. translateCues：首句优先 + 并发编排 ============ */
-  console.log("\n[translateCues：首句优先 + 批内并发 + 增量回调]");
-
-  test("planBatches 首句优先批排最前、其余补满不重叠", () => {
-    const cues = Array.from({ length: 12 }, (_, i) => ({ content: "c" + i }));
-    const batches = Core.planBatches(cues, { batchSize: 5, priorityIndex: 7, priorityLines: 3 });
-    const pri = batches.find((b) => b.priority);
-    assert.ok(pri, "应有优先批");
-    assert.strictEqual(pri.start, 7);
-    assert.strictEqual(pri.end, 10, "优先批覆盖 7..10");
-    // 全部 cue 恰好被覆盖一次（不重叠不遗漏）
-    const covered = new Array(12).fill(0);
-    batches.forEach((b) => {
-      for (let i = b.start; i < b.end; i++) covered[i]++;
-    });
-    assert.ok(covered.every((c) => c === 1), "每个 cue 恰好被一个批覆盖");
-  });
-
-  await asyncTest("translateCues 并发翻译并按行号正确对齐回 cue", async () => {
-    const cues = Array.from({ length: 12 }, (_, i) => ({ content: "line" + i }));
-    let calls = 0;
-    const mockFetch = async (url, opts) => {
-      calls++;
-      const body = JSON.parse(opts.body);
-      // 回显：把 user 里的带行号原文转成 "n. T<原文>"
-      const userLines = body.messages[1].content.split("\n").filter((l) => /^\d+\./.test(l));
-      const content = userLines
-        .map((l) => {
-          const m = l.match(/^(\d+)\.\s*(.*)$/);
-          return m[1] + ". T" + m[2];
-        })
-        .join("\n");
-      return { ok: true, status: 200, async json() { return { choices: [{ message: { content } }] }; }, async text() { return ""; } };
-    };
-    const out = await Core.translateCues({
-      cues,
-      apiBaseUrl: "https://gw/v1",
-      apiModel: "m",
-      targetLang: "zh-Hans",
-      batchSize: 5,
-      concurrency: 3,
-      fetchImpl: mockFetch,
-    });
-    assert.strictEqual(out.length, 12);
-    for (let i = 0; i < 12; i++) {
-      assert.strictEqual(out[i], "Tline" + i, "第 " + i + " 行应正确对齐");
-    }
-    assert.ok(calls >= 3, "应分多批（并发）调用");
-  });
-
-  await asyncTest("translateCues contextLines=3：每批带前 3 条原文作上下文，编号区只含本批（P1-a）", async () => {
-    // 18 条 cue，batchSize=6，单并发(顺序)便于稳定断言。非首批应带前 3 条原文作 context。
-    const cues = Array.from({ length: 18 }, (_, i) => ({ content: "src" + i }));
-    const captured = []; // 每次 fetch 的 user message
-    const mockFetch = async (url, opts) => {
-      const body = JSON.parse(opts.body);
-      const userMsg = body.messages[1].content;
-      captured.push(userMsg);
-      const userLines = userMsg.split("\n").filter((l) => /^\d+\.\s/.test(l));
-      const content = userLines
-        .map((l) => {
-          const m = l.match(/^(\d+)\.\s*(.*)$/);
-          return m[1] + ". T" + m[2];
-        })
-        .join("\n");
-      return { ok: true, status: 200, async json() { return { choices: [{ message: { content } }] }; }, async text() { return ""; } };
-    };
-    const out = await Core.translateCues({
-      cues,
-      apiBaseUrl: "https://gw/v1",
-      apiModel: "m",
-      targetLang: "zh-Hans",
-      batchSize: 6,
-      contextLines: 3,
-      concurrency: 1, // 串行：批顺序稳定，便于断言
-      fetchImpl: mockFetch,
-    });
-    // 对齐结果仍每行就位、行数 == 输入数
-    assert.strictEqual(out.length, 18);
-    for (let i = 0; i < 18; i++) assert.strictEqual(out[i], "Tsrc" + i, "第 " + i + " 行对齐");
-
-    // 找到「第二批(start=6)」对应的 user message：它编号区第一行是 "1. src6"
-    const secondBatchMsg = captured.find((m) => /(^|\n)1\. src6(\n|$)/.test(m));
-    assert.ok(secondBatchMsg, "应能定位到第二批的请求");
-    // 含 context 标记 + 前 3 条原文(src3,src4,src5)，且明确"不翻译"
-    assert.ok(/do NOT translate/i.test(secondBatchMsg), "应有不翻译的 context 前缀");
-    assert.ok(/src3[\s\S]*src4[\s\S]*src5/.test(secondBatchMsg), "context 应是前 3 条原文 src3/4/5");
-    // context 行不进编号区：src3/4/5 不应带行号出现在编号块
-    assert.ok(!/\d+\.\s*src3\b/.test(secondBatchMsg), "context 行不计入编号");
-    // 编号区只含本批 6 条（行号 1..6），不多不少 → 对齐契约不被 context 污染
-    const numberedLines = secondBatchMsg.split("\n").filter((l) => /^\d+\.\s/.test(l));
-    assert.strictEqual(numberedLines.length, 6, "编号区行数 == 本批 cue 数(6)，不含 context");
-    assert.ok(/^1\. src6$/.test(numberedLines[0]), "编号区从本批首条开始(1. src6)");
-    assert.ok(/^6\. src11$/.test(numberedLines[5]), "编号区到本批末条(6. src11)");
-
-    // 首批(start=0)不应带 context（前面没有原文可借）
-    const firstBatchMsg = captured.find((m) => /(^|\n)1\. src0(\n|$)/.test(m));
-    assert.ok(firstBatchMsg, "应能定位首批请求");
-    assert.ok(!/do NOT translate/i.test(firstBatchMsg), "clip 首批不带 context");
-  });
-
-  await asyncTest("translateCues contextLines 未配置时退化为旧行为（仅句中断点带 1 句）", async () => {
-    // 不传 contextLines：上一条无句末标点 → 带 1 句；clip 首批不带。
-    const cues = [
-      { content: "this sentence keeps going" }, // 无句末标点
-      { content: "and finishes right here." },
-      { content: "brand new sentence." },
-    ];
-    const captured = [];
-    const mockFetch = async (url, opts) => {
-      const body = JSON.parse(opts.body);
-      captured.push(body.messages[1].content);
-      const userLines = body.messages[1].content.split("\n").filter((l) => /^\d+\.\s/.test(l));
-      const content = userLines.map((l) => l.match(/^(\d+)\./)[1] + ". ok").join("\n");
-      return { ok: true, status: 200, async json() { return { choices: [{ message: { content } }] }; }, async text() { return ""; } };
-    };
-    await Core.translateCues({
-      cues,
-      apiBaseUrl: "https://gw/v1",
-      apiModel: "m",
-      batchSize: 1, // 每条一批，凸显逐批 context 决策
-      concurrency: 1,
-      fetchImpl: mockFetch,
-    });
-    // 第二批(start=1)上一条"this sentence keeps going"无句末标点 → 带 1 句 context
-    const b2 = captured.find((m) => /(^|\n)1\. and finishes right here\.(\n|$)/.test(m));
-    assert.ok(b2 && /do NOT translate/i.test(b2), "句中断点应带 1 句 context");
-    assert.ok(/this sentence keeps going/.test(b2), "带的是上一条原文");
-    // 第三批(start=2)上一条"and finishes right here."有句末标点 → 不带 context
-    const b3 = captured.find((m) => /(^|\n)1\. brand new sentence\.(\n|$)/.test(m));
-    assert.ok(b3 && !/do NOT translate/i.test(b3), "自然句首不带 context");
-  });
-
-  await asyncTest("translateCues 首句优先批最先返回（onProgress 首回调含优先区）", async () => {
-    const cues = Array.from({ length: 12 }, (_, i) => ({ content: "x" + i }));
-    const mockFetch = async (url, opts) => {
-      const body = JSON.parse(opts.body);
-      const userLines = body.messages[1].content.split("\n").filter((l) => /^\d+\./.test(l));
-      // 大批故意慢返回，小的优先批快返回 → 验证优先批先完成
-      const delay = userLines.length > 3 ? 30 : 1;
-      await new Promise((r) => setTimeout(r, delay));
-      const content = userLines.map((l) => l.match(/^(\d+)\./)[1] + ". ok").join("\n");
-      return { ok: true, status: 200, async json() { return { choices: [{ message: { content } }] }; }, async text() { return ""; } };
-    };
-    let firstUpdateIndices = null;
-    await Core.translateCues({
-      cues,
-      apiBaseUrl: "https://gw/v1",
-      apiModel: "m",
-      batchSize: 5,
-      priorityIndex: 6,
-      priorityLines: 3,
-      concurrency: 3,
-      fetchImpl: mockFetch,
-      onProgress: (updates) => {
-        if (!firstUpdateIndices) firstUpdateIndices = updates.map((u) => u.index);
-      },
-    });
-    assert.ok(firstUpdateIndices, "应有 onProgress 回调");
-    assert.ok(firstUpdateIndices.indexOf(6) !== -1, "首个完成的批应是首句优先批(含 index 6)");
-  });
-
-  await asyncTest("translateCues 某批失败：失败批留空、其余成功、触发 onError", async () => {
-    const cues = Array.from({ length: 10 }, (_, i) => ({ content: "y" + i }));
-    let errored = 0;
-    const mockFetch = async (url, opts) => {
-      const body = JSON.parse(opts.body);
-      const userLines = body.messages[1].content.split("\n").filter((l) => /^\d+\./.test(l));
-      // 含 "y0" 的批（首批）失败，其余成功
-      if (/\by0\b/.test(body.messages[1].content)) {
-        return { ok: false, status: 500, async json() { return {}; }, async text() { return "boom"; } };
-      }
-      const content = userLines.map((l) => l.match(/^(\d+)\./)[1] + ". ok").join("\n");
-      return { ok: true, status: 200, async json() { return { choices: [{ message: { content } }] }; }, async text() { return ""; } };
-    };
-    const out = await Core.translateCues({
-      cues,
-      apiBaseUrl: "https://gw/v1",
-      apiModel: "m",
-      batchSize: 5,
-      concurrency: 2,
-      fetchImpl: mockFetch,
-      onError: () => errored++,
-    });
-    assert.strictEqual(out.length, 10);
-    assert.ok(errored >= 1, "失败批应触发 onError");
-    assert.strictEqual(out[0], undefined, "失败批对应行留空（调用方兜底原文）");
-    assert.strictEqual(out[5], "ok", "成功批仍正确填充");
-  });
-
-  /* ============ 句级语义重断（方案 A：句级对齐 + 覆盖性兜底） ============ */
-  console.log("\n[句级语义重断：parseSentenceResponse + alignSentences + translateSentences]");
-
-  // 6 条无标点 ASR 碎片样本，带时间轴，源行号 1..6
-  const SENT_CUES = [
-    { start: 0, end: 600, content: "so today we are gonna" },
-    { start: 600, end: 1200, content: "take a look at how" },
-    { start: 1250, end: 1800, content: "large language models work" },
-    { start: 2600, end: 3100, content: "they predict the next token" },
-    { start: 3150, end: 3700, content: "one step at a time" },
-    { start: 4600, end: 5200, content: "and that is basically it" },
-  ];
-
-  test("alignSentences 正常：3 句覆盖 [1-2][3-4][5-6]，时间区间=首行start→末行end", () => {
-    const model = [
-      "[1-2] ||| So today we are gonna take a look at how. ||| 那么今天我们来看看。",
-      "[3-4] ||| Large language models work, they predict the next token. ||| 大语言模型预测下一个 token。",
-      "[5-6] ||| One step at a time, and that is basically it. ||| 一次一步，基本就是这样。",
-    ].join("\n");
-    const r = Core.alignSentences(SENT_CUES, model);
-    assert.strictEqual(r.ok, true, "覆盖完整应 ok");
-    assert.strictEqual(r.sentences.length, 3);
-    // 时间轴：句 = [首源行.start, 末源行.end]
-    assert.deepStrictEqual([r.sentences[0].startMs, r.sentences[0].endMs], [0, 1200]);
-    assert.deepStrictEqual([r.sentences[1].startMs, r.sentences[1].endMs], [1250, 3100]);
-    assert.deepStrictEqual([r.sentences[2].startMs, r.sentences[2].endMs], [3150, 5200]);
-    assert.strictEqual(r.sentences[0].originalText, "So today we are gonna take a look at how.");
-    assert.strictEqual(r.sentences[2].translation, "一次一步，基本就是这样。");
-  });
-
-  test("alignSentences 时间轴：单行号句 [4] 区间=该 cue 的 start/end", () => {
-    const model = [
-      "[1-3] ||| A. ||| 甲。",
-      "[4] ||| B. ||| 乙。",
-      "[5-6] ||| C. ||| 丙。",
-    ].join("\n");
-    const r = Core.alignSentences(SENT_CUES, model);
-    assert.strictEqual(r.ok, true);
-    assert.deepStrictEqual([r.sentences[1].startMs, r.sentences[1].endMs], [2600, 3100], "第4行单行号句区间");
-  });
-
-  test("覆盖性兜底：漏掉第 5 行 → ok=false(gap)，调用方退回逐行", () => {
-    const model = "[1-3] ||| A ||| 甲\n[4] ||| B ||| 乙\n[6] ||| C ||| 丙"; // 缺 5
-    const r = Core.alignSentences(SENT_CUES, model);
-    assert.strictEqual(r.ok, false, "漏行应不通过覆盖性");
-    assert.strictEqual(r.reason, "gap");
-    assert.strictEqual(r.sentences.length, 0);
-  });
-
-  test("覆盖性兜底：范围重叠 [1-3][3-6] → ok=false(overlap)", () => {
-    const r = Core.alignSentences(SENT_CUES, "[1-3] ||| A ||| 甲\n[3-6] ||| B ||| 乙");
-    assert.strictEqual(r.ok, false);
-    assert.strictEqual(r.reason, "overlap");
-  });
-
-  test("覆盖性兜底：越界 [1-7] 超过输入行数 → ok=false(out-of-range)", () => {
-    const r = Core.alignSentences(SENT_CUES, "[1-7] ||| A ||| 甲");
-    assert.strictEqual(r.ok, false);
-    assert.strictEqual(r.reason, "out-of-range");
-  });
-
-  test("覆盖性兜底：末行未覆盖（只到 5）→ ok=false(uncovered)", () => {
-    const r = Core.alignSentences(SENT_CUES, "[1-3] ||| A ||| 甲\n[4-5] ||| B ||| 乙");
-    assert.strictEqual(r.ok, false);
-    assert.strictEqual(r.reason, "uncovered");
-  });
-
-  test("覆盖性兜底：解析为空（纯自由文本无 [范围]）→ ok=false(empty)", () => {
-    const r = Core.alignSentences(SENT_CUES, "这是一段没有任何行号范围的自由文本。");
-    assert.strictEqual(r.ok, false);
-    assert.strictEqual(r.reason, "empty");
-  });
-
-  test("parseSentenceResponse 容错：单行号 [3]、范围 [3-5]、多余空白都能解析", () => {
-    const txt = [
-      "  [ 3 - 5 ]   ||| Restored sentence.  |||   重组后的译文 ",
-      "[7]|||No spaces.|||无空格译文",
-      "[ 9 ] ||| trailing. ||| 末尾。   ",
-    ].join("\n");
-    const recs = Core.parseSentenceResponse(txt);
-    assert.strictEqual(recs.length, 3);
-    assert.deepStrictEqual([recs[0].srcStart, recs[0].srcEnd], [3, 5]);
-    assert.strictEqual(recs[0].originalText, "Restored sentence.");
-    assert.strictEqual(recs[0].translation, "重组后的译文");
-    assert.deepStrictEqual([recs[1].srcStart, recs[1].srcEnd], [7, 7], "单行号 srcStart=srcEnd");
-    assert.strictEqual(recs[2].translation, "末尾。");
-  });
-
-  test("parseSentenceResponse 跳过非法行：段数不足/无范围", () => {
-    const txt = [
-      "[1-2] ||| only two fields", // 缺第三段
-      "no bracket at all",
-      "[3] ||| ok ||| 好",
-    ].join("\n");
-    const recs = Core.parseSentenceResponse(txt);
-    assert.strictEqual(recs.length, 1, "只有合法一行");
-    assert.strictEqual(recs[0].srcStart, 3);
-  });
-
-  await asyncTest("translateSentences 正常：一次调用解析为句级时间轴(ok=true)", async () => {
-    let calls = 0;
-    const mockFetch = async (url, opts) => {
-      calls++;
-      const body = JSON.parse(opts.body);
-      // 校验：句级 user message 含带行号源碎片
-      assert.ok(/1\.\s+so today/.test(body.messages[1].content), "user 含编号源行");
-      const content = [
-        "[1-3] ||| So today we take a look at how large language models work. ||| 今天我们看看大语言模型怎么工作。",
-        "[4-6] ||| They predict the next token one step at a time, and that is basically it. ||| 它们一次预测一个 token，基本就这样。",
-      ].join("\n");
-      return { ok: true, status: 200, async json() { return { choices: [{ message: { content } }] }; }, async text() { return ""; } };
-    };
-    const r = await Core.translateSentences({
-      cues: SENT_CUES,
-      apiBaseUrl: "https://gw/v1",
-      apiModel: "m",
-      targetLang: "zh-Hans",
-      fetchImpl: mockFetch,
-    });
-    assert.strictEqual(calls, 1, "句级重断只一次调用");
-    assert.strictEqual(r.ok, true);
-    assert.strictEqual(r.sentences.length, 2);
-    assert.deepStrictEqual([r.sentences[0].startMs, r.sentences[0].endMs], [0, 1800]);
-    assert.deepStrictEqual([r.sentences[1].startMs, r.sentences[1].endMs], [2600, 5200]);
-  });
-
-  await asyncTest("translateSentences 覆盖性不过：返回 ok=false 让调用方退回逐行", async () => {
-    const mockFetch = async () => {
-      const content = "[1-3] ||| A ||| 甲\n[5-6] ||| B ||| 乙"; // 漏第 4 行
-      return { ok: true, status: 200, async json() { return { choices: [{ message: { content } }] }; }, async text() { return ""; } };
-    };
-    const r = await Core.translateSentences({
-      cues: SENT_CUES, apiBaseUrl: "https://gw/v1", apiModel: "m", targetLang: "zh-Hans", fetchImpl: mockFetch,
-    });
-    assert.strictEqual(r.ok, false, "漏行 → 不通过，调用方应退回逐行 fallback");
-    assert.strictEqual(r.sentences.length, 0);
-  });
-
-  test("句级 system prompt 含范围协议 + 目标语言填充 + 自定义覆盖", () => {
-    const sys = Core.buildSentenceSystemPrompt("zh-Hans");
-    assert.ok(/\|\|\|/.test(sys), "应说明 ||| 分隔协议");
-    assert.ok(/startLine-endLine/.test(sys), "应说明行号范围协议");
-    assert.ok(/zh-Hans/.test(sys) && !/\{TARGET_LANG\}/.test(sys), "目标语言已填充");
-    assert.strictEqual(Core.buildSentenceSystemPrompt("zh-Hans", "MY {TARGET_LANG}"), "MY zh-Hans", "自定义覆盖默认");
-  });
-
-  test("句级 prompt(A2)：含「为每个源行号都给/分配到每行」强化措辞", () => {
-    const sys = Core.buildSentenceSystemPrompt("zh-Hans");
-    assert.ok(/EACH/.test(sys), "应含 EACH（强调每个源行）");
-    assert.ok(/distribute/i.test(sys), "应含 distribute（把整句译文分配到各行）");
-    assert.ok(/account for/i.test(sys) || /every line/i.test(sys), "应强调覆盖每一行");
-  });
-
-  /* ============ A1：二次拆分回填（splitTranslation + alignSentences splitFill） ============ */
-  console.log("\n[A1 二次拆分回填：splitTranslation + alignSentences(splitFill)]");
-
-  test("splitTranslation：按标点把一条译文拆成 3 份（各非空）", () => {
-    const parts = Core.splitTranslation("今天我们来看。它预测下一个词。基本就这样。", 3);
-    assert.ok(Array.isArray(parts) && parts.length === 3, "应拆成 3 份");
-    parts.forEach((p) => assert.ok(p && p.length > 0, "每份非空"));
-    assert.ok(/今天/.test(parts[0]) && /基本/.test(parts[2]), "顺序保持");
-  });
-
-  test("splitTranslation：标点不足时按字符近似等分仍得 n 份", () => {
-    const parts = Core.splitTranslation("这是一段没有标点的连续中文译文内容", 3);
-    assert.ok(Array.isArray(parts) && parts.length === 3, "无标点也能拆成 3 份");
-    parts.forEach((p) => assert.ok(p && p.length > 0));
-    assert.strictEqual(parts.join(""), "这是一段没有标点的连续中文译文内容", "拼回无丢字");
-  });
-
-  test("splitTranslation：n=1 原样返回；太短拆不出 n 份返回 null", () => {
-    assert.deepStrictEqual(Core.splitTranslation("整句", 1), ["整句"]);
-    assert.strictEqual(Core.splitTranslation("短", 3), null, "1 字拆 3 份不可能 → null");
-  });
-
-  test("alignSentences(splitFill)：[1-3] 一条合并译文 → 本地拆 3 份回填，3 个单元、时间轴按各源行", () => {
-    const model = "[1-3] ||| Today we look at how models work. ||| 今天我们来看。模型怎么工作。基本如此。";
-    const r = Core.alignSentences(SENT_CUES.slice(0, 3), model, { splitFill: true });
-    assert.strictEqual(r.ok, true, "覆盖通过 + 拆分成功");
-    assert.strictEqual(r.sentences.length, 3, "渲染单元数 == 源行数 3");
-    // 时间轴：逐行回到各源 cue 的 start/end
-    assert.deepStrictEqual([r.sentences[0].startMs, r.sentences[0].endMs], [0, 600]);
-    assert.deepStrictEqual([r.sentences[1].startMs, r.sentences[1].endMs], [600, 1200]);
-    assert.deepStrictEqual([r.sentences[2].startMs, r.sentences[2].endMs], [1250, 1800]);
-    // 各行有译文片段
-    r.sentences.forEach((u) => assert.ok(u.translation && u.translation.length, "每行有译文"));
-    // 原文回填为源行碎片
-    assert.strictEqual(r.sentences[0].originalText, "so today we are gonna");
-  });
-
-  test("alignSentences(splitFill)：拆不出对应份数 → ok=false(split-fail) 退逐行", () => {
-    // [1-3] 覆盖 3 行，但译文只 1 个字符，无法拆出 3 份非空
-    const r = Core.alignSentences(SENT_CUES, "[1-3] ||| x. ||| 好\n[4-6] ||| y. ||| 也好啊朋友们", {
-      splitFill: true,
-    });
-    assert.strictEqual(r.ok, false, "拆不出 → 整体不通过");
-    assert.strictEqual(r.reason, "split-fail");
-    assert.strictEqual(r.sentences.length, 0);
-  });
-
-  test("alignSentences(splitFill)：单行号句 [4] 不拆，区间=该 cue", () => {
-    const model = "[1-3] ||| A. ||| 甲一。甲二。甲三。\n[4] ||| B. ||| 乙。\n[5-6] ||| C. ||| 丙一。丙二。";
-    const r = Core.alignSentences(SENT_CUES, model, { splitFill: true });
-    assert.strictEqual(r.ok, true);
-    assert.strictEqual(r.sentences.length, 6, "3+1+2 → 6 个逐行单元");
-    assert.deepStrictEqual([r.sentences[3].startMs, r.sentences[3].endMs], [2600, 3100], "第4行单行号区间");
-    assert.strictEqual(r.sentences[3].translation, "乙。");
-  });
-
-  test("alignSentences 默认(无 splitFill)：[1-3] 仍合并成 1 个句单元（不回归）", () => {
-    const r = Core.alignSentences(SENT_CUES, "[1-3] ||| A. ||| 甲。\n[4-6] ||| B. ||| 乙。");
-    assert.strictEqual(r.ok, true);
-    assert.strictEqual(r.sentences.length, 2, "默认仍按句合并");
-    assert.deepStrictEqual([r.sentences[0].startMs, r.sentences[0].endMs], [0, 1800]);
-  });
-
-  await asyncTest("translateSentences(splitFill) 透传：合并译文 → 逐行单元", async () => {
-    const mockFetch = async () => {
-      const content = "[1-6] ||| One long restored sentence here. ||| 第一句。第二句。第三句。第四句。第五句。第六句。";
-      return { ok: true, status: 200, async json() { return { choices: [{ message: { content } }] }; }, async text() { return ""; } };
-    };
-    const r = await Core.translateSentences({
-      cues: SENT_CUES, apiBaseUrl: "https://gw/v1", apiModel: "m", targetLang: "zh-Hans",
-      splitFill: true, fetchImpl: mockFetch,
-    });
-    assert.strictEqual(r.ok, true);
-    assert.strictEqual(r.sentences.length, 6, "[1-6] 合并译文 splitFill → 6 个逐行单元");
-    assert.deepStrictEqual([r.sentences[5].startMs, r.sentences[5].endMs], [4600, 5200]);
-  });
-
-  /* ============ 第1层：alignSentencesPartial 部分接受 + 缺口 ============ */
-  console.log("\n[第1层 句级部分接受：alignSentencesPartial]");
-
-  // 5 行专用样本（缺口测试更直观）
-  const P_CUES = [
-    { start: 0, end: 500, content: "line one here" },
-    { start: 500, end: 1000, content: "line two here" },
-    { start: 1000, end: 1500, content: "line three here" },
-    { start: 1500, end: 2000, content: "line four here" },
-    { start: 2000, end: 2500, content: "line five here" },
-  ];
-
-  test("alignSentencesPartial 中间漏一段：覆盖[1-2]+[4-5]，gaps==[[3,3]]", () => {
-    const model = [
-      "[1-2] ||| One two. ||| 一二。",
-      "[4-5] ||| Four five. ||| 四五。",
-    ].join("\n");
-    const r = Core.alignSentencesPartial(P_CUES, model, { splitFill: false });
-    assert.deepStrictEqual(r.gaps, [[3, 3]], "第3行未覆盖 → 缺口[3,3]");
-    // sentences 覆盖 [1-2] 和 [4-5]
-    const covered = r.sentences.map((s) => [s.srcStart, s.srcEnd]);
-    assert.deepStrictEqual(covered, [[1, 2], [4, 5]]);
-    assert.deepStrictEqual([r.sentences[0].startMs, r.sentences[0].endMs], [0, 1000]);
-    assert.deepStrictEqual([r.sentences[1].startMs, r.sentences[1].endMs], [1500, 2500]);
-  });
-
-  test("alignSentencesPartial 全废(空字符串) → gaps==[[1,n]], sentences==[]", () => {
-    const r = Core.alignSentencesPartial(P_CUES, "", { splitFill: false });
-    assert.deepStrictEqual(r.gaps, [[1, 5]], "整段当缺口");
-    assert.strictEqual(r.sentences.length, 0);
-  });
-
-  test("alignSentencesPartial 完美覆盖 → gaps==[]，等价 alignSentences ok=true", () => {
-    const model = [
-      "[1-2] ||| One two. ||| 一二。",
-      "[3-3] ||| Three. ||| 三。",
-      "[4-5] ||| Four five. ||| 四五。",
-    ].join("\n");
-    const r = Core.alignSentencesPartial(P_CUES, model, { splitFill: false });
-    assert.deepStrictEqual(r.gaps, [], "全覆盖无缺口");
-    const ref = Core.alignSentences(P_CUES, model);
-    assert.strictEqual(ref.ok, true, "对照 alignSentences 应 ok");
-    assert.strictEqual(r.sentences.length, ref.sentences.length, "句单元数与 alignSentences 一致");
-    for (let i = 0; i < ref.sentences.length; i++) {
-      assert.deepStrictEqual(
-        [r.sentences[i].srcStart, r.sentences[i].srcEnd, r.sentences[i].startMs, r.sentences[i].endMs, r.sentences[i].translation],
-        [ref.sentences[i].srcStart, ref.sentences[i].srcEnd, ref.sentences[i].startMs, ref.sentences[i].endMs, ref.sentences[i].translation],
-        "句单元与 alignSentences 完全等价"
-      );
-    }
-  });
-
-  test("alignSentencesPartial 重叠回退条被跳过：[1-2][2-3] → 接受[1-2]，缺口[3,5]", () => {
-    const model = "[1-2] ||| A. ||| 甲。\n[2-3] ||| B. ||| 乙。";
-    const r = Core.alignSentencesPartial(P_CUES, model, { splitFill: false });
-    const covered = r.sentences.map((s) => [s.srcStart, s.srcEnd]);
-    assert.deepStrictEqual(covered, [[1, 2]], "重叠的[2-3]被跳过");
-    assert.deepStrictEqual(r.gaps, [[3, 5]]);
-  });
-
-  test("alignSentencesPartial 越界条被丢弃：[1-2][4-9] → 接受[1-2]，缺口[3,5]", () => {
-    const model = "[1-2] ||| A. ||| 甲。\n[4-9] ||| B. ||| 乙。";
-    const r = Core.alignSentencesPartial(P_CUES, model, { splitFill: false });
-    const covered = r.sentences.map((s) => [s.srcStart, s.srcEnd]);
-    assert.deepStrictEqual(covered, [[1, 2]], "越界[4-9]丢弃");
-    assert.deepStrictEqual(r.gaps, [[3, 5]]);
-  });
-
-  test("alignSentencesPartial splitFill：多源行合并 → 逐行单元，无缺口", () => {
-    const model = "[1-3] ||| a. b. c. ||| 甲。乙。丙。\n[4-5] ||| d. e. ||| 丁。戊。";
-    const r = Core.alignSentencesPartial(P_CUES, model, { splitFill: true });
-    assert.deepStrictEqual(r.gaps, []);
-    assert.strictEqual(r.sentences.length, 5, "splitFill 下 5 行各 1 单元");
-    assert.deepStrictEqual([r.sentences[0].srcStart, r.sentences[0].srcEnd], [1, 1]);
-  });
-
-  /* ============ 第3层：makeAdaptiveGate 自适应降并发 ============ */
   console.log("\n[第3层 自适应 gate：makeAdaptiveGate]");
 
   test("makeAdaptiveGate 429×2 → cap 4→2→1；之后 8 次成功 → 回升到 2", () => {
@@ -1904,19 +974,19 @@ async function main() {
     assert.ok(/00:00:00,000 --> 00:00:01,000/.test(srt), "start/end 也能取到时间");
   });
 
-  await asyncTest("缓存命中则零调用：命中缓存不触发 translateCues/fetch", async () => {
+  await asyncTest("缓存命中则零调用：命中缓存不触发 translateClipLines/fetch", async () => {
     // 模拟 isolated.js 的"先查缓存命中则零调用"语义
     const key = Core.makeCacheKey({ videoId: "v", trackCode: "en-asr", targetLang: "zh", apiModel: "m", clipStartMs: 0 });
     const cache = {};
     cache[key] = { t: Date.now(), lines: ["你好", "世界"] };
     let fetchCalled = false;
-    // 命中：直接用缓存，不调 translateCues/fetch
+    // 命中：直接用缓存，不调 translateClipLines/fetch
     let lines;
     if (cache[key]) {
       lines = cache[key].lines;
     } else {
       fetchCalled = true;
-      lines = await Core.translateCues({ cues: [{ content: "hello" }], apiBaseUrl: "x", apiModel: "m", fetchImpl: async () => { fetchCalled = true; return {}; } });
+      lines = await Core.translateClipLines({ cues: [{ content: "hello" }], apiBaseUrl: "x", apiModel: "m", fetchImpl: async () => { fetchCalled = true; return {}; } });
     }
     assert.deepStrictEqual(lines, ["你好", "世界"]);
     assert.strictEqual(fetchCalled, false, "命中缓存不应触发 fetch");
@@ -1979,270 +1049,129 @@ async function main() {
     assert.strictEqual(peak, 1, "cap=0→1 应严格串行");
   });
 
-  await asyncTest("translateCues 接 gate：多 clip 并行翻译总在途不超全局 cap", async () => {
-    // 模拟滑动窗口预取：3 个 clip 各自 concurrency=3 同时翻，但共享一个 cap=4 的全局信号量。
-    // 不封顶会瞬时 ~9 并发；封顶后任意时刻 fetch 在途 <= 4。
-    const cap = 4;
-    const gate = Core.makeSemaphore(cap);
-    let inFlight = 0;
-    let peak = 0;
-    const mockFetch = async (url, opts) => {
-      inFlight++;
-      peak = Math.max(peak, inFlight);
-      assert.ok(inFlight <= cap, "fetch 在途不应超过全局 cap=" + cap + "（实际 " + inFlight + "）");
-      await new Promise((r) => setTimeout(r, 5));
-      const body = JSON.parse(opts.body);
-      const userLines = body.messages[1].content.split("\n").filter((l) => /^\d+\./.test(l));
-      const content = userLines.map((l) => l.match(/^(\d+)\./)[1] + ". ok").join("\n");
-      inFlight--;
-      return { ok: true, status: 200, async json() { return { choices: [{ message: { content } }] }; }, async text() { return ""; } };
-    };
-    const mkCues = (p) => Array.from({ length: 12 }, (_, i) => ({ content: p + i }));
-    const runClip = (p) =>
-      Core.translateCues({
-        cues: mkCues(p),
-        apiBaseUrl: "https://gw/v1",
-        apiModel: "m",
-        batchSize: 4, // 12/4 = 3 批/clip
-        concurrency: 3, // 单 clip 批内并发 3
-        gate, // 全局上限 4
-        fetchImpl: mockFetch,
-      });
-    // 3 个 clip 同时翻（共 9 批） → 若无 gate 峰值可达 9
-    const [a, b, c] = await Promise.all([runClip("a"), runClip("b"), runClip("c")]);
-    assert.strictEqual(a.length, 12);
-    assert.strictEqual(b.length, 12);
-    assert.strictEqual(c.length, 12);
-    assert.ok(peak > 1 && peak <= cap, "应确有并发(>1)但被全局 cap 封顶(<=" + cap + ")，实际峰值 " + peak);
-    assert.strictEqual(inFlight, 0, "全部完成后在途归零");
-  });
 
-  /* ============ 6z. v0.3.1 端到端回归：真实风格 ASR → 句级/逐行翻译 → 渲染时间轴 ============
-   * 这是 v0.3.0 三层重构引入的两个回归（症状1永久「翻译中」、症状2英文断句被中文节奏切碎 +
-   * 无句间间隙）一直没被挡住的根本原因——之前全是纯函数单测，没有端到端路径。
-   * 下面用一段真实风格英文 ASR(多条无句中标点碎 cue + 长句) 喂进 resegment → 句级重断(mock
-   * fetch 可控译文) → rebuildRenderTimeline 等价逻辑，断言三件事：
-   *   (a) 英文原文按自己边界分段、不被按中文字数切碎；(b) 渲染单元之间有时间间隙；
-   *   (c) mock 译文正确落到渲染单元、不残留 pending。 */
-  console.log("\n[v0.3.1 端到端回归：ASR → 翻译 → 渲染时间轴]");
+  /* ============ 6d. v0.4.0 集成回归：core/isolated 不脱节 + 端到端产出 ============
+   * 6/29 的 v0.4.0 架构简化删了 core 的 translateSentences/segmentSentenceUnit/
+   * alignSentencesPartial/translateCues/translateBatch，但 isolated.js 一度仍在调它们，
+   * 扩展一翻译就 Core.xxx is not a function 崩。这组测试锁死两条契约，防再次脱节：
+   *  (1) isolated.js 源码里不再出现任何已删函数名（静态扫描）；且已删函数在 core 确实 0 定义。
+   *  (2) translateClipLines(mock) → buildClipUnits 端到端：行数合理、时间轴单调不回退、
+   *      全覆盖 clip 时间窗、译文不空，与 isolated.js 主路径同一调用序列（照 e2e-harness）。
+   */
+  console.log("\n[v0.4.0 集成回归：core/isolated 对接]");
 
-  // 真实风格 ASR：YouTube 滚动字幕——碎、无句中标点、相邻时间重叠。
-  const ASR_RAW = [
-    { start: 1000, end: 3200, content: "so today we are going to talk about" },
-    { start: 3000, end: 5400, content: "going to talk about how neural networks" },
-    { start: 5200, end: 7600, content: "how neural networks actually learn from" },
-    { start: 7400, end: 9800, content: "actually learn from data and why it" },
-    { start: 9600, end: 12000, content: "and why it matters so much" },
-    { start: 12200, end: 14000, content: "let's start with a simple example" },
-    { start: 13800, end: 16400, content: "a simple example of a single neuron" },
+  const DELETED_FNS = [
+    "translateSentences",
+    "segmentSentenceUnit",
+    "alignSentencesPartial",
+    "translateCues",
+    "translateBatch",
   ];
 
-  // 把 isolated.js 的 rebuildRenderTimeline 渲染逻辑抽成等价纯函数（不依赖 DOM/chrome）：
-  // 句级优先(clipSentences) → 逐行兜底(clipCache)，每单元经 segmentSentenceUnit 展开。
-  function buildRenderUnits(clips, clipSentences, clipCache, segOpts) {
-    const units = [];
-    function pushSegmented(unit, clipIdx) {
-      const segs = Core.segmentSentenceUnit(unit, segOpts);
-      for (const s of segs) {
-        units.push({
-          start: s.startMs,
-          end: s.endMs,
-          originalText: s.originalText,
-          translation: s.translation != null && s.translation !== "" ? s.translation : null,
-          clipIdx: clipIdx,
-        });
-      }
-    }
-    for (let ci = 0; ci < clips.length; ci++) {
-      const sents = clipSentences[ci];
-      if (sents && sents.length) {
-        for (const se of sents) {
-          pushSegmented(
-            { startMs: se.startMs, endMs: se.endMs, originalText: se.originalText, translation: se.translation != null ? se.translation : "" },
-            ci
-          );
-        }
-        continue;
-      }
-      const clip = clips[ci];
-      const arr = clipCache[ci];
-      for (let k = 0; k < clip.cues.length; k++) {
-        const cue = clip.cues[k];
-        pushSegmented({ startMs: cue.start, endMs: cue.end, originalText: cue.content, translation: arr && arr[k] != null ? arr[k] : "" }, ci);
-      }
-    }
-    return units;
-  }
+  test("isolated.js 不再引用任何 v0.4.0 已删的 core 函数", () => {
+    const src = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
+    DELETED_FNS.forEach((fn) => {
+      const re = new RegExp("Core\\." + fn + "\\b");
+      assert.ok(!re.test(src), "isolated.js 不应再调用 Core." + fn + "（已删，会 is not a function 崩）");
+    });
+    // 正向：新主路径入口确实在被调用（对接到位，不是把调用整段删没了）
+    assert.ok(/Core\.translateClipLines\b/.test(src), "isolated.js 应调用新入口 Core.translateClipLines");
+    assert.ok(/Core\.buildClipUnits\b/.test(src), "isolated.js 应调用 Core.buildClipUnits 配时间轴");
+  });
 
-  // 症状2(a)：英文原文按自己边界分段，不被中文字数节奏切碎；短英文在多屏间 hold 不被拦腰切。
-  test("e2e 症状2(a)：短英文/长中文——英文保持自然边界，不被中文字数切碎", () => {
-    // 一个真实句单元：英文短(无句中标点)、中文长(需多屏)。
-    const unit = {
-      startMs: 1000,
-      endMs: 5080,
-      originalText: "and why it matters",
-      translation: "以及为什么它如此重要这关系到我们后面要讲的所有内容的根基",
+  test("已删函数在 core.js 确实 0 定义、且不在导出表里", () => {
+    DELETED_FNS.forEach((fn) => {
+      assert.strictEqual(typeof Core[fn], "undefined", "core 不应再导出 " + fn);
+    });
+    // 新架构入口应存在且为函数
+    assert.strictEqual(typeof Core.translateClipLines, "function", "translateClipLines 应存在");
+    assert.strictEqual(typeof Core.buildClipUnits, "function", "buildClipUnits 应存在");
+  });
+
+  await asyncTest("translateClipLines→buildClipUnits 端到端（mock）：行数/时间轴/覆盖/译文合理", async () => {
+    // isolated.js 主路径的最小复刻（与 e2e-harness ~184-258 同序列）：
+    //   clip.cues → translateClipLines(模型直接吐自然中文行) → buildClipUnits 配时间轴。
+    // mock 模型：把编号英文行数回一段固定中文，按标点分好 3 行（模拟「一步到位分行」）。
+    const clip = {
+      startMs: 10000,
+      endMs: 25000, // 15s 窗
+      cues: [
+        { start: 10000, end: 13000, content: "so today we are going to" },
+        { start: 13000, end: 17000, content: "take a close look at how" },
+        { start: 17000, end: 21000, content: "transformers actually work" },
+        { start: 21000, end: 25000, content: "under the hood step by step" },
+      ],
     };
-    const out = Core.segmentSentenceUnit(unit, { maxCharsPerScreen: 20, maxDurPerScreen: 4000 });
-    assert.ok(out.length >= 2, "长中文应被切成多屏，实际 " + out.length);
-    // 关键回归：英文 18 字 < origCap(40)，应作为「一个整体」在多屏间 hold——
-    // 各屏去重后只剩 1 个 distinct 英文片段；旧实现按中文份数切成 >=2 个互不相同的碎片。
-    const distinct = [];
-    for (const u of out) if (!distinct.length || distinct[distinct.length - 1] !== u.originalText) distinct.push(u.originalText);
-    assert.strictEqual(distinct.length, 1, "短英文应整体 hold 不被切碎，实际 distinct 片段=" + JSON.stringify(distinct));
-    assert.strictEqual(distinct[0], "and why it matters", "英文应完整保留，不被按中文节奏切开");
-  });
-
-  test("e2e 症状2(a)：长英文按自己词边界分屏(不斩词)，与中文份数解耦", () => {
-    const unit = {
-      startMs: 0,
-      endMs: 8000,
-      originalText: "so today we are going to talk about how neural networks actually learn from data",
-      translation: "所以今天我们要聊聊神经网络究竟如何从数据中学习以及为什么这件事情如此重要值得深入",
+    const MODEL_LINES = ["今天我们来看看", "变换器到底是怎么", "一步步运作的"];
+    let sysSeen = "";
+    let userSeen = "";
+    const mockFetch = async (url, opts) => {
+      const body = JSON.parse(opts.body);
+      sysSeen = body.messages[0].content;
+      userSeen = body.messages[1].content;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ choices: [{ message: { content: MODEL_LINES.join("\n") } }] }),
+        text: async () => "",
+      };
     };
-    const out = Core.segmentSentenceUnit(unit, { maxCharsPerScreen: 20, maxDurPerScreen: 4000 });
-    assert.ok(out.length >= 2, "应被切成多屏");
-    // 英文按 origCap(40) 自己的边界切，绝不在词中间断开。
-    const distinct = [];
-    for (const u of out) if (!distinct.length || distinct[distinct.length - 1] !== u.originalText) distinct.push(u.originalText);
-    for (const piece of distinct) {
-      const words = piece.split(/\s+/).filter(Boolean);
-      for (const w of words) {
-        // 每个英文「词」都应是完整词（拼回原文里能找到），不被拦腰斩开。
-        assert.ok(unit.originalText.indexOf(w) !== -1, "英文词不应被斩断: '" + w + "' in " + JSON.stringify(piece));
-      }
-      assert.ok(piece.length <= 40, "英文每屏 <= origCap(40)，实际 " + piece.length + ": " + piece);
-    }
-    // 去重拼回无丢字(hold 重复不计)。
-    const joined = distinct.join(" ").replace(/\s+/g, "");
-    const expect = unit.originalText.replace(/\s+/g, "");
-    assert.strictEqual(joined, expect, "英文去重拼回应无丢字");
-  });
 
-  // 症状2(b)：端到端整条渲染时间轴上，渲染单元之间确有时间间隙(不首尾相接一直显示)。
-  await asyncTest("e2e 症状2(b)：整条渲染时间轴存在句间/屏间间隙", async () => {
-    const cues = Core.resegmentCues(Core.cleanupCues(ASR_RAW), { tailTrimMs: 120 });
-    const clips = Core.sliceClipsByCue(cues, 30000);
-    // 给每个 clip 造句级译文(长中文，触发多屏分段)。
-    const clipSentences = {};
-    for (let ci = 0; ci < clips.length; ci++) {
-      clipSentences[ci] = clips[ci].cues.map(() => null); // 占位，下面用整 clip 句级单元替换
-    }
-    // 用句单元(每个 resegment 句 = 一个句级单元) + 长中文译文。
-    const sents = cues.map((c) => ({
-      startMs: c.start,
-      endMs: c.end,
-      originalText: c.content,
-      translation: "这是一段刻意写得比较长的中文译文用来触发多屏分段从而检验屏间是否留白",
-    }));
-    // 按 clip 分组句级单元。
-    const map = Core.cueClipIndexMap(clips);
-    const byClip = {};
-    let gi = 0;
-    for (let ci = 0; ci < clips.length; ci++) byClip[ci] = [];
-    // resegment 后 cues 与 clips[].cues 同源同序，直接按 clip 累计。
-    let cursor = 0;
-    for (let ci = 0; ci < clips.length; ci++) {
-      const cnt = clips[ci].cues.length;
-      byClip[ci] = sents.slice(cursor, cursor + cnt);
-      cursor += cnt;
-    }
-    const renderUnits = buildRenderUnits(clips, byClip, {}, { maxCharsPerScreen: 20, maxDurPerScreen: 4000 });
-    assert.ok(renderUnits.length >= 2, "应有多个渲染单元");
-    // 单调不重叠 + 至少存在一处正间隙(屏间/句间留白)。
-    let anyGap = false;
-    for (let i = 1; i < renderUnits.length; i++) {
-      assert.ok(renderUnits[i].start >= renderUnits[i - 1].end, "渲染单元单调不重叠: " + JSON.stringify([renderUnits[i - 1], renderUnits[i]]));
-      if (renderUnits[i].start > renderUnits[i - 1].end) anyGap = true;
-    }
-    assert.ok(anyGap, "整条时间轴必须存在句间/屏间间隙，不能首尾相接一直显示");
-  });
+    const lines = await Core.translateClipLines({
+      cues: clip.cues,
+      apiBaseUrl: "http://mock/v1",
+      apiKey: "k",
+      apiModel: "m",
+      targetLang: "zh-Hans",
+      reasoningEffort: "low",
+      minLineChars: Core.DEFAULT_CONFIG.minLineChars,
+      timeoutMs: 5000,
+      fetchImpl: mockFetch,
+    });
+    // 请求契约：system 是 v0.4.0 分行 prompt，user 是带序号的原文行
+    assert.ok(/只输出中文/.test(sysSeen), "system 应为 v0.4.0 分行 prompt");
+    assert.ok(/^1\. so today/m.test(userSeen), "user 应含带序号的原文行");
+    // 模型行经 parseSubtitleLines + mergeShortLines 清洗后返回（这里都 >=6 字，不被合并）
+    assert.deepStrictEqual(lines, MODEL_LINES, "应返回清洗后的自然中文行");
 
-  // 症状2(b) 强化：单个多屏句单元内部，屏与屏之间必须有 INTER_SEG_GAP 间隙(治「无间隙一直显示」)。
-  // 旧 layoutTimeline 在语音密(idealMs >= slotDur)时屏间间隙塌成 0，字幕首尾相接永不消隐。
-  test("e2e 症状2(b)：多屏句单元内部屏间有间隙(密集语音也不首尾相接)", () => {
-    // 密集：6s 内塞长中文 → 多屏，且每屏 idealMs 接近 slotDur(旧实现间隙会塌成 0)。
-    const unit = {
-      startMs: 0,
-      endMs: 6000,
-      originalText: "this is a fairly long english sentence spoken quickly without much pause",
-      translation: "这是一段语速很快几乎没有停顿的中文译文需要被切成好几屏滚动显示出来给观众看",
-    };
-    const out = Core.segmentSentenceUnit(unit, { maxCharsPerScreen: 20, maxDurPerScreen: 4000 });
-    assert.ok(out.length >= 2, "应被切成多屏，实际 " + out.length);
-    // 至少一处屏间正间隙(非末屏 endMs < 下屏 startMs)；旧实现密集时全为 0。
-    let anyInnerGap = false;
-    for (let i = 1; i < out.length; i++) {
-      assert.ok(out[i].startMs >= out[i - 1].endMs, "屏间单调不重叠");
-      if (out[i].startMs > out[i - 1].endMs) anyInnerGap = true;
-    }
-    assert.ok(anyInnerGap, "多屏句单元内部必须有屏间间隙，不能首尾相接(out=" + JSON.stringify(out.map((u) => [u.startMs, u.endMs])) + ")");
-  });
-
-  // 症状1(c) 纯函数核心：clipDisplayFlags——done 但某行无译文不再永久「翻译中」。
-  test("e2e 症状1(c)：clipDisplayFlags——done 但缺译文的行优雅显原文，不永久 pending", () => {
-    assert.deepStrictEqual(Core.clipDisplayFlags("你好", "done"), { pending: false, failed: false });
-    assert.deepStrictEqual(Core.clipDisplayFlags(null, undefined), { pending: true, failed: false });
-    assert.deepStrictEqual(Core.clipDisplayFlags(null, "pending"), { pending: true, failed: false });
-    assert.deepStrictEqual(Core.clipDisplayFlags(null, "failed"), { pending: false, failed: true });
-    // 关键回归：done/error 已结案但该行无译文(覆盖缺口/降级) → 都 false(优雅显原文)。
-    // 旧逻辑 `trans==null && st!=="error" && st!=="failed"` 会让 done 缺译文行永久 pending。
-    assert.deepStrictEqual(Core.clipDisplayFlags(null, "done"), { pending: false, failed: false });
-    assert.deepStrictEqual(Core.clipDisplayFlags("", "done"), { pending: false, failed: false });
-  });
-
-  // 症状1(c) 端到端：句级覆盖不全 → 逐行补 → 译文真正落到渲染单元、clip 收敛 done、无 pending 残留。
-  await asyncTest("e2e 症状1(c)：句级部分覆盖 → 逐行补齐 → 译文上屏、无永久 pending", async () => {
-    const cues = Core.resegmentCues(Core.cleanupCues(ASR_RAW), { tailTrimMs: 120 });
-    const clips = Core.sliceClipsByCue(cues, 30000);
-    const clip = clips[0];
-    const N = clip.cues.length;
-    const half = Math.max(1, Math.floor(N / 2));
-    function mockFetch(url, optsArg) {
-      const body = JSON.parse(optsArg.body);
-      const user = body.messages[1].content;
-      let content;
-      if (/Regroup/.test(user)) {
-        // 句级：只覆盖 [1-half]，故意漏掉 half+1..N（真实「覆盖不全」失败模式）。
-        content = "[1-" + half + "] ||| restored sentence ||| 这是被句级覆盖的前半段完整中文译文。\n";
-      } else {
-        const lines = user.split("\n").filter((l) => /^\d+\.\s/.test(l));
-        content = lines.map((l, i) => (i + 1) + ". 补译第" + (i + 1) + "行内容").join("\n");
-      }
-      return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) });
-    }
-    const apiCfg = { apiBaseUrl: "http://x", apiKey: "", apiModel: "m", targetLang: "zh-Hans" };
-    const clipState = {};
-    const clipSentences = {};
-    clipState[0] = "pending";
-    const res = await Core.translateSentences(Object.assign({ cues: clip.cues, splitFill: true, fetchImpl: mockFetch }, apiCfg));
-    const part = Core.alignSentencesPartial(clip.cues, res.rawText, { splitFill: true });
-    let units = part.sentences.slice();
-    let stillMissing = false;
-    for (const [a, b] of part.gaps) {
-      const gapCues = clip.cues.slice(a - 1, b);
-      const lines = await Core.translateCues(Object.assign({ cues: gapCues, batchSize: 14, contextLines: 3, concurrency: 3, fetchImpl: mockFetch }, apiCfg));
-      for (let k = 0; k < gapCues.length; k++) {
-        if (lines[k] != null && lines[k] !== "") {
-          units.push({ srcStart: a + k, srcEnd: a + k, originalText: gapCues[k].content, translation: lines[k], startMs: gapCues[k].start, endMs: gapCues[k].end });
-        } else stillMissing = true;
+    const units = Core.buildClipUnits(lines, clip.startMs, clip.endMs, clip.cues);
+    // 行数 == 模型行数（代码不切译文，一行一单元）
+    assert.strictEqual(units.length, MODEL_LINES.length, "渲染单元数 == 模型输出行数（不切译文）");
+    // 时间轴：首单元起点==clip 起点；各单元落在 [clip.startMs, clip.endMs] 内、单调不回退、start<end。
+    // 注意：layoutTimeline 会把每段显示终点回缩到「阅读时长」留白，故末单元 endMs 通常 < clip.endMs。
+    assert.strictEqual(units[0].startMs, clip.startMs, "首单元贴 clip 起点");
+    assert.ok(units[units.length - 1].endMs <= clip.endMs, "末单元不超出 clip 终点");
+    for (let i = 0; i < units.length; i++) {
+      assert.ok(units[i].startMs < units[i].endMs, "单元 " + i + " start<end（不闪现）");
+      assert.ok(units[i].startMs >= clip.startMs && units[i].endMs <= clip.endMs, "单元 " + i + " 落在 clip 时间窗内");
+      assert.ok(units[i].translation && units[i].translation.length > 0, "单元 " + i + " 译文非空");
+      if (i > 0) {
+        assert.ok(units[i].startMs >= units[i - 1].startMs, "起点单调不回退");
       }
     }
-    units.sort((x, y) => x.srcStart - y.srcStart);
-    clipSentences[0] = units;
-    clipState[0] = !stillMissing && units.length ? "done" : "error";
-    assert.ok(part.gaps.length > 0, "本用例应制造句级缺口(覆盖不全)");
-    assert.strictEqual(clipState[0], "done", "逐行补齐后应收敛 done，而非永久 error/pending");
-    assert.strictEqual(units.length, N, "每个源行都应有句级单元(覆盖 + 补齐)，实际 " + units.length + "/" + N);
-    const renderUnits = buildRenderUnits(clips, clipSentences, {}, { maxCharsPerScreen: 20, maxDurPerScreen: 4000 });
-    let pendingCount = 0;
-    for (const u of renderUnits) {
-      const flags = Core.clipDisplayFlags(u.translation, clipState[u.clipIdx]);
-      if (flags.pending) pendingCount++;
-      assert.ok(u.translation != null && u.translation !== "", "每个渲染单元都应带译文，缺译文单元: " + JSON.stringify(u));
-    }
-    assert.strictEqual(pendingCount, 0, "不应残留任何「翻译中…」pending 单元，实际 " + pendingCount);
+    // 原文按时间重叠就近归并进各单元（双语显示用）：4 条原文分摊到 3 个单元，合计应含全部原文词
+    const allOrig = units.map((u) => u.originalText).join(" ");
+    assert.ok(/transformers/.test(allOrig) && /under the hood/.test(allOrig), "原文应按时间归并进单元");
   });
+
+  await asyncTest("translateClipLines 模型空响应 → 返回空数组（isolated 侧回退显原文）", async () => {
+    // 契约：模型吐空/纯空白 → parseSubtitleLines 得空数组 → isolated.js applyClipLines 走空分支
+    // （error+退避，渲染层回退显原文）。这里只验证 core 侧返回空数组。
+    const emptyFetch = async () => ({
+      ok: true, status: 200,
+      json: async () => ({ choices: [{ message: { content: "   \n  \n" } }] }),
+      text: async () => "",
+    });
+    const lines = await Core.translateClipLines({
+      cues: [{ start: 0, end: 2000, content: "hello" }],
+      apiBaseUrl: "http://mock/v1", apiKey: "k", apiModel: "m",
+      timeoutMs: 5000, fetchImpl: emptyFetch,
+    });
+    assert.deepStrictEqual(lines, [], "空/空白响应应清洗为空数组");
+    // buildClipUnits 对空行数组返回空（isolated 侧据此回退显原文，不产出空译文单元）
+    assert.deepStrictEqual(Core.buildClipUnits(lines, 0, 2000, [{ start: 0, end: 2000, content: "hello" }]), []);
+  });
+
 
   /* ============ 7. 交付物校验 ============ */
   console.log("\n[交付物校验]");

@@ -15,6 +15,12 @@ Thumbs.db
 *.local
 scratch/
 
+# E2E harness 产物（subtitles.srt / review.html / stats.json，不入库）
+test/e2e-out/
+
+# CC 临时文件
+.cc_*
+
 # 不要提交任何真实密钥
 *.key
 .env

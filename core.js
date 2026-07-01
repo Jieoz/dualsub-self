@@ -301,8 +301,8 @@
     apiModel: "gpt-4o-mini",
     sourceLang: "auto", // auto = 用第一条 ASR / 第一条轨道
     targetLang: "zh-Hans",
-    systemPrompt: "", // 空 = 用 core 默认（逐行兜底路径的 prompt）
-    sentencePrompt: "", // 空 = 用 core 句级重断默认 prompt（主路径：句级语义重断 + 翻译）
+    systemPrompt: "", // 空 = 用 core 默认行级 prompt（一步到位输出自然分行的中文字幕行）
+    sentencePrompt: "", // 已废弃（v0.4.0 移除句级重断路径）；保留键仅为兼容旧导出配置，不再使用
     // 显示样式
     fontSize: 22, // px —— 语义为"基准高度(FONT_BASE_HEIGHT=480，常规非全屏)下的字号"；
     //               实际渲染字号随播放器高度由 computeFontPx 同比缩放（全屏放大、退出缩小）。
@@ -320,17 +320,22 @@
     transOnTop: true, // true=译文在上，原文在下
     showOriginal: true, // 是否显示原文行
     showLoading: true, // 译文未到时显示轻量"翻译中…"指示（false=只显原文）
-    clipSeconds: 30, // 每个翻译 clip 多少秒（按 cue 边界就近切）
-    batchLines: 14, // 每批最多多少行（clip 内再分批）。瘦身 prompt 后调高省固定开销
-    contextLines: 3, // 每批携带的「前 N 条原文」作为上下文（不翻译、不计入对齐）。
-    //                  跨批不再孤立翻译：模型可借上下文理解碎片/指代/话题连贯。0=关闭。
+    clipSeconds: 15, // 每个翻译 clip 多少秒（按 cue 边界就近切）。推理模型(gpt-5.x-mini)
+    //                  prompt 越长烧的 reasoning token 越多、单次延迟越不稳；clip 调小
+    //                  → 单次请求更轻 → 首单元延迟/单 clip 耗时显著更稳（见 e2e-harness A/B）。
+    batchLines: 14, // 已废弃（v0.4.0 一个 clip = 一次请求，不再 clip 内分批）；保留键兼容旧配置。
+    contextLines: 3, // 已废弃（v0.4.0 整 clip 一次翻，模型自带上下文）；保留键兼容旧配置。
     globalConcurrency: 4, // 跨 clip 的全局 in-flight 翻译请求上限（信号量）。滑动窗口预取
-    //                       (depth=2)叠加批内并发(3)若不封顶会冲垮网关→429；此值统一封顶。
+    //                       (depth=3)若不封顶会冲垮网关→429；此值统一封顶。
+    reasoningEffort: "low", // 推理模型(gpt-5.x-mini)的 reasoning_effort。行级 prompt 把规则写死 +
+    //                  「直接给结果不要思考过程」压住 reasoning 爆点；"low" 时实测延迟 4.5-6.7s 稳定、
+    //                  reasoning 14-103 token。取值 low|medium|high；空串或 "default" = 不发该字段。
+    minLineChars: 6, // 最小行长（可视字符）：模型偶尔吐出过短碎行时，把短行【整行】并入相邻行
+    //                  （只在行边界落点，绝不切词）。<=0 关闭合并。规则2「每行不要过分短」的兜底。
     tailTrimMs: 120, // 句间视觉尾缩(ms)：连续语流句单元 end 回缩此值制造句间断点(修字幕墙)。
     //                  0=关闭。仅长句(duration>2×)缩，缩后保留 >=300ms 可视；真停顿不受影响。
-    maxCharsPerScreen: 20, // 长句分段：单屏最多译文字符数(CJK 约 20)。超过按标点切成多段分屏滚动。
-    //                       0 或极大值=关闭分段（向后兼容）。
-    maxDurPerScreen: 4000, // 长句分段：单屏最长时长(ms)。超过即使字数不多也按标点切分，避免久不动。
+    maxCharsPerScreen: 20, // 已废弃（v0.4.0 模型直接分行，代码不再切割）；保留键兼容旧配置/UI。
+    maxDurPerScreen: 4000, // 已废弃（v0.4.0 模型直接分行，代码不再切割）；保留键兼容旧配置/UI。
   };
 
   /**
@@ -444,86 +449,42 @@
     if (px > hi) px = hi;
     return Math.round(px);
   }
-
   /* ---------------------------------------------------------------
-   * 4. 翻译：分批 + 上下文 + 按行号对齐
+   * 4. 翻译：一步到位「自然分行的中文字幕行」（v0.4.0 架构简化）
    * -------------------------------------------------------------
-   * 核心策略（brief 已验证质量好）：
-   *  - 绝不逐句翻译。把一批 cue 拼成带行号的文本一次性发给 LLM。
-   *  - system prompt 要求模型先在脑内恢复标点/合并碎片理解语义，
-   *    但输出严格"每个输入行号一行译文，行号和行数完全一致"。
-   *  - 拿回结果后按行号对齐回各 cue。行数/行号不匹配时做兜底。
+   * 旧架构（v0.2.1→v0.3.x）让模型先把碎片重组成「完整句」，再由代码把整句
+   * 拆回逐行时间轴 —— 这一「拆回」动作硬切中文译文，把「经常」切成「经/常」、
+   * 「隔三差/五」斩断（用户最痛的切词 bug 的根因），还堆了 16 个职责重叠的
+   * 切割/对齐函数（splitTranslation/splitTransIntoN/alignOriginalToScreens…）。
+   *
+   * 新架构（已用真实 API 在 3 批真实字幕验证）：让模型【一步到位】直接吐出
+   * 「自然分好行的中文字幕行」，代码只负责配时间轴，绝不再做任何译文切割。
+   *  - 没有「拆回逐行」动作 → 切词从根消失（代码永不在词中间落刀）。
+   *  - 模型输出的字幕行数可能 != 原始 cue 数：按【字符长度比例】把该 clip 覆盖
+   *    的总时间分给各输出行（行边界对齐；因为不切词所以不会切字）。
+   *  - reasoning 爆点用 reasoning_effort:low + 把规则写死进 prompt + 「直接给结果
+   *    不要思考过程」压住（实测延迟 4.5-6.7s 稳定、reasoning 14-103 token）。
+   * 后处理兜底（即使 prompt 漏网也保证）：去每行行尾逗号/句号、丢空行、合并连续重复行。
    */
 
-  // 默认 system prompt（{TARGET_LANG} 会被替换为目标语言）
-  // ⚠️ 取舍说明（经 Jay 确认，推翻原来"砍到 509→3 句"的省 token 决策）：
-  //   之前为省 token 把 prompt 砍到只剩 3 句，结果译文翻译腔重、不连贯，明显逊于
-  //   沉浸式翻译/sider 类原版。根因不是模型弱，是策略砍太狠——模型只能逐行硬译。
-  //   这里有意把固定开销加回来换质量：给足口语化/连贯性/语序自由/术语约束。
-  // 硬约束（绝不能动，否则破坏逐行→时间轴对齐）：每个输入行号对应输出同一行号的
-  //   一行译文、行号与行数完全一致、只输出译文。其余是质量引导。
+  // 已验证 system prompt（直接写死规则 + 压 reasoning）。{TARGET_LANG} 仅在调用方
+  // 传自定义 prompt 时替换；默认 prompt 面向简体中文，无占位符（替换为 no-op）。
   var DEFAULT_SYSTEM_PROMPT =
-    "You are translating video subtitles into natural, fluent {TARGET_LANG}. " +
-    "Write the way a native speaker actually speaks: colloquial, smooth, easy to read. " +
-    "Avoid stiff word-for-word translation, literal translationese, or bookish phrasing.\n" +
-    "Use the surrounding context lines to understand fragments, resolve pronouns and references, " +
-    "and keep the topic coherent across lines. The text comes from speech recognition, so a line " +
-    "may lack punctuation or be cut mid-sentence; mentally restore the meaning before translating.\n" +
-    "You may freely reorder words and rephrase WITHIN each line so the {TARGET_LANG} reads naturally — " +
-    "do not translate word by word. But every input line number must map to exactly one output line " +
-    "with the SAME number; never merge, split, drop, or reorder the lines themselves.\n" +
-    "Keep proper nouns, names, and technical terms sensible: preserve them or use the common accepted " +
-    "translation, do not invent odd renderings.\n" +
-    "Output format (strict): one translation per input line, prefixed with its original line number, " +
-    "line count identical to the input. Output ONLY the translations — no explanations, no source text, " +
-    "no extra commentary.";
+    "你是专业字幕翻译。下面是被ASR切碎的英文字幕行。请把它们的完整意思翻译成简体中文，并切分成适合阅读的字幕行，规则严格如下：\n" +
+    "1) 在自然语义/短语边界断行，绝不把一个词语切成两半。\n" +
+    "2) 每行长度适中：尽量 8-16 个汉字，不要切得太碎（除非这段原文内容本来就很少）。\n" +
+    "3) 去掉每行行尾的逗号和句号；但行中间的顿号、问号、感叹号保留。\n" +
+    "4) 只输出中文字幕行，每行一条，不要行号、不要英文、不要任何解释或思考过程。\n" +
+    "直接给结果。";
 
   function buildSystemPrompt(targetLang, customPrompt) {
     var tpl = customPrompt && String(customPrompt).trim() ? customPrompt : DEFAULT_SYSTEM_PROMPT;
-    return tpl.replace(/\{TARGET_LANG\}/g, targetLang || "the target language");
-  }
-
-  /* ---------------------------------------------------------------
-   * 句级语义重断（主路径）：让 LLM 一次调用同时把无标点 ASR 碎片
-   * 重组成完整句子 + 翻译，并标注每句覆盖的源行号范围，供时间轴回映。
-   * 输出协议（每行一条，固定三段分隔）：
-   *   [3-5] ||| Restored full sentence. ||| 重组后的完整译文。
-   * 解析器（parseSentenceResponse）容忍单行号 [3]、范围 [3-5]、多余空白。
-   * 覆盖性校验（alignSentences）：源行号必须连续覆盖全部输入行、不重叠/不遗漏，
-   * 否则标记 fallback，由调用方退回逐行对齐路径（保留旧 alignTranslations）。
-   * ------------------------------------------------------------- */
-
-  // 在前置任务（口语/连贯/语序自由/术语约束）基础上扩展为「句级重断 + 翻译」。
-  var DEFAULT_SENTENCE_SYSTEM_PROMPT =
-    "You restore and translate auto-generated video subtitles. " +
-    "You will receive numbered subtitle fragments from speech recognition: they have NO punctuation " +
-    "and are often cut mid-sentence or merged across sentences.\n" +
-    "Your job, in ONE pass:\n" +
-    "1. Regroup the consecutive fragments into complete, natural sentences and restore punctuation.\n" +
-    "2. For each restored sentence, state which input line numbers it is built from, as a CONTIGUOUS range.\n" +
-    "3. Translate each complete sentence into natural, fluent, colloquial {TARGET_LANG} — " +
-    "the way a native speaker actually talks, never stiff word-for-word translationese.\n" +
-    "Use neighbouring fragments as context to resolve pronouns, references and keep the topic coherent. " +
-    "Keep proper nouns, names and technical terms sensible (preserve or use the common accepted translation).\n" +
-    "Output format (STRICT): one restored sentence per line, exactly:\n" +
-    "[startLine-endLine] ||| restored source sentence with punctuation ||| {TARGET_LANG} translation\n" +
-    "A single-line sentence uses [n] (e.g. [4]). The ranges MUST be contiguous, in order, cover EVERY " +
-    "input line exactly once, and never overlap or skip a line. " +
-    "You MUST account for EACH input line number — every line from the first to the last must fall inside " +
-    "exactly one range. Do NOT drop, merge away or ignore any line. Intelligently distribute the full " +
-    "restored sentence and its translation across all the original line numbers it spans, so each source " +
-    "line is represented; never collapse the whole input into one giant range when it is really several " +
-    "sentences. Output ONLY these lines — no commentary, no blank lines, no source echo outside the middle field.";
-
-  function buildSentenceSystemPrompt(targetLang, customPrompt) {
-    var tpl =
-      customPrompt && String(customPrompt).trim() ? customPrompt : DEFAULT_SENTENCE_SYSTEM_PROMPT;
-    return tpl.replace(/\{TARGET_LANG\}/g, targetLang || "the target language");
+    return tpl.replace(/\{TARGET_LANG\}/g, targetLang || "简体中文");
   }
 
   /**
-   * 把碎片 cue 拼成带行号的 user message（句级重断用）。
-   * 与 buildNumberedBatch 同构（"1. xxx"），单独留一个函数便于将来差异化。
+   * 把碎片 cue 拼成带序号的 user message（`1. xxx\n2. yyy...`）。序号只帮模型
+   * 理解原文顺序/碎片归属，模型输出不要求带序号（parseSubtitleLines 会剥离漏网序号）。
    */
   function buildNumberedSourceLines(lines) {
     return (lines || [])
@@ -533,577 +494,93 @@
       .join("\n");
   }
 
+  // 行尾标点去除（规则3）：仅去行尾的逗号/句号/空白；行中顿号、问号、感叹号保留。
+  var TRAILING_PUNCT_RE = /[，。,.\s]+$/u;
+  // 漏网的行号前缀（模型偶尔违反规则4）：「1. 」「1、」「1) 」「1）」等。
+  var LEADING_NUM_RE = /^\s*\d{1,3}\s*[.、)）:：]\s*/u;
+
   /**
-   * 解析句级重断模型输出，返回记录数组：
-   *   [{ srcStart, srcEnd, originalText, translation }]
-   * 每行格式 `[范围] ||| 原文句 ||| 译文`，容忍：
-   *  - 单行号 [3] → srcStart=srcEnd=3；范围 [3-5] / [3 - 5]；
-   *  - 三段分隔可有多余空白；分隔符固定为 |||。
-   * 不做覆盖性校验（交给 alignSentences），只做语法解析。
-   * 行号非法 / 段数不足的行直接跳过。
+   * 解析模型输出为「干净的中文字幕行数组」（后处理兜底，纯函数）。
+   *  - 按换行切；逐行剥离漏网行号前缀、去行尾逗号/句号、trim。
+   *  - 丢空行；合并连续完全相同的重复行（ASR 回声/模型复读兜底）。
+   * 不做任何按词/按字切割 —— 模型已分好行，代码只清洗，不动行边界。
    */
-  function parseSentenceResponse(text) {
+  function parseSubtitleLines(text) {
+    if (typeof text !== "string") return [];
+    var raw = text.replace(/\r/g, "").split("\n");
     var out = [];
-    if (typeof text !== "string") return out;
-    var lines = text.replace(/\r/g, "").split("\n");
-    // [n] 或 [a-b]（容忍内部空白与全角连字符）
-    var rangeRe = /^\s*\[\s*(\d+)\s*(?:[-–—]\s*(\d+)\s*)?\]\s*(.*)$/;
-    for (var i = 0; i < lines.length; i++) {
-      var m = lines[i].match(rangeRe);
-      if (!m) continue;
-      var a = parseInt(m[1], 10);
-      var b = m[2] != null ? parseInt(m[2], 10) : a;
-      if (!(a >= 1) || !(b >= a)) continue;
-      // 范围已剥离，剩余形如「||| 原文 ||| 译文」（协议含范围后第一个分隔符）；
-      // 容忍模型省略前导分隔符的「原文 ||| 译文」。先去掉可能的前导 |||，再按 ||| 切两段。
-      var rest = (m[3] || "").replace(/^\s*\|\|\|\s*/, "");
-      var parts = rest.split("|||");
-      if (parts.length < 2) continue; // 至少要能切出 原文 + 译文
-      var originalText = collapseWhitespace(parts[0]);
-      // 译文取其后全部（极少数情况下译文自身含 ||| 时拼回分隔符）
-      var translation = collapseWhitespace(parts.slice(1).join("|||"));
-      if (!translation) continue;
-      out.push({ srcStart: a, srcEnd: b, originalText: originalText, translation: translation });
+    for (var i = 0; i < raw.length; i++) {
+      var ln = raw[i].replace(LEADING_NUM_RE, "");
+      ln = collapseWhitespace(ln).replace(TRAILING_PUNCT_RE, "").trim();
+      if (!ln) continue; // 丢空行
+      if (out.length && out[out.length - 1] === ln) continue; // 合并连续重复行
+      out.push(ln);
     }
     return out;
   }
 
-  /**
-   * 本地轻量「按 n 份拆分一条译文」(借鉴 srt 程序 split_text_simple 思路，但纯本地不再调 API)。
-   * 用途（A1 二次拆分回填）：句级模型把多个源行合并成 [a-b] 的一条长译文时，
-   * 不立即整段退回逐行，先把这条译文近似拆成 (b-a+1) 份回填到各源行，时间轴更细。
-   * 策略：优先按句末/逗号等标点切成片段；片段够则贪心按累计长度均衡聚成 n 组；
-   *      标点不足则退化按字符长度近似等分（CJK 无空格也可切）。
-   * 返回：长度 == n 的字符串数组；无法切出 n 份非空片段时返回 null（调用方退逐行兜底）。
-   */
-  function splitTranslation(text, n) {
-    var s = collapseWhitespace(text);
-    if (!s || !(n >= 1)) return null;
-    if (n === 1) return [s];
-
-    // 1) 先按标点（句末 / 逗号 / 顿号 / 分号，含中英）切片，保留标点在片尾。
-    var segs = [];
-    var re = /[^。！？\.!?；;，,、]+[。！？\.!?；;，,、]?/g;
-    var m;
-    while ((m = re.exec(s)) !== null) {
-      var piece = collapseWhitespace(m[0]);
-      if (piece) segs.push(piece);
+  // 可视长度（按码点计，CJK/拉丁字符各计 1）。用于最小行长判定 + 时间轴占比权重。
+  function charLen(s) {
+    var n = 0;
+    var str = String(s == null ? "" : s);
+    for (var i = 0; i < str.length; i++) {
+      var c = str.charCodeAt(i);
+      // 跳过代理对低位，避免 emoji/扩展区算两次
+      if (c >= 0xdc00 && c <= 0xdfff) continue;
+      n++;
     }
-    if (segs.length === 0) segs = [s];
-
-    // 2) 标点片段数 < n：再退化按字符近似等分（CJK 无空格场景）。
-    if (segs.length < n) {
-      segs = splitByLength(s, n);
-      if (!segs) return null;
-    }
-
-    // 3) 片段数 >= n：贪心按累计长度把 segs 聚成正好 n 组（每组至少 1 片）。
-    var total = 0;
-    for (var i = 0; i < segs.length; i++) total += segs[i].length;
-    var target = total / n;
-    var groups = [];
-    var buf = "";
-    var acc = 0;
-    for (var j = 0; j < segs.length; j++) {
-      var remainSeg = segs.length - j;
-      var remainGrp = n - groups.length;
-      buf += segs[j];
-      acc += segs[j].length;
-      // 累计长度过半数边界，或必须给后面每组各留一片时，封一组（最多封 n-1 组，末组收尾）。
-      var enough = acc >= target * (groups.length + 1);
-      var forceSingle = remainSeg <= remainGrp;
-      if ((enough || forceSingle) && groups.length < n - 1) {
-        groups.push(buf);
-        buf = "";
-      }
-    }
-    if (buf) groups.push(buf);
-    // 收尾对齐：若聚少了（最后一组吞太多），按需把最长组再砍；聚多了不可能(受 n-1 限制)。
-    while (groups.length < n) {
-      // 找最长组从中间按长度二分一次
-      var idx = 0;
-      for (var g = 1; g < groups.length; g++) if (groups[g].length > groups[idx].length) idx = g;
-      var two = splitByLength(groups[idx], 2);
-      if (!two) break;
-      groups.splice(idx, 1, two[0], two[1]);
-    }
-    if (groups.length !== n) return null;
-    for (var k = 0; k < groups.length; k++) {
-      groups[k] = collapseWhitespace(groups[k]);
-      if (!groups[k]) return null;
-    }
-    return groups;
+    return n;
   }
 
-  /** 按字符长度把字符串近似等分成 n 份（每份非空）；不足以切出 n 份非空时返回 null。 */
-  function splitByLength(text, n) {
-    var s = collapseWhitespace(text);
-    if (!s || s.length < n) return null;
+  // 拼接两行：边界两侧都是拉丁/数字时插一个空格（不粘连英文词），否则直接相连（CJK 不加空格）。
+  function joinLine(a, b) {
+    var x = String(a || "");
+    var y = String(b || "");
+    if (!x) return y;
+    if (!y) return x;
+    var lastCh = x[x.length - 1];
+    var firstCh = y[0];
+    var sep = /[0-9A-Za-z]/.test(lastCh) && /[0-9A-Za-z]/.test(firstCh) ? " " : "";
+    return x + sep + y;
+  }
+
+  /**
+   * 最小行长兜底（规则2：每行不要过分短）。把短于 minChars 的行【整行】合并到相邻行 ——
+   * 只在【行边界】落点，绝不切词（这是与旧架构的根本区别）。
+   *  - 贪心：某行短于阈值 → 把它后面的行并进来，直到达标或并完。
+   *  - 末行若仍短 → 向前并入前一行。
+   *  - 全部都短（原文内容本来就少）→ 合并成一行，宁可一行也不切碎。
+   * minChars<=0 关闭合并，原样返回（便于 A/B 与单测）。
+   */
+  function mergeShortLines(lines, minChars) {
+    var min = minChars > 0 ? minChars : 0;
+    var src = (lines || []).slice();
+    if (!min || src.length <= 1) return src;
     var out = [];
-    var per = Math.floor(s.length / n);
-    var pos = 0;
-    for (var i = 0; i < n; i++) {
-      var len = i === n - 1 ? s.length - pos : per;
-      out.push(s.slice(pos, pos + len));
-      pos += len;
+    for (var i = 0; i < src.length; i++) {
+      if (out.length && charLen(out[out.length - 1]) < min) {
+        out[out.length - 1] = joinLine(out[out.length - 1], src[i]);
+      } else {
+        out.push(src[i]);
+      }
     }
-    for (var k = 0; k < out.length; k++) {
-      out[k] = collapseWhitespace(out[k]);
-      if (!out[k]) return null;
+    // 末行仍短 → 向前并（>=2 行时）。
+    while (out.length >= 2 && charLen(out[out.length - 1]) < min) {
+      var last = out.pop();
+      out[out.length - 1] = joinLine(out[out.length - 1], last);
     }
     return out;
   }
-
-  /**
-   * 句级对齐：解析模型输出 + 覆盖性校验 + 时间轴回映。
-   * 入参：
-   *  - originalCues: 本次输入的碎片 cue[]（顺序即源行号 1..N，需带 start/end）。
-   *  - modelText: 模型按句级协议输出的文本。
-   * 返回：
-   *   { ok, sentences, reason? }
-   *   - ok=true：sentences = [{ srcStart, srcEnd, originalText, translation, startMs, endMs }]
-   *     时间区间 = [首源行.start, 末源行.end]（按源 cue 推出）。
-   *   - ok=false：覆盖性校验未过（漏行/重叠/越界/行数对不上/解析空）→ 调用方退回逐行对齐。
-   *     reason 给出诊断（empty/gap/overlap/out-of-range/uncovered）。
-   * 覆盖性规则（必须连续、覆盖全部、不重叠、不遗漏）：
-   *   按 srcStart 排序后，第一条须从 1 开始，每条 srcStart == 上一条 srcEnd+1，
-   *   末条 srcEnd == N。任一不满足即 ok=false。
-   * A1 二次拆分回填（opts.splitFill=true 开启，默认关）：
-   *   覆盖性通过后，对覆盖多源行的 [a-b] 记录（模型把多行合并成一条译文），
-   *   不直接整段当一个粗时间轴单元，而是用 splitTranslation 把这条译文本地拆成
-   *   (b-a+1) 份，逐份回填到各源行 → 渲染单元数 == 源行数，时间轴更细。
-   *   任一记录拆不出对应份数 → 整体 ok=false(reason=split-fail)，调用方退逐行 fallback。
-   */
-  function alignSentences(originalCues, modelText, opts) {
-    opts = opts || {};
-    var cues = originalCues || [];
-    var n = cues.length;
-    if (!n) return { ok: false, sentences: [], reason: "empty-input" };
-
-    var recs = parseSentenceResponse(modelText);
-    if (!recs.length) return { ok: false, sentences: [], reason: "empty" };
-
-    // 越界检查 + 排序（按 srcStart 升序，稳定）
-    for (var i = 0; i < recs.length; i++) {
-      if (recs[i].srcStart < 1 || recs[i].srcEnd > n) {
-        return { ok: false, sentences: [], reason: "out-of-range" };
-      }
-    }
-    var sorted = recs.slice().sort(function (a, b) {
-      return a.srcStart - b.srcStart;
-    });
-
-    // 覆盖性：从 1 连续到 N，逐条衔接、不重叠不遗漏
-    var expect = 1;
-    for (var j = 0; j < sorted.length; j++) {
-      var r = sorted[j];
-      if (r.srcStart !== expect) {
-        return { ok: false, sentences: [], reason: r.srcStart < expect ? "overlap" : "gap" };
-      }
-      expect = r.srcEnd + 1;
-    }
-    if (expect !== n + 1) return { ok: false, sentences: [], reason: "uncovered" };
-
-    // 时间轴回映：句区间 = [首源 cue.start, 末源 cue.end]
-    if (!opts.splitFill) {
-      var sentences = sorted.map(function (rec) {
-        var first = cues[rec.srcStart - 1];
-        var last = cues[rec.srcEnd - 1];
-        return {
-          srcStart: rec.srcStart,
-          srcEnd: rec.srcEnd,
-          originalText: rec.originalText,
-          translation: rec.translation,
-          startMs: first.start,
-          endMs: last.end,
-        };
-      });
-      return { ok: true, sentences: sentences };
-    }
-
-    // A1 二次拆分回填：把多源行 [a-b] 记录的合并译文本地拆成每行一份，回填到各源行。
-    var units = [];
-    for (var s = 0; s < sorted.length; s++) {
-      var rec = sorted[s];
-      var span = rec.srcEnd - rec.srcStart + 1;
-      if (span === 1) {
-        var c = cues[rec.srcStart - 1];
-        units.push({
-          srcStart: rec.srcStart,
-          srcEnd: rec.srcStart,
-          originalText: rec.originalText,
-          translation: rec.translation,
-          startMs: c.start,
-          endMs: c.end,
-        });
-        continue;
-      }
-      var parts = splitTranslation(rec.translation, span);
-      if (!parts) return { ok: false, sentences: [], reason: "split-fail" };
-      for (var p = 0; p < span; p++) {
-        var lineNo = rec.srcStart + p;
-        var cue = cues[lineNo - 1];
-        units.push({
-          srcStart: lineNo,
-          srcEnd: lineNo,
-          // 回填后单位是源行：原文用该源行碎片，译文用拆出的对应份
-          originalText: cue.content != null ? cue.content : rec.originalText,
-          translation: parts[p],
-          startMs: cue.start,
-          endMs: cue.end,
-        });
-      }
-    }
-    return { ok: true, sentences: units };
-  }
-
-  /**
-   * 句级「部分接受 + 缺口逐行补」(第1层，治中英错位)。
-   * 与 alignSentences 不同：不要求模型全覆盖。校验失败时不整段退回逐行硬切，
-   * 而是接受模型已正确覆盖的连续句段，把没被任何有效 rec 覆盖的源行返回为 gaps，
-   * 由调用方对 gaps 逐行补翻，错位面积从「整段」缩到「个别缺口」。
-   * 入参同 alignSentences；opts.splitFill 透传（多源行合并译文本地拆分回填到每行）。
-   * 返回：{ sentences:[...句级单元...], gaps:[[a,b],...] }
-   *  - sentences: 被有效 rec 覆盖的句级单元（含 startMs/endMs/originalText/translation/srcStart/srcEnd），按 srcStart 升序。
-   *  - gaps: 没被任何有效 rec 覆盖的源行闭区间列表（1-based，升序、互不相邻）。
-   * 贪心策略：recs 按 srcStart 排序后，从左到右挑互不重叠的记录（srcStart > 上一条已接受的 srcEnd）；
-   *   越界 / 回退重叠的记录跳过。splitFill 下某条拆不出对应份数 → 该条降级为缺口（不整段废）。
-   * 边界：recs 全废(空/全越界) → sentences=[], gaps=[[1,n]]（整段当缺口，等价旧 fallback）。
-   */
-  function alignSentencesPartial(originalCues, modelText, opts) {
-    opts = opts || {};
-    var cues = originalCues || [];
-    var n = cues.length;
-    if (!n) return { sentences: [], gaps: [] };
-
-    var recs = parseSentenceResponse(modelText);
-    // 排序 + 贪心取互不重叠的极大连续段（保留覆盖到的源行）
-    var sorted = recs.slice().sort(function (a, b) {
-      return a.srcStart - b.srcStart;
-    });
-    var covered = new Array(n + 1).fill(false); // 1-based 命中标记
-    var units = [];
-    var lastEnd = 0; // 已接受记录的最大 srcEnd
-    for (var i = 0; i < sorted.length; i++) {
-      var rec = sorted[i];
-      // 越界 / 与已接受段重叠（回退）→ 跳过该条
-      if (rec.srcStart < 1 || rec.srcEnd > n || rec.srcStart <= lastEnd) continue;
-      var built = buildSentenceUnits(rec, cues, !!opts.splitFill);
-      if (!built) continue; // splitFill 拆分失败：该条降级为缺口
-      for (var u = 0; u < built.length; u++) units.push(built[u]);
-      for (var ln = rec.srcStart; ln <= rec.srcEnd; ln++) covered[ln] = true;
-      lastEnd = rec.srcEnd;
-    }
-
-    // 缺口：把连续未覆盖的源行聚成闭区间
-    var gaps = [];
-    var gs = 0;
-    for (var p = 1; p <= n + 1; p++) {
-      if (p <= n && !covered[p]) {
-        if (gs === 0) gs = p;
-      } else if (gs !== 0) {
-        gaps.push([gs, p - 1]);
-        gs = 0;
-      }
-    }
-    return { sentences: units, gaps: gaps };
-  }
-
-  /**
-   * 把一条句级 rec 回填成句级单元数组（alignSentences splitFill 分支抽出来共用）。
-   *  - splitFill=false 或单行号：1 个单元，时间区间 = [首源行.start, 末源行.end]。
-   *  - splitFill=true 且多源行：用 splitTranslation 把合并译文拆成 (span) 份逐行回填；
-   *    拆不出对应份数 → 返回 null（调用方决定降级为缺口或退兜底）。
-   */
-  function buildSentenceUnits(rec, cues, splitFill) {
-    var span = rec.srcEnd - rec.srcStart + 1;
-    if (!splitFill || span === 1) {
-      var first = cues[rec.srcStart - 1];
-      var last = cues[rec.srcEnd - 1];
-      return [{
-        srcStart: rec.srcStart,
-        srcEnd: rec.srcEnd,
-        originalText: rec.originalText,
-        translation: rec.translation,
-        startMs: first.start,
-        endMs: last.end,
-      }];
-    }
-    var parts = splitTranslation(rec.translation, span);
-    if (!parts) return null;
-    var out = [];
-    for (var p = 0; p < span; p++) {
-      var lineNo = rec.srcStart + p;
-      var cue = cues[lineNo - 1];
-      out.push({
-        srcStart: lineNo,
-        srcEnd: lineNo,
-        originalText: cue.content != null ? cue.content : rec.originalText,
-        translation: parts[p],
-        startMs: cue.start,
-        endMs: cue.end,
-      });
-    }
-    return out;
-  }
-
-  /**
-   * -------------------------------------------------------------
-   * 句级重断后 LLM 常把多行 ASR 合并成一个很长的完整句（如 78 字、占屏 5.4s），
-   * 整句一个渲染单元 → 软换行堆满画面、长时间不动；旧 splitFill 按字符数硬切又会把
-   * 单词/数字拦腰斩断。这里按「单屏最多字数」硬上限把长句切成可读段，每段 <= cap，
-   * 按字符占比线性分到它覆盖的时间窗，做成分屏滚动（到点切下一段）。
-   * 切分语义（v0.2.2 起硬上限，非「只落标点」）：标点是优选切点；超长片段在内部按
-   * 可读边界硬切（CJK 按字、拉丁词与数字成整体不斩断、实在超长的不可分原子按 cap 硬截）；
-   * 每段 <= maxCharsPerScreen；无句中标点的长句也切；时长维度有最小段长/可视时长保护。
-   */
-
-  // 切点标点（句末 + 句中），命中处可断句；用于把长译文按可读片段切分。
-  var SEGMENT_PUNCT_RE = /[^。！？．\.!?；;，,、…]+[。！？．\.!?；;，,、…]+/g;
-
-  // 时长维度切分的下限保护（修「短句被切成单字闪烁」）：
-  //  - SEG_MIN_VISIBLE_MS：每段至少可视这么久（ms），低于此不为凑时长再切；也是「一屏可视
-  //    时长地板」（缺陷7）：除「整段太短放不下」的退化情形外，任何一屏 endMs-startMs >= 此值。
-  //  - segMinChars()：每段译文最小字符数 = max(2, ceil(cap/4))，随单屏上限自适应。
-  //  - TARGET_CPS：目标阅读速度（字/秒，缺陷5）。每屏「该显示多久」= ceil(字数/TARGET_CPS*1000)，
-  //    取此与地板的较大值为 idealMs；屏起点贴语音、终点提前到 起点+idealMs，剩余时间留白成
-  //    句间停顿，而非把字幕拖满到下一屏（单纯多切并不能提高 cps，留白才是正解）。
-  // 时长维度只在「不破坏这两个下限」时才提高段数；短句宁可静止显示也不切碎。
+  /* ---------------------------------------------------------------
+   * 4a. 时间轴排布常量（layoutTimeline 用）。
+   * ------------------------------------------------------------- */
+  // 每段至少可视这么久(ms)，也是「一屏可视时长地板」：除整段太短放不下的退化情形外，
+  // 任何一行 endMs-startMs >= 此值（不闪现）。
   var SEG_MIN_VISIBLE_MS = 800;
+  // 目标阅读速度（字/秒）：每行「该显示多久」= ceil(字数/TARGET_CPS*1000)，剩余 slot 留白成停顿。
   var TARGET_CPS = 7;
-  // v0.3.1：句单元内分屏之间的最小可见间隙(ms)。修「无间隙一直显示」——多屏长句
-  // 各屏终点往回扣此值，使屏与屏之间露出一个停顿（与跨句单元 tailTrimMs 节奏一致）。
-  // 让位于 SEG_MIN_VISIBLE_MS 可视地板：slot 太短放不下断点时优先保可视、不闪现。
+  // 行与行之间的最小可见间隙(ms)：非末行终点往回扣此值，露出停顿（让位于可视地板）。
   var INTER_SEG_GAP_MS = 120;
-  function segMinChars(cap) {
-    return cap > 0 ? Math.max(2, Math.ceil(cap / 4)) : 2;
-  }
-
-  /**
-   * 把一段文本按标点切成「原始片段」数组（保留标点在片尾、保留原字符不折叠）。
-   * 末尾若有不带标点的残尾也作为一片。拼回所有片 === 原串（无丢字）。
-   * 标点不足（整段无可切标点）→ 返回 [text]（单片，由上层决定是否退化按长度）。
-   */
-  function splitByPunctPieces(text) {
-    var s = String(text == null ? "" : text);
-    var pieces = [];
-    var lastEnd = 0;
-    var re = new RegExp(SEGMENT_PUNCT_RE.source, "g");
-    var m;
-    while ((m = re.exec(s)) !== null) {
-      var end = re.lastIndex;
-      // 不把数字间的小数点当切点（避免把 1.8 / v2.0 拦腰斩开）。
-      var pc = s[end - 1];
-      if ((pc === "." || pc === "．") && /[0-9]/.test(s[end - 2] || "") && /[0-9]/.test(s[end] || "")) {
-        continue;
-      }
-      pieces.push(s.slice(lastEnd, end));
-      lastEnd = end;
-    }
-    if (lastEnd < s.length) pieces.push(s.slice(lastEnd)); // 末尾无标点残尾
-    if (!pieces.length) pieces.push(s);
-    return pieces;
-  }
-
-  /**
-   * 贪心把「标点片段」聚成若干组，使每组折叠后长度尽量 <= maxChars（至少 1 片/组，
-   * 单片超长也不再切——绝不拦腰斩词）。返回折叠后的非空组字符串数组（>=1）。
-   */
-  /**
-   * 判断单字符是否 CJK（中日韩，含假名/全角）。用于硬切时按字断行。
-   */
-  function isCJK(ch) {
-    return /[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uff66-\uff9f]/.test(ch);
-  }
-
-  /**
-   * 把一段文本切成「原子」数组：CJK 单字成一原子；拉丁/数字串（含词内 . , :，
-   * 保住 1.8 / 3,000 / v2.0）成一原子。空格不入原子（拉丁原子间重连时再补）。
-   * 供 hardSplitPiece（硬切）与 splitOriginalIntoN（原文按占比均分）共用。
-   */
-  function tokenizeAtoms(s) {
-    var atoms = [];
-    var i = 0;
-    while (i < s.length) {
-      var ch = s[i];
-      if (ch === " ") { i++; continue; }
-      if (isCJK(ch)) { atoms.push(ch); i++; continue; }
-      // 拉丁/数字串：含数字/字母间的 . , : （保住 1.8 / 3,000 / v2.0）
-      var j = i;
-      while (j < s.length) {
-        var c = s[j];
-        if (c === " " || isCJK(c)) break;
-        if ((c === "." || c === "," || c === ":") &&
-            !(/[0-9A-Za-z]/.test(s[j - 1] || "") && /[0-9A-Za-z]/.test(s[j + 1] || ""))) break;
-        j++;
-      }
-      if (j > i) { atoms.push(s.slice(i, j)); i = j; }
-      else { atoms.push(s[i]); i++; }
-    }
-    return atoms;
-  }
-
-  /**
-   * 把一个「超过 cap」的标点片段在内部按可读边界硬切成多块（每块 <= cap，无例外）。
-   * 规则：CJK 按字可断；拉丁/数字串视为原子（绝不斩断词/数字/小数 1.8/版本 v2.0），
-   * 拉丁原子之间用空格重连。单个不可分原子本身 > cap（URL/连写串）时降级：在原子内部
-   * 按 cap 硬截成多块（字幕可读性 > 词完整性），保证每块 <= cap。
-   */
-  function hardSplitPiece(piece, cap) {
-    var s = collapseWhitespace(piece);
-    if (cap <= 0 || s.length <= cap) return [s];
-    var atoms = tokenizeAtoms(s);
-    var out = [];
-    var buf = "";
-    for (var k = 0; k < atoms.length; k++) {
-      var a = atoms[k];
-      // 单个原子本身就 > cap（实在切不动的 URL/连写串）→ 在原子内部按 cap 硬截。
-      // 字幕可读性优先于词完整性：保证每段 <= cap，无例外。
-      if (a.length > cap) {
-        if (buf) { out.push(buf); buf = ""; }
-        for (var off = 0; off < a.length; off += cap) out.push(a.slice(off, off + cap));
-        continue;
-      }
-      var sep = (buf && /[A-Za-z0-9]$/.test(buf) && /^[A-Za-z0-9]/.test(a)) ? " " : "";
-      var cand = buf + sep + a;
-      if (buf && cand.length > cap) { out.push(buf); buf = a; }
-      else { buf = cand; }
-    }
-    if (buf) out.push(buf);
-    return out;
-  }
-
-  /**
-   * 把整段译文切成「每段 <= cap」的可读段：先按标点切，再对超长片段硬切，
-   * 最后把相邻小块在不超 cap 的前提下回粘（保可读）。cap<=0 = 不切。
-   * 这是「单屏最多字数」的硬上限实现（标点是优选切点，不是唯一约束）。
-   */
-  function segmentTextByCap(trans, cap) {
-    var s = collapseWhitespace(trans);
-    if (cap <= 0 || s.length <= cap) return [s];
-    var pieces = splitByPunctPieces(s);
-    var segs = [];
-    var buf = "";
-    for (var p = 0; p < pieces.length; p++) {
-      var sub = hardSplitPiece(pieces[p], cap);
-      for (var q = 0; q < sub.length; q++) {
-        var chunk = sub[q];
-        var cand = buf ? buf + chunk : chunk;
-        if (buf && collapseWhitespace(cand).length > cap) {
-          segs.push(collapseWhitespace(buf));
-          buf = chunk;
-        } else {
-          buf = cand;
-        }
-      }
-    }
-    if (collapseWhitespace(buf)) segs.push(collapseWhitespace(buf));
-    return segs.length ? segs : [s];
-  }
-
-  function groupPiecesByLen(pieces, maxChars) {
-    var cap = maxChars > 0 ? maxChars : Infinity;
-    var groups = [];
-    var buf = "";
-    for (var i = 0; i < pieces.length; i++) {
-      var pieceLen = collapseWhitespace(pieces[i]).length;
-      var bufLen = collapseWhitespace(buf).length;
-      // 当前组已非空、再加这片会超 cap → 先封一组
-      if (buf && bufLen + pieceLen > cap) {
-        groups.push(buf);
-        buf = "";
-      }
-      buf += pieces[i];
-    }
-    if (collapseWhitespace(buf)) groups.push(buf);
-    var out = [];
-    for (var g = 0; g < groups.length; g++) {
-      var c = collapseWhitespace(groups[g]);
-      if (c) out.push(c);
-    }
-    return out.length ? out : [collapseWhitespace(pieces.join("")) || ""];
-  }
-
-  /**
-   * 把整段译文「尽量均摊」成正好 n 段（缺陷6：消灭「前满后碎」的尾巴）。
-   * 思路：先按标点切片，贪心聚成 n 组使各组累计长度尽量接近 total/n（只在标点/原子边界落点，
-   * 不斩词）；标点不足时退化到原子级均分（CJK 按字、拉丁/数字成原子）。每组仍 <= cap。
-   * 单原子本身 > cap 的极端串由 hardSplitPiece 在原子内按 cap 硬截兜底（保证 <= cap）。
-   * 返回 n 个非空段（内容不足时末段可能更短，但不会出现「20 vs 5」式悬殊）。
-   */
-  function splitTransIntoN(trans, n, cap) {
-    var s = collapseWhitespace(trans);
-    if (n <= 1) return [s];
-    // 先确保每段 <= cap：用「均摊等效 cap」= max(ceil(len/n), 最长不可分原子, segMinChars) 但不超 cap。
-    var atoms = tokenizeAtoms(s);
-    var maxAtom = 0;
-    for (var a = 0; a < atoms.length; a++) if (atoms[a].length > maxAtom) maxAtom = atoms[a].length;
-    var evenCap = Math.ceil(s.length / n);
-    evenCap = Math.max(evenCap, Math.min(maxAtom, cap > 0 ? cap : maxAtom));
-    if (cap > 0) evenCap = Math.min(evenCap, cap);
-    // 用均摊 cap 把原子贪心聚组（标点不再是唯一约束，目标是各组长度接近）。
-    var target = s.length / n;
-    var groups = [];
-    var buf = "";
-    var acc = 0;
-    for (var j = 0; j < atoms.length; j++) {
-      var atom = atoms[j];
-      var sep = (buf && /[A-Za-z0-9]$/.test(buf) && /^[A-Za-z0-9]/.test(atom)) ? " " : "";
-      var cand = buf + sep + atom;
-      var remainAtom = atoms.length - j;
-      var remainGrp = n - groups.length;
-      var forceSingle = remainAtom <= remainGrp; // 必须给后面每组各留一原子
-      // 单原子超 cap：在原子内按 cap 硬截，每块单独成段（极端串兜底）。
-      if (cap > 0 && atom.length > cap) {
-        if (buf) { groups.push(buf); buf = ""; }
-        for (var off = 0; off < atom.length; off += cap) groups.push(atom.slice(off, off + cap));
-        acc += atom.length;
-        continue;
-      }
-      // 加上这片会超均摊 cap 且当前组非空 → 先封组（保证 <= evenCap <= cap）。
-      if (buf && collapseWhitespace(cand).length > evenCap && groups.length < n - 1) {
-        groups.push(buf);
-        buf = atom; // 新组从该原子起
-        acc += atom.length;
-        continue;
-      }
-      buf = cand;
-      acc += atom.length;
-      // 达到累计目标且还需留组给后续 → 封组（均摊落点）。
-      var enough = acc >= target * (groups.length + 1);
-      if ((enough || forceSingle) && groups.length < n - 1 && collapseWhitespace(buf)) {
-        groups.push(buf);
-        buf = "";
-      }
-    }
-    if (collapseWhitespace(buf)) groups.push(buf);
-    // 段数兜底：多于 n 则把尾部回粘到 <= n，但绝不突破 cap（不超 maxCharsPerScreen 优先于正好 n 段）。
-    while (groups.length > n) {
-      var last = groups.pop();
-      var merged = collapseWhitespace(groups[groups.length - 1] + last);
-      if (cap > 0 && merged.length > cap) { groups.push(last); break; } // 回粘会超硬上限 → 宁可多于 n 段
-      groups[groups.length - 1] = merged;
-    }
-    if (groups.length < n) {
-      var re = segmentTextByCap(s, Math.max(1, Math.min(evenCap, cap > 0 ? cap : evenCap)));
-      if (re.length >= n) groups = re.slice(0, n - 1).concat([collapseWhitespace(re.slice(n - 1).join(""))]);
-    }
-    // 最终硬上限保证（缺陷3 不回归）：均摊/回粘后仍 > cap 的段（超长不可分原子残留）按 cap 硬截，单屏字数无例外。
-    if (cap > 0) {
-      var capped = [];
-      for (var h = 0; h < groups.length; h++) {
-        var hs = hardSplitPiece(groups[h], cap);
-        for (var hi = 0; hi < hs.length; hi++) if (hs[hi]) capped.push(hs[hi]);
-      }
-      groups = capped;
-    }
-    var out = [];
-    for (var g = 0; g < groups.length; g++) {
-      var c = collapseWhitespace(groups[g]);
-      if (c) out.push(c);
-    }
-    return out.length ? out : [s];
-  }
 
   /**
    * 给定各段字数 lens 与时间区间，算出每段 { startMs, endMs }（缺陷5+7）。
@@ -1186,379 +663,118 @@
     }
     return out;
   }
+  /* ---------------------------------------------------------------
+   * 4b. 按字符比例配时间轴（v0.4.0 核心）：把模型吐出的「不可再切的整行」
+   *     字幕行铺到该 clip 覆盖的总时间上。代码只配时间，绝不切译文。
+   * ------------------------------------------------------------- */
 
   /**
-   * 长句分段（纯函数，必导出）。基线 v0.2.2 硬上限语义 + v0.2.3 原文对齐/最小段长/超长原子，
-   * 本版(v0.2.4)再加：目标阅读速度留白(缺陷5)、段长均摊(缺陷6)、每屏可视时长地板(缺陷7)。
-   * 入参：
-   *  - unit: { startMs, endMs, originalText, translation, ... }（额外字段透传/忽略）
-   *  - opts: { maxCharsPerScreen (默认 20，CJK 约 20 字), maxDurPerScreen (默认 4000ms) }
-   * 行为（硬上限语义，v0.2.2 起；非旧版「只落标点」）：
-   *  - translation 长度 <= maxCharsPerScreen 且 时长 <= maxDurPerScreen → 原样返回 [unit]（不分段）。
-   *    maxCharsPerScreen<=0 或极大值 = 关闭分段（向后兼容）。
-   *  - 否则把 translation 切成每段 <= maxCharsPerScreen 的可读段：标点是优选切点；超长片段
-   *    在内部按可读边界硬切（CJK 按字、拉丁词与数字 1.8/v2.0 成整体不斩断、实在超长的不可分
-   *    原子按 cap 硬截）；无句中标点的长句也切。每段 <= maxCharsPerScreen（无例外）。
-   *  - 时长维度：段数不足以满足单屏最长时长时按时长提段数，但有下限保护——每段不短于
-   *    segMinChars(cap) 字、不短于 SEG_MIN_VISIBLE_MS 可视，短句宁可静止显示也不切成单字。
-   *  - 段长均摊（缺陷6）：确定 N 段后用 splitTransIntoN 把译文尽量均摊（消灭「20 vs 5」碎尾），
-   *    每段仍 <= maxCharsPerScreen。
-   *  - originalText 同步切成同段数：标点足够按标点均衡聚组，否则按原子占比均分，每段都带
-   *    对应原文片段（不再后段全空），拼回（去空格）无丢字。
-   *  - 时间轴（缺陷5+7）：屏起点按字数占比贴语音排布；屏终点提前到 起点+idealMs（按目标阅读
-   *    速度 TARGET_CPS 该显示多久就显示多久），剩余时间留白成句间停顿（不慢飘）；每屏可视有
-   *    SEG_MIN_VISIBLE_MS 地板（不闪现）。语音密时退化顶满。
-   *  优先级（冲突时）：不丢字 > 不超 maxCharsPerScreen > 可视时长地板 > 目标阅读速度均匀。
-   * 返回：[{ startMs, endMs, originalText, translation }, ...]，N>=1，拼接无丢字。
-   * 注意：屏终点可能早于下一屏起点（句间留白），故时间轴不再要求「全覆盖到下屏起点」，
-   * 但起点仍单调贴语音、各屏不重叠、首屏 start=原 start、末屏 end<=原 end。
+   * 把 N 行字幕（每行已是不可再切的整行）铺到 [startMs,endMs] 时间窗，按各行字符数
+   * 占比分配显示区间，并为每行就近配上原文（仅供双语显示/对照，按时间重叠归并 cue）。
+   *  - lines: 模型输出并清洗后的中文字幕行数组（行边界即时间轴边界，不切词）。
+   *  - startMs/endMs: 该 clip 覆盖的总时间（取自 clip.startMs / clip.endMs）。
+   *  - cues: 该 clip 的原始 cue（用于把原文按时间重叠分给各输出行；可空）。
+   * 复用 layoutTimeline（字符数为占比权重 + SEG_MIN_VISIBLE_MS 可视地板 + 句间留白），
+   * 但输入是【不可再切的整行】—— 行长就是权重，layoutTimeline 不会、也无需碰行内字符。
+   * 返回：[{ srcStart, srcEnd, originalText, translation, startMs, endMs }]（与渲染单元同构）。
+   *   srcStart/srcEnd 为 1-based 输出行号（仅排序用，不再回映 cue 时间）。
    */
-  function segmentSentenceUnit(unit, opts) {
-    opts = opts || {};
-    unit = unit || {};
-    var maxChars = opts.maxCharsPerScreen != null ? opts.maxCharsPerScreen : 20;
-    var maxDur = opts.maxDurPerScreen != null ? opts.maxDurPerScreen : 4000;
-    var startMs = unit.startMs != null ? unit.startMs : unit.start;
-    var endMs = unit.endMs != null ? unit.endMs : unit.end;
-    startMs = Number(startMs) || 0;
-    endMs = Number(endMs);
-    if (!Number.isFinite(endMs)) endMs = startMs;
-    var origRaw = unit.originalText != null ? unit.originalText : "";
-    var transRaw = unit.translation != null ? unit.translation : "";
-    var trans = collapseWhitespace(transRaw);
-    var orig = collapseWhitespace(origRaw);
-
-    function passthrough() {
-      return [
-        {
-          startMs: startMs,
-          endMs: endMs,
-          originalText: orig,
-          translation: trans,
-        },
-      ];
-    }
-
-    // 关闭分段（maxChars<=0）或本就够短够快 → 原样返回。
-    var durMs = endMs - startMs;
-    var charOk = !(maxChars > 0) || trans.length <= maxChars;
-    var durOk = !(maxDur > 0) || durMs <= maxDur;
-    if (charOk && durOk) return passthrough();
-    if (!trans) return passthrough(); // 无译文不分（原文兜底单元，已够短）
-
-    // 译文按「单屏最多字数」硬上限切成可读段（标点优选切点；超长片段在内部按可读边界硬切，
-    // CJK 按字、拉丁/数字成词不斩断；每段 <= maxChars）。再按时长需求决定是否进一步细分。
-    var transGroups = maxChars > 0 ? segmentTextByCap(trans, maxChars) : [trans];
-
-    // 时长维度：若按字数切完段数仍不足以满足「单屏最长时长」，按时长把段数提上来。
-    // 但有下限保护，绝不为凑时长把短句切成单字闪烁：
-    //  - 每段不短于 segMinChars(cap) 字 → 段数 <= floor(trans.length / minChars)。
-    //  - 每段不短于 SEG_MIN_VISIBLE_MS 可视 → 段数 <= floor(durMs / minVisible)。
-    var byDur = maxDur > 0 ? Math.ceil(durMs / maxDur) : 1;
-    if (byDur > transGroups.length && maxChars > 0) {
-      var minChars = segMinChars(maxChars);
-      var capByChars = Math.floor(trans.length / minChars); // 字数下限决定的最大段数
-      var capByVisible = Math.floor(durMs / SEG_MIN_VISIBLE_MS); // 可视时长下限决定的最大段数
-      var maxSegs = Math.min(byDur, capByChars, capByVisible);
-      if (maxSegs > transGroups.length) {
-        // 用更小的等效 cap 重切，逼出更多段（但不超过下限允许的 maxSegs）。
-        var tighterCap = Math.max(minChars, Math.ceil(trans.length / maxSegs));
-        if (tighterCap < maxChars) transGroups = segmentTextByCap(trans, tighterCap);
-      }
-    }
-
-    var n = transGroups.length;
-    if (n <= 1) return passthrough(); // 切不动（整段是单个不可分原子或已够短）→ 原样返回
-
-    // 段长均摊（缺陷6）：确定 N 段后把译文尽量均摊，消灭「前满后碎」尾巴；每段仍 <= maxChars。
-    if (maxChars > 0) {
-      var even = splitTransIntoN(trans, n, maxChars);
-      if (even.length) transGroups = even;
-      n = transGroups.length;
-      if (n <= 1) return passthrough();
-    }
-
-    // 原文按自己的自然边界独立分段后对齐到 n 个译文屏（v0.3.1，修「英文被中文节奏切碎」）：
-    // 不再 splitOriginalIntoN 强切成正好 n 段；origCap 用译文 cap 的 2 倍（拉丁可读字数约 CJK 两倍）。
-    var lens = [];
-    for (var i = 0; i < n; i++) lens.push(transGroups[i].length || 1);
-    var origCap = maxChars > 0 ? maxChars * 2 : 0;
-    var origGroups = alignOriginalToScreens(orig, n, lens, origCap);
-
-    // 时间轴（缺陷5+7）：屏起点按字数占比贴语音，屏终点提前到 起点+idealMs 留白成句间停顿，
-    // 每屏可视有 SEG_MIN_VISIBLE_MS 地板（整段太短放不下时地板让步）。详见 layoutTimeline。
+  function buildClipUnits(lines, startMs, endMs, cues) {
+    var arr = (lines || []).filter(function (l) {
+      return l != null && String(l).trim() !== "";
+    });
+    if (!arr.length) return [];
+    var lens = arr.map(function (l) {
+      return Math.max(1, charLen(l));
+    });
     var times = layoutTimeline(lens, startMs, endMs, SEG_MIN_VISIBLE_MS, TARGET_CPS);
-    var units = [];
-    for (var j = 0; j < n; j++) {
-      units.push({
-        startMs: times[j].startMs,
-        endMs: times[j].endMs,
-        originalText: origGroups[j] != null ? origGroups[j] : "",
-        translation: transGroups[j],
+
+    // 原文按时间重叠就近分给各输出行：用 layoutTimeline 产出的「时隙」边界（贴语音、
+    // 全覆盖），把每条 cue 归到其中点所落的那一行。仅供双语/对照显示，不参与切割。
+    var origByLine = assignOriginalsToLines(times, cues, arr.length, startMs, endMs);
+
+    var out = [];
+    for (var i = 0; i < arr.length; i++) {
+      out.push({
+        srcStart: i + 1,
+        srcEnd: i + 1,
+        originalText: origByLine[i] || "",
+        translation: arr[i],
+        startMs: times[i].startMs,
+        endMs: times[i].endMs,
       });
-    }
-    return units;
-  }
-
-  /**
-   * 把原文切成正好 n 段（数量与译文对齐），每段尽量非空、落在可读边界。
-   * 两级策略：
-   *  1. 句中标点片段 >= n → 贪心按累计长度均衡聚成 n 组（只在标点处切，绝不斩词）。
-   *  2. 标点不足（英文 ASR 几乎无句中标点）→ 退化按「原子占比」均分：把原文切成原子
-   *     （CJK 按字、拉丁词/数字成整体不斩断），再按字符占比线性均分到 n 组。
-   * 这样每段都带对应原文片段（不再后段全空）；拼回（去空格）无丢字。
-   * 原文原子数 < n（极短原文 + 多译文段）才会出现末尾若干空段——无可分内容，属合理。
-   */
-  function splitOriginalIntoN(orig, n) {
-    var s = collapseWhitespace(orig);
-    if (n <= 1) return [s];
-    if (!s) return new Array(n).fill("");
-    var pieces = splitByPunctPieces(s);
-    // 标点片段足够 → 沿用按标点均衡聚组（可读切点优先）。
-    if (pieces.length >= n) return groupPiecesIntoN(pieces, n);
-    // 标点不足 → 按原子占比均分，保证每段尽量非空、不斩词。
-    return splitAtomsIntoN(s, n);
-  }
-
-  /**
-   * v0.3.1 修「英文原文被中文字数节奏切碎」：原文按它自己的自然边界独立分段，
-   * 再对齐到译文的 n 个分屏时间窗（而非被强行切成正好 n 段）。
-   *  - 原文用自己的 cap（origCap，默认译文 cap 的 2 倍——拉丁文每屏可读字数约为 CJK 两倍）
-   *    经 segmentTextByCap 切成「不斩词、标点优选切点」的自然片段 origGroups（数量与 n 无关）。
-   *  - 把 origGroups 与译文段都摊到「字符占比」轴上：第 i 个原文片段落在它占比中点所在的
-   *    译文屏，append 到该屏。一个译文屏可承载 0..多 个原文片段。
-   *  - 没分到原文片段的屏「沿用上一屏原文」（hold）：短英文一句话稳定显示、中文在其下滚动，
-   *    不再把 "talk about" 这种短语拦腰切给不同屏。前导空屏回填首个非空原文。
-   * 返回长度 == n 的原文字符串数组；相邻屏可重复（hold），拼接去重后无丢字。
-   * transLens: 各译文段长度（占比权重，与 layoutTimeline 同源，保证时间窗对齐一致）。
-   */
-  function alignOriginalToScreens(orig, n, transLens, origCap) {
-    var s = collapseWhitespace(orig);
-    if (n <= 1) return [s];
-    if (!s) return new Array(n).fill("");
-    var origGroups = origCap > 0 ? segmentTextByCap(s, origCap) : [s];
-    var out = new Array(n).fill("");
-
-    // 译文屏在占比轴 [0,1) 上的边界（与 layoutTimeline 的 slot 占比一致）。
-    var transTotal = 0;
-    for (var t = 0; t < n; t++) transTotal += (transLens && transLens[t]) || 1;
-    var bounds = new Array(n + 1);
-    bounds[0] = 0;
-    var accT = 0;
-    for (var b = 0; b < n; b++) {
-      accT += (transLens && transLens[b]) || 1;
-      bounds[b + 1] = accT / transTotal;
-    }
-
-    // 原文片段在占比轴上的中点 → 落在哪个译文屏（按 bounds 二分式线性查找）。
-    var origTotal = 0;
-    for (var g = 0; g < origGroups.length; g++) origTotal += origGroups[g].length || 1;
-    var accO = 0;
-    for (var k = 0; k < origGroups.length; k++) {
-      var len = origGroups[k].length || 1;
-      var mid = (accO + len / 2) / origTotal;
-      accO += len;
-      var screen = n - 1;
-      for (var sc = 0; sc < n; sc++) {
-        if (mid < bounds[sc + 1]) { screen = sc; break; }
-      }
-      if (out[screen]) {
-        var join = (/[A-Za-z0-9]$/.test(out[screen]) && /^[A-Za-z0-9]/.test(origGroups[k])) ? " " : "";
-        out[screen] = out[screen] + join + origGroups[k];
-      } else {
-        out[screen] = origGroups[k];
-      }
-    }
-    // 空屏 hold：前向继承上一屏（原文稳定显示），再回填前导空屏为首个非空原文。
-    var lastSeen = "";
-    for (var f = 0; f < n; f++) {
-      if (out[f]) lastSeen = out[f];
-      else out[f] = lastSeen;
-    }
-    if (!out[0]) {
-      var firstNonEmpty = "";
-      for (var e = 0; e < n; e++) { if (out[e]) { firstNonEmpty = out[e]; break; } }
-      for (var z = 0; z < n && !out[z]; z++) out[z] = firstNonEmpty;
     }
     return out;
   }
 
-  /** 贪心把标点片段按累计长度均衡聚成正好 n 组（每组 collapse 后非空，不足补空）。 */
-  function groupPiecesIntoN(pieces, n) {
-    var total = 0;
-    for (var i = 0; i < pieces.length; i++) total += collapseWhitespace(pieces[i]).length;
-    var target = total / n;
-    var groups = [];
-    var buf = "";
-    var acc = 0;
-    for (var j = 0; j < pieces.length; j++) {
-      var remainPiece = pieces.length - j;
-      var remainGrp = n - groups.length;
-      buf += pieces[j];
-      acc += collapseWhitespace(pieces[j]).length;
-      var enough = acc >= target * (groups.length + 1);
-      var forceSingle = remainPiece <= remainGrp; // 必须给后面每组各留一片
-      if ((enough || forceSingle) && groups.length < n - 1) {
-        groups.push(collapseWhitespace(buf));
-        buf = "";
-      }
-    }
-    if (buf) groups.push(collapseWhitespace(buf));
-    while (groups.length < n) groups.push(""); // 不足补空（不硬切词）
-    return groups.slice(0, n);
-  }
-
-  /**
-   * 把原文按「原子占比」均分成 n 组（标点不足时的退化路径）。
-   * 原子：CJK 单字 / 拉丁词 / 数字串（成整体不斩断）。按字符占比贪心聚组，
-   * 拉丁原子间用空格重连。原子数 >= n 时每组非空；原子数 < n 时末尾补空段。
-   */
-  function splitAtomsIntoN(s, n) {
-    var atoms = tokenizeAtoms(s);
-    if (!atoms.length) return new Array(n).fill("");
-    var total = 0;
-    for (var i = 0; i < atoms.length; i++) total += atoms[i].length;
-    var target = total / n;
-    var groups = [];
-    var buf = "";
-    var acc = 0;
-    for (var j = 0; j < atoms.length; j++) {
-      var a = atoms[j];
-      var remainAtom = atoms.length - j;
-      var remainGrp = n - groups.length;
-      var sep = (buf && /[A-Za-z0-9]$/.test(buf) && /^[A-Za-z0-9]/.test(a)) ? " " : "";
-      buf += sep + a;
-      acc += a.length;
-      var enough = acc >= target * (groups.length + 1);
-      var forceSingle = remainAtom <= remainGrp; // 必须给后面每组各留一原子
-      if ((enough || forceSingle) && groups.length < n - 1) {
-        groups.push(buf);
-        buf = "";
-      }
-    }
-    if (buf) groups.push(buf);
-    while (groups.length < n) groups.push(""); // 原子数 < n：末尾补空（无可分内容）
-    return groups.slice(0, n);
-  }
-
-  /**
-   * 把一批文本拼成带行号的 user message。
-   * 输入 lines: string[]；返回 "1. ...\n2. ...\n"。
-   */
-  function buildNumberedBatch(lines) {
-    return lines
-      .map(function (t, i) {
-        return i + 1 + ". " + collapseWhitespace(t);
-      })
-      .join("\n");
-  }
-
-  /**
-   * 解析模型输出的带行号译文，返回 Map<行号(1-based), 译文>。
-   * 容忍前导空白、"1." / "1．" / "1、" / "1)" / "1 -" 等多种行号写法。
-   */
-  function parseNumberedResponse(text) {
-    var map = {};
-    if (typeof text !== "string") return map;
-    var lines = text.replace(/\r/g, "").split("\n");
-    var lineRe = /^\s*(\d+)\s*[.．、):\-]+\s*(.*)$/;
-    for (var i = 0; i < lines.length; i++) {
-      var m = lines[i].match(lineRe);
-      if (m) {
-        var n = parseInt(m[1], 10);
-        var content = collapseWhitespace(m[2]);
-        if (content) map[n] = content;
-      }
-    }
-    return map;
-  }
-
-  /**
-   * 按行号把译文对齐回原始行。
-   * 入参 originals: string[]（本批原文，顺序即行号 1..N）。
-   * 返回 string[]，与 originals 等长。
-   * 兜底：
-   *  - 命中行号 → 用译文。
-   *  - 行号缺失 / 行数不匹配 → 该行留原文（保证不丢内容、不错位）。
-   * 若整体行号完全对不上（map 为空但 fallbackByOrder 为真），
-   * 退化为按出现顺序对齐（模型没给行号但给了等长若干行时）。
-   */
-  function alignTranslations(originals, modelText) {
-    var n = originals.length;
-    var map = parseNumberedResponse(modelText);
-    var keys = Object.keys(map);
-    var result = new Array(n);
-
-    if (keys.length === 0) {
-      // 模型完全没按行号输出 → 尝试按非空行顺序对齐
-      var rawLines = String(modelText || "")
-        .replace(/\r/g, "")
-        .split("\n")
-        .map(collapseWhitespace)
-        .filter(function (l) {
-          return l.length > 0;
-        });
+  // 把 cue 按中点时间归到输出行（用占比时隙的 slotStart 作为边界），同一行的原文顺序拼接。
+  function assignOriginalsToLines(times, cues, n, startMs, endMs) {
+    var origByLine = new Array(n).fill("");
+    var list = cues || [];
+    if (!list.length) return origByLine;
+    // 时隙边界：bound[k] = 第 k 行的起点；bound[n] = endMs。times[].startMs 即贴语音的 slotStart。
+    var bound = [];
+    for (var k = 0; k < n; k++) bound.push(times[k].startMs);
+    bound.push(endMs);
+    for (var c = 0; c < list.length; c++) {
+      var cue = list[c];
+      var mid = (cue.start + cue.end) / 2;
+      // 找 mid 落在哪个 [bound[i], bound[i+1]) 区间（线性即可，n 通常很小）。
+      var idx = 0;
       for (var i = 0; i < n; i++) {
-        result[i] = rawLines[i] != null ? rawLines[i] : originals[i];
+        if (mid >= bound[i]) idx = i;
+        else break;
       }
-      return result;
+      var piece = collapseWhitespace(cue.content);
+      if (!piece) continue;
+      origByLine[idx] = origByLine[idx] ? joinLine(origByLine[idx], piece) : piece;
     }
-
-    for (var j = 0; j < n; j++) {
-      var lineNo = j + 1;
-      result[j] = map[lineNo] != null ? map[lineNo] : originals[j];
-    }
-    return result;
+    return origByLine;
   }
 
   /**
-   * 翻译一批 cue（核心入口，fetch 注入便于测试）。
-   * 参数 opts:
-   *   - cues: cue[]（本批要翻的字幕）
-   *   - apiBaseUrl, apiKey, apiModel: 用户配置三件套（显式具名变量）
-   *   - targetLang: 目标语言
-   *   - systemPrompt: 可选自定义 system prompt
-   *   - temperature: 默认 0.3
-   *   - contextTail: 可选，上一批末尾若干原文，作为上下文（不计入对齐）
-   *   - timeoutMs: 可选，单次请求超时（默认 20000，<=0 关闭）。超时按失败抛错走兜底。
-   *   - fetchImpl: 注入的 fetch（默认用全局 fetch）
-   * 返回：与 cues 等长的 string[]（译文）。
-   * 出错（HTTP 非 200、网络异常、超时）时抛出 Error，由调用方决定兜底（保留原文）。
+   * 翻译一个 clip：一次 chat 调用，让模型直接吐「自然分行的中文字幕行」，
+   * 解析清洗（去行号/去行尾标点/去空行/合并重复）+ 最小行长合并后返回字幕行数组。
+   * 入参（opts）：
+   *  - cues: 该 clip 的碎片 cue[]（带 content，顺序即源行号）
+   *  - apiBaseUrl, apiKey, apiModel, targetLang
+   *  - systemPrompt: 可选自定义（覆盖默认行级 prompt）
+   *  - reasoningEffort: 透传 chatCompletion（默认配置 "low" 压 reasoning 爆点）
+   *  - minLineChars: 最小行长（默认 DEFAULT_CONFIG.minLineChars）；<=0 关闭合并
+   *  - temperature, timeoutMs, fetchImpl
+   * 返回：string[] 中文字幕行（可能为空数组=模型空响应，调用方兜底显原文）。
+   * 网络/HTTP/超时错误向上抛出（与旧 chatCompletion 一致），调用方兜底 + 退避。
    */
-  async function translateBatch(opts) {
+  async function translateClipLines(opts) {
     var cues = opts.cues || [];
-    var originals = cues.map(function (c) {
-      return c.content;
-    });
-    if (originals.length === 0) return [];
+    if (!cues.length) return [];
 
     var sys = buildSystemPrompt(opts.targetLang, opts.systemPrompt);
-    var userContent = "";
-    if (opts.contextTail && opts.contextTail.length) {
-      // 上下文以注释形式前置，明确告知模型只翻译编号行
-      userContent +=
-        "[context, do NOT translate, for reference only]\n" +
-        opts.contextTail.map(collapseWhitespace).join("\n") +
-        "\n\n[translate these numbered lines]\n";
-    }
-    userContent += buildNumberedBatch(originals);
+    var userContent = buildNumberedSourceLines(
+      cues.map(function (c) {
+        return c.content;
+      })
+    );
 
     var content = await chatCompletion({
       apiBaseUrl: opts.apiBaseUrl,
       apiKey: opts.apiKey,
       apiModel: opts.apiModel,
       temperature: opts.temperature,
+      reasoningEffort: opts.reasoningEffort,
       systemContent: sys,
       userContent: userContent,
       timeoutMs: opts.timeoutMs,
       fetchImpl: opts.fetchImpl,
     });
-    return alignTranslations(originals, content);
-  }
 
+    var lines = parseSubtitleLines(content);
+    var min = opts.minLineChars != null ? opts.minLineChars : DEFAULT_CONFIG.minLineChars;
+    return mergeShortLines(lines, min);
+  }
   /**
    * 发一次 chat/completions 并返回 message.content 字符串。
-   * 抽出 translateBatch / translateSentences 共用：构造请求、AbortController 超时、
+   * translateClipLines 复用：构造请求、AbortController 超时、
    * HTTP/网络错误归一化抛出。纯 I/O，不做任何对齐/解析（交给调用方）。
    * 出错（HTTP 非 200、网络异常、超时）抛 Error，调用方决定兜底。
    */
@@ -1575,6 +791,10 @@
         { role: "user", content: opts.userContent },
       ],
     };
+    // 推理模型限流：reasoning_effort=low 把句级重断 prompt 的 reasoning token 从 2000+ 砍到
+    // ~70（延迟 40s→7s，质量不降）。空串/"default"/"none" → 不发该字段（兼容非推理模型与老网关）。
+    var re = opts.reasoningEffort;
+    if (re && re !== "default" && re !== "none") body.reasoning_effort = String(re);
 
     // 超时控制：AbortController 在 timeoutMs 后中断请求，按失败走兜底 + 退避，
     // 避免网关无响应时 clip 永久挂在 pending、占着并发位。
@@ -1625,52 +845,6 @@
       ? data.choices[0].message.content
       : "";
   }
-
-  /**
-   * 句级语义重断 + 翻译（主路径）。一次 chat 调用同时重组断句与翻译，
-   * 然后用 alignSentences 解析 + 覆盖性校验 + 时间轴回映。
-   * 入参（opts）：
-   *  - cues: 本次输入的碎片 cue[]（带 start/end，顺序即源行号）
-   *  - apiBaseUrl, apiKey, apiModel, targetLang
-   *  - systemPrompt: 可选自定义（覆盖句级默认 prompt）
-   *  - temperature, timeoutMs, fetchImpl
-   *  - splitFill: 透传给 alignSentences（true=多源行合并译文本地拆分回填到每行，时间轴更细）
-   * 返回：
-   *   { ok, sentences, reason? }（直接转发 alignSentences 结果）
-   *   - ok=true：句级时间轴可用，渲染层按完整句显示；
-   *   - ok=false：覆盖性校验未过 → 调用方退回逐行 translateCues 兜底（reason 便于诊断）。
-   * 网络/HTTP/超时错误向上抛出（与 translateBatch 一致），调用方兜底。
-   */
-  async function translateSentences(opts) {
-    var cues = opts.cues || [];
-    if (!cues.length) return { ok: false, sentences: [], reason: "empty-input" };
-
-    var sys = buildSentenceSystemPrompt(opts.targetLang, opts.systemPrompt);
-    var userContent =
-      "Regroup, restore punctuation and translate these numbered fragments:\n" +
-      buildNumberedSourceLines(
-        cues.map(function (c) {
-          return c.content;
-        })
-      );
-
-    var content = await chatCompletion({
-      apiBaseUrl: opts.apiBaseUrl,
-      apiKey: opts.apiKey,
-      apiModel: opts.apiModel,
-      temperature: opts.temperature,
-      systemContent: sys,
-      userContent: userContent,
-      timeoutMs: opts.timeoutMs,
-      fetchImpl: opts.fetchImpl,
-    });
-    var res = alignSentences(cues, content, { splitFill: !!opts.splitFill });
-    // 把模型原始输出一并带回：覆盖性校验未过(ok=false)时，调用方可用 rawText
-    // 走 alignSentencesPartial 做「部分接受 + 缺口逐行补」，而不是整段退回逐行（第1层）。
-    res.rawText = content;
-    return res;
-  }
-
   /** 拼接 base 和 path，避免重复/缺失斜杠 */
   function joinUrl(base, path) {
     var b = String(base || "").replace(/\/+$/, "");
@@ -1787,9 +961,9 @@
   /* ---------------------------------------------------------------
    * 5c. 全局并发信号量（跨 clip 的 in-flight 请求上限）
    * -------------------------------------------------------------
-   * 滑动窗口预取(depth=2)会让 idx/idx+1/idx+2 几乎同时各自发起翻译。每个
-   * translateCues 内部又有自己的批内并发池(默认 3)。若不封顶，瞬时并发可达
-   * ~9，足以触发网关 429 → 退避 → 反而更卡。这里提供一个进程级（每个内容脚本
+   * 滑动窗口预取(depth=3)会让 idx..idx+3 几乎同时各自发起翻译。每个 clip 现在
+   * 一次 translateClipLines = 一个请求。若不封顶，瞬时并发可达 ~4+，足以触发网关
+   * 429 → 退避 → 反而更卡。这里提供一个进程级（每个内容脚本
    * 实例一个）的小信号量：所有 clip 的所有批请求都先 acquire 一个令牌再发，
    * 发完 release。在全局 cap 下，滑动窗口仍能尽量保持最大领先，但绝不冲垮网关。
    * 纯逻辑、无定时器、可离线单测：用 Promise 队列实现"超额则排队等令牌"。
@@ -1800,7 +974,7 @@
    *  - max: 同时允许的最大令牌数（<=0 视为 1）。
    * 返回 { run(fn), acquire(), release(), get inFlight(), get max(), get queued() }。
    *  - run(fn): 等到有令牌后执行 fn()（可返回 Promise），结束(成功/抛错)自动 release。
-   *            这是给 translateCues 用的入口——把单批请求包进来即受全局上限约束。
+   *            这是给翻译请求用的入口——把单次请求包进来即受全局上限约束。
    */
   function makeSemaphore(max) {
     var cap = Number(max);
@@ -2076,137 +1250,6 @@
       },
     };
   }
-
-  /* ---------------------------------------------------------------
-   * 8. 翻译编排：首句优先 + 批内受控并发 + 增量回调
-   * -------------------------------------------------------------
-   * translateCues 把一个 clip 的 cue 切成多个 batch：
-   *  - 首句优先：把 priorityIndex 附近的一小批排到最前先翻先返回。
-   *  - 受控并发：用并发池（默认上限 3）替代串行 await。
-   *  - 增量：每批完成就回调 onProgress(updates)，让 UI 尽快显示。
-   *  - contextTail：仅当某批起点不在自然句首（上一条原文无句末标点）时，
-   *    带上一条原文 1 句；clip 第一批不带。省 token 又保连贯。
-   * 返回与 cues 等长的 string[]（全部批完成后）。fetch 注入便于测试。
-   */
-  function planBatches(cues, opts) {
-    opts = opts || {};
-    var batchSize = opts.batchSize > 0 ? opts.batchSize : 10;
-    var priLines = opts.priorityLines > 0 ? opts.priorityLines : 4;
-    var n = cues.length;
-    var pri = opts.priorityIndex;
-    var batches = [];
-    var covered = new Array(n).fill(false);
-
-    // 首句优先批：以 priorityIndex 为起点的一小批
-    if (pri != null && pri >= 0 && pri < n) {
-      var pEnd = Math.min(n, pri + priLines);
-      batches.push({ start: pri, end: pEnd, priority: true });
-      for (var x = pri; x < pEnd; x++) covered[x] = true;
-    }
-    // 其余按顺序补满（跳过已覆盖区间）
-    var i = 0;
-    while (i < n) {
-      if (covered[i]) {
-        i++;
-        continue;
-      }
-      var start = i;
-      var end = i;
-      while (end < n && !covered[end] && end - start < batchSize) end++;
-      batches.push({ start: start, end: end, priority: false });
-      i = end;
-    }
-    return batches;
-  }
-
-  async function translateCues(opts) {
-    var cues = opts.cues || [];
-    var n = cues.length;
-    var result = new Array(n);
-    if (!n) return result;
-    var concurrency = opts.concurrency > 0 ? opts.concurrency : 3;
-    var batches = planBatches(cues, {
-      batchSize: opts.batchSize,
-      priorityIndex: opts.priorityIndex,
-      priorityLines: opts.priorityLines,
-    });
-    // 首句优先批排最前，保证先被并发池取走
-    batches.sort(function (a, b) {
-      return (b.priority ? 1 : 0) - (a.priority ? 1 : 0) || a.start - b.start;
-    });
-
-    var bi = 0;
-    // 上下文窗口：每批携带前 contextLines 条原文作为「参考不翻译」前缀，
-    // 让模型借上下文理解碎片/代词指代/话题连贯（P1-a：扩上下文窗口）。
-    //  - contextLines > 0：每批都带前 N 条原文（不只在句中断点），更连贯。
-    //  - contextLines 未配置（null/未传）：退化为旧行为——仅当批起点不在自然句首
-    //    (上一条原文无句末标点)时带 1 句，clip 第一批不带。保持向后兼容。
-    // context 行不计入编号、不计入对齐（translateBatch 已把它放在编号区之外）。
-    var contextLines = opts.contextLines != null ? opts.contextLines : null;
-    async function worker() {
-      while (bi < batches.length) {
-        var b = batches[bi++];
-        var sub = cues.slice(b.start, b.end);
-        var ctx = null;
-        if (contextLines != null) {
-          // 新策略：每批都带前 N 条原文（N = contextLines，受 clip 起点裁剪）。
-          var cl = contextLines > 0 ? Math.floor(contextLines) : 0;
-          if (cl > 0 && b.start > 0) {
-            var from = Math.max(0, b.start - cl);
-            ctx = [];
-            for (var ci = from; ci < b.start; ci++) ctx.push(cues[ci].content);
-            if (!ctx.length) ctx = null;
-          }
-        } else if (b.start > 0) {
-          // 旧策略：仅当批起点不在自然句首时带 1 句上下文；clip 第一批(start=0)不带。
-          var prev = cues[b.start - 1];
-          if (prev && !SENTENCE_END_RE.test(prev.content)) ctx = [prev.content];
-        }
-        var lines;
-        try {
-          var doBatch = function () {
-            return translateBatch({
-              cues: sub,
-              apiBaseUrl: opts.apiBaseUrl,
-              apiKey: opts.apiKey,
-              apiModel: opts.apiModel,
-              targetLang: opts.targetLang,
-              systemPrompt: opts.systemPrompt,
-              temperature: opts.temperature,
-              contextTail: ctx,
-              timeoutMs: opts.timeoutMs,
-              fetchImpl: opts.fetchImpl,
-            });
-          };
-          // 全局并发信号量（可选）：所有 clip 的所有批共享一个上限，避免滑动窗口
-          // 预取(depth=2) × 批内并发(3) 叠加冲垮网关(~9 并发 → 429)。无 gate 时退化为旧行为。
-          lines = opts.gate && typeof opts.gate.run === "function"
-            ? await opts.gate.run(doBatch)
-            : await doBatch();
-        } catch (e) {
-          // 自适应 gate：把 429/超时回报给 gate 以动态降并发（第3层）
-          if (opts.gate && typeof opts.gate.reportError === "function") {
-            opts.gate.reportError(errorKind(e));
-          }
-          if (opts.onError) opts.onError(e, b);
-          if (opts.failFast) throw e;
-          continue; // 该批失败：留空，调用方兜底显示原文
-        }
-        var updates = [];
-        for (var k = 0; k < sub.length; k++) {
-          result[b.start + k] = lines[k];
-          updates.push({ index: b.start + k, text: lines[k] });
-        }
-        if (opts.onProgress) opts.onProgress(updates, b);
-      }
-    }
-
-    var pool = [];
-    for (var w = 0; w < Math.min(concurrency, batches.length); w++) pool.push(worker());
-    await Promise.all(pool);
-    return result;
-  }
-
   /* ---------------------------------------------------------------
    * 9. 运行时占用优化：二分查找当前 cue + cue→clip 映射
    * -------------------------------------------------------------
@@ -2431,7 +1474,6 @@
     }
     return blocks.length ? blocks.join("\n\n") + "\n" : "";
   }
-
   var EXPORTS = {
     parseJson3: parseJson3,
     parseVtt: parseVtt,
@@ -2450,24 +1492,14 @@
     DEFAULT_CONFIG: DEFAULT_CONFIG,
     DEFAULT_SYSTEM_PROMPT: DEFAULT_SYSTEM_PROMPT,
     buildSystemPrompt: buildSystemPrompt,
-    DEFAULT_SENTENCE_SYSTEM_PROMPT: DEFAULT_SENTENCE_SYSTEM_PROMPT,
-    buildSentenceSystemPrompt: buildSentenceSystemPrompt,
     buildNumberedSourceLines: buildNumberedSourceLines,
-    parseSentenceResponse: parseSentenceResponse,
-    alignSentences: alignSentences,
-    alignSentencesPartial: alignSentencesPartial,
-    buildSentenceUnits: buildSentenceUnits,
-    segmentSentenceUnit: segmentSentenceUnit,
-    alignOriginalToScreens: alignOriginalToScreens,
-    splitTranslation: splitTranslation,
-    translateSentences: translateSentences,
+    parseSubtitleLines: parseSubtitleLines,
+    mergeShortLines: mergeShortLines,
+    charLen: charLen,
+    layoutTimeline: layoutTimeline,
+    buildClipUnits: buildClipUnits,
+    translateClipLines: translateClipLines,
     chatCompletion: chatCompletion,
-    buildNumberedBatch: buildNumberedBatch,
-    parseNumberedResponse: parseNumberedResponse,
-    alignTranslations: alignTranslations,
-    translateBatch: translateBatch,
-    translateCues: translateCues,
-    planBatches: planBatches,
     sliceClips: sliceClips,
     sliceClipsByCue: sliceClipsByCue,
     makeCacheKey: makeCacheKey,
