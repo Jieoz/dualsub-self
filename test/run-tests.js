@@ -1269,6 +1269,14 @@ async function main() {
     assert.deepStrictEqual(lines, ["所以专门烧水的东西叫水壶", "我先从一些测试和演示开始"]);
   });
 
+  test("sanitizeSubtitleLine：去掉非中文目标杂质（拉丁串/异常脚本）但保留数字与常用标点", () => {
+    assert.strictEqual(typeof Core.sanitizeSubtitleLine, "function");
+    assert.strictEqual(Core.sanitizeSubtitleLine("这里少得多ഒരു"), "这里少得多");
+    assert.strictEqual(Core.sanitizeSubtitleLine("把水烧开对，这是个 SodaStream 瓶子"), "把水烧开对，这是个瓶子");
+    assert.strictEqual(Core.sanitizeSubtitleLine("功率是 8.8 千瓦"), "功率是 8.8 千瓦");
+    assert.strictEqual(Core.sanitizeSubtitleLine("  hello  "), "");
+  });
+
   test("DEFAULT_SYSTEM_PROMPT 强调自然短语边界与长度上限", () => {
     const p = Core.DEFAULT_SYSTEM_PROMPT;
     assert.ok(/绝不/.test(p) && /词语/.test(p), "仍强调不切词");

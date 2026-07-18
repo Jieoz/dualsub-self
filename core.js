@@ -475,7 +475,7 @@
     "2) 每行长度适中：尽量 8-16 个汉字，不要过长（尽量不超过 18 字）；也不要切得太碎（除非这段原文内容本来就很少）。\n" +
     "3) 不要在行尾留下半截连接尾巴（如以「的/和/与/或/及/而/以/把/被/让/从/在」结尾却把后续成分甩到下一行）。\n" +
     "4) 去掉每行行尾的逗号和句号；但行中间的顿号、问号、感叹号保留。\n" +
-    "5) 只输出中文字幕行，每行一条，不要行号、不要英文、不要任何解释或思考过程。\n" +
+    "5) 只输出中文字幕行，每行一条，不要行号、不要英文/其它语言字母、不要任何解释或思考过程。\n" +
     "直接给结果。";
 
   function buildSystemPrompt(targetLang, customPrompt) {
@@ -513,11 +513,29 @@
     for (var i = 0; i < raw.length; i++) {
       var ln = raw[i].replace(LEADING_NUM_RE, "");
       ln = collapseWhitespace(ln).replace(TRAILING_PUNCT_RE, "").trim();
+      ln = sanitizeSubtitleLine(ln);
       if (!ln) continue; // 丢空行
       if (out.length && out[out.length - 1] === ln) continue; // 合并连续重复行
       out.push(ln);
     }
     return out;
+  }
+
+  /**
+   * 译文行杂质清洗（v0.4.1）：模型偶发夹带非目标脚本（如马拉雅拉姆字母）或英文专名。
+   *  - 去掉 CJK/数字/空白/常用中文标点以外的字符（含拉丁字母、其它 Unicode 脚本）。
+   *  - 折叠空白；若洗完为空则返回空串（上层 parse/merge 会丢空行）。
+   * 绝不在 CJK 词中间插入/删除汉字——只剥杂质。
+   */
+  function sanitizeSubtitleLine(line) {
+    var s = String(line == null ? "" : line);
+    if (!s) return "";
+    // 保留：CJK 统一表意、扩展A常见区粗略、数字、空白、中文/通用标点
+    s = s.replace(/[^一-鿿㐀-䶿0-9\s，。！？、：；“”‘’（）()\-–—…·℃°%\/.，]/gu, "");
+    s = collapseWhitespace(s).trim();
+    // 去掉拉丁串后可能留下「个 瓶子」：仅压 CJK 之间的空格，数字两侧空格保留（「功率是 8.8 千瓦」）。
+    s = s.replace(/([一-鿿])\s+([一-鿿])/gu, "$1$2");
+    return s;
   }
 
   // 可视长度（按码点计，CJK/拉丁字符各计 1）。用于最小行长判定 + 时间轴占比权重。
@@ -1592,6 +1610,7 @@
     buildSystemPrompt: buildSystemPrompt,
     buildNumberedSourceLines: buildNumberedSourceLines,
     parseSubtitleLines: parseSubtitleLines,
+    sanitizeSubtitleLine: sanitizeSubtitleLine,
     mergeShortLines: mergeShortLines,
     mergeDanglingLines: mergeDanglingLines,
     charLen: charLen,
