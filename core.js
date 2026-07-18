@@ -320,9 +320,9 @@
     transOnTop: true, // true=译文在上，原文在下
     showOriginal: true, // 是否显示原文行
     showLoading: true, // 译文未到时显示轻量"翻译中…"指示（false=只显原文）
-    clipSeconds: 15, // 每个翻译 clip 多少秒（按 cue 边界就近切）。推理模型(gpt-5.x-mini)
-    //                  prompt 越长烧的 reasoning token 越多、单次延迟越不稳；clip 调小
-    //                  → 单次请求更轻 → 首单元延迟/单 clip 耗时显著更稳（见 e2e-harness A/B）。
+    clipSeconds: 12, // 每个翻译 clip 多少秒（按 cue 边界就近切）。v0.4.1 从 15 收到 12：
+    //                  推理模型(gpt-5.x-mini) prompt 越长 reasoning token 越多、首单元越慢；
+    //                  更短 clip → 单次请求更轻 → 首包/换段更稳（见 e2e-harness A/B）。
     batchLines: 14, // 已废弃（v0.4.0 一个 clip = 一次请求，不再 clip 内分批）；保留键兼容旧配置。
     contextLines: 3, // 已废弃（v0.4.0 整 clip 一次翻，模型自带上下文）；保留键兼容旧配置。
     globalConcurrency: 4, // 跨 clip 的全局 in-flight 翻译请求上限（信号量）。滑动窗口预取
@@ -472,9 +472,10 @@
   var DEFAULT_SYSTEM_PROMPT =
     "你是专业字幕翻译。下面是被ASR切碎的英文字幕行。请把它们的完整意思翻译成简体中文，并切分成适合阅读的字幕行，规则严格如下：\n" +
     "1) 在自然语义/短语边界断行，绝不把一个词语切成两半。\n" +
-    "2) 每行长度适中：尽量 8-16 个汉字，不要切得太碎（除非这段原文内容本来就很少）。\n" +
-    "3) 去掉每行行尾的逗号和句号；但行中间的顿号、问号、感叹号保留。\n" +
-    "4) 只输出中文字幕行，每行一条，不要行号、不要英文、不要任何解释或思考过程。\n" +
+    "2) 每行长度适中：尽量 8-16 个汉字，不要过长（尽量不超过 18 字）；也不要切得太碎（除非这段原文内容本来就很少）。\n" +
+    "3) 不要在行尾留下半截连接尾巴（如以「的/和/与/或/及/而/以/把/被/让/从/在」结尾却把后续成分甩到下一行）。\n" +
+    "4) 去掉每行行尾的逗号和句号；但行中间的顿号、问号、感叹号保留。\n" +
+    "5) 只输出中文字幕行，每行一条，不要行号、不要英文、不要任何解释或思考过程。\n" +
     "直接给结果。";
 
   function buildSystemPrompt(targetLang, customPrompt) {
@@ -566,6 +567,57 @@
     }
     // 末行仍短 → 向前并（>=2 行时）。
     while (out.length >= 2 && charLen(out[out.length - 1]) < min) {
+      var last = out.pop();
+      out[out.length - 1] = joinLine(out[out.length - 1], last);
+    }
+    return out;
+  }
+
+  // 强连接尾（几乎总是半截）：和/与/或/及/而/以/把/被/让/从/在
+  // 「的」单独处理：很多完整短语以「的」结尾（这根本不是真的 / 一步步运作的），不能一律并。
+  var STRONG_DANGLING_TAIL_RE = /[和与或及而以把被让从在]$/u;
+  // 「的」后接的下一行若像定语中心语（东西/地方/时候…）才合并，避免误并完整句。
+  var DE_NOMINAL_HEAD_RE = /^(东西|事情|地方|时候|人|原因|问题|方法|方式|样子|结果|情况|部分|内容|时间|过程|作用|意义|感觉|声音|颜色|味道|温度|速度|功率|电压|电流|水壶|电热|炉灶)/u;
+
+  function isDanglingLine(line, nextLine) {
+    var s = String(line == null ? "" : line);
+    if (!s) return false;
+    if (STRONG_DANGLING_TAIL_RE.test(s)) return true;
+    if (/的$/u.test(s)) {
+      // 末行「…的」通常是完整收尾（不是真的/运作的）→ 不并
+      if (nextLine == null) return false;
+      var nxt = String(nextLine);
+      if (!nxt) return false;
+      // 下一行是名词中心语开头 → 典型半截定语（专门烧水的 + 东西…）
+      if (DE_NOMINAL_HEAD_RE.test(nxt)) return true;
+      // 下一行很短（<=4 字）且整行像名词尾巴时也并（东西叫水壶 会更长，靠 head re）
+      return false;
+    }
+    return false;
+  }
+
+  /**
+   * 合并半截连接尾行（v0.4.1 观感打磨）。
+   *  - 强连接尾（和/与/…）整行并入下一行。
+   *  - 「的」仅在下一行像定语中心语时并入（防「不是真的」「运作的」误并）。
+   *  - 末行强连接尾 → 向前并；末行「…的」不并。
+   *  - 只在行边界落点，绝不切词；空/单行/无半截原样返回。
+   */
+  function mergeDanglingLines(lines) {
+    var src = (lines || []).slice();
+    if (src.length <= 1) return src;
+    var out = [];
+    for (var i = 0; i < src.length; i++) {
+      var cur = String(src[i] == null ? "" : src[i]);
+      if (!cur) continue;
+      if (out.length && isDanglingLine(out[out.length - 1], cur)) {
+        out[out.length - 1] = joinLine(out[out.length - 1], cur);
+      } else {
+        out.push(cur);
+      }
+    }
+    // 末行仅强连接尾才向前并（「…的」完整收尾保留）
+    while (out.length >= 2 && STRONG_DANGLING_TAIL_RE.test(out[out.length - 1])) {
       var last = out.pop();
       out[out.length - 1] = joinLine(out[out.length - 1], last);
     }
@@ -673,7 +725,7 @@
    * 占比分配显示区间，并为每行就近配上原文（仅供双语显示/对照，按时间重叠归并 cue）。
    *  - lines: 模型输出并清洗后的中文字幕行数组（行边界即时间轴边界，不切词）。
    *  - startMs/endMs: 该 clip 覆盖的总时间（取自 clip.startMs / clip.endMs）。
-   *  - cues: 该 clip 的原始 cue（用于把原文按时间重叠分给各输出行；可空）。
+   *  - cues: 该 clip 的原始 cue（v0.4.1：按时隙时间重叠分给各输出行 + 空槽最近邻回填；可空）。
    * 复用 layoutTimeline（字符数为占比权重 + SEG_MIN_VISIBLE_MS 可视地板 + 句间留白），
    * 但输入是【不可再切的整行】—— 行长就是权重，layoutTimeline 不会、也无需碰行内字符。
    * 返回：[{ srcStart, srcEnd, originalText, translation, startMs, endMs }]（与渲染单元同构）。
@@ -707,27 +759,71 @@
     return out;
   }
 
-  // 把 cue 按中点时间归到输出行（用占比时隙的 slotStart 作为边界），同一行的原文顺序拼接。
+  // 把 cue 按「时隙时间重叠」归到输出行，再对仍空的时隙做最近邻回填。
+  // v0.4.1：旧中点分桶在「译文行 > cue」时会在语音间隙开出空 originalText（双语对照约 1/3 空行）。
+  // 重叠分配允许长 cue 覆盖多个时隙（可重复）；宁可双语重复也不留白。
   function assignOriginalsToLines(times, cues, n, startMs, endMs) {
     var origByLine = new Array(n).fill("");
     var list = cues || [];
-    if (!list.length) return origByLine;
+    if (!list.length || n <= 0) return origByLine;
     // 时隙边界：bound[k] = 第 k 行的起点；bound[n] = endMs。times[].startMs 即贴语音的 slotStart。
     var bound = [];
     for (var k = 0; k < n; k++) bound.push(times[k].startMs);
     bound.push(endMs);
+
+    // Pass 1：时间重叠分配（cue.start < slotEnd && cue.end > slotStart）。
     for (var c = 0; c < list.length; c++) {
       var cue = list[c];
-      var mid = (cue.start + cue.end) / 2;
-      // 找 mid 落在哪个 [bound[i], bound[i+1]) 区间（线性即可，n 通常很小）。
-      var idx = 0;
-      for (var i = 0; i < n; i++) {
-        if (mid >= bound[i]) idx = i;
-        else break;
-      }
       var piece = collapseWhitespace(cue.content);
       if (!piece) continue;
-      origByLine[idx] = origByLine[idx] ? joinLine(origByLine[idx], piece) : piece;
+      var cStart = Number(cue.start);
+      var cEnd = Number(cue.end);
+      if (!Number.isFinite(cStart) || !Number.isFinite(cEnd)) continue;
+      if (cEnd < cStart) {
+        var tmp = cStart;
+        cStart = cEnd;
+        cEnd = tmp;
+      }
+      var hit = false;
+      for (var i = 0; i < n; i++) {
+        var s0 = bound[i];
+        var s1 = bound[i + 1];
+        if (cStart < s1 && cEnd > s0) {
+          origByLine[i] = origByLine[i] ? joinLine(origByLine[i], piece) : piece;
+          hit = true;
+        }
+      }
+      // 完全落在窗外的退化：退回中点就近桶，避免丢 cue。
+      if (!hit) {
+        var mid = (cStart + cEnd) / 2;
+        var idx = 0;
+        for (var j = 0; j < n; j++) {
+          if (mid >= bound[j]) idx = j;
+          else break;
+        }
+        origByLine[idx] = origByLine[idx] ? joinLine(origByLine[idx], piece) : piece;
+      }
+    }
+
+    // Pass 2：最近邻回填仍空的时隙（纯间隙 / 布局留白）。
+    for (var e = 0; e < n; e++) {
+      if (origByLine[e]) continue;
+      var prev = "";
+      var next = "";
+      for (var p = e - 1; p >= 0; p--) {
+        if (origByLine[p]) {
+          prev = origByLine[p];
+          break;
+        }
+      }
+      for (var q = e + 1; q < n; q++) {
+        if (origByLine[q]) {
+          next = origByLine[q];
+          break;
+        }
+      }
+      // 优先前邻（阅读方向连续）；没有则用后邻。
+      origByLine[e] = prev || next || "";
     }
     return origByLine;
   }
@@ -770,7 +866,9 @@
 
     var lines = parseSubtitleLines(content);
     var min = opts.minLineChars != null ? opts.minLineChars : DEFAULT_CONFIG.minLineChars;
-    return mergeShortLines(lines, min);
+    // 先并半截连接尾（的/和…），再并过短碎行；顺序很重要：短行合并会吃掉中心语，
+    // 导致「的+东西」识别失败。两者都只在行边界落点，绝不切词。
+    return mergeShortLines(mergeDanglingLines(lines), min);
   }
   /**
    * 发一次 chat/completions 并返回 message.content 字符串。
@@ -1495,6 +1593,7 @@
     buildNumberedSourceLines: buildNumberedSourceLines,
     parseSubtitleLines: parseSubtitleLines,
     mergeShortLines: mergeShortLines,
+    mergeDanglingLines: mergeDanglingLines,
     charLen: charLen,
     layoutTimeline: layoutTimeline,
     buildClipUnits: buildClipUnits,

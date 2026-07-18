@@ -581,6 +581,8 @@ test("DEFAULT_CONFIG 含关键字段且颜色非空", () => {
   assert.ok(d && typeof d === "object");
   assert.ok(/^#/.test(d.fontColor) && /^#/.test(d.transColor), "默认颜色非空");
   assert.ok(d.clipSeconds > 0 && d.batchLines > 0);
+  // v0.4.1：首包延迟打磨——默认 clip 收短到 12s（仍 >0；旧 15 易让单请求 > 播放窗）
+  assert.ok(d.clipSeconds >= 8 && d.clipSeconds <= 12, "clipSeconds 默认应在 8–12 以压首包");
   assert.strictEqual(d.contextLines, 3, "新增 contextLines 默认 3（每批带前 3 条原文作上下文）");
   assert.strictEqual(typeof d.showLoading, "boolean", "新增 showLoading 加载态开关");
   assert.ok(d.batchLines >= 12 && d.batchLines <= 15, "batchLines 默认在 12–15（瘦身后调优）");
@@ -1170,6 +1172,110 @@ async function main() {
     assert.deepStrictEqual(lines, [], "空/空白响应应清洗为空数组");
     // buildClipUnits 对空行数组返回空（isolated 侧据此回退显原文，不产出空译文单元）
     assert.deepStrictEqual(Core.buildClipUnits(lines, 0, 2000, [{ start: 0, end: 2000, content: "hello" }]), []);
+  });
+
+
+
+  /* ============ 6e. v0.4.1 打磨：原文对齐空行 / 半截短语 / 首包默认 ============
+   * 验收里发现：译文行多于 cue 时，旧「cue 中点落槽」会在时隙空白处留下空 originalText
+   * （双语对照约 1/3 行无英文）。这里锁死：只要该时隙与任一 cue 时间重叠，就有原文。
+   */
+  console.log("\n[v0.4.1 打磨：原文对齐 + 半截短语 + 默认 clip]");
+
+  test("buildClipUnits：译文行多于 cue 时，重叠时隙不得空 originalText", () => {
+    // 复现验收空原文：布局在 cue 间隙开出时隙，中点分配会漏行。
+    const cues = [
+      { start: 160, end: 3636, content: "If you're a human person, one of those things you're going to want to do with" },
+      { start: 4160, end: 5183, content: "some regularity is boil water. We do it for lots of reasons," },
+      { start: 7211, end: 8091, content: "from cooking to" },
+      { start: 10000, end: 13697, content: "cleaning and disinfecting to other things probably .And one of those other" },
+      { start: 14559, end: 15297, content: "things is preparing" },
+    ];
+    const lines = [
+      "如果你是人类",
+      "你会经常做的一件事",
+      "就是烧水我们这么做有很多原因",
+      "从做饭到清洁、消毒",
+      "还有其他用途",
+      "热饮，比如茶",
+    ];
+    const units = Core.buildClipUnits(lines, 160, 15297, cues);
+    assert.strictEqual(units.length, lines.length, "一行一单元");
+    const empty = units.filter((u) => !String(u.originalText || "").trim());
+    assert.strictEqual(
+      empty.length,
+      0,
+      "有时间重叠的译文行不应空原文；空行=" + JSON.stringify(empty.map((u) => u.translation))
+    );
+    // 长 cue 跨多时隙时，被覆盖的时隙都应带上该 cue 文本（可重复，双语显示优先不留白）
+    const allOrig = units.map((u) => u.originalText).join(" | ");
+    assert.ok(/cleaning and disinfecting/.test(allOrig), "长 cue 应按重叠落入相关时隙");
+    assert.ok(/from cooking to/.test(allOrig), "短 cue 仍应保留");
+  });
+
+  test("buildClipUnits：完全无重叠的时隙用最近邻原文回填，仍不切词", () => {
+    // 极端：中间时隙落在 cue 间隙（无任何时间重叠）→ 仍应用最近非空原文回填
+    const cues = [
+      { start: 0, end: 1000, content: "hello there" },
+      { start: 9000, end: 10000, content: "goodbye now" },
+    ];
+    const lines = ["你好啊", "中间这行", "再见啦"];
+    const units = Core.buildClipUnits(lines, 0, 10000, cues);
+    assert.strictEqual(units.length, 3);
+    units.forEach((u, i) => {
+      assert.ok(String(u.originalText || "").trim(), "单元 " + i + " 原文不应为空");
+    });
+  });
+
+  test("mergeDanglingLines：半截连接尾（的/和/与）整行并入下一行", () => {
+    assert.strictEqual(typeof Core.mergeDanglingLines, "function", "应导出 mergeDanglingLines");
+    const src = ["所以专门烧水的", "东西叫水壶", "我先从一些测试和", "演示开始", "这根本不是真的"];
+    const out = Core.mergeDanglingLines(src);
+    assert.deepStrictEqual(out, ["所以专门烧水的东西叫水壶", "我先从一些测试和演示开始", "这根本不是真的"]);
+  });
+
+  test("mergeDanglingLines：空/单行/无半截原样返回", () => {
+    assert.deepStrictEqual(Core.mergeDanglingLines([]), []);
+    assert.deepStrictEqual(Core.mergeDanglingLines(["完整一行"]), ["完整一行"]);
+    assert.deepStrictEqual(Core.mergeDanglingLines(["你会经常做的一件事", "就是烧水"]), [
+      "你会经常做的一件事",
+      "就是烧水",
+    ]);
+  });
+
+  await asyncTest("translateClipLines 后处理链：短行合并 + 半截连接尾合并", async () => {
+    const mockFetch = async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        choices: [{ message: { content: "所以专门烧水的\n东西叫水壶\n我先从一些测试和\n演示开始" } }],
+      }),
+      text: async () => "",
+    });
+    const lines = await Core.translateClipLines({
+      cues: [
+        { start: 0, end: 2000, content: "so the thing made for boiling water" },
+        { start: 2000, end: 4000, content: "is called a kettle" },
+        { start: 4000, end: 6000, content: "I'll start with some testing and" },
+        { start: 6000, end: 8000, content: "demonstration" },
+      ],
+      apiBaseUrl: "http://mock/v1",
+      apiKey: "k",
+      apiModel: "m",
+      minLineChars: 6,
+      timeoutMs: 5000,
+      fetchImpl: mockFetch,
+    });
+    assert.deepStrictEqual(lines, ["所以专门烧水的东西叫水壶", "我先从一些测试和演示开始"]);
+  });
+
+  test("DEFAULT_SYSTEM_PROMPT 强调自然短语边界与长度上限", () => {
+    const p = Core.DEFAULT_SYSTEM_PROMPT;
+    assert.ok(/绝不/.test(p) && /词语/.test(p), "仍强调不切词");
+    assert.ok(/8-16|8–16/.test(p), "保留适中行长");
+    // 打磨：明确禁止半截连接尾、尽量不超 18 字
+    assert.ok(/的$|连接|半截|悬空|尾巴/.test(p), "应提示避免半截连接尾");
+    assert.ok(/18|不要过长|过长/.test(p), "应提示避免过长行");
   });
 
 
