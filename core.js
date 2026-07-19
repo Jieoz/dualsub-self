@@ -218,7 +218,15 @@
 
   // 语义恢复的边界来自模型，但长句 rescue 仍可能在数字/介词/连词处给出
   // 可验证却不适合阅读的边界。这里只合并相邻源 token，绝不改写、重排或删词。
-  var CONTINUATION_START_RE = /^(?:from|to|of|in|on|at|with|for|by|into|over|under|through|during|after|before|without|and|or|but|although|because|which|who|whose|when|while|if|than|as|is|are|was|were|be|been|being)\b/;
+  var CONTINUATION_START_WORDS = {
+    from: true, to: true, of: true, in: true, on: true, at: true, with: true, for: true, by: true,
+    into: true, over: true, under: true, through: true, during: true, after: true, before: true, without: true,
+    and: true, or: true, but: true, although: true, because: true, which: true, who: true, whose: true,
+    when: true, while: true, if: true, than: true, as: true,
+  };
+  function isContinuationStart(word) {
+    return !!CONTINUATION_START_WORDS[String(word || "").toLowerCase()];
+  }
   var DANGLING_END_RE = /\b(?:to|of|for|with|from|at|in|on|by|about|into|over|under|between|through|and|or|but|because|that|which|who|whose|when|while|if|than|as|the|a|an)$/i;
 
   function unitWordCount(unit) {
@@ -246,14 +254,14 @@
    */
   function repairNaturalUnitBoundaries(units, opts) {
     opts = opts || {};
-    var maxNaturalWords = Math.max(1, Math.floor(Number(opts.maxNaturalWords) || 36));
+    var maxNaturalWords = Math.max(1, Math.floor(Number(opts.maxNaturalWords) || 24));
     var maxJoinGapMs = opts.maxJoinGapMs != null ? Math.max(0, Number(opts.maxJoinGapMs)) : 2200;
     var out = [];
     for (var i = 0; i < (units || []).length; i++) {
       var current = Object.assign({}, units[i]);
       if (!current.content) continue;
       var first = restoredWords(current.content)[0] || "";
-      var startsContinuation = first === first.toLowerCase() && CONTINUATION_START_RE.test(first);
+      var startsContinuation = first === first.toLowerCase() && isContinuationStart(first);
       var isLowercaseOrphan = first === first.toLowerCase() && unitWordCount(current) <= 2;
       var previous = out[out.length - 1];
       var previousTail = previous && DANGLING_END_RE.test(String(previous.content || "").replace(/[.,;:!?]+$/, ""));
@@ -1537,6 +1545,19 @@
     return { tokens: tokens, marks: marks };
   }
 
+  // 局部 rescue 的 | 只在两侧都可作为连续字幕阅读时保留。
+  // 模型偶尔会给出 "boiling water | than this ..."；删掉这个坏边界后，
+  // 同一句仍可保留前面的自然 14/20 分屏，而不是整句退化成 34 词。
+  function filterUnsafeRescueMarks(words, marks) {
+    var out = (marks || []).slice();
+    for (var i = 0; i < out.length - 1; i++) {
+      if (out[i] !== "|") continue;
+      var next = String(words[i + 1] || "").toLowerCase();
+      if (isContinuationStart(next)) out[i] = "";
+    }
+    return out;
+  }
+
   async function restoreAndPackTokens(opts) {
     opts = opts || {};
     var restored = await restoreTokenBoundaries(opts);
@@ -1569,6 +1590,7 @@
         });
         var localMarks = restoredBoundaryMarks(tokenWords(restored.tokens.slice(begin, end)), answer);
         if (!localMarks) continue;
+        localMarks = filterUnsafeRescueMarks(tokenWords(restored.tokens.slice(begin, end)), localMarks);
         var safe = true;
         for (var mi = 0, run = 0; mi < localMarks.length; mi++) {
           run++;
@@ -1583,7 +1605,7 @@
     }
     return repairNaturalUnitBoundaries(units, {
       preferredMaxWords: maxWords,
-      maxNaturalWords: opts.maxNaturalWords || 36,
+      maxNaturalWords: opts.maxNaturalWords || maxWords,
     });
   }
 
@@ -2411,6 +2433,7 @@
     chunkTokenRanges: chunkTokenRanges,
     packRestoredTokens: packRestoredTokens,
     repairNaturalUnitBoundaries: repairNaturalUnitBoundaries,
+    filterUnsafeRescueMarks: filterUnsafeRescueMarks,
     collapseWhitespace: collapseWhitespace,
     normalizeColor: normalizeColor,
     shadowCss: shadowCss,
