@@ -1245,6 +1245,62 @@ async function main() {
    */
   console.log("\n[v0.4.1 打磨：原文对齐 + 半截短语 + 默认 clip]");
 
+  test("joinLine：句号后拼接英文要有空格", () => {
+    assert.strictEqual(Core.joinLine("water.", "We do it"), "water. We do it");
+    assert.strictEqual(Core.joinLine("hello", "world"), "hello world");
+    assert.strictEqual(Core.joinLine("你好", "世界"), "你好世界");
+  });
+
+  test("splitOriginalByPunct：按句读标点切段并保留标点", () => {
+    assert.strictEqual(typeof Core.splitOriginalByPunct, "function");
+    assert.deepStrictEqual(
+      Core.splitOriginalByPunct("Hello world. We boil water, for tea! OK?"),
+      ["Hello world.", "We boil water, for tea!", "OK?"]
+    );
+    // 无标点整段保留
+    assert.deepStrictEqual(Core.splitOriginalByPunct("no punctuation here"), ["no punctuation here"]);
+    // 空/空白
+    assert.deepStrictEqual(Core.splitOriginalByPunct("  "), []);
+    assert.deepStrictEqual(Core.splitOriginalByPunct(""), []);
+    // 不在小数点处切
+    assert.deepStrictEqual(Core.splitOriginalByPunct("Use 120.5 volts now."), ["Use 120.5 volts now."]);
+    // 词边界硬切不应留下 "water." 这种 ≤12 字孤儿尾巴
+    const longish =
+      "If you are a human person, one of those things you are going to want to do is boil water.";
+    const parts = Core.splitOriginalByPunct(longish);
+    assert.ok(parts.every((p) => !/^water\.?$/i.test(p.trim())), "不应单独拆出 water.: " + JSON.stringify(parts));
+    assert.ok(parts.some((p) => /boil water/i.test(p)), "boil water 应同段: " + JSON.stringify(parts));
+  });
+
+  test("buildClipUnits：长英文 cue 覆盖多行中文时按标点拆分分配，不全文重复", () => {
+    const cues = [
+      {
+        start: 0,
+        end: 12000,
+        content:
+          "If you're a human person, one of those things you're going to want to do is boil water. We do it for lots of reasons from cooking to cleaning.",
+      },
+    ];
+    const lines = ["如果你是人类", "你会经常做的一件事", "就是烧水", "我们这么做有很多原因", "从做饭到清洁"];
+    const units = Core.buildClipUnits(lines, 0, 12000, cues);
+    assert.strictEqual(units.length, 5);
+    // 每行都应有原文
+    units.forEach((u, i) => {
+      assert.ok(String(u.originalText || "").trim(), "行 " + i + " 原文不应空");
+    });
+    // 不应五行都是同一长句全文
+    const uniq = new Set(units.map((u) => u.originalText.trim()));
+    assert.ok(uniq.size >= 2, "长英文应按标点拆到多行，不应全文复制: " + JSON.stringify([...uniq]));
+    // 单行原文不应接近整段长度（允许略长，但不该每行都是全文）
+    const fullLen = cues[0].content.length;
+    const allFull = units.every((u) => u.originalText.replace(/\s+/g, " ").trim().length >= fullLen - 5);
+    assert.ok(!allFull, "不能每行都挂接近全文的英文");
+    // 拼接后应覆盖主要信息（boil / cooking 等关键词还在）
+    const joined = units.map((u) => u.originalText).join(" ");
+    assert.ok(/boil/i.test(joined), "应保留 boil");
+    assert.ok(/cooking|cleaning/i.test(joined), "应保留 cooking/cleaning");
+  });
+
   test("buildClipUnits：译文行多于 cue 时，重叠时隙不得空 originalText", () => {
     // 复现验收空原文：布局在 cue 间隙开出时隙，中点分配会漏行。
     const cues = [

@@ -646,7 +646,12 @@
       "  font-weight:var(--ds-fontweight,500);",
       "  white-space:pre-wrap; word-break:break-word;",
       "}",
-      ".dualsub-orig{ color:var(--ds-orig-color,#fff); }",
+      ".dualsub-subtitle.dualsub-orig{",
+      "  color:var(--ds-orig-color,#fff);",
+      // 原文最多约 2 行：防长英文折行堆成字幕墙盖住画面（显示层，不改数据）
+      "  display:-webkit-box !important; -webkit-box-orient:vertical; -webkit-line-clamp:2;",
+      "  overflow:hidden; text-overflow:ellipsis; max-height:calc(1.25em * 2 + 2px);",
+      "}",
       ".dualsub-trans{ color:var(--ds-trans-color,#7fdfff); }",
       // 描边/阴影改为变量驱动（width=0 即无描边，无需 class 开关）。
       // paint-order:stroke fill 让描边描在文字下方，不啃掉字形。

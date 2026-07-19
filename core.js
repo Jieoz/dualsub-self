@@ -569,7 +569,10 @@
     if (!y) return x;
     var lastCh = x[x.length - 1];
     var firstCh = y[0];
-    var sep = /[0-9A-Za-z]/.test(lastCh) && /[0-9A-Za-z]/.test(firstCh) ? " " : "";
+    // 拉丁词之间、句读后接下一段英文，都要空格；CJK 相连不加空格。
+    var sep = "";
+    if (/[0-9A-Za-z]/.test(lastCh) && /[0-9A-Za-z]/.test(firstCh)) sep = " ";
+    else if (/[.!?;,:%)]/.test(lastCh) && /[0-9A-Za-z"'(]/.test(firstCh)) sep = " ";
     return x + sep + y;
   }
 
@@ -834,7 +837,7 @@
    * 占比分配显示区间，并为每行就近配上原文（仅供双语显示/对照，按时间重叠归并 cue）。
    *  - lines: 模型输出并清洗后的中文字幕行数组（行边界即时间轴边界，不切词）。
    *  - startMs/endMs: 该 clip 覆盖的总时间（取自 clip.startMs / clip.endMs）。
-   *  - cues: 该 clip 的原始 cue（v0.4.1：按时隙时间重叠分给各输出行 + 空槽最近邻回填；可空）。
+   *  - cues: 该 clip 的原始 cue（v0.4.4：标点切段后按时序分配到各输出行 + 空槽最近邻回填；可空）。
    * 复用 layoutTimeline（字符数为占比权重 + SEG_MIN_VISIBLE_MS 可视地板 + 句间留白），
    * 但输入是【不可再切的整行】—— 行长就是权重，layoutTimeline 不会、也无需碰行内字符。
    * 返回：[{ srcStart, srcEnd, originalText, translation, startMs, endMs }]（与渲染单元同构）。
@@ -868,23 +871,144 @@
     return out;
   }
 
-  // 把 cue 按「时隙时间重叠」归到输出行，再对仍空的时隙做最近邻回填。
-  // v0.4.1：旧中点分桶在「译文行 > cue」时会在语音间隙开出空 originalText（双语对照约 1/3 空行）。
-  // 重叠分配允许长 cue 覆盖多个时隙（可重复）；宁可双语重复也不留白。
+  /**
+   * 英文/原文显示切段（本地、零 token）：在句读标点后断开。
+   *  - 强切：. ! ? ;（保留标点在左段；不在小数 12.5 处切；... 视为一体）
+   *  - 弱切：单段超过 maxChunk 时在逗号后补切
+   *  - 仍过长：按词边界硬切到 maxChunk（只断空格，不拆单词）
+   */
+  function splitOriginalByPunct(text, maxChunk) {
+    var s = collapseWhitespace(text);
+    if (!s) return [];
+    var limit = maxChunk > 0 ? maxChunk : 64;
+
+    function strongSplit(str) {
+      var parts = [];
+      var buf = "";
+      for (var i = 0; i < str.length; i++) {
+        var ch = str[i];
+        buf += ch;
+        var isStrong = ch === "!" || ch === "?" || ch === ";";
+        if (ch === ".") {
+          var prev = i > 0 ? str[i - 1] : "";
+          var next = i + 1 < str.length ? str[i + 1] : "";
+          if (/\d/.test(prev) && /\d/.test(next)) {
+            // 小数点
+          } else {
+            while (i + 1 < str.length && str[i + 1] === ".") {
+              i++;
+              buf += ".";
+            }
+            isStrong = true;
+          }
+        }
+        if (isStrong) {
+          while (i + 1 < str.length && /["')\]]/.test(str[i + 1])) {
+            i++;
+            buf += str[i];
+          }
+          parts.push(buf.trim());
+          buf = "";
+          while (i + 1 < str.length && /\s/.test(str[i + 1])) i++;
+        }
+      }
+      if (buf.trim()) parts.push(buf.trim());
+      return parts.length ? parts : [str];
+    }
+
+    function commaSplit(str) {
+      if (str.length <= limit) return [str];
+      var pieces = [];
+      var b = "";
+      for (var j = 0; j < str.length; j++) {
+        b += str[j];
+        if (str[j] === "," && b.length >= Math.floor(limit * 0.4)) {
+          var nextCh = j + 1 < str.length ? str[j + 1] : "";
+          if (!nextCh || /\s/.test(nextCh)) {
+            pieces.push(b.trim());
+            b = "";
+            while (j + 1 < str.length && /\s/.test(str[j + 1])) j++;
+          }
+        }
+      }
+      if (b.trim()) pieces.push(b.trim());
+      return pieces.length ? pieces : [str];
+    }
+
+    function wordWrap(str) {
+      if (str.length <= limit) return [str];
+      var words = str.split(/\s+/).filter(Boolean);
+      if (words.length <= 1) return [str];
+      var out = [];
+      var b = "";
+      for (var w = 0; w < words.length; w++) {
+        var cand = b ? b + " " + words[w] : words[w];
+        if (b && cand.length > limit) {
+          out.push(b);
+          b = words[w];
+        } else {
+          b = cand;
+        }
+      }
+      if (b) out.push(b);
+      // 吞掉过短尾巴（如 "water."），避免 "…boil" / "water." 这种难看硬切
+      if (out.length >= 2) {
+        var last = out[out.length - 1];
+        var prev = out[out.length - 2];
+        if (last.length <= 12 && prev.length + 1 + last.length <= Math.floor(limit * 1.25)) {
+          out[out.length - 2] = prev + " " + last;
+          out.pop();
+        }
+      }
+      return out;
+    }
+
+    var out = [];
+    var strong = strongSplit(s);
+    for (var a = 0; a < strong.length; a++) {
+      var mid = commaSplit(strong[a]);
+      for (var b = 0; b < mid.length; b++) {
+        var wrap = wordWrap(mid[b]);
+        for (var c = 0; c < wrap.length; c++) if (wrap[c]) out.push(wrap[c]);
+      }
+    }
+    return out;
+  }
+
+  // 把 cue 归到输出行（v0.4.4）：标点/逗号/词边界切段 → 按时间比例落到时隙 → 空槽填最近邻段。
+  // 目标：长英文不再「全文复制到每一行中文」；本地零 token。
   function assignOriginalsToLines(times, cues, n, startMs, endMs) {
     var origByLine = new Array(n).fill("");
     var list = cues || [];
     if (!list.length || n <= 0) return origByLine;
-    // 时隙边界：bound[k] = 第 k 行的起点；bound[n] = endMs。times[].startMs 即贴语音的 slotStart。
+
     var bound = [];
     for (var k = 0; k < n; k++) bound.push(times[k].startMs);
     bound.push(endMs);
 
-    // Pass 1：时间重叠分配（cue.start < slotEnd && cue.end > slotStart）。
+    function slotIndexAt(ms) {
+      var idx = 0;
+      for (var j = 0; j < n; j++) {
+        if (ms >= bound[j]) idx = j;
+        else break;
+      }
+      if (idx > n - 1) idx = n - 1;
+      if (idx < 0) idx = 0;
+      return idx;
+    }
+
+    function put(i, piece) {
+      if (i < 0 || i >= n || !piece) return;
+      if (!origByLine[i]) origByLine[i] = piece;
+      else if (origByLine[i].indexOf(piece) === -1) origByLine[i] = joinLine(origByLine[i], piece);
+    }
+
+    // 收集带时间戳的原文段
+    var timed = []; // {text, mid, start, end}
     for (var c = 0; c < list.length; c++) {
       var cue = list[c];
-      var piece = collapseWhitespace(cue.content);
-      if (!piece) continue;
+      var text = collapseWhitespace(cue.content);
+      if (!text) continue;
       var cStart = Number(cue.start);
       var cEnd = Number(cue.end);
       if (!Number.isFinite(cStart) || !Number.isFinite(cEnd)) continue;
@@ -893,46 +1017,81 @@
         cStart = cEnd;
         cEnd = tmp;
       }
-      var hit = false;
-      for (var i = 0; i < n; i++) {
-        var s0 = bound[i];
-        var s1 = bound[i + 1];
-        if (cStart < s1 && cEnd > s0) {
-          origByLine[i] = origByLine[i] ? joinLine(origByLine[i], piece) : piece;
-          hit = true;
-        }
+      if (cEnd === cStart) cEnd = cStart + 1;
+      var segs = splitOriginalByPunct(text);
+      if (!segs.length) continue;
+      var totalW = 0;
+      var weights = [];
+      for (var s0 = 0; s0 < segs.length; s0++) {
+        var w = Math.max(1, segs[s0].length);
+        weights.push(w);
+        totalW += w;
       }
-      // 完全落在窗外的退化：退回中点就近桶，避免丢 cue。
-      if (!hit) {
-        var mid = (cStart + cEnd) / 2;
-        var idx = 0;
-        for (var j = 0; j < n; j++) {
-          if (mid >= bound[j]) idx = j;
-          else break;
-        }
-        origByLine[idx] = origByLine[idx] ? joinLine(origByLine[idx], piece) : piece;
+      var acc = 0;
+      for (var s = 0; s < segs.length; s++) {
+        var frac0 = acc / totalW;
+        acc += weights[s];
+        var frac1 = acc / totalW;
+        var segStart = cStart + frac0 * (cEnd - cStart);
+        var segEnd = cStart + frac1 * (cEnd - cStart);
+        timed.push({
+          text: segs[s],
+          mid: (segStart + segEnd) / 2,
+          start: segStart,
+          end: segEnd,
+        });
       }
     }
 
-    // Pass 2：最近邻回填仍空的时隙（纯间隙 / 布局留白）。
+    // 按时序把每段落到对应时隙
+    for (var t = 0; t < timed.length; t++) {
+      put(slotIndexAt(timed[t].mid), timed[t].text);
+    }
+
+    // 空槽回填：优先最近「未占用」段，减少相邻行全文重复；实在没有再退回邻行。
+    var used = {};
+    for (var z = 0; z < n; z++) {
+      if (origByLine[z]) used[origByLine[z]] = true;
+    }
     for (var e = 0; e < n; e++) {
       if (origByLine[e]) continue;
-      var prev = "";
-      var next = "";
-      for (var p = e - 1; p >= 0; p--) {
-        if (origByLine[p]) {
-          prev = origByLine[p];
-          break;
+      var slotMid = (bound[e] + bound[e + 1]) / 2;
+      var best = null;
+      var bestDist = Infinity;
+      var bestAny = null;
+      var bestAnyDist = Infinity;
+      for (var u = 0; u < timed.length; u++) {
+        var d = Math.abs(timed[u].mid - slotMid);
+        if (d < bestAnyDist) {
+          bestAnyDist = d;
+          bestAny = timed[u].text;
+        }
+        if (!used[timed[u].text] && d < bestDist) {
+          bestDist = d;
+          best = timed[u].text;
         }
       }
-      for (var q = e + 1; q < n; q++) {
-        if (origByLine[q]) {
-          next = origByLine[q];
-          break;
+      var pick = best || bestAny || "";
+      if (!pick) {
+        for (var p = e - 1; p >= 0; p--) {
+          if (origByLine[p]) {
+            pick = origByLine[p];
+            break;
+          }
         }
       }
-      // 优先前邻（阅读方向连续）；没有则用后邻。
-      origByLine[e] = prev || next || "";
+      if (!pick) {
+        for (var q = e + 1; q < n; q++) {
+          if (origByLine[q]) {
+            pick = origByLine[q];
+            break;
+          }
+        }
+      }
+      if (pick) {
+        origByLine[e] = pick;
+        used[pick] = true;
+      }
     }
     return origByLine;
   }
@@ -1764,6 +1923,8 @@
     charLen: charLen,
     layoutTimeline: layoutTimeline,
     buildClipUnits: buildClipUnits,
+    splitOriginalByPunct: splitOriginalByPunct,
+    joinLine: joinLine,
     translateClipLines: translateClipLines,
     chatCompletion: chatCompletion,
     sliceClips: sliceClips,
