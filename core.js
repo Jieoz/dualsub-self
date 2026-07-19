@@ -337,7 +337,9 @@
     reasoningEffort: "low", // 推理模型(gpt-5.x-mini)的 reasoning_effort。行级 prompt 把规则写死 +
     //                  「直接给结果不要思考过程」压住 reasoning 爆点；"low" 时实测延迟 4.5-6.7s 稳定、
     //                  reasoning 14-103 token。取值 low|medium|high；空串或 "default" = 不发该字段。
-    minLineChars: 6, // 最小行长（可视字符）：模型偶尔吐出过短碎行时，把短行【整行】并入相邻行
+    minLineChars: 6,
+    // 字幕行目标上限（字）。后处理 splitLongLines 用；只在短语标记边界拆，绝不切词。
+    maxLineChars: 16, // 最小行长（可视字符）：模型偶尔吐出过短碎行时，把短行【整行】并入相邻行
     //                  （只在行边界落点，绝不切词）。<=0 关闭合并。规则2「每行不要过分短」的兜底。
     tailTrimMs: 120, // 句间视觉尾缩(ms)：连续语流句单元 end 回缩此值制造句间断点(修字幕墙)。
     //                  0=关闭。仅长句(duration>2×)缩，缩后保留 >=300ms 可视；真停顿不受影响。
@@ -479,10 +481,11 @@
   var DEFAULT_SYSTEM_PROMPT =
     "你是专业字幕翻译。下面是被ASR切碎的英文字幕行。请把它们的完整意思翻译成简体中文，并切分成适合阅读的字幕行，规则严格如下：\n" +
     "1) 在自然语义/短语边界断行，绝不把一个词语切成两半。\n" +
-    "2) 每行长度适中：尽量 8-16 个汉字，不要过长（尽量不超过 18 字）；也不要切得太碎（除非这段原文内容本来就很少）。\n" +
-    "3) 不要在行尾留下半截连接尾巴（如以「的/和/与/或/及/而/以/把/被/让/从/在」结尾却把后续成分甩到下一行）。\n" +
-    "4) 去掉每行行尾的逗号和句号；但行中间的顿号、问号、感叹号保留。\n" +
-    "5) 只输出中文字幕行，每行一条，不要行号、不要英文/其它语言字母、不要任何解释或思考过程。\n" +
+    "2) 一句一意：一行只表达一个完整小意群；不要把两句粘成一行（如「就是烧水我们…」「比如泡茶也许…」应拆开）。\n" +
+    "3) 每行长度适中：尽量 8-16 个汉字，不要过长（尽量不超过 18 字）；也不要切得太碎（除非这段原文内容本来就很少）。\n" +
+    "4) 不要在行尾留下半截连接尾巴（如以「的/和/与/或/及/而/以/把/被/让/从/在/以至于」结尾却把后续成分甩到下一行）。\n" +
+    "5) 去掉每行行尾的逗号和句号；但行中间的顿号、问号、感叹号保留。\n" +
+    "6) 只输出中文字幕行，每行一条，不要行号、不要英文/其它语言字母、不要任何解释或思考过程。\n" +
     "直接给结果。";
 
   function buildSystemPrompt(targetLang, customPrompt) {
@@ -600,7 +603,7 @@
 
   // 强连接尾（几乎总是半截）：和/与/或/及/而/以/把/被/让/从/在
   // 「的」单独处理：很多完整短语以「的」结尾（这根本不是真的 / 一步步运作的），不能一律并。
-  var STRONG_DANGLING_TAIL_RE = /[和与或及而以把被让从在]$/u;
+  var STRONG_DANGLING_TAIL_RE = /(?:[和与或及而以把被让从在]|以至于)$/u;
   // 「的」后接的下一行若像定语中心语（东西/地方/时候…）才合并，避免误并完整句。
   var DE_NOMINAL_HEAD_RE = /^(东西|事情|地方|时候|人|原因|问题|方法|方式|样子|结果|情况|部分|内容|时间|过程|作用|意义|感觉|声音|颜色|味道|温度|速度|功率|电压|电流|水壶|电热|炉灶)/u;
 
@@ -648,6 +651,87 @@
     }
     return out;
   }
+
+  // 超长粘句安全拆分点：只在这些「话语标记」之前断开，标记本身完整保留到下一行。
+  // 绝不在字/词中间切开——找不到安全点就整行保留。
+  var LONG_LINE_SPLIT_MARKERS = [
+    "就是", "我们", "你们", "他们", "咱们",
+    "从", "比如", "例如", "还有", "而且", "并且",
+    "但是", "不过", "所以", "因为", "如果", "然后",
+    "以及", "以至于", "其实", "总之", "也许", "可能",
+    "一个", "这种", "那个",
+  ];
+
+  /**
+   * 拆超长/粘句字幕行（v0.4.3 可读性打磨）。
+   *  - 仅当 charLen(line) > maxChars 时尝试拆。
+   *  - 只在 LONG_LINE_SPLIT_MARKERS 之前断开，且左右两边都 >= minPart（默认 4）。
+   *  - 优先选使左段落在 8–maxChars 的切点；找不到安全点 → 原样保留（宁可不切词）。
+   *  - maxChars<=0 关闭。可递归拆到都不再超长或无法再拆。
+   */
+  function splitLongLines(lines, maxChars, minPart) {
+    var max = maxChars > 0 ? maxChars : 0;
+    var minP = minPart > 0 ? minPart : 4;
+    // 粘句门槛：即使总长未超过 max，只要 >= glueMin 也尝试在话语标记处拆（一句一意）。
+    var glueMin = Math.min(10, max > 0 ? max : 10);
+    var src = (lines || []).slice();
+    if (!max || !src.length) return src;
+
+    function trySplit(line) {
+      var s = String(line == null ? "" : line);
+      var n = charLen(s);
+      // 太短不拆；刚好舒适且无强粘句需求时，后面找不到好切点也会原样返回。
+      if (n < glueMin) return [s];
+      var best = null; // {left, right, score, leftLen}
+      for (var m = 0; m < LONG_LINE_SPLIT_MARKERS.length; m++) {
+        var mk = LONG_LINE_SPLIT_MARKERS[m];
+        var from = 0;
+        while (from < s.length) {
+          var at = s.indexOf(mk, from);
+          if (at < 0) break;
+          if (at === 0) {
+            from = mk.length;
+            continue; // 行首标记不拆
+          }
+          var left = s.slice(0, at);
+          var right = s.slice(at);
+          var ll = charLen(left);
+          var rl = charLen(right);
+          if (ll >= minP && rl >= minP) {
+            // 超长行：任何安全切点都可；未超长粘句：左段应是完整短句（<=max 且不宜过长）。
+            if (n <= max && ll > max) {
+              from = at + mk.length;
+              continue;
+            }
+            var score = 0;
+            if (ll >= 4 && ll <= max) score += 100 - Math.abs(8 - ll); // 左段 4–max，越近 8 越好
+            else if (ll > max) score += Math.max(0, 30 - (ll - max));
+            else score += ll;
+            // 总长越超 max 越倾向拆
+            if (n > max) score += 20;
+            if (!best || score > best.score || (score === best.score && Math.abs(8 - ll) < Math.abs(8 - best.leftLen))) {
+              best = { leftLen: ll, score: score, left: left, right: right };
+            }
+          }
+          from = at + mk.length;
+        }
+      }
+      // 未超长且没找到像样切点 → 不拆
+      if (!best) return [s];
+      if (n <= max && best.score < 90) return [s]; // 粘句只接受左段舒适的高分切点
+      return trySplit(best.left).concat(trySplit(best.right));
+    }
+
+    var out = [];
+    for (var i = 0; i < src.length; i++) {
+      var parts = trySplit(src[i]);
+      for (var j = 0; j < parts.length; j++) {
+        if (parts[j]) out.push(parts[j]);
+      }
+    }
+    return out;
+  }
+
   /* ---------------------------------------------------------------
    * 4a. 时间轴排布常量（layoutTimeline 用）。
    * ------------------------------------------------------------- */
@@ -891,9 +975,18 @@
 
     var lines = parseSubtitleLines(content);
     var min = opts.minLineChars != null ? opts.minLineChars : DEFAULT_CONFIG.minLineChars;
-    // 先并半截连接尾（的/和…），再并过短碎行；顺序很重要：短行合并会吃掉中心语，
-    // 导致「的+东西」识别失败。两者都只在行边界落点，绝不切词。
-    return mergeShortLines(mergeDanglingLines(lines), min);
+    // 后处理链（都只在行/短语边界落点，绝不切词）：
+    //  1) 半截连接尾合并（的/和/以至于…）
+    //  2) 过短碎行合并
+    //  3) 超长粘句按话语标记拆分（一句一意）
+    //  4) 再并一次半截尾 + 短行（拆完可能露出新的半截/过短）
+    var maxLine = opts.maxLineChars != null ? opts.maxLineChars : (DEFAULT_CONFIG.maxLineChars || 16);
+    lines = mergeDanglingLines(lines);
+    lines = mergeShortLines(lines, min);
+    lines = splitLongLines(lines, maxLine);
+    lines = mergeDanglingLines(lines);
+    // 拆完后不要再 mergeShortLines：会把「比如泡茶」(4字) 又粘回下一句。
+    return lines;
   }
   /**
    * 发一次 chat/completions 并返回 message.content 字符串。
@@ -1667,6 +1760,7 @@
     sanitizeSubtitleLine: sanitizeSubtitleLine,
     mergeShortLines: mergeShortLines,
     mergeDanglingLines: mergeDanglingLines,
+    splitLongLines: splitLongLines,
     charLen: charLen,
     layoutTimeline: layoutTimeline,
     buildClipUnits: buildClipUnits,

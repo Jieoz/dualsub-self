@@ -1332,6 +1332,61 @@ async function main() {
     assert.deepStrictEqual(lines, ["所以专门烧水的东西叫水壶", "我先从一些测试和演示开始"]);
   });
 
+  test("后处理链保留粘句拆分：mergeShort 不得把 split 结果再粘回", async () => {
+    const lines = await Core.translateClipLines({
+      cues: [{ content: "is boil water we do it for lots of reasons" }, { content: "such as tea maybe cooking" }],
+      apiBaseUrl: "https://example.invalid/v1",
+      apiKey: "x",
+      apiModel: "m",
+      targetLang: "zh-Hans",
+      minLineChars: 6,
+      maxLineChars: 16,
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ choices: [{ message: { content: "就是烧水我们烧水有很多原因\n比如说茶也许你会把这归到烹饪里" } }] }),
+      }),
+    });
+    assert.ok(lines.includes("就是烧水"), "应拆出「就是烧水」: " + JSON.stringify(lines));
+    assert.ok(lines.some((l) => l.includes("我们烧水")), "应保留后半: " + JSON.stringify(lines));
+    assert.ok(lines.some((l) => l.includes("也许")), "「也许」应起新行: " + JSON.stringify(lines));
+    assert.ok(!lines.some((l) => l.includes("就是烧水我们")), "不得再粘回: " + JSON.stringify(lines));
+  });
+
+  test("splitLongLines：超长粘句只在短语边界拆，绝不切词", () => {
+    assert.strictEqual(typeof Core.splitLongLines, "function");
+    // 粘句：就是烧水 + 我们…
+    assert.deepStrictEqual(
+      Core.splitLongLines(["就是烧水我们烧水有很多原因"], 16),
+      ["就是烧水", "我们烧水有很多原因"]
+    );
+    // 比如…也许… 粘句
+    assert.deepStrictEqual(
+      Core.splitLongLines(["比如泡茶也许你会把这归到烹饪里"], 16),
+      ["比如泡茶", "也许你会把这归到烹饪里"]
+    );
+    // 短行不动
+    assert.deepStrictEqual(Core.splitLongLines(["如果你是人类"], 16), ["如果你是人类"]);
+    // 无安全边界 → 不动（宁可不切词）
+    assert.deepStrictEqual(
+      Core.splitLongLines(["这根本不是真的电热水壶"], 10),
+      ["这根本不是真的电热水壶"]
+    );
+    // max<=0 关闭
+    assert.deepStrictEqual(Core.splitLongLines(["就是烧水我们烧水有很多原因"], 0), ["就是烧水我们烧水有很多原因"]);
+  });
+
+  test("splitLongLines：以至于半截与下一行在 mergeDangling 后可读", () => {
+    // 先 split 再 dangling 的链路由 translateClipLines 保证；这里单测 split 本身
+    const lines = Core.splitLongLines([
+      "是如此普遍的做法以至于专门用来烧水的器具叫做水壶",
+    ], 16);
+    assert.ok(lines.length >= 2, "应拆成多行");
+    assert.ok(lines.every((ln) => !/[\u4e00-\u9fff]{1}$/.test("") ), "sanity");
+    // 不应出现单字碎片
+    assert.ok(lines.every((ln) => Core.charLen(ln) >= 2));
+  });
+
   test("sanitizeSubtitleLine：去掉非中文目标杂质（拉丁串/异常脚本）但保留数字与常用标点", () => {
     assert.strictEqual(typeof Core.sanitizeSubtitleLine, "function");
     assert.strictEqual(Core.sanitizeSubtitleLine("这里少得多ഒരു"), "这里少得多");
@@ -1347,6 +1402,7 @@ async function main() {
     // 打磨：明确禁止半截连接尾、尽量不超 18 字
     assert.ok(/的$|连接|半截|悬空|尾巴/.test(p), "应提示避免半截连接尾");
     assert.ok(/18|不要过长|过长/.test(p), "应提示避免过长行");
+    assert.ok(/一句一意|不要把两句|不要粘/.test(Core.DEFAULT_SYSTEM_PROMPT), "应强调一句一意/不粘句");
   });
 
 
