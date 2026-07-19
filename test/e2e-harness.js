@@ -1,7 +1,7 @@
 /*
  * test/e2e-harness.js — 真·E2E 调试 harness（node 直接跑，零外部依赖除 fetch）
  * =============================================================================
- * v0.5.0 架构：模型按编号把每个源 cue 翻成一条中文，译文/原文/时间轴 1:1。
+ * v0.5.1 架构：模型按编号把每个源 cue 翻成一条中文，译文/原文/时间轴 1:1。
  *   本 harness 跑完整主链路：cleanupCues → resegmentCues → sliceClipsByCue
  *     → translateClipLines(编号解析与安全换行)
  *     → buildClipUnits(沿用对应 cue 原文与时间轴) → buildSrt
@@ -185,7 +185,7 @@ async function run() {
     mode = "MOCK (offline structural 1:1 using legacy fragmented ref_zh)";
   }
 
-  console.log("\n=== dualsub E2E harness (v0.5.0) ===");
+  console.log("\n=== dualsub E2E harness (v0.5.1) ===");
   console.log("mode      :", mode);
   console.log("cues      :", originalCues.length, "original →", reseg.length, "resegmented →", clips.length, "clips");
   console.log("tuning    : clipSeconds=" + a.clipSeconds + " firstClipSeconds=" + a.firstClipSeconds +
@@ -337,7 +337,7 @@ function printStats(stats, renderUnits, a) {
 /*
  * 为什么不能只用 Intl.Segmenter：它把成语「隔三差五」切成 4 个单字词 [隔][三][差][五]，
  * 于是「隔三差」|「五要」边界被判为「落在两个独立单字之间」→ 合法 → 漏报（旧 audit 的盲区）。
- * v0.4.0 后处理会去行尾逗号/句号，故相邻行多为 CJK 收尾→CJK 起头，「裸 CJK 边界即切词」会
+ * 字幕后处理后的相邻行常为 CJK 收尾→CJK 起头；若把「裸 CJK 边界」一律判成切词，会
  * 把每个正常断行都误报。因此分三层检测，既抓 segmenter 漏网的成语，又不误伤干净断行：
  *  Tier1 拉丁/数字 token 跨行被劈（边界两侧都是字母/数字、无空格）。
  *  Tier2 segmenter 识别的 >=2 字普通词跨行被劈（治「经/常」「预/测」）。

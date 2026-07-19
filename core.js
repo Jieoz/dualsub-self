@@ -114,7 +114,7 @@
         start: toInt(c.start, 0),
         end: toInt(c.end, 0),
         duration: toInt(c.duration, 0),
-        content: collapseWhitespace(c.content || ""),
+        content: collapseWhitespace(c.content || "").replace(/^\.(?=[A-Za-z])/u, ""),
       }))
       .filter((c) => c.content.length > 0);
 
@@ -194,6 +194,10 @@
     // 硬切会断在半句；一个超过 longPauseMs 的间隙本身就是自然停顿边界，即使没标点也在此切句。
     // 间隙 < longPauseMs 视为同一语流可继续合并（含正常换气停顿），>= 即断。
     var longPauseMs = opts.longPauseMs != null ? opts.longPauseMs : 700;
+    var grammarContinuationMaxGapMs = opts.grammarContinuationMaxGapMs != null
+      ? opts.grammarContinuationMaxGapMs : 2200;
+    var grammarContinuationMaxDurationMs = opts.grammarContinuationMaxDurationMs != null
+      ? opts.grammarContinuationMaxDurationMs : 8000;
     // 句间视觉尾缩（修「字幕墙」）：YouTube 滚动 ASR 几乎每条都与下一条时间重叠，
     // cleanupCues 去重叠后前句 end 被精确压到后句 start → 连续语流内句单元首尾相接、
     // gap 恒为 0，字幕永不消隐。这里在产出句单元时把 end 往回缩一点点，制造句间断点，
@@ -212,6 +216,11 @@
 
     var out = [];
     var cur = null; // 当前累积段：{start,end,words:[]}
+
+    function hasEnglishContinuationTail(words) {
+      var text = collapseWhitespace((words || []).join(" ")).replace(/[,:;!?]+$/g, "").toLowerCase();
+      return /(?:^|\s)(?:to|of|for|with|from|at|in|on|by|about|into|over|under|between|through|and|or|but|because|that|which|who|whose|when|while|if|than|as|the|a|an|my|your|his|her|its|our|their|is|are|was|were|be|been|being|do|does|did|have|has|had|will|would|can|could|should|may|might|must)$/.test(text);
+    }
 
     function flush() {
       if (!cur) return;
@@ -242,7 +251,7 @@
       if (!words.length) continue;
 
       if (!cur) {
-        cur = { start: c.start, end: c.end, words: words.slice() };
+        cur = { start: c.start, end: c.end, words: words.slice(), continuationExtended: false };
       } else {
         var gap = c.start - cur.end;
         var added = stripOverlap(cur.words, words);
@@ -255,15 +264,23 @@
         // 长停顿(gap >= longPauseMs)是自然边界，优先于碎句黏合：即使当前段太短/未结束，
         // 一旦遇到长停顿也不再合并，断在此处（比 maxWords 硬切更自然）。
         var canMerge = !ended || cur.words.length < minWords;
-        var mergeable =
-          gap < longPauseMs && canMerge && wouldWords <= maxWords && wouldDur <= maxDur;
+        var normalMerge = gap < longPauseMs && wouldWords <= maxWords;
+        // 语法尾续接最多额外容纳约 3/4 个普通段；仍受单次续接、gap 与 8s 硬上限约束。
+        var continuationCap = maxWords + Math.max(4, Math.ceil(maxWords * 0.75));
+        var grammarContinuation =
+          !ended && !cur.continuationExtended && hasEnglishContinuationTail(cur.words) &&
+          gap < grammarContinuationMaxGapMs && wouldWords <= continuationCap;
+        var mergeable = canMerge &&
+          ((normalMerge && wouldDur <= maxDur) ||
+            (grammarContinuation && wouldDur <= grammarContinuationMaxDurationMs));
         if (mergeable) {
           for (var w = 0; w < added.length; w++) cur.words.push(added[w]);
+          if (grammarContinuation && !normalMerge) cur.continuationExtended = true;
           cur.end = Math.max(cur.end, c.end);
         } else {
           // 无法再合并（长停顿 / 会超上限）→ 当前段（含太短的碎句）单独成段
           flush();
-          cur = { start: c.start, end: c.end, words: words.slice() };
+          cur = { start: c.start, end: c.end, words: words.slice(), continuationExtended: false };
         }
       }
 
@@ -275,8 +292,8 @@
       var curWords = cur.words.length;
       var endedNow = SENTENCE_END_RE.test(cur.words.join(" "));
       if (
-        curWords >= maxWords ||
-        cur.end - cur.start >= maxDur ||
+        (curWords >= maxWords && !hasEnglishContinuationTail(cur.words) && !cur.continuationExtended) ||
+        (cur.end - cur.start >= maxDur && !hasEnglishContinuationTail(cur.words) && !cur.continuationExtended) ||
         (endedNow && curWords >= minWords)
       ) {
         flush();
@@ -464,32 +481,32 @@
     return Math.round(px);
   }
   /* ---------------------------------------------------------------
-   * 4. 翻译：源 cue 与译文 1:1 对齐（v0.5.0）
+   * 4. 翻译：上下文感知且源 cue 与译文 1:1 对齐（v0.5.1）
    * -------------------------------------------------------------
    * 旧架构（v0.2.1→v0.3.x）让模型先把碎片重组成「完整句」，再由代码把整句
    * 拆回逐行时间轴 —— 这一「拆回」动作硬切中文译文，把「经常」切成「经/常」、
    * 「隔三差/五」斩断（用户最痛的切词 bug 的根因），还堆了 16 个职责重叠的
    * 切割/对齐函数（splitTranslation/splitTransIntoN/alignOriginalToScreens…）。
    *
-   * v0.5.0 让模型按编号把每个已重组 cue 翻成一条自然中文字幕，输出与 cue 1:1：
+   * v0.5.1 让模型结合 clip 上下文并按编号把每个已重组 cue 翻成一条自然中文字幕，输出与 cue 1:1：
    *  - 时间轴与英文原文直接沿用对应 cue，不再做跨行猜测或二次切词。
    *  - 超长译文只允许在安全短语边界形成同一字幕单元内的两行显示，不硬切词。
    *  - reasoning 爆点用 reasoning_effort:low + 把规则写死进 prompt + 「直接给结果
    *    不要思考过程」压住（实测延迟 4.5-6.7s 稳定、reasoning 14-103 token）。
-   * 后处理兜底：按编号落槽、清洗目标语言杂质、去行尾逗号/句号；空响应交给调用方回退原文。
+   * 后处理兜底：按编号落槽、保留必要中文标点并清洗格式噪声；缺槽拒绝缓存并交给调用方退避重试。
    */
 
   // 已验证 system prompt（直接写死规则 + 压 reasoning）。{TARGET_LANG} 仅在调用方
   // 传自定义 prompt 时替换；默认 prompt 面向简体中文，无占位符（替换为 no-op）。
   var DEFAULT_SYSTEM_PROMPT =
-    "你是专业字幕翻译。输入是带序号的源字幕行（通常是英文 ASR 重组后的一句/一小段）。\n" +
-    "请翻译成简体中文，并严格按相同序号输出，规则如下：\n" +
-    "1) 输出行数必须与输入行数完全一致；每行以相同序号开头，例如 `1. …`。\n" +
-    "2) 第 N 行译文只对应第 N 行原文的完整意思，不要跨行合并、不要拆成多行、不要省略、不要重排。\n" +
-    "3) 译文像正常中文字幕：一句一意、完整可读，尽量 12–20 个汉字；不要把两句话粘在一起，也不要输出过长行。\n" +
-    "4) 绝不把一个中文词切成两半，也不要留下以「的/和/与/或」等连接词结尾的半截尾巴。\n" +
-    "5) 去掉行尾逗号和句号；行中问号/感叹号/顿号可保留；不要输出英文/其它字母或解释。\n" +
-    "只输出带编号的中文字幕行。直接给结果。";
+    "你是专业中文字幕翻译。输入是同一段连续语流中带序号的源字幕 cue。请先结合前后行理解整段，再严格按相同序号输出简体中文。\n" +
+    "规则如下：\n" +
+    "1) 输出行数、序号和顺序必须与输入完全一致；每行以相同序号开头，例如 `1. …`。\n" +
+    "2) 第 N 行只承载第 N 个 cue 在连续语流中的信息，不把信息挪到相邻编号，不合并、不遗漏、不重复。\n" +
+    "3) 若源 cue 是半句或语法续接片段，译文也应自然承接前后行；不要为了让单行完整而补入源文没有的意思。\n" +
+    "4) 译文应简洁、自然、适合字幕显示；绝不把一个中文词切成两半，同一 cue 过长时只在安全短语边界换行。\n" +
+    "5) 保留必要的中文标点，包括逗号、句号、问号和感叹号，避免两句话或话语标记粘连。\n" +
+    "6) 不要输出英文、其它字母、解释或思考过程。只输出带编号的中文字幕行。直接给结果。";
 
   /** 是否中文相关 BCP47 / YouTube languageCode（zh, zh-Hans, zh-CN, yue, cmn…） */
   function isChineseLangCode(code) {
@@ -537,14 +554,24 @@
       .join("\n");
   }
 
-  // 行尾标点去除（规则3）：仅去行尾的逗号/句号/空白；行中顿号、问号、感叹号保留。
-  var TRAILING_PUNCT_RE = /[，。,.\s]+$/u;
+  // 保留有语义的行尾标点，仅折叠模型偶发重复输出的同类尾部标点与空白。
+  var TRAILING_SPACE_RE = /\s+$/u;
+  var REPEATED_TRAILING_PUNCT_RE = /([，。！？,.!?])\1+$/u;
+
+  function cleanSubtitleBody(text) {
+    var body = collapseWhitespace(text).replace(TRAILING_SPACE_RE, "").trim();
+    body = body.replace(/([，。！？、：；,.!?:;])\s+/gu, "$1");
+    while (REPEATED_TRAILING_PUNCT_RE.test(body)) {
+      body = body.replace(REPEATED_TRAILING_PUNCT_RE, "$1");
+    }
+    return body;
+  }
   // 漏网的行号前缀（模型偶尔违反规则4）：「1. 」「1、」「1) 」「1）」等。
   var LEADING_NUM_RE = /^\s*\d{1,3}\s*[.、)）:：]\s*/u;
 
   /**
    * 解析模型输出为「干净的中文字幕行数组」（后处理兜底，纯函数）。
-   *  - 按换行切；逐行剥离漏网行号前缀、去行尾逗号/句号、trim。
+   *  - 按换行切；逐行剥离漏网行号前缀、保留必要标点并折叠格式噪声、trim。
    *  - 丢空行；合并连续完全相同的重复行（ASR 回声/模型复读兜底）。
    * 不做任何按词/按字切割 —— 模型已分好行，代码只清洗，不动行边界。
    */
@@ -554,7 +581,7 @@
     var out = [];
     for (var i = 0; i < raw.length; i++) {
       var ln = raw[i].replace(LEADING_NUM_RE, "");
-      ln = collapseWhitespace(ln).replace(TRAILING_PUNCT_RE, "").trim();
+      ln = cleanSubtitleBody(ln);
       ln = sanitizeSubtitleLine(ln);
       if (!ln) continue; // 丢空行
       if (out.length && out[out.length - 1] === ln) continue; // 合并连续重复行
@@ -582,7 +609,7 @@
       var m = String(line).match(/^\s*(\d{1,3})\s*[.、)）:：]\s*(.*)$/u);
       var body = "", idx = -1;
       if (m) { idx = parseInt(m[1], 10) - 1; body = m[2]; } else { body = line; }
-      body = collapseWhitespace(body).replace(TRAILING_PUNCT_RE, "").trim();
+      body = cleanSubtitleBody(body);
       body = sanitizeSubtitleLine(body);
       if (!body) continue;
       if (idx >= 0 && idx < n) { if (!slots[idx]) slots[idx] = body; }
@@ -1217,21 +1244,25 @@
     var maxLine = opts.maxLineChars != null ? opts.maxLineChars : DEFAULT_CONFIG.maxLineChars || 20;
     var aligned = parseAlignedSubtitleLines(content, n);
     var lines = [];
-    for (var i = 0; i < n; i++) lines.push(shapeAlignedLine(aligned[i] || "", maxLine));
-    var any = false;
-    for (var a = 0; a < lines.length; a++) if (lines[a] && String(lines[a]).trim()) { any = true; break; }
-    if (!any) {
-      var loose = parseSubtitleLines(content);
-      // 只有未编号输出数量恰好等于 cue 数时才能安全按顺序兜底；否则返回
-      // 等长空槽，绝不让运行层收到可变行数并把后续原文/译文错配。
-      if (loose.length === n) {
-        var shapedLoose = [];
-        for (var l = 0; l < n; l++) shapedLoose.push(shapeAlignedLine(loose[l], maxLine));
-        return shapedLoose;
-      }
-      return loose.length ? lines : [];
+    var complete = 0;
+    for (var i = 0; i < n; i++) {
+      var shaped = shapeAlignedLine(aligned[i] || "", maxLine);
+      lines.push(shaped);
+      if (shaped && String(shaped).trim()) complete++;
     }
-    return lines;
+    if (complete === n) return lines;
+
+    var loose = parseSubtitleLines(content);
+    // 仅当完全没有可用编号槽、且未编号输出数量严格等于 cue 数时，才可安全顺序接受。
+    if (complete === 0 && loose.length === n) {
+      var shapedLoose = [];
+      for (var l = 0; l < n; l++) shapedLoose.push(shapeAlignedLine(loose[l], maxLine));
+      return shapedLoose;
+    }
+    // 真正空响应沿用既有语义：返回 []，由渲染层暂显原文并进入重试。
+    if (complete === 0 && loose.length === 0) return [];
+    // 部分编号/数量异常绝不接受、猜填或缓存；抛给既有 clip 退避调度整包重试。
+    throw new Error("incomplete translation: " + complete + "/" + n + " aligned lines");
   }
   /**
    * 发一次 chat/completions 并返回 message.content 字符串。
@@ -1684,7 +1715,7 @@
   function makeCacheKey(parts) {
     parts = parts || {};
     return [
-      "dsc-v5",
+      "dsc-v51",
       parts.videoId || "",
       parts.trackCode || "",
       parts.targetLang || "",

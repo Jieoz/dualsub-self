@@ -348,7 +348,7 @@
    * 独立发起 translateClip——"下下个"不被"下一个还 pending"阻塞。窗口由全局信号量
    * (ensureGate)封顶，避免多 clip 并发冲垮网关。
    * 已翻 / 正在翻 / 退避中的 clip 由 translateClip 内部跳过。
-   * v0.5.0：一个 clip = 一次 translateClipLines，按源 cue 编号 1:1 返回，无 clip 内首句优先起点。
+   * v0.5.1：一个 clip = 一次 translateClipLines，按源 cue 编号 1:1 返回，无 clip 内首句优先起点。
    */
 
   function clearWaitTimer() {

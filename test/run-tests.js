@@ -169,6 +169,32 @@ test("resegment 去 ASR 滚动重叠词（不出现 work work）", () => {
   assert.ok(!/work work/.test(seg[0].content), "重叠词 work 应只出现一次");
 });
 
+test("resegment 真实长句在 with 后允许一次受限续接", () => {
+  const frags = Core.cleanupCues([
+    { start: 160, end: 1875, content: "If you're a human person," },
+    { start: 2184, end: 3756, content: "one of those things you're going to want to do with" },
+    { start: 4160, end: 5303, content: "some regularity is boil water. We do it for lots of reasons," },
+  ]);
+  const seg = Core.resegmentCues(frags, { maxWords: 16, maxDurationMs: 6000, grammarContinuationMaxDurationMs: 8000, tailTrimMs: 0 });
+  assert.strictEqual(seg.length, 1, "with 后的宾语不应因普通词数上限被拆到下一 cue");
+  assert.ok(/with some regularity is boil water/.test(seg[0].content));
+});
+
+test("cleanupCues 去掉 ASR 行首孤立英文句点", () => {
+  const cleaned = Core.cleanupCues([{ start: 0, end: 1000, content: ".And one of those other" }]);
+  assert.strictEqual(cleaned[0].content, "And one of those other");
+});
+
+test("resegment 英文介词/连接词结尾时允许跨 cue 续接", () => {
+  const frags = Core.cleanupCues([
+    { start: 7211, end: 8091, content: "from cooking to" },
+    { start: 10000, end: 13697, content: "cleaning and disinfecting to other things probably" },
+  ]);
+  const seg = Core.resegmentCues(frags, { maxWords: 6, maxDurationMs: 6000, grammarContinuationMaxDurationMs: 8000, tailTrimMs: 0 });
+  assert.strictEqual(seg.length, 1, "语法未完成的 cue 应允许在下一个 cue 边界续接");
+  assert.strictEqual(seg[0].content, "from cooking to cleaning and disinfecting to other things probably");
+});
+
 test("resegment 句末标点处断句", () => {
   // 两个都达 minWords(3) 的完整句应各自成段（句尾标点切句）
   const frags = Core.cleanupCues([
@@ -367,9 +393,9 @@ test("makeCacheKey 同输入稳定、异输入不同", () => {
   assert.notStrictEqual(a, c, "目标语言不同 key 不同 → 不误命中");
 });
 
-test("makeCacheKey v0.5 namespace 隔离旧可变行数缓存", () => {
+test("makeCacheKey v0.5.1 namespace 隔离旧 prompt 与分段缓存", () => {
   const key = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", clipStartMs: 0 });
-  assert.ok(key.startsWith("dsc-v5|"), "v0.5 必须换缓存 namespace，避免读取 v0.4 行数不一致缓存");
+  assert.ok(key.startsWith("dsc-v51|"), "v0.5.1 必须换缓存 namespace，避免读取 v0.5.0 旧翻译");
 });
 
 test("pruneCache LRU 淘汰最旧条目", () => {
@@ -598,20 +624,35 @@ test("importConfig 坏 JSON / 空对象报错", () => {
 /* ============ 5j. DEFAULT_SYSTEM_PROMPT：v0.5 cue 1:1 契约 ============ */
 console.log("\n[system prompt v0.5 cue 1:1 契约校验]");
 
-test("DEFAULT_SYSTEM_PROMPT v0.5：源 cue 1:1 对齐（编号行/12-20字/不切词）", () => {
+test("DEFAULT_SYSTEM_PROMPT v0.5.1：上下文 cue 1:1（自然承接/标点/不切词）", () => {
   const filled = Core.buildSystemPrompt("zh-Hans");
-  // v0.5 契约：模型按源 cue 编号 1:1 返回，不跨 cue 合并或拆分。
+  // v0.5.1 契约：模型结合上下文，但按源 cue 编号 1:1 返回。
   // 规则1：绝不把中文词切成两半。
   assert.ok(/不把一个词语切成两半|绝不.*切成两半/.test(filled), "应含「不切词」规则");
-  // 规则2：每行 12-20 汉字，不要过分短碎或过长。
-  assert.ok(/12-20|12\s*-\s*20|12–20|8-16/.test(filled), "应含正常字幕行长规则");
-  // 规则3：去掉每行行尾的逗号/句号。
-  assert.ok(/行尾/.test(filled) && /(逗号|句号)/.test(filled), "应含去行尾标点规则");
+  // 规则2：允许相邻 cue 自然承接，不强迫半句独立完整或擅自补意。
+  assert.ok(/承接|半句|补/.test(filled), "应允许跨 cue 的自然语法承接");
+  // 规则3：保留必要的中文标点，避免分句粘连。
+  assert.ok(/标点/.test(filled) && /问号|感叹号|逗号|句号/.test(filled), "应含必要标点规则");
   // 规则4：只输出带编号的中文字幕行，不要英文或解释。
   assert.ok(/只输出.*中文.*行/.test(filled), "应要求只输出中文字幕行");
   assert.ok(/相同序号|编号|完全一致/.test(filled), "应要求编号 1:1");
   // 目标语言占位符：默认中文 prompt 无占位符（替换为 no-op），不应残留 {TARGET_LANG}。
   assert.ok(!/\{TARGET_LANG\}/.test(filled), "占位符应被全部替换（默认中文 prompt 无占位符）");
+});
+
+test("字幕清洗保留有意义标点并折叠重复尾部标点", () => {
+  assert.deepStrictEqual(Core.parseSubtitleLines("1. 总之，我不知道。\n2. 真的？\n3. 好了。。。"), [
+    "总之，我不知道。",
+    "真的？",
+    "好了。",
+  ]);
+  assert.deepStrictEqual(Core.parseSubtitleLines("1. 清洁、消毒， 以及其他事情。"), [
+    "清洁、消毒，以及其他事情。",
+  ]);
+  assert.deepStrictEqual(Core.parseAlignedSubtitleLines("1. 总之，我不知道。\n2. 真的？", 2), [
+    "总之，我不知道。",
+    "真的？",
+  ]);
 });
 
 test("自定义 systemPrompt 仍覆盖默认（现有逻辑不变）", () => {
@@ -1224,13 +1265,26 @@ async function main() {
   });
 
 
-  await asyncTest("translateClipLines 未编号且数量不足时保留等长空槽，不得返回可变行数", async () => {
-    const lines = await Core.translateClipLines({
-      cues: [{ content: "first" }, { content: "second" }],
-      apiBaseUrl: "https://example.test/v1", apiKey: "mock-key", apiModel: "m", targetLang: "zh-Hans",
-      fetchImpl: async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: "只有一条" } }] }) }),
-    });
-    assert.deepStrictEqual(lines, ["", ""]);
+  await asyncTest("translateClipLines 数量不足时拒绝部分结果，交运行层整包重试", async () => {
+    await assert.rejects(
+      Core.translateClipLines({
+        cues: [{ content: "first" }, { content: "second" }],
+        apiBaseUrl: "https://example.test/v1", apiKey: "k", apiModel: "m", targetLang: "zh-Hans",
+        fetchImpl: async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: "只有一条" } }] }) }),
+      }),
+      /incomplete translation.*0\/2/,
+    );
+  });
+
+  await asyncTest("translateClipLines 编号缺槽时拒绝部分结果，绝不缓存空译文", async () => {
+    await assert.rejects(
+      Core.translateClipLines({
+        cues: [{ content: "first" }, { content: "second" }, { content: "third" }],
+        apiBaseUrl: "https://example.test/v1", apiKey: "k", apiModel: "m", targetLang: "zh-Hans",
+        fetchImpl: async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: "1. 第一条\n3. 第三条" } }] }) }),
+      }),
+      /incomplete translation.*2\/3/,
+    );
   });
 
   /* ============ 6e. v0.4.1 打磨：原文对齐空行 / 半截短语 / 首包默认 ============
@@ -1443,14 +1497,13 @@ async function main() {
     assert.strictEqual(Core.sanitizeSubtitleLine("  hello  "), "");
   });
 
-  test("DEFAULT_SYSTEM_PROMPT 强调自然短语边界与长度上限", () => {
+  test("DEFAULT_SYSTEM_PROMPT 强调上下文 1:1 与自然短语边界", () => {
     const p = Core.DEFAULT_SYSTEM_PROMPT;
     assert.ok(/绝不/.test(p) && /(中文词|切成两半)/.test(p), "仍强调不切词");
-    assert.ok(/12-20|12–20|8-16|8–16/.test(p), "保留适中行长");
-    // 打磨：明确禁止半截连接尾、尽量不超 18 字
-    assert.ok(/的$|连接|半截|悬空|尾巴/.test(p), "应提示避免半截连接尾");
-    assert.ok(/18|不要过长|过长/.test(p), "应提示避免过长行");
-    assert.ok(/一句一意|不要把两句|不要粘/.test(Core.DEFAULT_SYSTEM_PROMPT), "应强调一句一意/不粘句");
+    assert.ok(/简洁|适合字幕/.test(p), "应要求字幕表达简洁可读");
+    assert.ok(/半句|语法续接/.test(p) && /补入|没有的意思/.test(p), "半句应自然承接且不得擅自补意");
+    assert.ok(/安全短语边界/.test(p), "同一 cue 内只可按安全短语边界换行");
+    assert.ok(/标点/.test(p) && /粘连/.test(p), "应保留必要标点避免分句粘连");
   });
 
 
