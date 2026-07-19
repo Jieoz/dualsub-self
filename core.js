@@ -299,7 +299,10 @@
     apiBaseUrl: "",
     apiKey: "",
     apiModel: "gpt-4o-mini",
-    sourceLang: "auto", // auto = 用第一条 ASR / 第一条轨道
+    sourceLang: "auto", // auto = 优先非中文 ASR / 非中文轨，再退回第一条
+    // 源字幕轨语言是中文（zh/zh-Hans/zh-CN/yue…）时自动跳过：不拉轨、不翻译、不叠加。
+    // 默认开：目标常为 zh-Hans，中文片再翻中文既浪费又挡画面。手动指定 sourceLang=zh* 时仍会跑。
+    skipChineseSource: true,
     targetLang: "zh-Hans",
     systemPrompt: "", // 空 = 用 core 默认行级 prompt（一步到位输出自然分行的中文字幕行）
     sentencePrompt: "", // 已废弃（v0.4.0 移除句级重断路径）；保留键仅为兼容旧导出配置，不再使用
@@ -487,6 +490,38 @@
     "5) 去掉每行行尾的逗号和句号；但行中间的顿号、问号、感叹号保留。\n" +
     "6) 只输出中文字幕行，每行一条，不要行号、不要英文/其它语言字母、不要任何解释或思考过程。\n" +
     "直接给结果。";
+
+  /** 是否中文相关 BCP47 / YouTube languageCode（zh, zh-Hans, zh-CN, yue, cmn…） */
+  function isChineseLangCode(code) {
+    var s = String(code || "").trim().toLowerCase();
+    if (!s) return false;
+    // 去掉 -asr 后缀再判
+    s = s.replace(/-asr$/, "");
+    var base = s.split(/[-_]/)[0];
+    if (base === "zh" || base === "yue" || base === "cmn" || base === "zhx") return true;
+    // 少数轨道直接标 chinese
+    if (/chinese|中文|普通话|粤语|国语/.test(s)) return true;
+    return false;
+  }
+
+  /**
+   * 该源轨是否应跳过翻译（中文片保护）。
+   *  - skipChineseSource 关闭 → 永不跳
+   *  - 用户手动指定 sourceLang 且其本身是中文 → 不跳（尊重显式选择）
+   *  - 否则看轨 languageCode / code
+   */
+  function shouldSkipChineseSource(track, opts) {
+    opts = opts || {};
+    if (!opts.skipChineseSource) return false;
+    var sourceLang = opts.sourceLang;
+    // 用户显式选了中文源轨：不跳
+    if (sourceLang && sourceLang !== "auto" && isChineseLangCode(sourceLang)) return false;
+    if (!track) return false;
+    if (isChineseLangCode(track.languageCode) || isChineseLangCode(track.code)) return true;
+    // name 兜底（无 languageCode 时）
+    if (isChineseLangCode(track.name)) return true;
+    return false;
+  }
 
   function buildSystemPrompt(targetLang, customPrompt) {
     var tpl = customPrompt && String(customPrompt).trim() ? customPrompt : DEFAULT_SYSTEM_PROMPT;
@@ -1925,6 +1960,8 @@
     buildClipUnits: buildClipUnits,
     splitOriginalByPunct: splitOriginalByPunct,
     joinLine: joinLine,
+    isChineseLangCode: isChineseLangCode,
+    shouldSkipChineseSource: shouldSkipChineseSource,
     translateClipLines: translateClipLines,
     chatCompletion: chatCompletion,
     sliceClips: sliceClips,

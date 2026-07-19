@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "MyDualsub - 双语字幕 (自带翻译API)",
   "description": "在 YouTube 上显示双语字幕，使用你自己的 OpenAI 兼容翻译 API。翻译不经过任何第三方服务端，密钥仅存本地。",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "icons": {
     "16": "icons/16.png",
     "48": "icons/48.png",

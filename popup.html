@@ -118,6 +118,11 @@
       </select>
       <label for="targetLang">译文语言</label>
       <input type="text" id="targetLang" placeholder="zh-Hans" />
+      <div class="inline" style="margin-top:8px">
+        <input type="checkbox" id="skipChineseSource" />
+        <label for="skipChineseSource">跳过中文源字幕（只对非中文视频翻译）</label>
+      </div>
+      <div class="hint">默认开启。源轨是 zh/粤语等时不请求翻译；手动把源语言选成中文轨时仍会翻译。</div>
     </fieldset>
 
     <fieldset>

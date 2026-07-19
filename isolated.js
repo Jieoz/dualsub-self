@@ -186,7 +186,13 @@
 
     if (!config.enabled) return;
     var track = pickTrack(state.tracks, config.sourceLang);
-    if (!track) return;
+    if (!track) {
+      // 无可用轨 / 中文源被跳过：清渲染，避免上一视频字幕残留
+      if (state.activeTrack || state.renderUnits.length || state.cues.length) {
+        resetForNewVideo();
+      }
+      return;
+    }
     if (state.activeTrack && state.activeTrack.url === track.url && state.cues.length) {
       return; // 已经在用这条轨道且已加载
     }
@@ -210,25 +216,47 @@
 
   /**
    * 选轨道：
-   *  - sourceLang === "auto"：优先第一条 ASR，其次第一条。
+   *  - sourceLang === "auto"：优先非中文 ASR → 任意非中文轨 → 再退回第一条 ASR/第一条。
    *  - 否则按 languageCode / code 精确或前缀匹配。
+   *  - skipChineseSource 时：若最终选中轨是中文，返回 null（调用方跳过本视频）。
    */
+  function isAsrTrack(t) {
+    return t && (/-asr$/.test(t.code) || t.kind === "asr");
+  }
+  function isChineseTrack(t) {
+    return !!(t && Core.shouldSkipChineseSource(t, {
+      skipChineseSource: true, // 只复用语言判定
+      sourceLang: "auto",
+    }));
+  }
   function pickTrack(tracks, sourceLang) {
     if (!tracks || !tracks.length) return null;
+    var list = tracks;
+    var picked = null;
     if (!sourceLang || sourceLang === "auto") {
-      var asr = tracks.find(function (t) {
-        return /-asr$/.test(t.code) || t.kind === "asr";
+      var nonZhAsr = list.find(function (t) { return isAsrTrack(t) && !isChineseTrack(t); });
+      var nonZhAny = list.find(function (t) { return !isChineseTrack(t); });
+      var anyAsr = list.find(isAsrTrack);
+      picked = nonZhAsr || nonZhAny || anyAsr || list[0];
+    } else {
+      var exact = list.find(function (t) {
+        return t.code === sourceLang || t.languageCode === sourceLang;
       });
-      return asr || tracks[0];
+      var prefix = list.find(function (t) {
+        return (t.languageCode || "").split("-")[0] === sourceLang.split("-")[0];
+      });
+      picked = exact || prefix || list[0];
     }
-    var exact = tracks.find(function (t) {
-      return t.code === sourceLang || t.languageCode === sourceLang;
-    });
-    if (exact) return exact;
-    var prefix = tracks.find(function (t) {
-      return (t.languageCode || "").split("-")[0] === sourceLang.split("-")[0];
-    });
-    return prefix || tracks[0];
+    if (
+      picked &&
+      Core.shouldSkipChineseSource(picked, {
+        skipChineseSource: config.skipChineseSource,
+        sourceLang: sourceLang || config.sourceLang,
+      })
+    ) {
+      return null;
+    }
+    return picked;
   }
 
   /* =====================================================

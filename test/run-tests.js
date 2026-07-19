@@ -1462,6 +1462,44 @@ async function main() {
   });
 
 
+
+  /* ============ 6f. 跳过中文源 ============ */
+  console.log("\n[跳过中文源：shouldSkipChineseSource / isChineseLangCode]");
+  test("isChineseLangCode 识别 zh / yue / 后缀", () => {
+    assert.strictEqual(Core.isChineseLangCode("zh"), true);
+    assert.strictEqual(Core.isChineseLangCode("zh-Hans"), true);
+    assert.strictEqual(Core.isChineseLangCode("zh-CN-asr"), true);
+    assert.strictEqual(Core.isChineseLangCode("yue"), true);
+    assert.strictEqual(Core.isChineseLangCode("en"), false);
+    assert.strictEqual(Core.isChineseLangCode("en-US"), false);
+    assert.strictEqual(Core.isChineseLangCode("ja"), false);
+  });
+
+  test("shouldSkipChineseSource：默认跳中文轨，手动选中文源不跳", () => {
+    const zhTrack = { code: "zh-Hans-asr", languageCode: "zh-Hans", kind: "asr", name: "Chinese" };
+    const enTrack = { code: "en-asr", languageCode: "en", kind: "asr", name: "English" };
+    assert.strictEqual(
+      Core.shouldSkipChineseSource(zhTrack, { skipChineseSource: true, sourceLang: "auto" }),
+      true
+    );
+    assert.strictEqual(
+      Core.shouldSkipChineseSource(enTrack, { skipChineseSource: true, sourceLang: "auto" }),
+      false
+    );
+    assert.strictEqual(
+      Core.shouldSkipChineseSource(zhTrack, { skipChineseSource: false, sourceLang: "auto" }),
+      false
+    );
+    assert.strictEqual(
+      Core.shouldSkipChineseSource(zhTrack, { skipChineseSource: true, sourceLang: "zh-Hans" }),
+      false
+    );
+  });
+
+  test("DEFAULT_CONFIG.skipChineseSource 默认 true", () => {
+    assert.strictEqual(Core.DEFAULT_CONFIG.skipChineseSource, true);
+  });
+
   /* ============ 7. 交付物校验 ============ */
   console.log("\n[交付物校验]");
 

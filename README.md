@@ -197,3 +197,8 @@ python3 gen_icons.py
 ## License
 
 [MIT](./LICENSE)
+
+
+## 跳过中文源
+
+`skipChineseSource` 默认 true：源轨 zh/yue 等时跳过。
