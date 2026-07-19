@@ -59,7 +59,8 @@
     tracks: [], // main.js 推来的轨道清单
     activeTrack: null, // 当前选中的轨道
     cues: [], // 最终原文 cue（优先严格词流语义恢复，否则稳定回退 resegmentCues）
-    segmentationMode: "fallback", // 'semantic' | 'fallback'，仅用于可观测性
+    segmentationMode: "fallback", // 'semantic' | 'fallback'，用于缓存隔离与可观测性
+    timelineEpoch: 0, // 每次整轨切换递增，拒绝旧异步翻译结果写入新分段
     clips: [], // 按 cue 边界切的 clip
     cueMap: [], // 全局 cue 下标 -> {clipIdx,cueIdx}（cueClipIndexMap 建表）
     // v0.4.0：每个 clip 一次 translateClipLines → buildClipUnits 得到渲染单元，按 clip 存这里。
@@ -160,6 +161,7 @@
       trackCode: state.activeTrack ? state.activeTrack.code : "",
       targetLang: config.targetLang,
       apiModel: config.apiModel,
+      segmentationMode: state.segmentationMode,
       clipStartMs: clip.startMs,
     });
   }
@@ -233,6 +235,7 @@
   }
 
   function resetForNewVideo() {
+    state.timelineEpoch++;
     state.activeTrack = null;
     state.cues = [];
     state.clips = [];
@@ -315,49 +318,53 @@
         cues = Core.parseVtt(text);
       }
       cues = Core.cleanupCues(cues);
-      // JSON3 有原生 token 时序时，先走模型只报边界、本地保留词流和时间的恢复协议。
-      // 无时序、无 API、超时或契约失败均回退到既有 ASR 规则重组。
-      var semanticCues = await restoreSemanticCuesIfAvailable(cues);
-      if (semanticCues && semanticCues.length) {
-        cues = Core.applyTailTrim(semanticCues, config.tailTrimMs);
-        state.segmentationMode = "semantic";
-      } else {
-        cues = Core.resegmentCues(cues, { tailTrimMs: config.tailTrimMs });
-        state.segmentationMode = "fallback";
-      }
-      if (!cues.length) {
+      // 先立即建立稳定 fallback 时间轴并翻译首段。语义恢复是整轨模型工作，不能阻塞首字幕。
+      var fallbackCues = Core.resegmentCues(cues, { tailTrimMs: config.tailTrimMs });
+      if (!installCueTimeline(fallbackCues, "fallback")) {
         console.warn("[dualsub] 解析后无有效字幕");
         return;
       }
-      state.cues = cues;
-      // 按 cue 边界切 clip（不在句子中间断、clip 间不重叠 → 省 token）
-      // v0.4.2：首 clip 用 firstClipSeconds 压 TTFT；软上限防超长源文一次请求。
-      var firstSec = Number(config.firstClipSeconds);
-      if (!Number.isFinite(firstSec) || firstSec <= 0) firstSec = config.clipSeconds;
-      state.clips = Core.sliceClipsByCue(cues, config.clipSeconds * 1000, {
-        firstTargetMs: firstSec * 1000,
-        maxCuesPerClip: config.maxCuesPerClip || 0,
-        maxSourceChars: config.maxSourceCharsPerClip || 0,
-      });
-      // 建全局 cue→clip 映射表，渲染时 O(1) 反查所属 clip
-      state.cueMap = Core.cueClipIndexMap(state.clips);
-      state.clipUnits = {};
-      state.renderUnits = [];
-      state.clipState = {};
-      state.clipBackoff = {};
-      state.clipInflight = {};
-      state.lastHitCueIdx = -1;
-      // 先用 resegment 分段铺一条「原文时间轴」(译文留空)，译文未到也能立刻显原文；
-      // 某 clip 翻好后由 rebuildRenderTimeline 用 buildClipUnits 的渲染单元替换该 clip 的单元。
-      rebuildRenderTimeline();
-      ensureRenderer();
-      bindVideo();
-      // 立即预取当前播放位置所在的 clip
-      prefetchAround(currentTimeMs(), true);
-      requestRender();
+      // 完整验证成功后才原子切换到语义时间轴；失败保持已工作的 fallback。
+      var loadEpoch = state.timelineEpoch;
+      setTimeout(function () {
+        restoreSemanticCuesIfAvailable(cues).then(function (semanticCues) {
+          if (loadEpoch !== state.timelineEpoch || !semanticCues || !semanticCues.length) return;
+          installCueTimeline(Core.applyTailTrim(semanticCues, config.tailTrimMs), "semantic");
+        });
+      }, 0);
     } catch (e) {
       console.warn("[dualsub] loadTrack 出错", e);
     }
+  }
+
+  // 仅在完整 cue 集合准备好时切换。递增 epoch 使旧分段的翻译请求自然失效。
+  function installCueTimeline(cues, mode) {
+    if (!cues || !cues.length) return false;
+    state.timelineEpoch++;
+    // fallback 已经给用户可播放首屏；后台语义切换绝不再次暂停视频等翻译。
+    if (mode === "semantic") state.firstClipReady = true;
+    state.segmentationMode = mode;
+    state.cues = cues;
+    var firstSec = Number(config.firstClipSeconds);
+    if (!Number.isFinite(firstSec) || firstSec <= 0) firstSec = config.clipSeconds;
+    state.clips = Core.sliceClipsByCue(cues, config.clipSeconds * 1000, {
+      firstTargetMs: firstSec * 1000,
+      maxCuesPerClip: config.maxCuesPerClip || 0,
+      maxSourceChars: config.maxSourceCharsPerClip || 0,
+    });
+    state.cueMap = Core.cueClipIndexMap(state.clips);
+    state.clipUnits = {};
+    state.renderUnits = [];
+    state.clipState = {};
+    state.clipBackoff = {};
+    state.clipInflight = {};
+    state.lastHitCueIdx = -1;
+    rebuildRenderTimeline();
+    ensureRenderer();
+    bindVideo();
+    prefetchAround(currentTimeMs(), true);
+    requestRender();
+    return true;
   }
 
   /* =====================================================
@@ -473,6 +480,7 @@
   }
 
   async function translateClip(idx) {
+    var timelineEpoch = state.timelineEpoch;
     var clip = state.clips[idx];
     if (!clip) return;
     if (state.clipState[idx] === "done") return;
@@ -498,6 +506,7 @@
       // 命中后重跑 buildClipUnits 按当前 clip 时间窗配时间轴（时间轴不入缓存，避免跨会话漂移）。
       var key = clipCacheKey(clip);
       var cached = await readCache();
+      if (timelineEpoch !== state.timelineEpoch) return;
       if (cached[key] && Array.isArray(cached[key].lines)) {
         state.clipUnits[idx] = Core.buildClipUnits(
           cached[key].lines,
@@ -546,8 +555,10 @@
         return;
       }
 
+      if (timelineEpoch !== state.timelineEpoch) return;
       applyClipLines(idx, clip, key, lines);
     } catch (e) {
+      if (timelineEpoch !== state.timelineEpoch) return;
       // applyClipLines / readCache / rebuildRenderTimeline 等意外抛出：绝不让 clip 卡死。
       // 降级为 error + 退避，交后台调度器重试（达 maxFails 才 failed），不再永久 pending。
       console.warn("[dualsub] clip", idx, "translateClip 意外异常 → 降级 error 重试：", e && e.message);
@@ -555,6 +566,7 @@
       getBackoff(idx).fail();
       ensureRetryScheduler();
     } finally {
+      if (timelineEpoch !== state.timelineEpoch) return;
       state.clipInflight[idx] = false;
       // 兜底：跑完后仍残留 pending（任何路径漏写终态）→ 当作可重试 error，杜绝永久「翻译中…」。
       if (state.clipState[idx] === "pending") {

@@ -612,9 +612,11 @@ test("makeCacheKey 同输入稳定、异输入不同", () => {
   assert.notStrictEqual(a, c, "目标语言不同 key 不同 → 不误命中");
 });
 
-test("makeCacheKey v0.5.2 namespace 隔离旧 cue 分段缓存", () => {
-  const key = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", clipStartMs: 0 });
-  assert.ok(key.startsWith("dsc-v52|"), "语义恢复分段必须换缓存 namespace，避免读取 v0.5.1 旧翻译");
+test("makeCacheKey v0.5.3 隔离旧缓存与 fallback/semantic 分段", () => {
+  const fallback = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", segmentationMode: "fallback", clipStartMs: 0 });
+  const semantic = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", segmentationMode: "semantic", clipStartMs: 0 });
+  assert.ok(fallback.startsWith("dsc-v53|fallback|"), "非阻塞切换必须隔离 v0.5.2 旧缓存");
+  assert.notStrictEqual(fallback, semantic, "fallback 与 semantic cue 边界不得共用翻译缓存");
 });
 
 test("pruneCache LRU 淘汰最旧条目", () => {
@@ -1403,13 +1405,26 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     "translateBatch",
   ];
 
+  test("语义恢复不阻塞 fallback 首屏，切换时隔离旧异步结果与缓存", () => {
+    const src = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
+    const load = src.slice(src.indexOf("async function loadTrack"), src.indexOf("/* =====================================================\n   * 翻译编排"));
+    assert.ok(load.indexOf('installCueTimeline(fallbackCues, "fallback")') >= 0, "应先安装 fallback 首屏时间轴");
+    assert.ok(load.indexOf('installCueTimeline(fallbackCues, "fallback")') < load.indexOf("restoreSemanticCuesIfAvailable(cues)"), "语义恢复必须后台启动，不得 await 阻塞首屏");
+    assert.ok(/timelineEpoch !== state\.timelineEpoch/.test(src), "旧分段异步请求不得写入新时间轴");
+    assert.ok(/function resetForNewVideo\(\) \{\n    state\.timelineEpoch\+\+/.test(src), "切视频必须废止旧轨道异步请求");
+    assert.ok(/if \(mode === "semantic"\) state\.firstClipReady = true/.test(src), "语义后台切换不得再次暂停已播放视频");
+    assert.ok(/segmentationMode: state\.segmentationMode/.test(src), "不同分段模式不得复用同一 clip 缓存");
+    assert.ok(/"dsc-v53"/.test(fs.readFileSync(path.join(ROOT, "core.js"), "utf8")), "非阻塞切换必须升级缓存 namespace");
+  });
+
   test("isolated.js 只在可靠 JSON3 token 时序下启用语义恢复，失败完整回退", () => {
     const src = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
     assert.ok(/Core\.hasNativeTokenTiming\(cues, 0\.8\)/.test(src), "应有 80% 原生 token timing 门槛");
     assert.ok(/Core\.restoreAndPackTokens\b/.test(src), "加载路径应调用生产语义恢复器");
-    assert.ok(/cues = Core\.resegmentCues\(cues, \{ tailTrimMs: config\.tailTrimMs \}\)/.test(src), "不满足契约时应完整回退 ASR 重组");
-    assert.ok(/state\.segmentationMode = "semantic"/.test(src), "启用路径应留下可诊断模式");
-    assert.ok(/state\.segmentationMode = "fallback"/.test(src), "回退路径应留下可诊断模式");
+    assert.ok(/var fallbackCues = Core\.resegmentCues\(cues, \{ tailTrimMs: config\.tailTrimMs \}\)/.test(src), "不满足契约时应完整回退 ASR 重组");
+    assert.ok(/installCueTimeline\(fallbackCues, "fallback"\)/.test(src), "fallback 必须先安装可播放时间轴");
+    assert.ok(/installCueTimeline\(Core\.applyTailTrim\(semanticCues, config\.tailTrimMs\), "semantic"\)/.test(src), "启用路径应原子切换到可诊断 semantic 模式");
+    assert.ok(/installCueTimeline\(fallbackCues, "fallback"\)/.test(src), "回退路径应安装可诊断 fallback 模式");
   });
 
   test("isolated.js 不再引用任何 v0.4.0 已删的 core 函数", () => {

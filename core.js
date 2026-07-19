@@ -2036,7 +2036,8 @@
   function makeCacheKey(parts) {
     parts = parts || {};
     return [
-      "dsc-v52",
+      "dsc-v53",
+      parts.segmentationMode || "fallback",
       parts.videoId || "",
       parts.trackCode || "",
       parts.targetLang || "",
