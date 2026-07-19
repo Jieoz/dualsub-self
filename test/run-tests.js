@@ -156,12 +156,57 @@ test("restoreAndPackTokens 对已验证超长句做一次局部 clause rescue", 
       : "let me reiterate that the cheapest electric kettle I could get my hands on | is significantly faster at boiling water | than this stove top kettle despite being limited." } }] }) }),
   });
   assert.strictEqual(call, 2);
-  assert.ok(units.every((u) => u.content.split(" ").length <= 24));
+  assert.ok(units.every((u) => u.content.split(" ").length <= 36));
   assert.deepStrictEqual(units.map((u) => u.content), [
-    "let me reiterate that the cheapest electric kettle I could get my hands on",
-    "is significantly faster at boiling water",
-    "than this stove top kettle despite being limited",
+    "let me reiterate that the cheapest electric kettle I could get my hands on is significantly faster at boiling water than this stove top kettle despite being limited",
   ]);
+  assert.ok(!/\b(?:on|to|of|for|with|from|at|in|and|or|but)$/i.test(units[0].content));
+});
+
+test("repairNaturalUnitBoundaries 合并介词起始的 ASR 半句", () => {
+  const repaired = Core.repairNaturalUnitBoundaries([
+    { start: 0, end: 1000, content: "We do it for lots of reasons", tokens: [{ text: "We" }] },
+    { start: 1000, end: 2000, content: "from cooking to cleaning and disinfecting", tokens: [{ text: "from" }] },
+    { start: 2000, end: 3000, content: "to other things probably", tokens: [{ text: "to" }] },
+  ], { preferredMaxWords: 24, maxNaturalWords: 36 });
+  assert.deepStrictEqual(repaired.map((u) => u.content), [
+    "We do it for lots of reasons from cooking to cleaning and disinfecting to other things probably",
+  ]);
+});
+
+test("repairNaturalUnitBoundaries 不留下孤立尾词", () => {
+  const repaired = Core.repairNaturalUnitBoundaries([
+    { start: 0, end: 1000, content: "I do know that the entire thing is 8 8 kW", tokens: [{ text: "I" }] },
+    { start: 1000, end: 1200, content: "altogether", tokens: [{ text: "altogether" }] },
+  ], { preferredMaxWords: 24, maxNaturalWords: 36 });
+  assert.deepStrictEqual(repaired.map((u) => u.content), ["I do know that the entire thing is 8 8 kW altogether"]);
+});
+
+test("repairNaturalUnitBoundaries 仅合并短间隙，并保留 token 与时间", () => {
+  const near = Core.repairNaturalUnitBoundaries([
+    { start: 0, end: 1000, content: "The entire thing is 8 8 kW", tokens: [{ text: "The", start: 0, end: 1000 }] },
+    { start: 1300, end: 1600, content: "altogether", tokens: [{ text: "altogether", start: 1300, end: 1600 }] },
+  ], { maxNaturalWords: 36, maxJoinGapMs: 2200 });
+  assert.strictEqual(near.length, 1);
+  assert.strictEqual(near[0].start, 0);
+  assert.strictEqual(near[0].end, 1600);
+  assert.deepStrictEqual(near[0].tokens.map((t) => t.text), ["The", "altogether"]);
+  const distant = Core.repairNaturalUnitBoundaries([
+    { start: 0, end: 1000, content: "We do it for lots of reasons", tokens: [{ text: "We" }] },
+    { start: 4000, end: 5000, content: "from cooking to cleaning", tokens: [{ text: "from" }] },
+  ], { maxNaturalWords: 36, maxJoinGapMs: 2200 });
+  assert.strictEqual(distant.length, 2, "长停顿后的新语流不能只因小写介词被回并");
+});
+
+test("repairNaturalUnitBoundaries 宁可略超偏好上限也不切开介词尾", () => {
+  const repaired = Core.repairNaturalUnitBoundaries([
+    { start: 0, end: 1000, content: "let me reiterate that the cheapest electric kettle I could get my hands on", tokens: [{ text: "let" }] },
+    { start: 1000, end: 2000, content: "is significantly faster at boiling water than this stove top kettle despite being limited", tokens: [{ text: "is" }] },
+  ], { preferredMaxWords: 24, maxNaturalWords: 36 });
+  assert.deepStrictEqual(repaired.map((u) => u.content), [
+    "let me reiterate that the cheapest electric kettle I could get my hands on is significantly faster at boiling water than this stove top kettle despite being limited",
+  ]);
+  assert.strictEqual(repaired[0].content.split(" ").length, 28);
 });
 
 test("applyTailTrim 为语义单元保留最小可视时长与 token 元数据", () => {

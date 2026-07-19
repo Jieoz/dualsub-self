@@ -216,6 +216,57 @@
     return segmentTokensByBoundaries(list, ends);
   }
 
+  // 语义恢复的边界来自模型，但长句 rescue 仍可能在数字/介词/连词处给出
+  // 可验证却不适合阅读的边界。这里只合并相邻源 token，绝不改写、重排或删词。
+  var CONTINUATION_START_RE = /^(?:from|to|of|in|on|at|with|for|by|into|over|under|through|during|after|before|without|and|or|but|although|because|which|who|whose|when|while|if|than|as|is|are|was|were|be|been|being)\b/;
+  var DANGLING_END_RE = /\b(?:to|of|for|with|from|at|in|on|by|about|into|over|under|between|through|and|or|but|because|that|which|who|whose|when|while|if|than|as|the|a|an)$/i;
+
+  function unitWordCount(unit) {
+    return restoredWords(unit && unit.content).length;
+  }
+
+  function mergeNaturalUnits(left, right) {
+    var merged = Object.assign({}, left);
+    merged.start = Math.min(toInt(left.start, 0), toInt(right.start, 0));
+    merged.end = Math.max(toInt(left.end, merged.start), toInt(right.end, merged.start));
+    merged.duration = Math.max(0, merged.end - merged.start);
+    merged.content = collapseWhitespace(String(left.content || "") + " " + String(right.content || ""));
+    if (Array.isArray(left.tokens) || Array.isArray(right.tokens)) {
+      merged.tokens = (Array.isArray(left.tokens) ? left.tokens : []).concat(Array.isArray(right.tokens) ? right.tokens : []);
+    }
+    return merged;
+  }
+
+  /**
+   * 修复被严格词数 rescue 切坏的英语显示单元：
+   * - 小写介词/连词/助动词开头是上句续接；
+   * - 小写 1-2 词单元是孤儿，优先回并；
+   * - 介词/连词/限定词尾不能悬空。
+   * preferredMaxWords 是偏好而非硬断点；为保持自然句界，可合并到 maxNaturalWords。
+   */
+  function repairNaturalUnitBoundaries(units, opts) {
+    opts = opts || {};
+    var maxNaturalWords = Math.max(1, Math.floor(Number(opts.maxNaturalWords) || 36));
+    var maxJoinGapMs = opts.maxJoinGapMs != null ? Math.max(0, Number(opts.maxJoinGapMs)) : 2200;
+    var out = [];
+    for (var i = 0; i < (units || []).length; i++) {
+      var current = Object.assign({}, units[i]);
+      if (!current.content) continue;
+      var first = restoredWords(current.content)[0] || "";
+      var startsContinuation = first === first.toLowerCase() && CONTINUATION_START_RE.test(first);
+      var isLowercaseOrphan = first === first.toLowerCase() && unitWordCount(current) <= 2;
+      var previous = out[out.length - 1];
+      var previousTail = previous && DANGLING_END_RE.test(String(previous.content || "").replace(/[.,;:!?]+$/, ""));
+      var gapMs = previous ? Math.max(0, toInt(current.start, 0) - toInt(previous.end, 0)) : Infinity;
+      if (previous && gapMs <= maxJoinGapMs && (startsContinuation || isLowercaseOrphan || previousTail) && unitWordCount(previous) + unitWordCount(current) <= maxNaturalWords) {
+        out[out.length - 1] = mergeNaturalUnits(previous, current);
+      } else {
+        out.push(current);
+      }
+    }
+    return out;
+  }
+
   /* ---------------------------------------------------------------
    * 2. 时间轴清洗
    * ------------------------------------------------------------- */
@@ -1530,7 +1581,10 @@
       for (var m = 0; m < marked.length; m++) restored.marks[begin + m] = marked[m];
       units = packRestoredTokens(restored.tokens, restored.marks, { maxWords: maxWords });
     }
-    return units;
+    return repairNaturalUnitBoundaries(units, {
+      preferredMaxWords: maxWords,
+      maxNaturalWords: opts.maxNaturalWords || 36,
+    });
   }
 
   /**
@@ -2356,6 +2410,7 @@
     restoredBoundaryMarks: restoredBoundaryMarks,
     chunkTokenRanges: chunkTokenRanges,
     packRestoredTokens: packRestoredTokens,
+    repairNaturalUnitBoundaries: repairNaturalUnitBoundaries,
     collapseWhitespace: collapseWhitespace,
     normalizeColor: normalizeColor,
     shadowCss: shadowCss,
