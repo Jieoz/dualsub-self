@@ -1,11 +1,10 @@
 /*
  * test/e2e-harness.js — 真·E2E 调试 harness（node 直接跑，零外部依赖除 fetch）
  * =============================================================================
- * v0.4.0 架构：模型【一步到位】直接吐「自然分行的中文字幕行」，代码只配时间轴、
- *   绝不切译文。本 harness 跑完整新链路：
- *     cleanupCues → resegmentCues → sliceClipsByCue
- *     → 每 clip: translateClipLines(模型出自然行 + parseSubtitleLines 清洗 + mergeShortLines)
- *     → buildClipUnits(按字符占比配时间轴 + 原文按时间重叠归并) → buildSrt
+ * v0.5.0 架构：模型按编号把每个源 cue 翻成一条中文，译文/原文/时间轴 1:1。
+ *   本 harness 跑完整主链路：cleanupCues → resegmentCues → sliceClipsByCue
+ *     → translateClipLines(编号解析与安全换行)
+ *     → buildClipUnits(沿用对应 cue 原文与时间轴) → buildSrt
  *   产出 SRT + 并排 HTML（原文 | 译文 | 时间轴）供肉眼核对断句/丢字，并打点延迟统计。
  *
  * 两种模型后端：
@@ -78,7 +77,8 @@ function resolveKey(a) {
 }
 
 /* --------------------------- 数据加载 + 链路前段 --------------------------- */
-const CUES_PATH = "/workspace/cache/dualsub-harness-yMMTVVJI4c-en-cues.json";
+const CUES_PATH = process.env.DUALSUB_CUES_PATH ||
+  path.resolve(__dirname, "../../../cache/dualsub-harness-yMMTVVJI4c-en-cues.json");
 
 function loadOriginalCues(limit) {
   const raw = JSON.parse(fs.readFileSync(CUES_PATH, "utf8"));
@@ -91,76 +91,38 @@ function loadOriginalCues(limit) {
   }));
 }
 
-/* ---------------- mock 模型：直接吐「自然分行的中文字幕行」 ----------------
- * 新架构下模型对一个 clip 的输入（带序号的英文碎片）回一段「已分好行的中文」。
- * 离线 mock 用真实 ref_zh 还原：把该 clip 覆盖的原始 cue 的 ref_zh 按时间顺序拼成
- * 整段中文（ref_zh 本身是旧程序按 cue char-split 的碎片，拼回即完整中文），再【只在
- * 标点边界】重切成 8~16 字的自然行（绝不在词/成语中间断）→ 模拟新模型「直接吐自然行」。
- */
-
-// 把整段中文按标点边界切成「目标 lo~hi 字」的自然行（标点留在行尾，后处理再去行尾标点）。
-function resplitNatural(zh, lo, hi) {
-  const s = Core.collapseWhitespace(zh);
-  if (!s) return [];
-  // 按句末/句中标点切片（标点留在片尾）；数字小数点/千分位不切。
-  const pieces = [];
-  const re = /[^。！？，、；：…]+[。！？，、；：…]?/g;
-  let m;
-  while ((m = re.exec(s)) !== null) {
-    const p = m[0];
-    if (p) pieces.push(p);
-  }
-  if (!pieces.length) pieces.push(s);
-  // 贪心聚片成行：累计到 >= lo 就收行；超过 hi 也收（但绝不切片内部 → 不切词）。
-  const lines = [];
-  let buf = "";
-  for (const p of pieces) {
-    const cand = buf + p;
-    if (buf && cand.length > hi) { lines.push(buf); buf = p; }
-    else { buf = cand; }
-    if (buf.length >= lo && /[。！？，、；：…]$/.test(buf)) { lines.push(buf); buf = ""; }
-  }
-  if (buf) lines.push(buf);
-  return lines;
-}
-
-// 该 clip 的整段中文 = clip 覆盖时间窗内所有原始 cue 的 ref_zh 顺序拼接（去相邻重复）。
-function clipZhFromRefs(clip, originalCues) {
+/* ---------------- mock 模型：按源 cue 编号 1:1 返回中文 ---------------- */
+function cueZhFromRefs(cue, originalCues) {
   let zh = "";
   for (const oc of originalCues) {
     if (!oc.ref_zh) continue;
-    const overlap = Math.min(clip.endMs, oc.end) - Math.max(clip.startMs, oc.start);
-    if (overlap > 0) {
-      const piece = oc.ref_zh.trim();
-      if (piece && !zh.endsWith(piece)) zh += piece;
-    }
+    const overlap = Math.min(cue.end, oc.end) - Math.max(cue.start, oc.start);
+    if (overlap <= 0) continue;
+    const piece = oc.ref_zh.trim();
+    if (piece && !zh.endsWith(piece)) zh += piece;
   }
-  return Core.collapseWhitespace(zh);
+  return Core.collapseWhitespace(zh) || "暂无译文";
 }
 
-function makeMockFetch(clipZhResolver, stats, opts) {
+function makeMockFetch(clipLinesResolver, stats, opts) {
   opts = opts || {};
-  const REASON_MS = opts.reasonMs != null ? opts.reasonMs : 500;
-  const PER_CHAR_MS = opts.perCharMs != null ? opts.perCharMs : 5;
+  const REASON_MS = opts.reasonMs != null ? opts.reasonMs : 20;
+  const PER_CHAR_MS = opts.perCharMs != null ? opts.perCharMs : 1;
   return function mockFetch(url, fetchOpts) {
     const body = JSON.parse(fetchOpts.body);
     const user = (body.messages[1] && body.messages[1].content) || "";
-    // mock 模型：用 user 里的编号英文行匹配出该 clip 的整段中文，再切成自然行。
-    const zh = clipZhResolver(user);
-    const lines = resplitNatural(zh, 8, 16);
-    const content = lines.join("\n"); // 模型「每行一条」的自然输出
+    const lines = clipLinesResolver(user);
+    const content = lines.map((line, i) => `${i + 1}. ${line}`).join("\n");
     const t0 = Date.now();
     const thinkMs = REASON_MS + content.length * PER_CHAR_MS;
-    return new Promise((resolve) => {
-      setTimeout(() => {
-        stats.requestMs.push(Date.now() - t0);
-        resolve({
-          ok: true, status: 200,
-          json: async () => ({ choices: [{ message: { content } }] }),
-          text: async () => "",
-        });
-      }, thinkMs);
-    });
+    return new Promise((resolve) => setTimeout(() => {
+      stats.requestMs.push(Date.now() - t0);
+      resolve({
+        ok: true, status: 200,
+        json: async () => ({ choices: [{ message: { content } }] }),
+        text: async () => "",
+      });
+    }, thinkMs));
   };
 }
 
@@ -194,20 +156,16 @@ async function run() {
   const stats = { requestMs: [], retries429: 0, clipFallbacks: 0, emptyClips: 0,
                   firstUnitMs: null, totalMs: 0, clipMs: [] };
 
-  // mock 模型的中文来源：按 clip 索引解析（用 clip.cues 的 content 匹配 user 编号行）。
+  // mock 中文按每个重组 cue 的时间窗从真实 ref_zh 聚合，再按编号 1:1 返回。
   const clipByFirstContent = new Map();
   for (const clip of clips) {
     const key = Core.collapseWhitespace(clip.cues[0] ? clip.cues[0].content : "");
-    clipByFirstContent.set(key, clipZhFromRefs(clip, originalCues));
+    clipByFirstContent.set(key, clip.cues.map((cue) => cueZhFromRefs(cue, originalCues)));
   }
-  const clipZhResolver = (userContent) => {
-    // user 是 buildNumberedSourceLines 产物：「1. <content>\n2. ...」。取第 1 行 content 匹配 clip。
+  const clipLinesResolver = (userContent) => {
     const first = userContent.split("\n").map((l) => l.match(/^\s*\d+\.\s+(.*)$/)).find(Boolean);
-    const c = first ? Core.collapseWhitespace(first[1]) : "";
-    if (clipByFirstContent.has(c)) return clipByFirstContent.get(c);
-    // 兜底：拼所有编号行对应 clip（按内容包含匹配）
-    for (const [k, v] of clipByFirstContent) if (k === c) return v;
-    return "（无对照中文）";
+    const key = first ? Core.collapseWhitespace(first[1]) : "";
+    return clipByFirstContent.get(key) || ["暂无译文"];
   };
 
   let fetchImpl, mode;
@@ -223,11 +181,11 @@ async function run() {
   } else {
     a.apiKey = "mock-key";
     a.base = "http://mock.local/v1";
-    fetchImpl = makeMockFetch(clipZhResolver, stats, {});
-    mode = "MOCK (offline, real ref_zh re-split at punctuation)";
+    fetchImpl = makeMockFetch(clipLinesResolver, stats, {});
+    mode = "MOCK (offline structural 1:1 using legacy fragmented ref_zh)";
   }
 
-  console.log("\n=== dualsub E2E harness (v0.4.0) ===");
+  console.log("\n=== dualsub E2E harness (v0.5.0) ===");
   console.log("mode      :", mode);
   console.log("cues      :", originalCues.length, "original →", reseg.length, "resegmented →", clips.length, "clips");
   console.log("tuning    : clipSeconds=" + a.clipSeconds + " firstClipSeconds=" + a.firstClipSeconds +
@@ -238,7 +196,7 @@ async function run() {
 
   const apiCfg = {
     apiBaseUrl: a.base, apiKey: a.apiKey, apiModel: a.model,
-    targetLang: a.target, reasoningEffort: a.reasoningEffort, minLineChars: a.minLineChars,
+    targetLang: a.target, reasoningEffort: a.reasoningEffort, maxLineChars: Core.DEFAULT_CONFIG.maxLineChars,
     timeoutMs: a.timeoutMs || (a.real ? 90000 : 20000), fetchImpl,
   };
 
@@ -275,12 +233,19 @@ async function run() {
   writeOutputs(renderUnits, stats, a, mode);
   printStats(stats, renderUnits, a);
   // 切词/丢字自检：先跑检测器自检（对照样本必须 FAIL），再审真实产物（应 PASS）。
-  auditSelfTest();
-  auditWordCuts(renderUnits);
+  const detectorOk = auditSelfTest();
+  const audit = auditWordCuts(renderUnits);
+  const oneToOneOk = renderUnits.length === reseg.length &&
+    renderUnits.every((u) => u.originalText && u.translation && u.start < u.end);
+  console.log("结构 1:1      :", oneToOneOk ? "PASS" : "FAIL");
+  if (!detectorOk || !oneToOneOk || (a.real && !audit.pass)) process.exitCode = 1;
+  if (!a.real && !audit.pass) {
+    console.log("说明          : MOCK 使用旧逐 cue 碎片译文，只验证 1:1/时轴/空响应；语言切词告警仅作提示，不冒充真实模型质量。" );
+  }
 }
 
 /* ============================== 产物输出 ============================== */
-const OUT_DIR = path.join(__dirname, "e2e-out");
+const OUT_DIR = process.env.DUALSUB_E2E_OUT || path.join(__dirname, "e2e-out");
 function ensureDir(dir) { fs.mkdirSync(dir, { recursive: true }); }
 function htmlEscape(s) {
   return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -322,7 +287,7 @@ function writeOutputs(renderUnits, stats, a, mode) {
     "td.n{color:#999;text-align:right;width:40px}td.t{color:#888;white-space:nowrap;font-family:monospace;width:170px}" +
     "td.o{color:#555;width:42%}td.z{color:#06c;font-weight:600}" +
     "tr:nth-child(even){background:#fafafa}</style></head><body>" +
-    "<h1>dualsub E2E review (v0.4.0)</h1><div class=meta>mode: " + htmlEscape(mode) +
+    "<h1>dualsub E2E review (v0.5.0)</h1><div class=meta>mode: " + htmlEscape(mode) +
     " &nbsp;|&nbsp; render units: " + renderUnits.length +
     " &nbsp;|&nbsp; clipSeconds=" + a.clipSeconds + " minLineChars=" + a.minLineChars + "</div>" +
     "<table><thead><tr><th>#</th><th>时间轴</th><th>原文</th><th>译文</th></tr></thead><tbody>" +
@@ -515,7 +480,7 @@ function auditSelfTest() {
   return ok;
 }
 
-module.exports = { detectCut, auditWordCuts, auditSelfTest, resplitNatural };
+module.exports = { detectCut, auditWordCuts, auditSelfTest, cueZhFromRefs };
 
 // 入口（被 require 时不自动跑）。
 if (require.main === module) {

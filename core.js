@@ -304,8 +304,10 @@
     // 默认开：目标常为 zh-Hans，中文片再翻中文既浪费又挡画面。手动指定 sourceLang=zh* 时仍会跑。
     skipChineseSource: true,
     targetLang: "zh-Hans",
-    systemPrompt: "", // 空 = 用 core 默认行级 prompt（一步到位输出自然分行的中文字幕行）
-    sentencePrompt: "", // 已废弃（v0.4.0 移除句级重断路径）；保留键仅为兼容旧导出配置，不再使用
+    systemPrompt: "", // 空 = 用 core 默认「源 cue 1:1 对齐」prompt
+    sentencePrompt: "", // 已废弃；保留键仅为兼容旧导出配置，不再使用
+    waitForFirstTranslation: true,
+    waitForFirstTranslationMs: 8000,
     // 显示样式
     fontSize: 22, // px —— 语义为"基准高度(FONT_BASE_HEIGHT=480，常规非全屏)下的字号"；
     //               实际渲染字号随播放器高度由 computeFontPx 同比缩放（全屏放大、退出缩小）。
@@ -340,9 +342,9 @@
     reasoningEffort: "low", // 推理模型(gpt-5.x-mini)的 reasoning_effort。行级 prompt 把规则写死 +
     //                  「直接给结果不要思考过程」压住 reasoning 爆点；"low" 时实测延迟 4.5-6.7s 稳定、
     //                  reasoning 14-103 token。取值 low|medium|high；空串或 "default" = 不发该字段。
-    minLineChars: 6,
+    minLineChars: 10,
     // 字幕行目标上限（字）。后处理 splitLongLines 用；只在短语标记边界拆，绝不切词。
-    maxLineChars: 16, // 最小行长（可视字符）：模型偶尔吐出过短碎行时，把短行【整行】并入相邻行
+    maxLineChars: 20, // 最小行长（可视字符）：模型偶尔吐出过短碎行时，把短行【整行】并入相邻行
     //                  （只在行边界落点，绝不切词）。<=0 关闭合并。规则2「每行不要过分短」的兜底。
     tailTrimMs: 120, // 句间视觉尾缩(ms)：连续语流句单元 end 回缩此值制造句间断点(修字幕墙)。
     //                  0=关闭。仅长句(duration>2×)缩，缩后保留 >=300ms 可视；真停顿不受影响。
@@ -462,34 +464,32 @@
     return Math.round(px);
   }
   /* ---------------------------------------------------------------
-   * 4. 翻译：一步到位「自然分行的中文字幕行」（v0.4.0 架构简化）
+   * 4. 翻译：源 cue 与译文 1:1 对齐（v0.5.0）
    * -------------------------------------------------------------
    * 旧架构（v0.2.1→v0.3.x）让模型先把碎片重组成「完整句」，再由代码把整句
    * 拆回逐行时间轴 —— 这一「拆回」动作硬切中文译文，把「经常」切成「经/常」、
    * 「隔三差/五」斩断（用户最痛的切词 bug 的根因），还堆了 16 个职责重叠的
    * 切割/对齐函数（splitTranslation/splitTransIntoN/alignOriginalToScreens…）。
    *
-   * 新架构（已用真实 API 在 3 批真实字幕验证）：让模型【一步到位】直接吐出
-   * 「自然分好行的中文字幕行」，代码只负责配时间轴，绝不再做任何译文切割。
-   *  - 没有「拆回逐行」动作 → 切词从根消失（代码永不在词中间落刀）。
-   *  - 模型输出的字幕行数可能 != 原始 cue 数：按【字符长度比例】把该 clip 覆盖
-   *    的总时间分给各输出行（行边界对齐；因为不切词所以不会切字）。
+   * v0.5.0 让模型按编号把每个已重组 cue 翻成一条自然中文字幕，输出与 cue 1:1：
+   *  - 时间轴与英文原文直接沿用对应 cue，不再做跨行猜测或二次切词。
+   *  - 超长译文只允许在安全短语边界形成同一字幕单元内的两行显示，不硬切词。
    *  - reasoning 爆点用 reasoning_effort:low + 把规则写死进 prompt + 「直接给结果
    *    不要思考过程」压住（实测延迟 4.5-6.7s 稳定、reasoning 14-103 token）。
-   * 后处理兜底（即使 prompt 漏网也保证）：去每行行尾逗号/句号、丢空行、合并连续重复行。
+   * 后处理兜底：按编号落槽、清洗目标语言杂质、去行尾逗号/句号；空响应交给调用方回退原文。
    */
 
   // 已验证 system prompt（直接写死规则 + 压 reasoning）。{TARGET_LANG} 仅在调用方
   // 传自定义 prompt 时替换；默认 prompt 面向简体中文，无占位符（替换为 no-op）。
   var DEFAULT_SYSTEM_PROMPT =
-    "你是专业字幕翻译。下面是被ASR切碎的英文字幕行。请把它们的完整意思翻译成简体中文，并切分成适合阅读的字幕行，规则严格如下：\n" +
-    "1) 在自然语义/短语边界断行，绝不把一个词语切成两半。\n" +
-    "2) 一句一意：一行只表达一个完整小意群；不要把两句粘成一行（如「就是烧水我们…」「比如泡茶也许…」应拆开）。\n" +
-    "3) 每行长度适中：尽量 8-16 个汉字，不要过长（尽量不超过 18 字）；也不要切得太碎（除非这段原文内容本来就很少）。\n" +
-    "4) 不要在行尾留下半截连接尾巴（如以「的/和/与/或/及/而/以/把/被/让/从/在/以至于」结尾却把后续成分甩到下一行）。\n" +
-    "5) 去掉每行行尾的逗号和句号；但行中间的顿号、问号、感叹号保留。\n" +
-    "6) 只输出中文字幕行，每行一条，不要行号、不要英文/其它语言字母、不要任何解释或思考过程。\n" +
-    "直接给结果。";
+    "你是专业字幕翻译。输入是带序号的源字幕行（通常是英文 ASR 重组后的一句/一小段）。\n" +
+    "请翻译成简体中文，并严格按相同序号输出，规则如下：\n" +
+    "1) 输出行数必须与输入行数完全一致；每行以相同序号开头，例如 `1. …`。\n" +
+    "2) 第 N 行译文只对应第 N 行原文的完整意思，不要跨行合并、不要拆成多行、不要省略、不要重排。\n" +
+    "3) 译文像正常中文字幕：一句一意、完整可读，尽量 12–20 个汉字；不要把两句话粘在一起，也不要输出过长行。\n" +
+    "4) 绝不把一个中文词切成两半，也不要留下以「的/和/与/或」等连接词结尾的半截尾巴。\n" +
+    "5) 去掉行尾逗号和句号；行中问号/感叹号/顿号可保留；不要输出英文/其它字母或解释。\n" +
+    "只输出带编号的中文字幕行。直接给结果。";
 
   /** 是否中文相关 BCP47 / YouTube languageCode（zh, zh-Hans, zh-CN, yue, cmn…） */
   function isChineseLangCode(code) {
@@ -528,10 +528,7 @@
     return tpl.replace(/\{TARGET_LANG\}/g, targetLang || "简体中文");
   }
 
-  /**
-   * 把碎片 cue 拼成带序号的 user message（`1. xxx\n2. yyy...`）。序号只帮模型
-   * 理解原文顺序/碎片归属，模型输出不要求带序号（parseSubtitleLines 会剥离漏网序号）。
-   */
+  /** 把 cue 拼成带序号的 user message；模型必须按相同序号 1:1 返回。 */
   function buildNumberedSourceLines(lines) {
     return (lines || [])
       .map(function (t, i) {
@@ -572,6 +569,47 @@
    *  - 折叠空白；若洗完为空则返回空串（上层 parse/merge 会丢空行）。
    * 绝不在 CJK 词中间插入/删除汉字——只剥杂质。
    */
+
+  function parseAlignedSubtitleLines(text, expectedCount) {
+    var n = expectedCount > 0 ? expectedCount : 0;
+    var slots = new Array(n).fill("");
+    if (!n || typeof text !== "string") return slots;
+    var raw = text.replace(/\r/g, "").split("\n");
+    var sequential = [];
+    for (var i = 0; i < raw.length; i++) {
+      var line = raw[i];
+      if (line == null) continue;
+      var m = String(line).match(/^\s*(\d{1,3})\s*[.、)）:：]\s*(.*)$/u);
+      var body = "", idx = -1;
+      if (m) { idx = parseInt(m[1], 10) - 1; body = m[2]; } else { body = line; }
+      body = collapseWhitespace(body).replace(TRAILING_PUNCT_RE, "").trim();
+      body = sanitizeSubtitleLine(body);
+      if (!body) continue;
+      if (idx >= 0 && idx < n) { if (!slots[idx]) slots[idx] = body; }
+      else sequential.push(body);
+    }
+    var filled = 0;
+    for (var k = 0; k < n; k++) if (slots[k]) filled++;
+    // 无编号输出只有在数量恰好等于 cue 数时才可按顺序接受；数量不足/过多
+    // 都无法证明对应关系。只要已有编号行，也绝不拿未编号行猜填缺号。
+    if (filled === 0 && sequential.length === n) {
+      for (var s = 0; s < n; s++) slots[s] = sequential[s];
+    }
+    return slots;
+  }
+
+  function shapeAlignedLine(line, maxChars) {
+    var s = collapseWhitespace(line);
+    if (!s) return "";
+    var max = maxChars > 0 ? maxChars : DEFAULT_CONFIG.maxLineChars || 20;
+    if (charLen(s) <= max) return s;
+    var parts = splitLongLines([s], max, 4);
+    if (!parts || !parts.length) return s;
+    if (parts.length === 1) return parts[0];
+    if (parts.length === 2) return parts[0] + "\n" + parts[1];
+    return parts[0] + "\n" + parts.slice(1).join("");
+  }
+
   function sanitizeSubtitleLine(line) {
     var s = String(line == null ? "" : line);
     if (!s) return "";
@@ -879,28 +917,44 @@
    *   srcStart/srcEnd 为 1-based 输出行号（仅排序用，不再回映 cue 时间）。
    */
   function buildClipUnits(lines, startMs, endMs, cues) {
-    var arr = (lines || []).filter(function (l) {
-      return l != null && String(l).trim() !== "";
-    });
+    var list = cues || [];
+    var rawLines = lines || [];
+    // v0.5 主路径：源 cue 1:1。lines[i] 对应 cues[i]；时间轴用 cue 原时间，英文用 cue.content。
+    if (list.length && rawLines.length === list.length) {
+      var out1 = [];
+      for (var i = 0; i < list.length; i++) {
+        var cue = list[i];
+        var zh = rawLines[i] == null ? "" : String(rawLines[i]);
+        var cStart = Number(cue.start);
+        var cEnd = Number(cue.end);
+        if (!Number.isFinite(cStart)) cStart = startMs;
+        if (!Number.isFinite(cEnd)) cEnd = endMs;
+        if (cEnd < cStart) { var tmp = cStart; cStart = cEnd; cEnd = tmp; }
+        out1.push({
+          srcStart: i + 1,
+          srcEnd: i + 1,
+          originalText: collapseWhitespace(cue.content || ""),
+          translation: zh,
+          startMs: cStart,
+          endMs: cEnd,
+        });
+      }
+      return out1;
+    }
+    var arr = rawLines.filter(function (l) { return l != null && String(l).trim() !== ""; });
     if (!arr.length) return [];
-    var lens = arr.map(function (l) {
-      return Math.max(1, charLen(l));
-    });
+    var lens = arr.map(function (l) { return Math.max(1, charLen(String(l).replace(/\n/g, ""))); });
     var times = layoutTimeline(lens, startMs, endMs, SEG_MIN_VISIBLE_MS, TARGET_CPS);
-
-    // 原文按时间重叠就近分给各输出行：用 layoutTimeline 产出的「时隙」边界（贴语音、
-    // 全覆盖），把每条 cue 归到其中点所落的那一行。仅供双语/对照显示，不参与切割。
-    var origByLine = assignOriginalsToLines(times, cues, arr.length, startMs, endMs);
-
+    var origByLine = assignOriginalsToLines(times, list, arr.length, startMs, endMs);
     var out = [];
-    for (var i = 0; i < arr.length; i++) {
+    for (var j = 0; j < arr.length; j++) {
       out.push({
-        srcStart: i + 1,
-        srcEnd: i + 1,
-        originalText: origByLine[i] || "",
-        translation: arr[i],
-        startMs: times[i].startMs,
-        endMs: times[i].endMs,
+        srcStart: j + 1,
+        srcEnd: j + 1,
+        originalText: origByLine[j] || "",
+        translation: arr[j],
+        startMs: times[j].startMs,
+        endMs: times[j].endMs,
       });
     }
     return out;
@@ -1132,14 +1186,13 @@
   }
 
   /**
-   * 翻译一个 clip：一次 chat 调用，让模型直接吐「自然分行的中文字幕行」，
-   * 解析清洗（去行号/去行尾标点/去空行/合并重复）+ 最小行长合并后返回字幕行数组。
+   * 翻译一个 clip：一次 chat 调用，让模型按 cue 编号 1:1 返回中文字幕。
    * 入参（opts）：
    *  - cues: 该 clip 的碎片 cue[]（带 content，顺序即源行号）
    *  - apiBaseUrl, apiKey, apiModel, targetLang
    *  - systemPrompt: 可选自定义（覆盖默认行级 prompt）
    *  - reasoningEffort: 透传 chatCompletion（默认配置 "low" 压 reasoning 爆点）
-   *  - minLineChars: 最小行长（默认 DEFAULT_CONFIG.minLineChars）；<=0 关闭合并
+   *  - maxLineChars: 单个字幕单元的建议显示行长；超长时只在安全短语边界换行
    *  - temperature, timeoutMs, fetchImpl
    * 返回：string[] 中文字幕行（可能为空数组=模型空响应，调用方兜底显原文）。
    * 网络/HTTP/超时错误向上抛出（与旧 chatCompletion 一致），调用方兜底 + 退避。
@@ -1147,14 +1200,8 @@
   async function translateClipLines(opts) {
     var cues = opts.cues || [];
     if (!cues.length) return [];
-
     var sys = buildSystemPrompt(opts.targetLang, opts.systemPrompt);
-    var userContent = buildNumberedSourceLines(
-      cues.map(function (c) {
-        return c.content;
-      })
-    );
-
+    var userContent = buildNumberedSourceLines(cues.map(function (c) { return c.content; }));
     var content = await chatCompletion({
       apiBaseUrl: opts.apiBaseUrl,
       apiKey: opts.apiKey,
@@ -1166,20 +1213,24 @@
       timeoutMs: opts.timeoutMs,
       fetchImpl: opts.fetchImpl,
     });
-
-    var lines = parseSubtitleLines(content);
-    var min = opts.minLineChars != null ? opts.minLineChars : DEFAULT_CONFIG.minLineChars;
-    // 后处理链（都只在行/短语边界落点，绝不切词）：
-    //  1) 半截连接尾合并（的/和/以至于…）
-    //  2) 过短碎行合并
-    //  3) 超长粘句按话语标记拆分（一句一意）
-    //  4) 再并一次半截尾 + 短行（拆完可能露出新的半截/过短）
-    var maxLine = opts.maxLineChars != null ? opts.maxLineChars : (DEFAULT_CONFIG.maxLineChars || 16);
-    lines = mergeDanglingLines(lines);
-    lines = mergeShortLines(lines, min);
-    lines = splitLongLines(lines, maxLine);
-    lines = mergeDanglingLines(lines);
-    // 拆完后不要再 mergeShortLines：会把「比如泡茶」(4字) 又粘回下一句。
+    var n = cues.length;
+    var maxLine = opts.maxLineChars != null ? opts.maxLineChars : DEFAULT_CONFIG.maxLineChars || 20;
+    var aligned = parseAlignedSubtitleLines(content, n);
+    var lines = [];
+    for (var i = 0; i < n; i++) lines.push(shapeAlignedLine(aligned[i] || "", maxLine));
+    var any = false;
+    for (var a = 0; a < lines.length; a++) if (lines[a] && String(lines[a]).trim()) { any = true; break; }
+    if (!any) {
+      var loose = parseSubtitleLines(content);
+      // 只有未编号输出数量恰好等于 cue 数时才能安全按顺序兜底；否则返回
+      // 等长空槽，绝不让运行层收到可变行数并把后续原文/译文错配。
+      if (loose.length === n) {
+        var shapedLoose = [];
+        for (var l = 0; l < n; l++) shapedLoose.push(shapeAlignedLine(loose[l], maxLine));
+        return shapedLoose;
+      }
+      return loose.length ? lines : [];
+    }
     return lines;
   }
   /**
@@ -1626,13 +1677,14 @@
    * ------------------------------------------------------------- */
 
   /**
-   * 生成缓存 key：videoId + 轨道 code + 目标语言 + model + clip 起始毫秒。
+   * 生成缓存 key：架构版本 + videoId + 轨道 code + 目标语言 + model + clip 起始毫秒。
+   * v0.5 改为 cue 1:1 后必须换 namespace，避免读取 v0.4 可变行数缓存造成错位。
    * 同一视频/轨道/语言/模型下，clip 起点稳定 → 重看/拖回/刷新可命中不重翻。
    */
   function makeCacheKey(parts) {
     parts = parts || {};
     return [
-      "dsc",
+      "dsc-v5",
       parts.videoId || "",
       parts.trackCode || "",
       parts.targetLang || "",
@@ -1951,6 +2003,8 @@
     buildSystemPrompt: buildSystemPrompt,
     buildNumberedSourceLines: buildNumberedSourceLines,
     parseSubtitleLines: parseSubtitleLines,
+    parseAlignedSubtitleLines: parseAlignedSubtitleLines,
+    shapeAlignedLine: shapeAlignedLine,
     sanitizeSubtitleLine: sanitizeSubtitleLine,
     mergeShortLines: mergeShortLines,
     mergeDanglingLines: mergeDanglingLines,

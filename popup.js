@@ -21,7 +21,7 @@
   var TEXT_FIELDS = ["apiBaseUrl", "apiKey", "apiModel", "targetLang", "fontFamily"];
   var NUM_FIELDS = ["fontSize", "bottomOffset", "tailTrimMs", "maxCharsPerScreen", "maxDurPerScreen"];
   var COLOR_FIELDS = ["fontColor", "transColor", "strokeColor"];
-  var BOOL_FIELDS = ["enabled", "background", "transOnTop", "showOriginal", "showLoading", "skipChineseSource"];
+  var BOOL_FIELDS = ["enabled", "background", "transOnTop", "showOriginal", "showLoading", "skipChineseSource", "waitForFirstTranslation"];
   var SELECT_FIELDS = ["sourceLang", "fontWeight", "shadowStrength"];
   // strokeWidth 是 0–3 的小数滑块，单独处理（NUM_FIELDS 走 parseInt 会截断小数）。
 

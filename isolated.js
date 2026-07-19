@@ -81,6 +81,9 @@
     lastHitCueIdx: -1, // 上次命中的全局 cue 下标（findCueIndexAt 的 O(1) 提示）
     lastPrefetchMs: -1e9, // 上次 prefetch 的播放位置（节流）
     seeking: false, // 进度条拖动中（防抖期间不渲染/不预取目标外位置）
+    waitPausedByUs: false,
+    waitTimer: null,
+    firstClipReady: false,
   };
 
   // 渲染/预取节拍（ms）。渲染 250ms 人眼无感；预取 1s 一次（比渲染低频，但比旧 1.5s 更跟手），与渲染解耦。
@@ -263,6 +266,9 @@
    * 拉取 + 解析 + 切 clip
    * ===================================================== */
   async function loadTrack(track) {
+    state.firstClipReady = false;
+    state.waitPausedByUs = false;
+    clearWaitTimer();
     try {
       var resp = await fetch(track.url, { credentials: "omit" });
       if (!resp.ok) {
@@ -342,8 +348,47 @@
    * 独立发起 translateClip——"下下个"不被"下一个还 pending"阻塞。窗口由全局信号量
    * (ensureGate)封顶，避免多 clip 并发冲垮网关。
    * 已翻 / 正在翻 / 退避中的 clip 由 translateClip 内部跳过。
-   * v0.4.0：一个 clip = 一次 translateClipLines，整段一起翻，无 clip 内首句优先起点。
+   * v0.5.0：一个 clip = 一次 translateClipLines，按源 cue 编号 1:1 返回，无 clip 内首句优先起点。
    */
+
+  function clearWaitTimer() {
+    if (state.waitTimer != null) { clearTimeout(state.waitTimer); state.waitTimer = null; }
+  }
+  function maybePauseForFirstTranslation(clipIdx) {
+    if (!config.waitForFirstTranslation) return;
+    if (state.firstClipReady) return;
+    if (clipIdx !== 0) return;
+    var v = videoEl();
+    if (!v || v.paused) return;
+    try {
+      v.pause();
+      state.waitPausedByUs = true;
+      setRendererText((state.renderUnits[0] && state.renderUnits[0].originalText) || "", "", true, false);
+      clearWaitTimer();
+      var ms = Number(config.waitForFirstTranslationMs);
+      if (!Number.isFinite(ms) || ms <= 0) ms = 8000;
+      state.waitTimer = setTimeout(function () {
+        state.waitTimer = null;
+        state.firstClipReady = true;
+        if (state.waitPausedByUs) {
+          state.waitPausedByUs = false;
+          var vv = videoEl();
+          if (vv && vv.paused) { var p = vv.play(); if (p && p.catch) p.catch(function () {}); }
+        }
+        requestRender();
+      }, ms);
+    } catch (e) {}
+  }
+  function maybeResumeAfterFirstTranslation(clipIdx) {
+    if (clipIdx !== 0) return;
+    state.firstClipReady = true;
+    clearWaitTimer();
+    if (!state.waitPausedByUs) return;
+    state.waitPausedByUs = false;
+    var v = videoEl();
+    if (v && v.paused) { var p = v.play(); if (p && p.catch) p.catch(function () {}); }
+  }
+
   function prefetchAround(ms, force) {
     if (!config.enabled || !state.clips.length) return;
     // 节流：预取循环低频(1.5s)调用，位置没明显移动就不重复跑昂贵逻辑
@@ -425,6 +470,7 @@
           clip.cues
         );
         state.clipState[idx] = "done";
+        if (idx === 0) maybeResumeAfterFirstTranslation(0);
         backoff.reset();
         rebuildRenderTimeline();
         requestRender();
@@ -432,6 +478,7 @@
       }
 
       state.clipState[idx] = "pending";
+      if (idx === 0) maybePauseForFirstTranslation(0);
 
       // 主路径（v0.4.0）：一次 translateClipLines，模型直接吐「自然分行的中文字幕行」。
       // 代码只用 buildClipUnits 按字符占比配时间轴，绝不切译文（切词 bug 根治）。
@@ -446,7 +493,7 @@
             targetLang: config.targetLang,
             systemPrompt: config.systemPrompt || "",
             reasoningEffort: config.reasoningEffort,
-            minLineChars: config.minLineChars,
+            maxLineChars: config.maxLineChars,
             timeoutMs: 20000,
             fetchImpl: function (u, o) {
               return fetch(u, o);
@@ -494,6 +541,7 @@
     if (lines && lines.length) {
       state.clipUnits[idx] = Core.buildClipUnits(lines, clip.startMs, clip.endMs, clip.cues);
       state.clipState[idx] = "done";
+      if (idx === 0) maybeResumeAfterFirstTranslation(0);
       backoff.reset();
       writeCache(key, { lines: lines });
       rebuildRenderTimeline();
@@ -1023,6 +1071,15 @@
    * full=true 时连 renderer 也移除（禁用扩展）；false 仅清循环/监听（换 video）。
    */
   function teardownRuntime(full) {
+    clearWaitTimer();
+    if (state.waitPausedByUs) {
+      state.waitPausedByUs = false;
+      var waitingVideo = videoEl();
+      if (waitingVideo && waitingVideo.paused) {
+        var resumePromise = waitingVideo.play();
+        if (resumePromise && resumePromise.catch) resumePromise.catch(function () {});
+      }
+    }
     stopRenderLoop();
     stopPrefetchLoop();
     stopRetryScheduler();

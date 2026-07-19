@@ -183,6 +183,7 @@
       <div class="inline"><input type="checkbox" id="transOnTop" /><label for="transOnTop">译文在上（原文在下）</label></div>
       <div class="inline"><input type="checkbox" id="showOriginal" /><label for="showOriginal">显示原文行</label></div>
       <div class="inline"><input type="checkbox" id="showLoading" /><label for="showLoading">译文未到时显示"翻译中…"</label></div>
+      <div class="inline"><input type="checkbox" id="waitForFirstTranslation" /><label for="waitForFirstTranslation">首包未就绪时短暂暂停播放（就绪/超时后自动继续）</label></div>
     </fieldset>
 
     <fieldset>
@@ -201,7 +202,7 @@
           <input type="number" id="maxDurPerScreen" min="0" max="20000" />
         </div>
       </div>
-      <div class="hint">句间空隙：连续语流相邻句之间的视觉断点(0=关闭，消除字幕墙)。v0.4.0 起译文由模型一步到位自然分行，代码不再按字数/时长切译文；单屏字数/时长仅保留为旧配置兼容项，当前不参与主路径。</div>
+      <div class="hint">句间空隙：连续语流相邻句之间的视觉断点(0=关闭，消除字幕墙)。v0.5.0 起模型按源 cue 编号 1:1 返回译文，代码不再跨 cue 重排；超长译文只在同一字幕单元内安全换行。单屏字数/时长仅保留为旧配置兼容项，当前不参与主路径。</div>
     </fieldset>
 
     <fieldset>

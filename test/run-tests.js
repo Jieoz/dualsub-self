@@ -367,6 +367,11 @@ test("makeCacheKey 同输入稳定、异输入不同", () => {
   assert.notStrictEqual(a, c, "目标语言不同 key 不同 → 不误命中");
 });
 
+test("makeCacheKey v0.5 namespace 隔离旧可变行数缓存", () => {
+  const key = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", clipStartMs: 0 });
+  assert.ok(key.startsWith("dsc-v5|"), "v0.5 必须换缓存 namespace，避免读取 v0.4 行数不一致缓存");
+});
+
 test("pruneCache LRU 淘汰最旧条目", () => {
   const cache = { k1: { t: 100, lines: ["a"] }, k2: { t: 200, lines: ["b"] }, k3: { t: 300, lines: ["c"] } };
   const pruned = Core.pruneCache(cache, 2);
@@ -590,24 +595,21 @@ test("importConfig 坏 JSON / 空对象报错", () => {
   assert.strictEqual(Core.importConfig("{}").ok, false, "无可识别字段应失败");
 });
 
-/* ============ 5j. DEFAULT_SYSTEM_PROMPT：v0.4.0「一步到位分行」契约 ============ */
-console.log("\n[system prompt v0.4.0 分行契约校验]");
+/* ============ 5j. DEFAULT_SYSTEM_PROMPT：v0.5 cue 1:1 契约 ============ */
+console.log("\n[system prompt v0.5 cue 1:1 契约校验]");
 
-test("DEFAULT_SYSTEM_PROMPT v0.4.0：中文一步到位分行规则（不切词/8-16字/去行尾标点/只输出中文行/无行号）", () => {
+test("DEFAULT_SYSTEM_PROMPT v0.5：源 cue 1:1 对齐（编号行/12-20字/不切词）", () => {
   const filled = Core.buildSystemPrompt("zh-Hans");
-  // v0.4.0 契约：模型直接吐「自然分行的中文字幕行」，代码不再逐行对齐/切割。
-  // 规则1：在语义/短语边界断行，绝不把词切成两半（切词 bug 的根治）。
+  // v0.5 契约：模型按源 cue 编号 1:1 返回，不跨 cue 合并或拆分。
+  // 规则1：绝不把中文词切成两半。
   assert.ok(/不把一个词语切成两半|绝不.*切成两半/.test(filled), "应含「不切词」规则");
-  // 规则2：每行 8-16 汉字，不要过分短碎。
-  assert.ok(/8-16|8\s*-\s*16/.test(filled), "应含每行 8-16 汉字的长度规则");
+  // 规则2：每行 12-20 汉字，不要过分短碎或过长。
+  assert.ok(/12-20|12\s*-\s*20|12–20|8-16/.test(filled), "应含正常字幕行长规则");
   // 规则3：去掉每行行尾的逗号/句号。
   assert.ok(/行尾/.test(filled) && /(逗号|句号)/.test(filled), "应含去行尾标点规则");
-  // 规则4：只输出中文字幕行、每行一条、不要行号/英文/解释。
-  assert.ok(/只输出中文/.test(filled), "应要求只输出中文字幕行");
-  assert.ok(/不要行号|不.*行号/.test(filled), "应明确不要行号（新契约与旧逐行对齐相反）");
-  // 反契约断言：v0.4.0 不再是旧的逐行对齐 prompt（不得含 line number / same number / identical）。
-  assert.ok(!/line number/i.test(filled), "v0.4.0 不应再含旧的英文 line number 逐行对齐约束");
-  assert.ok(!/same number|identical/i.test(filled), "v0.4.0 不应再要求行号/行数逐行一致");
+  // 规则4：只输出带编号的中文字幕行，不要英文或解释。
+  assert.ok(/只输出.*中文.*行/.test(filled), "应要求只输出中文字幕行");
+  assert.ok(/相同序号|编号|完全一致/.test(filled), "应要求编号 1:1");
   // 目标语言占位符：默认中文 prompt 无占位符（替换为 no-op），不应残留 {TARGET_LANG}。
   assert.ok(!/\{TARGET_LANG\}/.test(filled), "占位符应被全部替换（默认中文 prompt 无占位符）");
 });
@@ -1153,13 +1155,10 @@ async function main() {
     assert.strictEqual(typeof Core.buildClipUnits, "function", "buildClipUnits 应存在");
   });
 
-  await asyncTest("translateClipLines→buildClipUnits 端到端（mock）：行数/时间轴/覆盖/译文合理", async () => {
-    // isolated.js 主路径的最小复刻（与 e2e-harness ~184-258 同序列）：
-    //   clip.cues → translateClipLines(模型直接吐自然中文行) → buildClipUnits 配时间轴。
-    // mock 模型：把编号英文行数回一段固定中文，按标点分好 3 行（模拟「一步到位分行」）。
+  await asyncTest("translateClipLines→buildClipUnits 端到端（mock）：cue/译文/时间轴 1:1", async () => {
     const clip = {
       startMs: 10000,
-      endMs: 25000, // 15s 窗
+      endMs: 25000,
       cues: [
         { start: 10000, end: 13000, content: "so today we are going to" },
         { start: 13000, end: 17000, content: "take a close look at how" },
@@ -1167,7 +1166,8 @@ async function main() {
         { start: 21000, end: 25000, content: "under the hood step by step" },
       ],
     };
-    const MODEL_LINES = ["今天我们来看看", "变换器到底是怎么", "一步步运作的"];
+    const MODEL_LINES = ["今天我们要来", "仔细看看变换器", "实际上如何工作", "以及底层实现步骤"];
+    const MODEL_RESPONSE = MODEL_LINES.map((line, i) => `${i + 1}. ${line}`).join("\n");
     let sysSeen = "";
     let userSeen = "";
     const mockFetch = async (url, opts) => {
@@ -1177,11 +1177,10 @@ async function main() {
       return {
         ok: true,
         status: 200,
-        json: async () => ({ choices: [{ message: { content: MODEL_LINES.join("\n") } }] }),
+        json: async () => ({ choices: [{ message: { content: MODEL_RESPONSE } }] }),
         text: async () => "",
       };
     };
-
     const lines = await Core.translateClipLines({
       cues: clip.cues,
       apiBaseUrl: "http://mock/v1",
@@ -1189,34 +1188,21 @@ async function main() {
       apiModel: "m",
       targetLang: "zh-Hans",
       reasoningEffort: "low",
-      minLineChars: Core.DEFAULT_CONFIG.minLineChars,
       timeoutMs: 5000,
       fetchImpl: mockFetch,
     });
-    // 请求契约：system 是 v0.4.0 分行 prompt，user 是带序号的原文行
-    assert.ok(/只输出中文/.test(sysSeen), "system 应为 v0.4.0 分行 prompt");
+    assert.ok(/相同序号|完全一致/.test(sysSeen), "system 应要求 cue 1:1 对齐");
     assert.ok(/^1\. so today/m.test(userSeen), "user 应含带序号的原文行");
-    // 模型行经 parseSubtitleLines + mergeShortLines 清洗后返回（这里都 >=6 字，不被合并）
-    assert.deepStrictEqual(lines, MODEL_LINES, "应返回清洗后的自然中文行");
+    assert.deepStrictEqual(lines, MODEL_LINES, "应按编号返回 1:1 中文字幕");
 
     const units = Core.buildClipUnits(lines, clip.startMs, clip.endMs, clip.cues);
-    // 行数 == 模型行数（代码不切译文，一行一单元）
-    assert.strictEqual(units.length, MODEL_LINES.length, "渲染单元数 == 模型输出行数（不切译文）");
-    // 时间轴：首单元起点==clip 起点；各单元落在 [clip.startMs, clip.endMs] 内、单调不回退、start<end。
-    // 注意：layoutTimeline 会把每段显示终点回缩到「阅读时长」留白，故末单元 endMs 通常 < clip.endMs。
-    assert.strictEqual(units[0].startMs, clip.startMs, "首单元贴 clip 起点");
-    assert.ok(units[units.length - 1].endMs <= clip.endMs, "末单元不超出 clip 终点");
+    assert.strictEqual(units.length, clip.cues.length, "渲染单元数应等于 cue 数");
     for (let i = 0; i < units.length; i++) {
-      assert.ok(units[i].startMs < units[i].endMs, "单元 " + i + " start<end（不闪现）");
-      assert.ok(units[i].startMs >= clip.startMs && units[i].endMs <= clip.endMs, "单元 " + i + " 落在 clip 时间窗内");
-      assert.ok(units[i].translation && units[i].translation.length > 0, "单元 " + i + " 译文非空");
-      if (i > 0) {
-        assert.ok(units[i].startMs >= units[i - 1].startMs, "起点单调不回退");
-      }
+      assert.strictEqual(units[i].startMs, clip.cues[i].start, "单元应沿用对应 cue 起点");
+      assert.strictEqual(units[i].endMs, clip.cues[i].end, "单元应沿用对应 cue 终点");
+      assert.strictEqual(units[i].originalText, clip.cues[i].content, "单元应沿用对应 cue 原文");
+      assert.strictEqual(units[i].translation, MODEL_LINES[i], "单元应沿用对应编号译文");
     }
-    // 原文按时间重叠就近归并进各单元（双语显示用）：4 条原文分摊到 3 个单元，合计应含全部原文词
-    const allOrig = units.map((u) => u.originalText).join(" ");
-    assert.ok(/transformers/.test(allOrig) && /under the hood/.test(allOrig), "原文应按时间归并进单元");
   });
 
   await asyncTest("translateClipLines 模型空响应 → 返回空数组（isolated 侧回退显原文）", async () => {
@@ -1238,6 +1224,14 @@ async function main() {
   });
 
 
+  await asyncTest("translateClipLines 未编号且数量不足时保留等长空槽，不得返回可变行数", async () => {
+    const lines = await Core.translateClipLines({
+      cues: [{ content: "first" }, { content: "second" }],
+      apiBaseUrl: "https://example.test/v1", apiKey: "mock-key", apiModel: "m", targetLang: "zh-Hans",
+      fetchImpl: async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: "只有一条" } }] }) }),
+    });
+    assert.deepStrictEqual(lines, ["", ""]);
+  });
 
   /* ============ 6e. v0.4.1 打磨：原文对齐空行 / 半截短语 / 首包默认 ============
    * 验收里发现：译文行多于 cue 时，旧「cue 中点落槽」会在时隙空白处留下空 originalText
@@ -1362,12 +1356,12 @@ async function main() {
     ]);
   });
 
-  await asyncTest("translateClipLines 后处理链：短行合并 + 半截连接尾合并", async () => {
+  await asyncTest("translateClipLines v0.5：1:1 对齐不跨 cue 合并", async () => {
     const mockFetch = async () => ({
       ok: true,
       status: 200,
       json: async () => ({
-        choices: [{ message: { content: "所以专门烧水的\n东西叫水壶\n我先从一些测试和\n演示开始" } }],
+        choices: [{ message: { content: "1. 所以专门烧水的\n2. 东西叫水壶\n3. 我先从一些测试和\n4. 演示开始" } }],
       }),
       text: async () => "",
     });
@@ -1381,32 +1375,30 @@ async function main() {
       apiBaseUrl: "http://mock/v1",
       apiKey: "k",
       apiModel: "m",
-      minLineChars: 6,
+      maxLineChars: 20,
       timeoutMs: 5000,
       fetchImpl: mockFetch,
     });
-    assert.deepStrictEqual(lines, ["所以专门烧水的东西叫水壶", "我先从一些测试和演示开始"]);
+    assert.deepStrictEqual(lines, ["所以专门烧水的", "东西叫水壶", "我先从一些测试和", "演示开始"]);
   });
 
-  test("后处理链保留粘句拆分：mergeShort 不得把 split 结果再粘回", async () => {
+  test("translateClipLines v0.5：超长 cue 只在单元内安全换行", async () => {
     const lines = await Core.translateClipLines({
       cues: [{ content: "is boil water we do it for lots of reasons" }, { content: "such as tea maybe cooking" }],
       apiBaseUrl: "https://example.invalid/v1",
-      apiKey: "x",
+      apiKey: "k",
       apiModel: "m",
       targetLang: "zh-Hans",
-      minLineChars: 6,
-      maxLineChars: 16,
+      maxLineChars: 10,
       fetchImpl: async () => ({
         ok: true,
         status: 200,
-        json: async () => ({ choices: [{ message: { content: "就是烧水我们烧水有很多原因\n比如说茶也许你会把这归到烹饪里" } }] }),
+        json: async () => ({ choices: [{ message: { content: "1. 就是烧水我们烧水有很多原因\n2. 比如泡茶也许你会把这归到烹饪里" } }] }),
       }),
     });
-    assert.ok(lines.includes("就是烧水"), "应拆出「就是烧水」: " + JSON.stringify(lines));
-    assert.ok(lines.some((l) => l.includes("我们烧水")), "应保留后半: " + JSON.stringify(lines));
-    assert.ok(lines.some((l) => l.includes("也许")), "「也许」应起新行: " + JSON.stringify(lines));
-    assert.ok(!lines.some((l) => l.includes("就是烧水我们")), "不得再粘回: " + JSON.stringify(lines));
+    assert.strictEqual(lines.length, 2, "仍保持 cue 1:1");
+    assert.strictEqual(lines[0], "就是烧水\n我们烧水有很多原因", "首 cue 只在安全短语边界换行");
+    assert.strictEqual(lines[1], "比如泡茶\n也许你会把这归到烹饪里", "次 cue 只在安全短语边界换行");
   });
 
   test("splitLongLines：超长粘句只在短语边界拆，绝不切词", () => {
@@ -1453,8 +1445,8 @@ async function main() {
 
   test("DEFAULT_SYSTEM_PROMPT 强调自然短语边界与长度上限", () => {
     const p = Core.DEFAULT_SYSTEM_PROMPT;
-    assert.ok(/绝不/.test(p) && /词语/.test(p), "仍强调不切词");
-    assert.ok(/8-16|8–16/.test(p), "保留适中行长");
+    assert.ok(/绝不/.test(p) && /(中文词|切成两半)/.test(p), "仍强调不切词");
+    assert.ok(/12-20|12–20|8-16|8–16/.test(p), "保留适中行长");
     // 打磨：明确禁止半截连接尾、尽量不超 18 字
     assert.ok(/的$|连接|半截|悬空|尾巴/.test(p), "应提示避免半截连接尾");
     assert.ok(/18|不要过长|过长/.test(p), "应提示避免过长行");
@@ -1498,6 +1490,53 @@ async function main() {
 
   test("DEFAULT_CONFIG.skipChineseSource 默认 true", () => {
     assert.strictEqual(Core.DEFAULT_CONFIG.skipChineseSource, true);
+  });
+
+  console.log("\n[v0.5 源 cue 1:1 对齐]");
+  test("parseAlignedSubtitleLines：按编号落槽，缺行留空", () => {
+    const slots = Core.parseAlignedSubtitleLines("1. 你好世界\n3. 第三行", 3);
+    assert.strictEqual(slots.length, 3);
+    assert.strictEqual(slots[0], "你好世界");
+    assert.strictEqual(slots[1], "");
+    assert.strictEqual(slots[2], "第三行");
+  });
+  test("parseAlignedSubtitleLines：无编号但行数对齐时顺序落槽", () => {
+    assert.deepStrictEqual(Core.parseAlignedSubtitleLines("甲行\n乙行", 2), ["甲行", "乙行"]);
+  });
+  test("buildClipUnits 1:1：行数=cue 数时用 cue 时间与原文", () => {
+    const cues = [
+      { start: 0, end: 3000, content: "If you are a human person," },
+      { start: 3000, end: 6000, content: "one of those things you will do" },
+      { start: 6000, end: 9000, content: "is boil water." },
+    ];
+    const units = Core.buildClipUnits(["如果你是人类", "你会经常做的一件事", "就是烧水"], 0, 9000, cues);
+    assert.strictEqual(units.length, 3);
+    assert.strictEqual(units[0].originalText, "If you are a human person,");
+    assert.strictEqual(units[0].startMs, 0);
+    assert.strictEqual(units[0].endMs, 3000);
+    assert.strictEqual(units[1].startMs, 3000);
+  });
+  test("DEFAULT_CONFIG 行长接近正常字幕 + 首包等待", () => {
+    assert.ok(Core.DEFAULT_CONFIG.minLineChars >= 10);
+    assert.ok(Core.DEFAULT_CONFIG.maxLineChars >= 18);
+    assert.strictEqual(Core.DEFAULT_CONFIG.waitForFirstTranslation, true);
+    assert.ok(Core.DEFAULT_CONFIG.waitForFirstTranslationMs >= 1000 && Core.DEFAULT_CONFIG.waitForFirstTranslationMs <= 15000);
+  });
+  await asyncTest("translateClipLines v0.5：mock 编号输出保持 1:1", async () => {
+    const cues = [
+      { start: 0, end: 2000, content: "Hello world." },
+      { start: 2000, end: 4000, content: "We boil water." },
+    ];
+    const lines = await Core.translateClipLines({
+      cues, apiBaseUrl: "https://example.test/v1", apiKey: "k", apiModel: "m", targetLang: "zh-Hans",
+      fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "1. 你好世界\n2. 我们烧水" } }] }) }),
+    });
+    assert.strictEqual(lines.length, 2);
+    assert.ok(/你好/.test(lines[0]));
+    assert.ok(/烧水/.test(lines[1]));
+    const units = Core.buildClipUnits(lines, 0, 4000, cues);
+    assert.strictEqual(units[0].originalText, "Hello world.");
+    assert.strictEqual(units[1].originalText, "We boil water.");
   });
 
   /* ============ 7. 交付物校验 ============ */
