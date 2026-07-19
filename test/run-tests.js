@@ -456,6 +456,58 @@ test("findCueIndexAt hint 命中相邻 O(1) 与二分结果一致", () => {
 /* ============ 5h. cueClipIndexMap：全局 cue→clip 映射 ============ */
 console.log("\n[cueClipIndexMap：cue→clip 反查表]");
 
+console.log("\n[sliceClipsByCue：首 clip 更短 + 软上限]");
+
+test("sliceClipsByCue firstTargetMs：首 clip 用更短目标，后续仍用 targetMs", () => {
+  // 模拟 resegment 后的长开场：前几条 cue 跨度大
+  const cues = [
+    { start: 0, end: 3500, content: "AAAA" },
+    { start: 4000, end: 5200, content: "BBBB" },
+    { start: 7000, end: 8100, content: "CCCC" },
+    { start: 10000, end: 14000, content: "DDDD" },
+    { start: 15000, end: 20000, content: "EEEE" },
+    { start: 21000, end: 28000, content: "FFFF" },
+  ];
+  // 无 firstTargetMs：target 12000 → 首 clip 会吃到 end-start>=12000 的那条
+  const plain = Core.sliceClipsByCue(cues, 12000);
+  assert.ok(plain[0].cues.length >= 3, "默认首 clip 会累积到 target");
+
+  // firstTargetMs=4000：首 clip 在第 2 条后就该收（span 5200>=4000）
+  const short = Core.sliceClipsByCue(cues, 12000, { firstTargetMs: 4000 });
+  assert.strictEqual(short[0].cues.length, 2, "首 clip 应更短");
+  assert.deepStrictEqual(short[0].cues.map((c) => c.content), ["AAAA", "BBBB"]);
+  // 后续 clip 仍按 12000
+  assert.ok(short.length >= 2);
+  const restChars = short.slice(1).reduce((n, cl) => n + cl.cues.length, 0);
+  assert.strictEqual(restChars, 4, "剩余 cue 全部分到后续 clip");
+});
+
+test("sliceClipsByCue maxCuesPerClip：软上限不跨 cue 切断", () => {
+  const cues = [];
+  for (let i = 0; i < 8; i++) {
+    cues.push({ start: i * 1000, end: i * 1000 + 900, content: "c" + i });
+  }
+  const clips = Core.sliceClipsByCue(cues, 60000, { maxCuesPerClip: 3 });
+  assert.ok(clips.every((c) => c.cues.length <= 3), "每 clip ≤3 cue");
+  assert.strictEqual(clips.reduce((n, c) => n + c.cues.length, 0), 8, "不丢 cue");
+  // 不重叠
+  for (let i = 1; i < clips.length; i++) {
+    assert.ok(clips[i].startMs >= clips[i - 1].endMs, "clip 不重叠");
+  }
+});
+
+test("sliceClipsByCue maxSourceChars：源文字数软上限", () => {
+  const cues = [
+    { start: 0, end: 1000, content: "abcdefghij" }, // 10
+    { start: 1100, end: 2000, content: "klmnopqrst" }, // 10 → 累计 20
+    { start: 2100, end: 3000, content: "uvwxyzABCD" }, // 10
+  ];
+  const clips = Core.sliceClipsByCue(cues, 60000, { maxSourceChars: 15 });
+  // 第 1 条后 10<15，吃第 2 条后 20>=15 收尾
+  assert.strictEqual(clips[0].cues.length, 2);
+  assert.strictEqual(clips[1].cues.length, 1);
+});
+
 test("cueClipIndexMap 与 sliceClipsByCue 协作映射正确", () => {
   const cues = [
     { start: 0, end: 10000, content: "a" },
@@ -582,7 +634,9 @@ test("DEFAULT_CONFIG 含关键字段且颜色非空", () => {
   assert.ok(/^#/.test(d.fontColor) && /^#/.test(d.transColor), "默认颜色非空");
   assert.ok(d.clipSeconds > 0 && d.batchLines > 0);
   // v0.4.1：首包延迟打磨——默认 clip 收短到 12s（仍 >0；旧 15 易让单请求 > 播放窗）
-  assert.ok(d.clipSeconds >= 8 && d.clipSeconds <= 12, "clipSeconds 默认应在 8–12 以压首包");
+  assert.ok(d.clipSeconds >= 8 && d.clipSeconds <= 12, "clipSeconds 默认应在 8–12");
+  assert.ok(d.firstClipSeconds > 0 && d.firstClipSeconds <= d.clipSeconds,
+    "firstClipSeconds 应更短或等于 clipSeconds，用于压首单元延迟");
   assert.strictEqual(d.contextLines, 3, "新增 contextLines 默认 3（每批带前 3 条原文作上下文）");
   assert.strictEqual(typeof d.showLoading, "boolean", "新增 showLoading 加载态开关");
   assert.ok(d.batchLines >= 12 && d.batchLines <= 15, "batchLines 默认在 12–15（瘦身后调优）");
@@ -699,6 +753,15 @@ test("computeFontPx 非法基准字号回落 DEFAULT_CONFIG.fontSize", () => {
 
 /* ============ 5l. planPrefetch：预取深度裁剪（滑动窗口 depth=3）============ */
 console.log("\n[planPrefetch：深度裁剪 + 越界安全]");
+
+test("prioritizePrefetch：当前 clip 始终排在队首，其余保序", () => {
+  assert.strictEqual(typeof Core.prioritizePrefetch, "function");
+  assert.deepStrictEqual(Core.prioritizePrefetch([2, 3, 4, 5], 2), [2, 3, 4, 5]);
+  assert.deepStrictEqual(Core.prioritizePrefetch([3, 4, 2, 5], 2), [2, 3, 4, 5]);
+  assert.deepStrictEqual(Core.prioritizePrefetch([1, 2, 3], 9), [1, 2, 3], "当前不在 plan 则原序");
+  assert.deepStrictEqual(Core.prioritizePrefetch([], 0), []);
+  assert.deepStrictEqual(Core.prioritizePrefetch(null, 0), []);
+});
 
 test("planPrefetch 默认 depth=3 返回 [idx..idx+3]", () => {
   assert.deepStrictEqual(Core.planPrefetch(0, 10), [0, 1, 2, 3]);

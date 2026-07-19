@@ -45,6 +45,7 @@ function parseArgs(argv) {
     target: "zh-Hans",
     // 调优旋钮（默认取 core DEFAULT_CONFIG，命令行可覆盖）。
     clipSeconds: Core.DEFAULT_CONFIG.clipSeconds,
+    firstClipSeconds: Core.DEFAULT_CONFIG.firstClipSeconds,
     minLineChars: Core.DEFAULT_CONFIG.minLineChars,
     reasoningEffort: Core.DEFAULT_CONFIG.reasoningEffort,
     timeoutMs: 0, // 0=按模式默认(real 90s/mock 20s)
@@ -60,6 +61,7 @@ function parseArgs(argv) {
     else if (arg.startsWith("--model=")) a.model = arg.slice(8);
     else if (arg.startsWith("--target=")) a.target = arg.slice(9);
     else if (arg.startsWith("--clip-seconds=")) a.clipSeconds = parseFloat(arg.slice(15)) || a.clipSeconds;
+    else if (arg.startsWith("--first-clip-seconds=")) a.firstClipSeconds = parseFloat(arg.slice(21)) || a.firstClipSeconds;
     else if (arg.startsWith("--min-line-chars=")) a.minLineChars = parseInt(arg.slice(17), 10);
     else if (arg.startsWith("--reasoning=")) a.reasoningEffort = arg.slice(12);
     else if (arg.startsWith("--timeout-ms=")) a.timeoutMs = parseInt(arg.slice(13), 10) || 0;
@@ -183,7 +185,11 @@ async function run() {
   // 链路前段（与 isolated.js 一致）：清洗 → 语义重组 → 按 cue 切 clip
   const cleaned = Core.cleanupCues(originalCues);
   const reseg = Core.resegmentCues(cleaned, { tailTrimMs: 120 });
-  const clips = Core.sliceClipsByCue(reseg, a.clipSeconds * 1000);
+  const clips = Core.sliceClipsByCue(reseg, a.clipSeconds * 1000, {
+    firstTargetMs: (a.firstClipSeconds > 0 ? a.firstClipSeconds : a.clipSeconds) * 1000,
+    maxCuesPerClip: Core.DEFAULT_CONFIG.maxCuesPerClip || 0,
+    maxSourceChars: Core.DEFAULT_CONFIG.maxSourceCharsPerClip || 0,
+  });
 
   const stats = { requestMs: [], retries429: 0, clipFallbacks: 0, emptyClips: 0,
                   firstUnitMs: null, totalMs: 0, clipMs: [] };
@@ -224,7 +230,8 @@ async function run() {
   console.log("\n=== dualsub E2E harness (v0.4.0) ===");
   console.log("mode      :", mode);
   console.log("cues      :", originalCues.length, "original →", reseg.length, "resegmented →", clips.length, "clips");
-  console.log("tuning    : clipSeconds=" + a.clipSeconds + " minLineChars=" + a.minLineChars +
+  console.log("tuning    : clipSeconds=" + a.clipSeconds + " firstClipSeconds=" + a.firstClipSeconds +
+              " minLineChars=" + a.minLineChars +
               " reasoning=" + (a.reasoningEffort || "(default)") +
               " timeoutMs=" + (a.timeoutMs || (a.real ? 90000 : 20000)));
   console.log("");
@@ -327,7 +334,8 @@ function writeOutputs(renderUnits, stats, a, mode) {
   const pct = (p) => sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))] : 0;
   const out = {
     mode,
-    tuning: { clipSeconds: a.clipSeconds, minLineChars: a.minLineChars,
+    tuning: { clipSeconds: a.clipSeconds, firstClipSeconds: a.firstClipSeconds,
+              minLineChars: a.minLineChars,
               reasoningEffort: a.reasoningEffort,
               timeoutMs: a.timeoutMs || (a.real ? 90000 : 20000) },
     totalMs: stats.totalMs,

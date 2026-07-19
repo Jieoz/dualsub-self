@@ -261,7 +261,14 @@
       }
       state.cues = cues;
       // 按 cue 边界切 clip（不在句子中间断、clip 间不重叠 → 省 token）
-      state.clips = Core.sliceClipsByCue(cues, config.clipSeconds * 1000);
+      // v0.4.2：首 clip 用 firstClipSeconds 压 TTFT；软上限防超长源文一次请求。
+      var firstSec = Number(config.firstClipSeconds);
+      if (!Number.isFinite(firstSec) || firstSec <= 0) firstSec = config.clipSeconds;
+      state.clips = Core.sliceClipsByCue(cues, config.clipSeconds * 1000, {
+        firstTargetMs: firstSec * 1000,
+        maxCuesPerClip: config.maxCuesPerClip || 0,
+        maxSourceChars: config.maxSourceCharsPerClip || 0,
+      });
       // 建全局 cue→clip 映射表，渲染时 O(1) 反查所属 clip
       state.cueMap = Core.cueClipIndexMap(state.clips);
       state.clipUnits = {};
@@ -332,8 +339,20 @@
     var plan = Core.planPrefetch(idx, state.clips.length, undefined, {
       remainMsInCurrent: remainMsInCurrent,
     });
-    for (var i = 0; i < plan.length; i++) {
-      translateClip(plan[i]);
+    // 当前 clip 必须排队首：先抢信号量/网关，避免与预取段并行抢跑拖慢首包。
+    plan = Core.prioritizePrefetch(plan, idx);
+    // force（刚加载/seek）时：先只踢当前段，下一 macrotask 再铺后续预取，
+    // 让首包请求更早离开浏览器、更少与同批预取抢模型算力。
+    if (force && plan.length > 1) {
+      translateClip(plan[0]);
+      var rest = plan.slice(1);
+      setTimeout(function () {
+        for (var j = 0; j < rest.length; j++) translateClip(rest[j]);
+      }, 0);
+    } else {
+      for (var i = 0; i < plan.length; i++) {
+        translateClip(plan[i]);
+      }
     }
   }
 

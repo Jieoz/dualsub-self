@@ -320,7 +320,14 @@
     transOnTop: true, // true=译文在上，原文在下
     showOriginal: true, // 是否显示原文行
     showLoading: true, // 译文未到时显示轻量"翻译中…"指示（false=只显原文）
-    clipSeconds: 12, // 每个翻译 clip 多少秒（按 cue 边界就近切）。v0.4.1 从 15 收到 12：
+    clipSeconds: 12,
+    // 首个 clip 单独用更短目标（秒）。开场长 ASR 句在 clipSeconds=12 时仍可能吃进 3–4 条 cue、
+    // 源文 200+ 字 → 首包 4–6s+。firstClipSeconds 压首单元 token，后续 clip 仍用 clipSeconds。
+    firstClipSeconds: 4,
+    // 单 clip 源文字符软上限（0=关闭）。防止超长 cue 组把一次请求撑爆；只在 cue 边界断开。
+    maxSourceCharsPerClip: 160,
+    // 单 clip 最多 cue 条数软上限（0=关闭）。
+    maxCuesPerClip: 4, // 每个翻译 clip 多少秒（按 cue 边界就近切）。v0.4.1 从 15 收到 12：
     //                  推理模型(gpt-5.x-mini) prompt 越长 reasoning token 越多、首单元越慢；
     //                  更短 clip → 单次请求更轻 → 首包/换段更稳（见 e2e-harness A/B）。
     batchLines: 14, // 已废弃（v0.4.0 一个 clip = 一次请求，不再 clip 内分批）；保留键兼容旧配置。
@@ -996,24 +1003,46 @@
   /**
    * 按 cue 边界切 clip：累积 cue 直到时长达到 ~targetMs，就在当前 cue 之后断开。
    * 绝不把一条 cue 切到两个 clip，clip 之间不重叠、不重复 → 省 token。
+   * opts（可选，v0.4.2 首包打磨）：
+   *  - firstTargetMs: 仅第 0 个 clip 使用的更短目标时长（压 TTFT）。
+   *  - maxCuesPerClip: 每 clip 最多 cue 条数软上限（0=关）。
+   *  - maxSourceChars: 每 clip 源文字符软上限（0=关）。
+   * 软上限都只在 cue 边界生效，单条超长 cue 仍整条进 clip。
    * 返回 clip 数组：{ index, startMs, endMs, cues, startIndex }（index 从 0 连续）。
    * startMs 用该 clip 第一条 cue 的 start（稳定，可做缓存 key 的一部分）。
    */
-  function sliceClipsByCue(cues, targetMs) {
-    var size = targetMs && targetMs > 0 ? targetMs : 30000;
+  function sliceClipsByCue(cues, targetMs, opts) {
+    opts = opts || {};
+    var defaultSize = targetMs && targetMs > 0 ? targetMs : 30000;
+    // 首 clip 可用更短目标压 TTFT；非法/缺失则回落 defaultSize。
+    var firstSize = opts.firstTargetMs != null ? Number(opts.firstTargetMs) : defaultSize;
+    if (!Number.isFinite(firstSize) || firstSize <= 0) firstSize = defaultSize;
+    var maxCues = opts.maxCuesPerClip != null ? Number(opts.maxCuesPerClip) : 0;
+    if (!Number.isFinite(maxCues) || maxCues < 0) maxCues = 0;
+    maxCues = Math.floor(maxCues);
+    var maxChars = opts.maxSourceChars != null ? Number(opts.maxSourceChars) : 0;
+    if (!Number.isFinite(maxChars) || maxChars < 0) maxChars = 0;
+    maxChars = Math.floor(maxChars);
+
     var clips = [];
     var i = 0;
     var n = (cues || []).length;
     while (i < n) {
+      var size = clips.length === 0 ? firstSize : defaultSize;
       var startMs = cues[i].start;
       var group = [];
       var startIndex = i;
+      var charCount = 0;
       while (i < n) {
         group.push(cues[i]);
+        charCount += String(cues[i].content == null ? "" : cues[i].content).length;
         var spanned = cues[i].end - startMs;
         i++;
         // 达到目标时长就收尾（至少 1 条）；下一条另起 clip
         if (spanned >= size) break;
+        // 软上限：只在 cue 边界断开，绝不切碎单条 cue
+        if (maxCues > 0 && group.length >= maxCues) break;
+        if (maxChars > 0 && charCount >= maxChars) break;
       }
       clips.push({
         index: clips.length,
@@ -1024,6 +1053,30 @@
       });
     }
     return clips;
+  }
+
+  /**
+   * 预取队列重排：保证 currentIdx 在队首先发起（抢信号量 + 网关首包）。
+   * plan 中其余下标保持相对顺序；current 不在 plan 时原样返回。
+   */
+  function prioritizePrefetch(plan, currentIdx) {
+    if (!plan || !plan.length) return [];
+    var cur = Number(currentIdx);
+    if (!Number.isFinite(cur)) return plan.slice();
+    cur = Math.floor(cur);
+    var head = [];
+    var tail = [];
+    var seen = false;
+    for (var i = 0; i < plan.length; i++) {
+      var v = plan[i];
+      if (!seen && v === cur) {
+        head.push(v);
+        seen = true;
+      } else {
+        tail.push(v);
+      }
+    }
+    return seen ? head.concat(tail) : plan.slice();
   }
 
   /* ---------------------------------------------------------------
@@ -1602,6 +1655,7 @@
     migrateConfig: migrateConfig,
     computeFontPx: computeFontPx,
     planPrefetch: planPrefetch,
+    prioritizePrefetch: prioritizePrefetch,
     makeSemaphore: makeSemaphore,
     makeAdaptiveGate: makeAdaptiveGate,
     errorKind: errorKind,
