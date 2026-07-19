@@ -65,6 +65,126 @@ test("parseJson3 拼接 segs 并过滤空内容", () => {
   assert.strictEqual(cues[2].content, "transformers", "应折叠多余空白");
 });
 
+test("parseJson3 保留 json3 segment 偏移推导的词级时间", () => {
+  const cues = Core.parseJson3({ events: [{
+    tStartMs: 1000, dDurationMs: 900,
+    segs: [{ utf8: "hello ", tOffsetMs: 0 }, { utf8: "world", tOffsetMs: 500 }],
+  }] });
+  assert.deepStrictEqual(cues[0].tokens.map(({ text, start, end }) => ({ text, start, end })), [
+    { text: "hello", start: 1000, end: 1500 },
+    { text: "world", start: 1500, end: 1900 },
+  ]);
+  assert.ok(cues[0].tokens.every((token) => token.nativeTiming));
+});
+
+test("parseJson3 词流去 ASR 标点并标记原生 tOffset 时间覆盖", () => {
+  const cues = Core.parseJson3({ events: [{ tStartMs: 100, dDurationMs: 900, segs: [
+    { utf8: "whistle. ", tOffsetMs: 0 }, { utf8: "on this", tOffsetMs: 300 },
+  ] }] });
+  assert.deepStrictEqual(cues[0].tokens.map((t) => t.text), ["whistle", "on", "this"]);
+  assert.ok(Core.hasNativeTokenTiming(cues));
+  cues[0].tokens[2].nativeTiming = false;
+  assert.ok(!Core.hasNativeTokenTiming(cues));
+});
+
+test("collectSemanticTokens 只去 JSON3 相邻滚动重叠，不改其它词流", () => {
+  const tokens = Core.collectSemanticTokens([
+    { tokens: [{ text: "a" }, { text: "b" }, { text: "c" }] },
+    { tokens: [{ text: "b" }, { text: "c" }, { text: "d" }] },
+  ]);
+  assert.deepStrictEqual(tokens.map((t) => t.text), ["a", "b", "c", "d"]);
+});
+
+test("segmentTokensByBoundaries 仅采纳边界，原词和时间不被改写", () => {
+  const units = Core.segmentTokensByBoundaries([
+    { text: "For", start: 0, end: 100 },
+    { text: "this", start: 100, end: 200 },
+    { text: "kettle,", start: 200, end: 300 },
+    { text: "boil.", start: 300, end: 450 },
+    { text: "Next", start: 500, end: 600 },
+  ], [3]);
+  assert.deepStrictEqual(units.map((u) => [u.content, u.start, u.end]), [
+    ["For this kettle, boil.", 0, 450],
+    ["Next", 500, 600],
+  ]);
+});
+
+test("语义恢复协议拒绝改词，并从合法标点提取边界", () => {
+  const source = ["For", "this", "kettle", "boil", "water", "Next"];
+  assert.ok(Core.sameRestoredWords(source, "For this kettle boil water. Next"));
+  assert.ok(!Core.sameRestoredWords(source, "For this kettle boils water. Next"));
+  assert.deepStrictEqual(Core.restoredBoundaryMarks(source, "For this kettle boil water. Next"), ["", "", "", "", ".", ""]);
+  assert.strictEqual(Core.restoredBoundaryMarks(source, "For this kettle boils water. Next"), null);
+});
+
+test("语义恢复分块带 overlap 且只提交非重叠前缀", () => {
+  assert.deepStrictEqual(Core.chunkTokenRanges(new Array(250), 120, 30), [
+    { start: 0, end: 120, commitStart: 0, commitEnd: 90 },
+    { start: 90, end: 210, commitStart: 90, commitEnd: 180 },
+    { start: 180, end: 250, commitStart: 180, commitEnd: 250 },
+  ]);
+});
+
+test("packRestoredTokens 只在恢复边界切，未知长句宁可完整保留", () => {
+  const tokens = "For this kettle boil water before the next part begins".split(" ").map((text, i) => ({ text, start: i * 100, end: (i + 1) * 100 }));
+  const units = Core.packRestoredTokens(tokens, ["", "", "", "", ".", "", "", "", "", ""], { maxWords: 4 });
+  assert.deepStrictEqual(units.map((u) => u.content), ["For this kettle boil water", "before the next part begins"]);
+});
+
+test("restoreAndPackTokens 整包拒绝改词输出，合法输出按句末重组", async () => {
+  const tokens = ["For", "this", "kettle", "boil", "water", "Next", "sentence"].map((text, i) => ({ text, start: i * 100, end: (i + 1) * 100 }));
+  const calls = [];
+  const units = await Core.restoreAndPackTokens({
+    tokens, apiBaseUrl: "https://example.test", apiKey: "x", apiModel: "m", chunkWords: 20,
+    fetchImpl: async (_url, opts) => { calls.push(opts); return { ok: true, json: async () => ({ choices: [{ message: { content: "For this kettle boil water. Next sentence." } }] }) }; },
+  });
+  assert.strictEqual(calls.length, 1);
+  assert.deepStrictEqual(units.map((u) => u.content), ["For this kettle boil water", "Next sentence"]);
+  await assert.rejects(() => Core.restoreAndPackTokens({
+    tokens, apiBaseUrl: "https://example.test", apiKey: "x", apiModel: "m", attempts: 1,
+    fetchImpl: async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: "For this kettle boils water." } }] }) }),
+  }), /invalid sentence restoration/);
+});
+
+test("restoreAndPackTokens 对已验证超长句做一次局部 clause rescue", async () => {
+  const tokens = "let me reiterate that the cheapest electric kettle I could get my hands on is significantly faster at boiling water than this stove top kettle despite being limited".split(" ").map((text, i) => ({ text, start: i * 100, end: (i + 1) * 100 }));
+  let call = 0;
+  const units = await Core.restoreAndPackTokens({
+    tokens, apiBaseUrl: "https://example.test", apiKey: "x", apiModel: "m", chunkWords: 80,
+    fetchImpl: async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: (++call === 1)
+      ? "let me reiterate that the cheapest electric kettle I could get my hands on is significantly faster at boiling water than this stove top kettle despite being limited."
+      : "let me reiterate that the cheapest electric kettle I could get my hands on | is significantly faster at boiling water | than this stove top kettle despite being limited." } }] }) }),
+  });
+  assert.strictEqual(call, 2);
+  assert.ok(units.every((u) => u.content.split(" ").length <= 24));
+  assert.deepStrictEqual(units.map((u) => u.content), [
+    "let me reiterate that the cheapest electric kettle I could get my hands on",
+    "is significantly faster at boiling water",
+    "than this stove top kettle despite being limited",
+  ]);
+});
+
+test("applyTailTrim 为语义单元保留最小可视时长与 token 元数据", () => {
+  const tokens = [{ text: "hello", start: 0, end: 1000, nativeTiming: true }];
+  const trimmed = Core.applyTailTrim([{ start: 0, end: 1000, duration: 1000, content: "hello", tokens }], 120);
+  assert.strictEqual(trimmed[0].end, 880);
+  assert.strictEqual(trimmed[0].duration, 880);
+  assert.strictEqual(trimmed[0].tokens, tokens, "尾缩不能丢 token 元数据");
+  const short = Core.applyTailTrim([{ start: 0, end: 400, content: "short" }], 120);
+  assert.strictEqual(short[0].end, 300, "短单元仍保留至少 300ms");
+  assert.strictEqual(Core.applyTailTrim([{ start: 0, end: 1000, content: "off" }], 0)[0].end, 1000);
+});
+
+test("cleanupCues 保留 JSON3 token 时序，使语义运行时门槛可达", () => {
+  const cleaned = Core.cleanupCues([{ start: 0, end: 1000, content: "hello world", tokens: [
+    { text: "hello", start: 0, end: 400, nativeTiming: true },
+    { text: "world", start: 400, end: 1000, nativeTiming: true },
+  ] }]);
+  assert.strictEqual(cleaned[0].tokens.length, 2);
+  assert.strictEqual(cleaned[0].tokens[1].text, "world");
+  assert.ok(Core.hasNativeTokenTiming(cleaned, 0.8), "清洗后仍应满足 JSON3 词级时间门槛");
+});
+
 test("cleanupCues 去重叠：前句 end 不超过后句 start", () => {
   const cues = Core.cleanupCues(Core.parseJson3(fakeJson3));
   // 第一句 (0~2000) 与第二句 start=1500 重叠 → 第一句 end 应被压到 1500
@@ -176,8 +296,9 @@ test("resegment 真实长句在 with 后允许一次受限续接", () => {
     { start: 4160, end: 5303, content: "some regularity is boil water. We do it for lots of reasons," },
   ]);
   const seg = Core.resegmentCues(frags, { maxWords: 16, maxDurationMs: 6000, grammarContinuationMaxDurationMs: 8000, tailTrimMs: 0 });
-  assert.strictEqual(seg.length, 1, "with 后的宾语不应因普通词数上限被拆到下一 cue");
-  assert.ok(/with some regularity is boil water/.test(seg[0].content));
+  assert.strictEqual(seg.length, 2, "with 后的宾语应续接完整，但后续新句必须在句号处分开");
+  assert.strictEqual(seg[0].content, "If you're a human person, one of those things you're going to want to do with some regularity is boil water.");
+  assert.strictEqual(seg[1].content, "We do it for lots of reasons,");
 });
 
 test("cleanupCues 去掉 ASR 行首孤立英文句点", () => {
@@ -193,6 +314,104 @@ test("resegment 英文介词/连接词结尾时允许跨 cue 续接", () => {
   const seg = Core.resegmentCues(frags, { maxWords: 6, maxDurationMs: 6000, grammarContinuationMaxDurationMs: 8000, tailTrimMs: 0 });
   assert.strictEqual(seg.length, 1, "语法未完成的 cue 应允许在下一个 cue 边界续接");
   assert.strictEqual(seg[0].content, "from cooking to cleaning and disinfecting to other things probably");
+});
+
+test("resegment 真实碎片链跨多个 cue 合并到完整句末", () => {
+  const frags = Core.cleanupCues([
+    { start: 12959, end: 13697, content: "And one of those other" },
+    { start: 14559, end: 15297, content: "things is preparing" },
+    { start: 16126, end: 16864, content: "hot beverages" },
+    { start: 17693, end: 18373, content: "such as tea." },
+  ]);
+  const seg = Core.resegmentCues(frags, { maxWords: 16, maxDurationMs: 6000, grammarContinuationMaxDurationMs: 8000, tailTrimMs: 0 });
+  assert.strictEqual(seg.length, 1, "同一句的多个短 ASR 碎片不应被一次续接锁提前截断");
+  assert.strictEqual(seg[0].content, "And one of those other things is preparing hot beverages such as tea.");
+});
+
+test("resegment 孤立限定词 One 与后续原因句合并", () => {
+  const frags = Core.cleanupCues([
+    { start: 42324, end: 43062, content: "One" },
+    { start: 44160, end: 45755, content: "often cited reason is that our 120 volt electrical" },
+    { start: 46637, end: 51680, content: "supply just doesn't have the gusto to make electric kettles worth it." },
+  ]);
+  const seg = Core.resegmentCues(frags, { maxWords: 16, maxDurationMs: 6000, grammarContinuationMaxDurationMs: 10000, tailTrimMs: 0 });
+  assert.strictEqual(seg.length, 1, "孤立限定词不能单独成为无意义字幕");
+  assert.strictEqual(seg[0].content, "One often cited reason is that our 120 volt electrical supply just doesn't have the gusto to make electric kettles worth it.");
+});
+
+test("resegment 单个 cue 内有完整句时在句号处分开", () => {
+  const frags = Core.cleanupCues([
+    { start: 160, end: 5183, content: "If you're a human person, one of those things you're going to want to do with some regularity is boil water. We do it for lots of reasons," },
+  ]);
+  const seg = Core.resegmentCues(frags, { maxWords: 24, maxDurationMs: 8000, tailTrimMs: 0 });
+  assert.strictEqual(seg.length, 2, "一个 ASR cue 内的两个句子不应挤进同一字幕单元");
+  assert.strictEqual(seg[0].content, "If you're a human person, one of those things you're going to want to do with some regularity is boil water.");
+  assert.strictEqual(seg[1].content, "We do it for lots of reasons,");
+  assert.strictEqual(seg[0].start, 160);
+  assert.strictEqual(seg[1].end, 5183);
+  assert.ok(seg[0].end <= seg[1].start, "按文本比例拆分后时间轴不得重叠");
+});
+
+test("resegment 句中小写续接修复真实 ASR 碎片", () => {
+  const cases = [
+    ["I will be bringing this much", "water to a boil.", "I will be bringing this much water to a boil."],
+    ["This stove does have a higher power burner available, but we'll get", "back to it in a bit.", "This stove does have a higher power burner available, but we'll get back to it in a bit."],
+    ["I brought the kettle and my measuring", "bottle along with me for a visit with my parents.", "I brought the kettle and my measuring bottle along with me for a visit with my parents."],
+    ["I think 2 kW is probably pretty", "fair.", "I think 2 kW is probably pretty fair."],
+    ["that's more than 3", "minutes faster than the stove top kettle", "that's more than 3 minutes faster than the stove top kettle"],
+    ["faster at boiling water than this stove", "top kettle, despite being limited by our system.", "faster at boiling water than this stove top kettle, despite being limited by our system."],
+    ["But by the end of this video, I hope you'll learn, as I have, that this just isn't", "true.", "But by the end of this video, I hope you'll learn, as I have, that this just isn't true."],
+  ];
+  for (const [a, b, expected] of cases) {
+    const seg = Core.resegmentCues(Core.cleanupCues([
+      { start: 0, end: 5000, content: a },
+      { start: 5500, end: 9000, content: b },
+    ]), { maxWords: 16, maxDurationMs: 6000, grammarContinuationMaxDurationMs: 10000, tailTrimMs: 0 });
+    assert.strictEqual(seg.length, 1, `小写开头的句中续接不能被切碎: ${a} / ${b}`);
+    assert.strictEqual(seg[0].content, expected);
+  }
+});
+
+// `whistle. on this gas...` is an ASR punctuation error. It belongs to the
+// sentence-restoration fixture for the semantic layer, not to resegmentCues.
+
+
+test("resegment 长句普通上限前的明显语法尾仍继续", () => {
+  const cases = [
+    ["It's red and it has a wide flat bottom, which is helpful for doing tests because it'll", "work great with any stove.", "It's red and it has a wide flat bottom, which is helpful for doing tests because it'll work great with any stove."],
+    ["I will be bringing this much", "water to a boil.", "I will be bringing this much water to a boil."],
+    ["But by the end of this video, I hope you'll learn, as I have, that this just isn't", "true.", "But by the end of this video, I hope you'll learn, as I have, that this just isn't true."],
+  ];
+  for (const [a, b, expected] of cases) {
+    const seg = Core.resegmentCues(Core.cleanupCues([
+      { start: 0, end: 7000, content: a },
+      { start: 7600, end: 10000, content: b },
+    ]), { maxWords: 16, maxDurationMs: 6000, grammarContinuationMaxDurationMs: 12000, tailTrimMs: 0 });
+    assert.strictEqual(seg.length, 1, `明显语法尾必须补完: ${a}`);
+    assert.strictEqual(seg[0].content, expected);
+  }
+});
+
+test("resegment probably 后接新句时不误吞下一句", () => {
+  const frags = Core.cleanupCues([
+    { start: 7211, end: 8091, content: "from cooking to" },
+    { start: 10000, end: 12600, content: "cleaning and disinfecting to other things probably" },
+    { start: 12959, end: 13697, content: "And one of those other" },
+    { start: 14559, end: 15297, content: "things is preparing" },
+    { start: 16126, end: 16864, content: "hot beverages" },
+    { start: 17693, end: 18373, content: "such as tea." },
+  ]);
+  const seg = Core.resegmentCues(frags, { maxWords: 16, maxDurationMs: 6000, grammarContinuationMaxDurationMs: 10000, tailTrimMs: 0 });
+  assert.strictEqual(seg.length, 2, "probably 已结束前一句，不能把 And 开头的新句吞进同一字幕");
+  assert.strictEqual(seg[0].content, "from cooking to cleaning and disinfecting to other things probably");
+  assert.strictEqual(seg[1].content, "And one of those other things is preparing hot beverages such as tea.");
+});
+
+test("cleanSubtitleBody 清除中文标点和汉字间异常空格", () => {
+  assert.deepStrictEqual(
+    Core.parseAlignedSubtitleLines("1. 如果你是人类，那么你会经常想做的一件事， 就是烧水。\n2. 不重要。 总之，这很常见。\n3. 结果 可能会略有不同。", 3),
+    ["如果你是人类，那么你会经常想做的一件事，就是烧水。", "不重要。总之，这很常见。", "结果可能会略有不同。"]
+  );
 });
 
 test("resegment 句末标点处断句", () => {
@@ -393,9 +612,9 @@ test("makeCacheKey 同输入稳定、异输入不同", () => {
   assert.notStrictEqual(a, c, "目标语言不同 key 不同 → 不误命中");
 });
 
-test("makeCacheKey v0.5.1 namespace 隔离旧 prompt 与分段缓存", () => {
+test("makeCacheKey v0.5.2 namespace 隔离旧 cue 分段缓存", () => {
   const key = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", clipStartMs: 0 });
-  assert.ok(key.startsWith("dsc-v51|"), "v0.5.1 必须换缓存 namespace，避免读取 v0.5.0 旧翻译");
+  assert.ok(key.startsWith("dsc-v52|"), "语义恢复分段必须换缓存 namespace，避免读取 v0.5.1 旧翻译");
 });
 
 test("pruneCache LRU 淘汰最旧条目", () => {
@@ -1075,7 +1294,15 @@ async function main() {
     assert.ok(/^2\n/.test(blocks[1]) && /\n乙$/.test(blocks[1]), "B 在后、序号连续");
   });
 
-  test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
+  test("buildSrt 保留字幕单元内安全换行，不把换行压成异常空格", () => {
+  const srt = Core.buildSrt([
+    { startMs: 0, endMs: 1000, originalText: "source", translation: "如果你是人类，你会经常做的一件事，\n就是烧水。" },
+  ], { mode: "bilingual_orig_top" });
+  assert.ok(srt.includes("如果你是人类，你会经常做的一件事，\n就是烧水。"));
+  assert.ok(!srt.includes("事， 就是"));
+});
+
+test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     const srt = Core.buildSrt([{ start: 0, end: 1000, originalText: "x", translation: "叉" }], {
       mode: "bilingual_orig_top",
     });
@@ -1175,6 +1402,15 @@ async function main() {
     "translateCues",
     "translateBatch",
   ];
+
+  test("isolated.js 只在可靠 JSON3 token 时序下启用语义恢复，失败完整回退", () => {
+    const src = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
+    assert.ok(/Core\.hasNativeTokenTiming\(cues, 0\.8\)/.test(src), "应有 80% 原生 token timing 门槛");
+    assert.ok(/Core\.restoreAndPackTokens\b/.test(src), "加载路径应调用生产语义恢复器");
+    assert.ok(/cues = Core\.resegmentCues\(cues, \{ tailTrimMs: config\.tailTrimMs \}\)/.test(src), "不满足契约时应完整回退 ASR 重组");
+    assert.ok(/state\.segmentationMode = "semantic"/.test(src), "启用路径应留下可诊断模式");
+    assert.ok(/state\.segmentationMode = "fallback"/.test(src), "回退路径应留下可诊断模式");
+  });
 
   test("isolated.js 不再引用任何 v0.4.0 已删的 core 函数", () => {
     const src = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");

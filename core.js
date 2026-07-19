@@ -24,28 +24,40 @@
 
   /**
    * 解析 YouTube json3 字幕格式。
-   * 输入形如 {events:[{tStartMs,dDurationMs,segs:[{utf8}]}]}。
-   * 返回 cue 列表：{start,end,duration,content}（单位毫秒）。
+   * 除 event 的粗粒度时间外，保留 seg.tOffsetMs 推导出的 token 时间。后续语义
+   * 重分段可以自由跨 ASR event 重组，仍准确落回原音频区间。
    */
   function parseJson3(json) {
     const out = [];
     if (!json || !Array.isArray(json.events)) return out;
     for (const ev of json.events) {
-      // 没有 segs 的事件（如纯窗口定义事件）跳过
       if (!ev || !Array.isArray(ev.segs)) continue;
-      const text = ev.segs
-        .map((s) => (s && typeof s.utf8 === "string" ? s.utf8 : ""))
-        .join("");
-      const content = collapseWhitespace(text);
-      if (!content) continue; // 空内容（常见的换行事件）丢弃
       const start = toInt(ev.tStartMs, 0);
       const duration = toInt(ev.dDurationMs, 0);
-      out.push({
-        start: start,
-        end: start + duration,
-        duration: duration,
-        content: content,
-      });
+      const eventEnd = start + duration;
+      const rawSegs = ev.segs.filter((seg) => seg && typeof seg.utf8 === "string" && seg.utf8.trim());
+      const content = collapseWhitespace(rawSegs.map((seg) => seg.utf8).join(""));
+      if (!content) continue;
+      const tokens = [];
+      for (let i = 0; i < rawSegs.length; i++) {
+        const seg = rawSegs[i];
+        const next = rawSegs[i + 1];
+        const offset = Number(seg.tOffsetMs);
+        const nextOffset = next ? Number(next.tOffsetMs) : NaN;
+        const tokenStart = Number.isFinite(offset) ? start + Math.max(0, offset) : start;
+        const tokenEnd = Number.isFinite(nextOffset)
+          ? start + Math.max(Math.max(0, offset) || 0, nextOffset)
+          : eventEnd;
+        // ASR 自带的标点不是词流的一部分。丢掉它后，恢复器才可以安全地
+        // 重建句末而不把错误的 event 标点带入新显示单元。
+        const words = String(seg.utf8).match(/[A-Za-z0-9]+(?:['’][A-Za-z]+)?/g) || [];
+        for (let j = 0; j < words.length; j++) {
+          const partStart = tokenStart + Math.round((tokenEnd - tokenStart) * j / words.length);
+          const partEnd = tokenStart + Math.round((tokenEnd - tokenStart) * (j + 1) / words.length);
+          tokens.push({ text: words[j], start: partStart, end: partEnd, nativeTiming: Number.isFinite(offset) });
+        }
+      }
+      out.push({ start: start, end: eventEnd, duration: duration, content: content, tokens: tokens });
     }
     return out;
   }
@@ -96,9 +108,140 @@
     return ((hh * 60 + mm) * 60 + ss) * 1000 + fff;
   }
 
+
+  /**
+   * 按外部语义恢复器给出的句末 token 下标重组连续 token。模型只提出边界，
+   * 文本和时间都由源 token 决定；无效边界被拒绝，避免模型改写/丢词。
+   */
+  function segmentTokensByBoundaries(tokens, boundaries) {
+    var list = (tokens || []).map(function (token) {
+      return {
+        text: collapseWhitespace(token && token.text || ""),
+        start: toInt(token && token.start, 0),
+        end: toInt(token && token.end, 0),
+      };
+    }).filter(function (token) { return token.text; });
+    if (!list.length) return [];
+    var seen = {};
+    var ends = (boundaries || []).map(function (value) { return Number(value); })
+      .filter(function (value) { return Number.isInteger(value) && value >= 0 && value < list.length && !seen[value] && (seen[value] = true); })
+      .sort(function (a, b) { return a - b; });
+    if (ends[ends.length - 1] !== list.length - 1) ends.push(list.length - 1);
+    var out = [];
+    var first = 0;
+    for (var i = 0; i < ends.length; i++) {
+      var last = ends[i];
+      if (last < first) continue;
+      var group = list.slice(first, last + 1);
+      out.push({
+        start: group[0].start,
+        end: Math.max(group[group.length - 1].end, group[0].start),
+        duration: Math.max(0, group[group.length - 1].end - group[0].start),
+        content: collapseWhitespace(group.map(function (token) { return token.text; }).join(" ")),
+        tokens: group,
+      });
+      first = last + 1;
+    }
+    return out;
+  }
+
+  // 语义恢复协议：模型只可在源词之间加入 .?!|，绝不拥有正文所有权。
+  // 逐词归一化后必须完全相等，否则整个 chunk 无效并由调用方重试/回退。
+  var RESTORE_WORD_RE = /[A-Za-z0-9]+(?:['’][A-Za-z]+)?/g;
+
+  function restoredWords(text) {
+    return String(text || "").match(RESTORE_WORD_RE) || [];
+  }
+
+  function sameRestoredWords(source, restored) {
+    var a = Array.isArray(source) ? source : restoredWords(source);
+    var b = restoredWords(restored);
+    if (a.length !== b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (String(a[i]).toLowerCase() !== String(b[i]).toLowerCase()) return false;
+    }
+    return true;
+  }
+
+  function restoredBoundaryMarks(sourceWords, restored) {
+    var words = Array.isArray(sourceWords) ? sourceWords : restoredWords(sourceWords);
+    if (!sameRestoredWords(words, restored)) return null;
+    var matches = [];
+    var re = /[A-Za-z0-9]+(?:['’][A-Za-z]+)?/g;
+    var match;
+    while ((match = re.exec(String(restored || "")))) matches.push(match);
+    if (matches.length !== words.length) return null;
+    var marks = [];
+    for (var i = 0; i < matches.length; i++) {
+      var next = i + 1 < matches.length ? matches[i + 1].index : String(restored || "").length;
+      var tail = String(restored || "").slice(matches[i].index + matches[i][0].length, next);
+      marks.push(/[.!?]/.test(tail) ? "." : (tail.indexOf("|") >= 0 ? "|" : ""));
+    }
+    return marks;
+  }
+
+  function chunkTokenRanges(tokens, size, overlap) {
+    var n = (tokens || []).length;
+    var limit = Math.max(1, Math.floor(Number(size) || 120));
+    var keep = Math.max(0, Math.min(limit - 1, Math.floor(Number(overlap) || 0)));
+    var out = [];
+    for (var start = 0; start < n;) {
+      var end = Math.min(n, start + limit);
+      out.push({ start: start, end: end, commitStart: start, commitEnd: end === n ? end : end - keep });
+      if (end === n) break;
+      start = end - keep;
+    }
+    return out;
+  }
+
+  function packRestoredTokens(tokens, marks, opts) {
+    opts = opts || {};
+    var maxWords = Math.max(1, Math.floor(Number(opts.maxWords) || 24));
+    var list = (tokens || []).filter(function (t) { return t && t.text; });
+    if (!list.length || !Array.isArray(marks) || marks.length !== list.length) return [];
+    var ends = [];
+    var start = 0;
+    while (start < list.length) {
+      // 模型声明的 | 和 . 都是经过词流校验的语义边界，必须逐个兑现。
+      // 不能为了靠近长度上限吞掉前一个 |，否则确定性排版又会破坏语义。
+      var marked = -1;
+      for (var i = start; i < list.length; i++) {
+        if (marks[i] === "." || marks[i] === "|") { marked = i; break; }
+      }
+      var end = marked >= 0 ? marked : list.length - 1;
+      // 无模型边界时仍不按长度强切，完整保留并由审计暴露 oversize。
+      ends.push(end);
+      start = end + 1;
+    }
+    return segmentTokensByBoundaries(list, ends);
+  }
+
   /* ---------------------------------------------------------------
    * 2. 时间轴清洗
    * ------------------------------------------------------------- */
+
+  /**
+   * 对连续字幕单元做小幅视觉尾缩，制造句间消隐空隙。
+   * 只改外层 end/duration，保留文本、token 及其它元数据；语义/回退分段共用。
+   */
+  function applyTailTrim(cues, tailTrimMs) {
+    var trim = Number(tailTrimMs);
+    if (!(trim > 0)) return (cues || []).map(function (cue) { return Object.assign({}, cue); });
+    var minVisibleMs = 300;
+    return (cues || []).map(function (cue) {
+      var copy = Object.assign({}, cue);
+      var start = toInt(copy.start, 0);
+      var end = Math.max(start, toInt(copy.end, start));
+      if (end - start > trim * 2) {
+        var trimmed = Math.max(start + minVisibleMs, end - trim);
+        if (trimmed < end) end = trimmed;
+      }
+      copy.start = start;
+      copy.end = end;
+      copy.duration = Math.max(0, end - start);
+      return copy;
+    });
+  }
 
   /**
    * 清洗 cue 列表：
@@ -115,6 +258,14 @@
         end: toInt(c.end, 0),
         duration: toInt(c.duration, 0),
         content: collapseWhitespace(c.content || "").replace(/^\.(?=[A-Za-z])/u, ""),
+        // JSON3 语义恢复依赖每个词的原生偏移。清洗排序/去重叠只改 cue 外层时间，
+        // 不能在这里丢掉 token 元数据，否则运行时会永久误判为“无词级时间”。
+        tokens: Array.isArray(c.tokens) ? c.tokens.map((token) => ({
+          text: collapseWhitespace(token && token.text || ""),
+          start: toInt(token && token.start, 0),
+          end: toInt(token && token.end, 0),
+          nativeTiming: !!(token && token.nativeTiming),
+        })).filter((token) => token.text) : undefined,
       }))
       .filter((c) => c.content.length > 0);
 
@@ -187,39 +338,88 @@
 
   function resegmentCues(cues, opts) {
     opts = opts || {};
-    var maxDur = opts.maxDurationMs != null ? opts.maxDurationMs : 6000; // 单句最长时长
-    var maxWords = opts.maxWords != null ? opts.maxWords : 16; // 单句最多词数（12→16：12 对中文目标偏短）
-    var minWords = opts.minWords != null ? opts.minWords : 3; // 单句最少词数（碎句黏合下限）
-    // 长停顿阈值：明显大于旧 maxGap(300，"同句紧密延续")。ASR 常无标点，单靠 maxWords
-    // 硬切会断在半句；一个超过 longPauseMs 的间隙本身就是自然停顿边界，即使没标点也在此切句。
-    // 间隙 < longPauseMs 视为同一语流可继续合并（含正常换气停顿），>= 即断。
+    var maxDur = opts.maxDurationMs != null ? opts.maxDurationMs : 6000;
+    var maxWords = opts.maxWords != null ? opts.maxWords : 16;
+    var minWords = opts.minWords != null ? opts.minWords : 3;
     var longPauseMs = opts.longPauseMs != null ? opts.longPauseMs : 700;
     var grammarContinuationMaxGapMs = opts.grammarContinuationMaxGapMs != null
       ? opts.grammarContinuationMaxGapMs : 2200;
     var grammarContinuationMaxDurationMs = opts.grammarContinuationMaxDurationMs != null
-      ? opts.grammarContinuationMaxDurationMs : 8000;
-    // 句间视觉尾缩（修「字幕墙」）：YouTube 滚动 ASR 几乎每条都与下一条时间重叠，
-    // cleanupCues 去重叠后前句 end 被精确压到后句 start → 连续语流内句单元首尾相接、
-    // gap 恒为 0，字幕永不消隐。这里在产出句单元时把 end 往回缩一点点，制造句间断点，
-    // 但绝不侵蚀真实停顿、绝不让 end < start：
-    //  - 仅当该句 duration > tailTrimMs*2 才缩（短句不缩，避免缩没）。
-    //  - 缩后保证 end-start >= TAIL_TRIM_MIN_VISIBLE_MS（下限 300ms，仍可读）。
-    //  - 真停顿（下一句 start 与本句原始 end 间本就有间隙）天然不受影响——尾缩只是让
-    //    「原本紧贴」的句子之间也出现 ~tailTrimMs 断点。tailTrimMs=0 完全关闭（向后兼容）。
+      ? opts.grammarContinuationMaxDurationMs : 12000;
     var tailTrimMs = opts.tailTrimMs != null ? opts.tailTrimMs : 120;
     if (!(tailTrimMs > 0)) tailTrimMs = 0;
     var TAIL_TRIM_MIN_VISIBLE_MS = 300;
-    var list = (cues || []).filter(function (c) {
-      return c && c.content;
+
+    // ASR 的一个 cue 可能已包含多个完整句。先在强句末标点处分开，再做跨 cue 合并；
+    // 时间按字符权重落回原 cue 区间，不猜词级时间，也不制造重叠。
+    function splitCueAtSentenceEnds(cue) {
+      var text = collapseWhitespace(cue.content || "");
+      if (!text) return [];
+      var parts = [];
+      var re = /.*?[.!?。！？…]+["'”’)\]]*(?=\s+|$)|.+$/g;
+      var m;
+      while ((m = re.exec(text))) {
+        var part = collapseWhitespace(m[0]);
+        if (part) parts.push(part);
+      }
+      if (parts.length <= 1) {
+        return [{ start: cue.start, end: cue.end, duration: Math.max(0, cue.end - cue.start), content: text }];
+      }
+      var total = 0;
+      for (var i = 0; i < parts.length; i++) total += Math.max(1, parts[i].length);
+      var span = Math.max(0, cue.end - cue.start);
+      var acc = 0;
+      var out = [];
+      for (var j = 0; j < parts.length; j++) {
+        var partStart = cue.start + Math.round(span * acc / total);
+        acc += Math.max(1, parts[j].length);
+        var partEnd = j === parts.length - 1 ? cue.end : cue.start + Math.round(span * acc / total);
+        out.push({ start: partStart, end: partEnd, duration: Math.max(0, partEnd - partStart), content: parts[j] });
+      }
+      return out;
+    }
+
+    var list = [];
+    (cues || []).filter(function (c) { return c && c.content; }).forEach(function (c) {
+      var pieces = splitCueAtSentenceEnds(c);
+      for (var i = 0; i < pieces.length; i++) list.push(pieces[i]);
     });
     if (!list.length) return [];
 
     var out = [];
-    var cur = null; // 当前累积段：{start,end,words:[]}
+    var cur = null;
 
     function hasEnglishContinuationTail(words) {
       var text = collapseWhitespace((words || []).join(" ")).replace(/[,:;!?]+$/g, "").toLowerCase();
-      return /(?:^|\s)(?:to|of|for|with|from|at|in|on|by|about|into|over|under|between|through|and|or|but|because|that|which|who|whose|when|while|if|than|as|the|a|an|my|your|his|her|its|our|their|is|are|was|were|be|been|being|do|does|did|have|has|had|will|would|can|could|should|may|might|must)$/.test(text);
+      return /(?:^|\s)(?:to|of|for|with|from|at|in|on|by|about|into|over|under|between|through|and|or|but|because|that|which|who|whose|when|while|if|than|as|the|a|an|my|your|his|her|its|our|their|other|one|much|many|more|less|pretty|is|are|was|were|be|been|being|do|does|did|have|has|had|will|would|can|could|should|may|might|must|\w+n['’]t|\w+['’](?:ll|re|ve|d|m|s))$/.test(text);
+    }
+
+    // 某些 ASR 片段不是“尾词命中介词”，而是从限定结构开头后被连续截碎：
+    // One / And one of those other / The …。一旦识别，只在 gap/词数/10s 三个硬边界内
+    // 延续到完整句末；这取代 v0.5.1 的“一次续接锁”，避免 4/5/6/14 类无意义碎片。
+    function startsSyntacticFragmentChain(words) {
+      var text = collapseWhitespace((words || []).join(" ")).replace(/^["']+|[,:;]+$/g, "").toLowerCase();
+      if (!text || words.length > 6) return false;
+      return /^(?:one|a|an|the|this|these|those)(?:\s|$)/.test(text) ||
+        /^(?:and|but|or)\s+(?:one|a|an|the|this|these|those)(?:\s|$)/.test(text);
+    }
+
+    function startsWithContinuation(words) {
+      var text = collapseWhitespace((words || []).join(" ")).toLowerCase();
+      return /^(?:such as|as well as|which|that|who|whose|where|when|while|because|than|and|or|but)\b/.test(text);
+    }
+
+    // 自动字幕通常只在真正的新句首使用大写；下一 cue 以小写词/数字开头时，
+    // 它几乎肯定仍是当前句的宾语、补语或复合词后半段（much / water、stove / top）。
+    // 这里只作为 grammarMerge 的必要信号，仍受 gap、词数和 12 秒三个硬上限约束。
+    function startsLowercaseContinuation(cue) {
+      var text = collapseWhitespace(cue && cue.content || "");
+      return /^[a-z0-9]/.test(text);
+    }
+
+    function startsOrphanPrepositionalPhrase(words) {
+      var text = collapseWhitespace((words || []).join(" ")).toLowerCase();
+      return /^(?:on|in|at|with|for|from|by|to|of|under|over|through|into|during|after|before|without)\b/.test(text);
     }
 
     function flush() {
@@ -227,20 +427,12 @@
       var content = collapseWhitespace(cur.words.join(" "));
       if (content) {
         var endMs = cur.end;
-        // 视觉尾缩：仅长句缩（duration > tailTrimMs*2），缩后保证 >= 最小可视时长。
         if (tailTrimMs > 0 && cur.end - cur.start > tailTrimMs * 2) {
           var trimmed = cur.end - tailTrimMs;
-          if (trimmed - cur.start < TAIL_TRIM_MIN_VISIBLE_MS) {
-            trimmed = cur.start + TAIL_TRIM_MIN_VISIBLE_MS;
-          }
-          if (trimmed < endMs) endMs = trimmed; // 绝不放大，只回缩
+          if (trimmed - cur.start < TAIL_TRIM_MIN_VISIBLE_MS) trimmed = cur.start + TAIL_TRIM_MIN_VISIBLE_MS;
+          if (trimmed < endMs) endMs = trimmed;
         }
-        out.push({
-          start: cur.start,
-          end: endMs,
-          duration: Math.max(0, endMs - cur.start),
-          content: content,
-        });
+        out.push({ start: cur.start, end: endMs, duration: Math.max(0, endMs - cur.start), content: content });
       }
       cur = null;
     }
@@ -251,51 +443,47 @@
       if (!words.length) continue;
 
       if (!cur) {
-        cur = { start: c.start, end: c.end, words: words.slice(), continuationExtended: false };
+        cur = { start: c.start, end: c.end, words: words.slice(), fragmentChain: startsSyntacticFragmentChain(words) };
       } else {
         var gap = c.start - cur.end;
         var added = stripOverlap(cur.words, words);
-        var prevText = cur.words.join(" ");
-        var ended = SENTENCE_END_RE.test(prevText);
+        var ended = SENTENCE_END_RE.test(cur.words.join(" "));
         var wouldWords = cur.words.length + added.length;
         var wouldDur = c.end - cur.start;
-        // 可并入下一条：续句(未自然结束) 或 自然结束但太短(< minWords，碎句黏合)；
-        // 两种都仍受「间隙不超 longPauseMs + 不超 maxWords/maxDur」约束。
-        // 长停顿(gap >= longPauseMs)是自然边界，优先于碎句黏合：即使当前段太短/未结束，
-        // 一旦遇到长停顿也不再合并，断在此处（比 maxWords 硬切更自然）。
-        var canMerge = !ended || cur.words.length < minWords;
-        var normalMerge = gap < longPauseMs && wouldWords <= maxWords;
-        // 语法尾续接最多额外容纳约 3/4 个普通段；仍受单次续接、gap 与 8s 硬上限约束。
+        var orphanPrepMerge = ended && startsOrphanPrepositionalPhrase(words) &&
+          gap < grammarContinuationMaxGapMs && wouldWords <= maxWords + 8 &&
+          wouldDur <= grammarContinuationMaxDurationMs;
+        var canMerge = !ended || cur.words.length < minWords || orphanPrepMerge;
+        var normalMerge = gap < longPauseMs && wouldWords <= maxWords && wouldDur <= maxDur;
         var continuationCap = maxWords + Math.max(4, Math.ceil(maxWords * 0.75));
-        var grammarContinuation =
-          !ended && !cur.continuationExtended && hasEnglishContinuationTail(cur.words) &&
-          gap < grammarContinuationMaxGapMs && wouldWords <= continuationCap;
-        var mergeable = canMerge &&
-          ((normalMerge && wouldDur <= maxDur) ||
-            (grammarContinuation && wouldDur <= grammarContinuationMaxDurationMs));
-        if (mergeable) {
+        // 下一 cue 若在内部很快出现句号，只需把第一个完整句并入；其后的新句已由
+        // splitCueAtSentenceEnds 拆成独立 piece，不应计入这次续接的词数预算。
+        var addedEndsSentence = SENTENCE_END_RE.test(added.join(" "));
+        var effectiveContinuationCap = addedEndsSentence ? continuationCap + 4 : continuationCap;
+        var nextStartsNewSentence = /^(?:And|But|Or|So)\b/.test(c.content || "") &&
+          !hasEnglishContinuationTail(cur.words) && !cur.fragmentChain;
+        var baseGrammarNeeded = hasEnglishContinuationTail(cur.words) ||
+          cur.fragmentChain || startsWithContinuation(words);
+        var lowercaseContinuation = startsLowercaseContinuation(c);
+        var grammarNeeded = !nextStartsNewSentence && (baseGrammarNeeded || lowercaseContinuation);
+        var grammarGapLimit = baseGrammarNeeded ? grammarContinuationMaxGapMs : longPauseMs;
+        var grammarMerge = !ended && grammarNeeded && gap < grammarGapLimit &&
+          wouldWords <= effectiveContinuationCap && wouldDur <= grammarContinuationMaxDurationMs;
+        if (canMerge && (normalMerge || grammarMerge || orphanPrepMerge)) {
           for (var w = 0; w < added.length; w++) cur.words.push(added[w]);
-          if (grammarContinuation && !normalMerge) cur.continuationExtended = true;
           cur.end = Math.max(cur.end, c.end);
         } else {
-          // 无法再合并（长停顿 / 会超上限）→ 当前段（含太短的碎句）单独成段
           flush();
-          cur = { start: c.start, end: c.end, words: words.slice(), continuationExtended: false };
+          cur = { start: c.start, end: c.end, words: words.slice(), fragmentChain: startsSyntacticFragmentChain(words) };
         }
       }
 
-      // 切句时机（优先级）：
-      //  - 超 maxWords / 超 maxDur → 立即切（防超长段，不变）。
-      //  - 自然结束(句尾标点)但仅当词数已达 minWords 才切；不足 minWords 先不切，
-      //    留待与下一条 cue 黏合（minWords 合并优先于句尾立即切）。
-      //  长停顿切句已在上面的合并判定中处理（gap >= longPauseMs 不再并入，自然成段）。
       var curWords = cur.words.length;
       var endedNow = SENTENCE_END_RE.test(cur.words.join(" "));
-      if (
-        (curWords >= maxWords && !hasEnglishContinuationTail(cur.words) && !cur.continuationExtended) ||
-        (cur.end - cur.start >= maxDur && !hasEnglishContinuationTail(cur.words) && !cur.continuationExtended) ||
-        (endedNow && curWords >= minWords)
-      ) {
+      if (endedNow && curWords >= minWords) {
+        flush();
+      } else if (!cur.fragmentChain && !hasEnglishContinuationTail(cur.words) &&
+        (curWords >= maxWords || cur.end - cur.start >= maxDur)) {
         flush();
       }
     }
@@ -1212,6 +1400,139 @@
     return origByLine;
   }
 
+  var DEFAULT_RESTORATION_PROMPT =
+    "恢复这段英语口语的句末标点。只返回原词，且原词的拼写、顺序和数量必须完全一致。\n" +
+    "你只能在词之间加入空格和 . ? ! |。 .?! 仅表示真实句末。对于超过约 20 词的句子，必须在自然、可独立翻译的从句边界加入 |，让每段不超过约 24 词。\n" +
+    "不得在名词短语、动词短语、短语动词、复合词、限定词+名词、介词短语、不定式、助动词+动词之间加入 |。不得添加、删除、替换、合并、拆分或重排任何词。不要解释。";
+
+  function tokenWords(tokens) {
+    var out = [];
+    (tokens || []).forEach(function (t) {
+      var words = restoredWords(t && t.text || "");
+      for (var i = 0; i < words.length; i++) out.push(words[i]);
+    });
+    return out;
+  }
+
+  function hasNativeTokenTiming(cues, minimumCoverage) {
+    var total = 0;
+    var timed = 0;
+    (cues || []).forEach(function (cue) {
+      (cue && cue.tokens || []).forEach(function (token) {
+        if (!token || !token.text) return;
+        total++;
+        if (token.nativeTiming) timed++;
+      });
+    });
+    var min = minimumCoverage == null ? 0.8 : Number(minimumCoverage);
+    return total > 0 && timed / total >= min;
+  }
+
+  // JSON3 滚动 event 常会把上一 event 的尾词重复一次。先在严格的词流层
+  // 去重，模型看到的才是一条连续语音，而不是 ASR 事件碎片的拼接。
+  function collectSemanticTokens(cues) {
+    var out = [];
+    (cues || []).forEach(function (cue) {
+      var next = (cue && cue.tokens || []).filter(function (t) { return t && t.text; });
+      var max = Math.min(out.length, next.length, 8);
+      var cut = 0;
+      for (var k = max; k >= 1; k--) {
+        var same = true;
+        for (var i = 0; i < k; i++) {
+          if (String(out[out.length - k + i].text).toLowerCase() !== String(next[i].text).toLowerCase()) { same = false; break; }
+        }
+        if (same) { cut = k; break; }
+      }
+      for (var j = cut; j < next.length; j++) out.push(next[j]);
+    });
+    return out;
+  }
+
+  /**
+   * 模型只恢复边界，正文/时间完全来自 source tokens。任一 chunk 文本不等价即抛错，
+   * 让运行层按现有退避整包重试，绝不接受半段或模型改写。
+   */
+  async function restoreTokenBoundaries(opts) {
+    opts = opts || {};
+    var tokens = (opts.tokens || []).filter(function (t) { return t && t.text; });
+    if (!tokens.length) return { tokens: [], marks: [] };
+    var ranges = chunkTokenRanges(tokens, opts.chunkWords || 120, opts.overlapWords || 30);
+    var marks = new Array(tokens.length).fill("");
+    var prompt = opts.systemPrompt || DEFAULT_RESTORATION_PROMPT;
+    for (var ri = 0; ri < ranges.length; ri++) {
+      var range = ranges[ri];
+      var chunk = tokens.slice(range.start, range.end);
+      var source = tokenWords(chunk).join(" ");
+      var chunkMarks = null;
+      var attempts = opts.attempts != null ? Math.max(1, Number(opts.attempts)) : 2;
+      for (var attempt = 0; attempt < attempts; attempt++) {
+        var restored = await chatCompletion({
+          apiBaseUrl: opts.apiBaseUrl,
+          apiKey: opts.apiKey,
+          apiModel: opts.apiModel,
+          temperature: opts.temperature,
+          reasoningEffort: opts.reasoningEffort,
+          systemContent: prompt,
+          userContent: source,
+          timeoutMs: opts.timeoutMs,
+          fetchImpl: opts.fetchImpl,
+        });
+        chunkMarks = restoredBoundaryMarks(tokenWords(chunk), restored);
+        if (chunkMarks) break;
+      }
+      if (!chunkMarks) throw new Error("invalid sentence restoration chunk " + ri);
+      for (var pos = range.commitStart; pos < range.commitEnd; pos++) marks[pos] = chunkMarks[pos - range.start];
+    }
+    return { tokens: tokens, marks: marks };
+  }
+
+  async function restoreAndPackTokens(opts) {
+    opts = opts || {};
+    var restored = await restoreTokenBoundaries(opts);
+    var maxWords = opts.maxWords || 24;
+    var units = packRestoredTokens(restored.tokens, restored.marks, { maxWords: maxWords });
+    // 第一轮保守只恢复全文句末；少数仍超长的完整句才做局部 clause rescue。
+    // 同样只接受逐词完全等价的结果，且每个 rescue 至多一次，避免无界模型调用。
+    var prompt = opts.oversizeSystemPrompt ||
+      "以下是一条已验证的英语长句。只返回完全相同的词，拼写、顺序、数量均不得变化。\n" +
+      "只在自然、两侧均可独立翻译的字幕从句边界加入 |，使每段不超过约 " + maxWords + " 词。\n" +
+      "不得在名词短语、动词短语、短语动词、复合词、限定词+名词、介词短语、不定式、助动词+动词之间加入 |。不得解释。";
+    for (var ui = 0; ui < units.length; ui++) {
+      var unit = units[ui];
+      var unitWords = restoredWords(unit.content);
+      if (unitWords.length <= maxWords) continue;
+      var begin = -1;
+      for (var i = 0; i < restored.tokens.length; i++) {
+        if (restored.tokens[i].start === unit.start && restored.tokens[i].end <= unit.end) { begin = i; break; }
+      }
+      if (begin < 0) continue;
+      var end = begin + unitWords.length;
+      var source = tokenWords(restored.tokens.slice(begin, end)).join(" ");
+      var marked = null;
+      var attempts = opts.attempts != null ? Math.max(1, Number(opts.attempts)) : 2;
+      for (var attempt = 0; attempt < attempts; attempt++) {
+        var answer = await chatCompletion({
+          apiBaseUrl: opts.apiBaseUrl, apiKey: opts.apiKey, apiModel: opts.apiModel,
+          temperature: opts.temperature, reasoningEffort: opts.reasoningEffort,
+          systemContent: prompt, userContent: source, timeoutMs: opts.timeoutMs, fetchImpl: opts.fetchImpl,
+        });
+        var localMarks = restoredBoundaryMarks(tokenWords(restored.tokens.slice(begin, end)), answer);
+        if (!localMarks) continue;
+        var safe = true;
+        for (var mi = 0, run = 0; mi < localMarks.length; mi++) {
+          run++;
+          if (localMarks[mi] === "." || localMarks[mi] === "|") run = 0;
+          if (run > maxWords) { safe = false; break; }
+        }
+        if (safe) { marked = localMarks; break; }
+      }
+      if (!marked) continue; // 宁可保持完整句，也不接受未校验/仍过长的局部模型输出。
+      for (var m = 0; m < marked.length; m++) restored.marks[begin + m] = marked[m];
+      units = packRestoredTokens(restored.tokens, restored.marks, { maxWords: maxWords });
+    }
+    return units;
+  }
+
   /**
    * 翻译一个 clip：一次 chat 调用，让模型按 cue 编号 1:1 返回中文字幕。
    * 入参（opts）：
@@ -1715,7 +2036,7 @@
   function makeCacheKey(parts) {
     parts = parts || {};
     return [
-      "dsc-v51",
+      "dsc-v52",
       parts.videoId || "",
       parts.trackCode || "",
       parts.targetLang || "",
@@ -1967,7 +2288,14 @@
           startMs: u.startMs != null ? u.startMs : u.start,
           endMs: u.endMs != null ? u.endMs : u.end,
           originalText: collapseWhitespace(u.originalText || ""),
-          translation: collapseWhitespace(u.translation || ""),
+          // shapeAlignedLine 会在安全短语边界插入同一字幕单元内的换行；SRT 必须保留它，
+          // 否则 collapseWhitespace 会把换行压成空格，形成「， 就是」这类伪异常。
+          translation: String(u.translation || "")
+            .replace(/\r/g, "")
+            .split("\n")
+            .map(function (line) { return collapseWhitespace(line); })
+            .filter(Boolean)
+            .join("\n"),
           _i: i, // 稳定排序的兜底键（startMs 相等时保持原序）
         };
       })
@@ -2017,7 +2345,16 @@
     parseJson3: parseJson3,
     parseVtt: parseVtt,
     cleanupCues: cleanupCues,
+    applyTailTrim: applyTailTrim,
     resegmentCues: resegmentCues,
+    segmentTokensByBoundaries: segmentTokensByBoundaries,
+    hasNativeTokenTiming: hasNativeTokenTiming,
+    collectSemanticTokens: collectSemanticTokens,
+    restoredWords: restoredWords,
+    sameRestoredWords: sameRestoredWords,
+    restoredBoundaryMarks: restoredBoundaryMarks,
+    chunkTokenRanges: chunkTokenRanges,
+    packRestoredTokens: packRestoredTokens,
     collapseWhitespace: collapseWhitespace,
     normalizeColor: normalizeColor,
     shadowCss: shadowCss,
@@ -2031,6 +2368,7 @@
     errorKind: errorKind,
     DEFAULT_CONFIG: DEFAULT_CONFIG,
     DEFAULT_SYSTEM_PROMPT: DEFAULT_SYSTEM_PROMPT,
+    DEFAULT_RESTORATION_PROMPT: DEFAULT_RESTORATION_PROMPT,
     buildSystemPrompt: buildSystemPrompt,
     buildNumberedSourceLines: buildNumberedSourceLines,
     parseSubtitleLines: parseSubtitleLines,
@@ -2048,6 +2386,8 @@
     isChineseLangCode: isChineseLangCode,
     shouldSkipChineseSource: shouldSkipChineseSource,
     translateClipLines: translateClipLines,
+    restoreTokenBoundaries: restoreTokenBoundaries,
+    restoreAndPackTokens: restoreAndPackTokens,
     chatCompletion: chatCompletion,
     sliceClips: sliceClips,
     sliceClipsByCue: sliceClipsByCue,

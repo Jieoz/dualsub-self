@@ -58,7 +58,8 @@
     videoId: null,
     tracks: [], // main.js 推来的轨道清单
     activeTrack: null, // 当前选中的轨道
-    cues: [], // 清洗 + 语义重组(resegmentCues)后的原文 cue（全局，按 start 升序）
+    cues: [], // 最终原文 cue（优先严格词流语义恢复，否则稳定回退 resegmentCues）
+    segmentationMode: "fallback", // 'semantic' | 'fallback'，仅用于可观测性
     clips: [], // 按 cue 边界切的 clip
     cueMap: [], // 全局 cue 下标 -> {clipIdx,cueIdx}（cueClipIndexMap 建表）
     // v0.4.0：每个 clip 一次 translateClipLines → buildClipUnits 得到渲染单元，按 clip 存这里。
@@ -125,6 +126,34 @@
    * key = videoId|轨道code|targetLang|model|clipStartMs
    * 命中直接用不重翻；写入时 LRU 裁剪防配额溢出。
    * ===================================================== */
+  // v0.5.2：JSON3 词级时间可用时，先做严格词流等价的句子/从句恢复。
+  // 所有失败都整轨回落，绝不把模型改写或半段边界混进字幕时间轴。
+  async function restoreSemanticCuesIfAvailable(cues) {
+    if (!config.apiBaseUrl || !config.apiKey || !config.apiModel) return null;
+    if (!Core.hasNativeTokenTiming(cues, 0.8)) return null;
+    var tokens = Core.collectSemanticTokens(cues);
+    if (!tokens.length) return null;
+    try {
+      var restored = await Core.restoreAndPackTokens({
+        tokens: tokens,
+        apiBaseUrl: config.apiBaseUrl,
+        apiKey: config.apiKey,
+        apiModel: config.apiModel,
+        reasoningEffort: config.reasoningEffort,
+        chunkWords: 120,
+        overlapWords: 30,
+        maxWords: 24,
+        attempts: 2,
+        timeoutMs: 20000,
+        fetchImpl: function (u, o) { return fetch(u, o); },
+      });
+      return restored && restored.length ? Core.cleanupCues(restored) : null;
+    } catch (e) {
+      console.warn("[dualsub] 语义恢复未通过词流契约，回退 ASR 重组：", e && e.message);
+      return null;
+    }
+  }
+
   function clipCacheKey(clip) {
     return Core.makeCacheKey({
       videoId: state.videoId,
@@ -286,9 +315,16 @@
         cues = Core.parseVtt(text);
       }
       cues = Core.cleanupCues(cues);
-      // 语义重组：合并 ASR 碎片、去滚动重叠词、按标点/停顿重新切句；
-      // 句间视觉尾缩(tailTrimMs)制造句间断点，避免连续语流字幕墙。
-      cues = Core.resegmentCues(cues, { tailTrimMs: config.tailTrimMs });
+      // JSON3 有原生 token 时序时，先走模型只报边界、本地保留词流和时间的恢复协议。
+      // 无时序、无 API、超时或契约失败均回退到既有 ASR 规则重组。
+      var semanticCues = await restoreSemanticCuesIfAvailable(cues);
+      if (semanticCues && semanticCues.length) {
+        cues = Core.applyTailTrim(semanticCues, config.tailTrimMs);
+        state.segmentationMode = "semantic";
+      } else {
+        cues = Core.resegmentCues(cues, { tailTrimMs: config.tailTrimMs });
+        state.segmentationMode = "fallback";
+      }
       if (!cues.length) {
         console.warn("[dualsub] 解析后无有效字幕");
         return;
