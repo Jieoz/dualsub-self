@@ -78,7 +78,7 @@ function resolveKey(a) {
 
 /* --------------------------- 数据加载 + 链路前段 --------------------------- */
 const CUES_PATH = process.env.DUALSUB_CUES_PATH ||
-  path.resolve(__dirname, "../../../cache/dualsub-harness-yMMTVVJI4c-en-cues.json");
+  path.resolve(__dirname, "fixtures/youtube-en-cues.json");
 
 function loadOriginalCues(limit) {
   const raw = JSON.parse(fs.readFileSync(CUES_PATH, "utf8"));
