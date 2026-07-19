@@ -1423,7 +1423,13 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     assert.ok(/Core\.restoreAndPackTokens\b/.test(src), "加载路径应调用生产语义恢复器");
     assert.ok(/var fallbackCues = Core\.resegmentCues\(cues, \{ tailTrimMs: config\.tailTrimMs \}\)/.test(src), "不满足契约时应完整回退 ASR 重组");
     assert.ok(/installCueTimeline\(fallbackCues, "fallback"\)/.test(src), "fallback 必须先安装可播放时间轴");
-    assert.ok(/installCueTimeline\(Core\.applyTailTrim\(semanticCues, config\.tailTrimMs\), "semantic"\)/.test(src), "启用路径应原子切换到可诊断 semantic 模式");
+    assert.ok(/stageSemanticTimeline\(Core\.applyTailTrim\(semanticCues, config\.tailTrimMs\), loadEpoch\)/.test(src), "启用路径应先预热当前 semantic clip");
+    assert.ok(/for \(var attempt = 0; attempt < 3; attempt\+\+\)/.test(src), "semantic 预热应有界重验播放头");
+    assert.ok(/var installIdx = clipIdxAtIn\(clips, currentTimeMs\(\)\)/.test(src), "翻译 await 后必须重验当前 clip");
+    assert.ok(/return installCueTimeline\(cues, "semantic", \{ clips: clips, seeds: seeds \}\)/.test(src), "只有当前段已有 seed 的 semantic 候选才能原子接管屏幕");
+    const install = src.slice(src.indexOf("function installCueTimeline"), src.indexOf("/* =====================================================\n   * 翻译编排"));
+    assert.ok(install.indexOf("state.clipUnits[seedIdx]") < install.indexOf("rebuildRenderTimeline();"), "semantic seeds 必须在首帧重建前写入，禁止闪回翻译中");
+    assert.ok(/if \(ms < clips\[i\]\.startMs\) return i/.test(src), "播放头在 gap 时应预热下一段而不是末段");
     assert.ok(/installCueTimeline\(fallbackCues, "fallback"\)/.test(src), "回退路径应安装可诊断 fallback 模式");
   });
 

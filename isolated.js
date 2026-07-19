@@ -329,7 +329,10 @@
       setTimeout(function () {
         restoreSemanticCuesIfAvailable(cues).then(function (semanticCues) {
           if (loadEpoch !== state.timelineEpoch || !semanticCues || !semanticCues.length) return;
-          installCueTimeline(Core.applyTailTrim(semanticCues, config.tailTrimMs), "semantic");
+          return stageSemanticTimeline(Core.applyTailTrim(semanticCues, config.tailTrimMs), loadEpoch);
+        }).catch(function (e) {
+          // The fallback timeline is already active; unexpected semantic errors are non-fatal.
+          console.warn("[dualsub] semantic restore failed; keeping fallback timeline", e);
         });
       }, 0);
     } catch (e) {
@@ -337,27 +340,98 @@
     }
   }
 
+  function sliceTimelineClips(cues) {
+    var firstSec = Number(config.firstClipSeconds);
+    if (!Number.isFinite(firstSec) || firstSec <= 0) firstSec = config.clipSeconds;
+    return Core.sliceClipsByCue(cues, config.clipSeconds * 1000, {
+      firstTargetMs: firstSec * 1000,
+      maxCuesPerClip: config.maxCuesPerClip || 0,
+      maxSourceChars: config.maxSourceCharsPerClip || 0,
+    });
+  }
+
+  function clipIdxAtIn(clips, ms) {
+    if (!clips || !clips.length) return -1;
+    for (var i = 0; i < clips.length; i++) {
+      if (ms >= clips[i].startMs && ms < clips[i].endMs) return i;
+      // In a cue gap, prepare the next upcoming clip rather than an unrelated last clip.
+      if (ms < clips[i].startMs) return i;
+    }
+    return clips.length - 1;
+  }
+
+  function translatePreparedClip(clip) {
+    return ensureGate().run(function () {
+      return Core.translateClipLines({
+        cues: clip.cues,
+        apiBaseUrl: config.apiBaseUrl,
+        apiKey: config.apiKey,
+        apiModel: config.apiModel,
+        targetLang: config.targetLang,
+        systemPrompt: config.systemPrompt || "",
+        reasoningEffort: config.reasoningEffort,
+        maxLineChars: config.maxLineChars,
+        timeoutMs: 20000,
+        fetchImpl: function (u, o) { return fetch(u, o); },
+      });
+    });
+  }
+
+  // Keep the working fallback visible while translating the semantic clip at the current playhead.
+  // Revalidate after every await: playback or a seek may move to another clip while the request is queued.
+  // Only install when the clip on screen has a ready translation, so semantic takeover cannot regress to
+  // "翻译中…" or blank Chinese. Three attempts bound extra work under adversarial repeated seeks.
+  async function stageSemanticTimeline(cues, loadEpoch) {
+    if (!cues || !cues.length || loadEpoch !== state.timelineEpoch) return false;
+    var clips = sliceTimelineClips(cues);
+    if (!clips.length) return false;
+    var seeds = {};
+    for (var attempt = 0; attempt < 3; attempt++) {
+      var currentIdx = clipIdxAtIn(clips, currentTimeMs());
+      if (currentIdx < 0) return false;
+      if (!seeds[currentIdx]) {
+        var lines = await translatePreparedClip(clips[currentIdx]);
+        if (loadEpoch !== state.timelineEpoch || !lines || !lines.length) return false;
+        seeds[currentIdx] = lines;
+      }
+      var installIdx = clipIdxAtIn(clips, currentTimeMs());
+      if (installIdx === currentIdx && seeds[installIdx]) {
+        return installCueTimeline(cues, "semantic", { clips: clips, seeds: seeds });
+      }
+    }
+    return false;
+  }
+
   // 仅在完整 cue 集合准备好时切换。递增 epoch 使旧分段的翻译请求自然失效。
-  function installCueTimeline(cues, mode) {
+  function installCueTimeline(cues, mode, prepared) {
     if (!cues || !cues.length) return false;
     state.timelineEpoch++;
     // fallback 已经给用户可播放首屏；后台语义切换绝不再次暂停视频等翻译。
     if (mode === "semantic") state.firstClipReady = true;
     state.segmentationMode = mode;
     state.cues = cues;
-    var firstSec = Number(config.firstClipSeconds);
-    if (!Number.isFinite(firstSec) || firstSec <= 0) firstSec = config.clipSeconds;
-    state.clips = Core.sliceClipsByCue(cues, config.clipSeconds * 1000, {
-      firstTargetMs: firstSec * 1000,
-      maxCuesPerClip: config.maxCuesPerClip || 0,
-      maxSourceChars: config.maxSourceCharsPerClip || 0,
-    });
+    state.clips = prepared && prepared.clips ? prepared.clips : sliceTimelineClips(cues);
     state.cueMap = Core.cueClipIndexMap(state.clips);
     state.clipUnits = {};
     state.renderUnits = [];
     state.clipState = {};
     state.clipBackoff = {};
     state.clipInflight = {};
+    if (prepared && prepared.seeds) {
+      for (var preparedIdx in prepared.seeds) {
+        var seedIdx = parseInt(preparedIdx, 10);
+        var seedLines = prepared.seeds[preparedIdx];
+        var seedClip = state.clips[seedIdx];
+        if (!seedClip || !seedLines || !seedLines.length) continue;
+        state.clipUnits[seedIdx] = Core.buildClipUnits(
+          seedLines,
+          seedClip.startMs,
+          seedClip.endMs,
+          seedClip.cues
+        );
+        state.clipState[seedIdx] = "done";
+      }
+    }
     state.lastHitCueIdx = -1;
     rebuildRenderTimeline();
     ensureRenderer();
