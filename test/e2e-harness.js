@@ -9,10 +9,9 @@
  *
  * 两种模型后端：
  *  --real   走真实 OpenAI 兼容网关（base/key/model 见下）。需要 key。
- *  --mock   (默认) 离线 mock 模型：用数据集里真实 ref_zh（旧程序逐 cue 中文，本身被 char-split
- *           切碎）按时间重叠拼回整段，再【只在标点边界】重切成自然字幕行返回 —— 模拟新模型
- *           「直接吐自然行」的行为（绝不在词中间断），故 mock 产物本身不含切词。mock 还注入
- *           ~首字节延迟 + 按字数吐字延迟，用于演练延迟统计/超时。
+ *  --mock   (默认) 离线结构 mock：为当前重组后的每个 semantic unit 返回一条短、完整、
+ *           可合法排版的确定性占位译文。旧 ref_zh 属于另一版逐 cue 分段，不能按时间或位置
+ *           强行映射到当前 semantic unit。mock 只验证 1:1、时间轴、空响应和延迟，不冒充语言质量。
  *
  * API key 注入优先级（--real 时）：
  *   --key=<k>  >  env DUALSUB_API_KEY  >  env OPENAI_API_KEY  >  --key-file=<path>
@@ -92,16 +91,8 @@ function loadOriginalCues(limit) {
 }
 
 /* ---------------- mock 模型：按源 cue 编号 1:1 返回中文 ---------------- */
-function cueZhFromRefs(cue, originalCues) {
-  let zh = "";
-  for (const oc of originalCues) {
-    if (!oc.ref_zh) continue;
-    const overlap = Math.min(cue.end, oc.end) - Math.max(cue.start, oc.start);
-    if (overlap <= 0) continue;
-    const piece = oc.ref_zh.trim();
-    if (piece && !zh.endsWith(piece)) zh += piece;
-  }
-  return Core.collapseWhitespace(zh) || "暂无译文";
+function structuralMockZh(index) {
+  return "完整译文" + String(index + 1);
 }
 
 function makeMockFetch(clipLinesResolver, stats, opts) {
@@ -156,11 +147,12 @@ async function run() {
   const stats = { requestMs: [], retries429: 0, clipFallbacks: 0, emptyClips: 0,
                   firstUnitMs: null, totalMs: 0, clipMs: [] };
 
-  // mock 中文按每个重组 cue 的时间窗从真实 ref_zh 聚合，再按编号 1:1 返回。
+  // mock 只验证当前 semantic unit 的结构契约；不复用版本不匹配的旧 ref_zh。
   const clipByFirstContent = new Map();
+  let mockUnitIndex = 0;
   for (const clip of clips) {
     const key = Core.collapseWhitespace(clip.cues[0] ? clip.cues[0].content : "");
-    clipByFirstContent.set(key, clip.cues.map((cue) => cueZhFromRefs(cue, originalCues)));
+    clipByFirstContent.set(key, clip.cues.map(() => structuralMockZh(mockUnitIndex++)));
   }
   const clipLinesResolver = (userContent) => {
     const first = userContent.split("\n").map((l) => l.match(/^\s*\d+\.\s+(.*)$/)).find(Boolean);
@@ -182,7 +174,7 @@ async function run() {
     a.apiKey = "mock-key";
     a.base = "http://mock.local/v1";
     fetchImpl = makeMockFetch(clipLinesResolver, stats, {});
-    mode = "MOCK (offline structural 1:1 using legacy fragmented ref_zh)";
+    mode = "MOCK (offline structural 1:1; no legacy translation remapping)";
   }
 
   console.log("\n=== dualsub E2E harness (v0.5.1) ===");
@@ -239,8 +231,8 @@ async function run() {
     renderUnits.every((u) => u.originalText && u.translation && u.start < u.end);
   console.log("结构 1:1      :", oneToOneOk ? "PASS" : "FAIL");
   if (!detectorOk || !oneToOneOk || (a.real && !audit.pass)) process.exitCode = 1;
-  if (!a.real && !audit.pass) {
-    console.log("说明          : MOCK 使用旧逐 cue 碎片译文，只验证 1:1/时轴/空响应；语言切词告警仅作提示，不冒充真实模型质量。" );
+  if (!a.real) {
+    console.log("说明          : MOCK 使用确定性占位译文，只验证 1:1/时轴/空响应；不冒充真实模型语言质量。" );
   }
 }
 
@@ -480,7 +472,7 @@ function auditSelfTest() {
   return ok;
 }
 
-module.exports = { detectCut, auditWordCuts, auditSelfTest, cueZhFromRefs };
+module.exports = { detectCut, auditWordCuts, auditSelfTest, structuralMockZh };
 
 // 入口（被 require 时不自动跑）。
 if (require.main === module) {

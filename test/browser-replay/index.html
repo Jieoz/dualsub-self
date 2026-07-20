@@ -1,0 +1,27 @@
+<!doctype html><html><head><meta charset="utf-8"><title>DualSub state-machine replay</title>
+<style>html,body{margin:0;background:#111;color:#eee;font-family:system-ui}.html5-video-player{position:relative;width:960px;height:540px;margin:20px auto;background:#172033}.html5-main-video{width:100%;height:100%}</style></head><body>
+<div class="html5-video-player"><video class="html5-main-video"></video></div>
+<script>
+const scenario=new URLSearchParams(location.search).get('scenario')||'happy';
+window.__report={scenario,startedAt:performance.now(),events:[],paints:[],pauseCalls:0,playCalls:0,errors:[],finished:false};
+const report=window.__report,v=document.querySelector('video');let now=.2,paused=false;
+Object.defineProperty(v,'currentTime',{get(){return now},set(x){now=Number(x)||0;report.events.push({type:'seek',at:now,t:performance.now()-report.startedAt})}});
+Object.defineProperty(v,'paused',{get(){return paused}});
+v.pause=()=>{paused=true;report.pauseCalls++;};v.play=()=>{paused=false;report.playCalls++;return Promise.resolve();};
+setInterval(()=>{if(!paused)now+=.1;v.dispatchEvent(new Event('timeupdate'))},100);
+addEventListener('error',e=>report.errors.push(String(e.error||e.message)));addEventListener('unhandledrejection',e=>report.errors.push('rejection:'+String(e.reason)));
+const cfg={enabled:true,apiBaseUrl:'https://fixture.invalid/v1',apiKey:'fixture',apiModel:'fixture',waitForFirstTranslation:true,waitForFirstTranslationMs:3000,showOriginal:true,showTranslated:true};
+window.chrome={storage:{local:{get(k,cb){setTimeout(()=>cb({['dualsub:'+location.origin]:cfg,'dualsub:cache':{}}),0)},set(o,cb){if(cb)cb()}}},runtime:{sendMessage(){},onMessage:{addListener(){}}}};
+</script>
+<script src="/core.js"></script>
+<script>
+Promise.all([fetch('/semantic.json').then(r=>r.json())]).then(([semantic])=>{
+ const Core=window.DualsubCore;let calls=0;
+ Core.hasNativeTokenTiming=()=>true;Core.collectSemanticTokens=c=>c.flatMap(x=>x.tokens||[]);
+ Core.restoreAndPackTokens=async()=>{report.events.push({type:'semantic-start',t:performance.now()-report.startedAt});await new Promise(r=>setTimeout(r,350));if(scenario==='semantic-failure')throw new Error('fixture semantic failure');report.events.push({type:'semantic-ready',t:performance.now()-report.startedAt});return semantic};
+ Core.translateClipLines=async opts=>{const call=calls++;report.events.push({type:'translation-start',call,t:performance.now()-report.startedAt,count:opts.cues.length});if(scenario==='seek-race'&&call===0)setTimeout(()=>{v.currentTime=7.4},60);await new Promise(r=>setTimeout(r,180));if(scenario==='prewarm-failure')throw new Error('fixture prewarm failure');const map={"If you're a human person one of those things you're going to want to do with some regularity is boil water":"如果你是人类，隔三差五总要烧水。","We do it for lots of reasons":"我们烧水有很多原因。","from cooking to cleaning and disinfecting":"从烹饪到清洁和消毒。"};const lines=opts.cues.map(c=>Core.shapeAlignedLine(map[c.content]||'对应的完整译文',16));report.events.push({type:'translation-ready',call,t:performance.now()-report.startedAt,lines});return lines};
+ new MutationObserver(()=>{const o=document.querySelector('.dualsub-orig'),z=document.querySelector('.dualsub-trans');const x={t:performance.now()-report.startedAt,at:now,orig:o?o.textContent:'',trans:z?z.textContent:'',paused};const p=report.paints.at(-1);if(!p||p.orig!==x.orig||p.trans!==x.trans||p.paused!==x.paused)report.paints.push(x)}).observe(document.body,{subtree:true,childList:true,characterData:true,attributes:true});
+ const s=document.createElement('script');s.src='/isolated.js';s.onload=()=>setTimeout(()=>dispatchEvent(new CustomEvent('__dualsub_rpc_8f3ad7c1b2e94__',{detail:{receiver:'isolated',subject:'update-manifest',content:{videoId:'fixture-video',files:[{code:'en-asr',languageCode:'en',kind:'asr',url:'/track.json'}]}}})),20);document.body.appendChild(s);
+ setTimeout(()=>{report.finished=true},scenario==='semantic-failure'||scenario==='prewarm-failure'?1400:1800);
+});
+</script></body></html>

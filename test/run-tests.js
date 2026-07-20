@@ -671,7 +671,7 @@ test("makeCacheKey 同输入稳定、异输入不同", () => {
 test("makeCacheKey v0.5.3 隔离旧缓存与 fallback/semantic 分段", () => {
   const fallback = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", segmentationMode: "fallback", clipStartMs: 0 });
   const semantic = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", segmentationMode: "semantic", clipStartMs: 0 });
-  assert.ok(fallback.startsWith("dsc-v53|fallback|"), "非阻塞切换必须隔离 v0.5.2 旧缓存");
+  assert.ok(fallback.startsWith("dsc-v55|fallback|"), "新语义单元与 16 字排版契约必须隔离旧缓存");
   assert.notStrictEqual(fallback, semantic, "fallback 与 semantic cue 边界不得共用翻译缓存");
 });
 
@@ -901,13 +901,14 @@ test("importConfig 坏 JSON / 空对象报错", () => {
 /* ============ 5j. DEFAULT_SYSTEM_PROMPT：v0.5 cue 1:1 契约 ============ */
 console.log("\n[system prompt v0.5 cue 1:1 契约校验]");
 
-test("DEFAULT_SYSTEM_PROMPT v0.5.1：上下文 cue 1:1（自然承接/标点/不切词）", () => {
+test("DEFAULT_SYSTEM_PROMPT：完整语义单元 1:1（完整译文/标点/不切词）", () => {
   const filled = Core.buildSystemPrompt("zh-Hans");
-  // v0.5.1 契约：模型结合上下文，但按源 cue 编号 1:1 返回。
+  // semantic 契约：模型结合上下文，按完整语义单元编号 1:1 返回。
   // 规则1：绝不把中文词切成两半。
   assert.ok(/不把一个词语切成两半|绝不.*切成两半/.test(filled), "应含「不切词」规则");
-  // 规则2：允许相邻 cue 自然承接，不强迫半句独立完整或擅自补意。
-  assert.ok(/承接|半句|补/.test(filled), "应允许跨 cue 的自然语法承接");
+  // 规则2：每个输入已经是完整语义单元，中文也必须完整自然，不得输出半句。
+  assert.ok(/完整语义单元/.test(filled) && /完整、自然|完整自然/.test(filled), "应要求每条都是完整自然译文");
+  assert.ok(!/源 cue 是半句|自然承接前后行/.test(filled), "不得继续鼓励半句中文承接");
   // 规则3：保留必要的中文标点，避免分句粘连。
   assert.ok(/标点/.test(filled) && /问号|感叹号|逗号|句号/.test(filled), "应含必要标点规则");
   // 规则4：只输出带编号的中文字幕行，不要英文或解释。
@@ -1470,7 +1471,11 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     assert.ok(/function resetForNewVideo\(\) \{\n    state\.timelineEpoch\+\+/.test(src), "切视频必须废止旧轨道异步请求");
     assert.ok(/if \(mode === "semantic"\) state\.firstClipReady = true/.test(src), "语义后台切换不得再次暂停已播放视频");
     assert.ok(/segmentationMode: state\.segmentationMode/.test(src), "不同分段模式不得复用同一 clip 缓存");
-    assert.ok(/"dsc-v53"/.test(fs.readFileSync(path.join(ROOT, "core.js"), "utf8")), "非阻塞切换必须升级缓存 namespace");
+    assert.ok(/"dsc-v55"/.test(fs.readFileSync(path.join(ROOT, "core.js"), "utf8")), "新语义单元与排版契约必须升级缓存 namespace");
+    const prefetch = src.slice(src.indexOf("function prefetchAround"), src.indexOf("function getBackoff"));
+    assert.ok(/state\.segmentationMode !== "semantic"/.test(prefetch), "fallback 只显原文，不得翻译技术 cue 产生碎中文");
+    const render = src.slice(src.indexOf("function onRenderTick"), src.indexOf("function setRendererText"));
+    assert.ok(/state\.segmentationMode === "semantic" \? Core\.clipDisplayFlags/.test(render), "fallback 中文层必须为空，不得显示翻译中");
   });
 
   test("isolated.js 只在可靠 JSON3 token 时序下启用语义恢复，失败完整回退", () => {
@@ -1577,6 +1582,23 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     assert.deepStrictEqual(Core.buildClipUnits(lines, 0, 2000, [{ start: 0, end: 2000, content: "hello" }]), []);
   });
 
+  await asyncTest("translateClipLines 无编号超长译文无法排成两行时拒绝整包", async () => {
+    const overlong = "这是第一部分不过这是第二部分因为这是第三部分所以这是第四部分而且还有第五部分";
+    const fetchImpl = async () => ({
+      ok: true, status: 200,
+      json: async () => ({ choices: [{ message: { content: overlong } }] }),
+      text: async () => "",
+    });
+    await assert.rejects(
+      Core.translateClipLines({
+        cues: [{ start: 0, end: 5000, content: "one complete semantic unit" }],
+        apiBaseUrl: "http://mock/v1", apiModel: "m",
+        maxLineChars: 16, timeoutMs: 5000, fetchImpl,
+      }),
+      /incomplete translation/,
+      "不能用空字幕冒充无编号译文成功"
+    );
+  });
 
   await asyncTest("translateClipLines 数量不足时拒绝部分结果，交运行层整包重试", async () => {
     await assert.rejects(
@@ -1756,7 +1778,7 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
       apiKey: "k",
       apiModel: "m",
       targetLang: "zh-Hans",
-      maxLineChars: 10,
+      maxLineChars: 12,
       fetchImpl: async () => ({
         ok: true,
         status: 200,
@@ -1770,15 +1792,15 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
 
   test("splitLongLines：超长粘句只在短语边界拆，绝不切词", () => {
     assert.strictEqual(typeof Core.splitLongLines, "function");
-    // 粘句：就是烧水 + 我们…
+    // 超过每行上限时，才在安全短语边界断行。
     assert.deepStrictEqual(
-      Core.splitLongLines(["就是烧水我们烧水有很多原因"], 16),
+      Core.splitLongLines(["就是烧水我们烧水有很多原因"], 10),
       ["就是烧水", "我们烧水有很多原因"]
     );
-    // 比如…也许… 粘句
+    // 未超过 16 字时保持完整一行，不为话语标记制造短碎片。
     assert.deepStrictEqual(
       Core.splitLongLines(["比如泡茶也许你会把这归到烹饪里"], 16),
-      ["比如泡茶", "也许你会把这归到烹饪里"]
+      ["比如泡茶也许你会把这归到烹饪里"]
     );
     // 短行不动
     assert.deepStrictEqual(Core.splitLongLines(["如果你是人类"], 16), ["如果你是人类"]);
@@ -1882,9 +1904,26 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     assert.strictEqual(units[0].endMs, 3000);
     assert.strictEqual(units[1].startMs, 3000);
   });
+  test("简体中文完整短句未超过 16 字时绝不为凑行长拆分", () => {
+    // Netflix 简体中文规范：通常保持一行；达到每行 16 字限制后才考虑换行。
+    // 这句含“不过”，旧的 glueMin/目标 8 字规则会错误拆成约 6+6 的碎片。
+    const line = "我先重申一下不过我们再说";
+    assert.strictEqual(Core.charLen(line), 12);
+    assert.deepStrictEqual(Core.splitLongLines([line], 16, 4), [line]);
+  });
+
+  test("简体中文单元最多两行且每行不超过 16 字", () => {
+    const shaped = Core.shapeAlignedLine("这是第一部分不过这是第二部分因为这是第三部分所以这是第四部分", 16);
+    assert.ok(shaped, "合法的 30 字中文应能排成非空的两行字幕");
+    const rows = shaped.split("\n");
+    assert.ok(rows.length <= 2, "一个字幕单元最多两行");
+    assert.ok(rows.every((row) => Core.charLen(row) <= 16), "每行最多 16 字");
+    assert.strictEqual(Core.shapeAlignedLine("甲甲甲甲甲甲甲甲甲甲甲甲甲甲甲甲甲", 16), "", "17 字且无安全边界时必须拒绝，不能返回超限单行");
+    assert.strictEqual(Core.shapeAlignedLine("甲不过乙乙乙乙乙乙乙乙乙乙乙乙乙乙乙乙乙", 16), "", "有标记但任一侧仍超限时必须拒绝");
+  });
   test("DEFAULT_CONFIG 行长接近正常字幕 + 首包等待", () => {
     assert.ok(Core.DEFAULT_CONFIG.minLineChars >= 10);
-    assert.ok(Core.DEFAULT_CONFIG.maxLineChars >= 18);
+    assert.strictEqual(Core.DEFAULT_CONFIG.maxLineChars, 16, "简体中文每行上限应为 16 个汉字");
     assert.strictEqual(Core.DEFAULT_CONFIG.waitForFirstTranslation, true);
     assert.ok(Core.DEFAULT_CONFIG.waitForFirstTranslationMs >= 1000 && Core.DEFAULT_CONFIG.waitForFirstTranslationMs <= 15000);
   });

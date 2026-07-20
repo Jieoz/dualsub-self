@@ -318,7 +318,7 @@
         cues = Core.parseVtt(text);
       }
       cues = Core.cleanupCues(cues);
-      // 先立即建立稳定 fallback 时间轴并翻译首段。语义恢复是整轨模型工作，不能阻塞首字幕。
+      // 先立即建立稳定 fallback 原文时间轴；技术 cue 不翻译。语义恢复是整轨模型工作，不能阻塞首字幕。
       var fallbackCues = Core.resegmentCues(cues, { tailTrimMs: config.tailTrimMs });
       if (!installCueTimeline(fallbackCues, "fallback")) {
         console.warn("[dualsub] 解析后无有效字幕");
@@ -465,7 +465,7 @@
    * 独立发起 translateClip——"下下个"不被"下一个还 pending"阻塞。窗口由全局信号量
    * (ensureGate)封顶，避免多 clip 并发冲垮网关。
    * 已翻 / 正在翻 / 退避中的 clip 由 translateClip 内部跳过。
-   * v0.5.1：一个 clip = 一次 translateClipLines，按源 cue 编号 1:1 返回，无 clip 内首句优先起点。
+   * semantic 模式：一个 clip = 一次 translateClipLines，按完整语义单元编号 1:1 返回；fallback 不进入翻译。
    */
 
   function clearWaitTimer() {
@@ -508,6 +508,9 @@
 
   function prefetchAround(ms, force) {
     if (!config.enabled || !state.clips.length) return;
+    // fallback 只保证原文立即可见；技术 cue 不得送翻译，否则会生成六字左右的碎中文。
+    // semantic 当前 clip 由 stageSemanticTimeline 直接预热，接管后才启用常规预取。
+    if (state.segmentationMode !== "semantic") return;
     // 节流：预取循环低频(1.5s)调用，位置没明显移动就不重复跑昂贵逻辑
     if (!force && Math.abs(ms - state.lastPrefetchMs) < 1000) return;
     state.lastPrefetchMs = ms;
@@ -1145,7 +1148,11 @@
     //  - 无译文 + failed(达 maxFails) → 显「翻译失败」。
     //  - 无译文 + 未结案(undefined=未翻 / pending=在翻) → 显「翻译中…」。
     //  - 无译文 + 已结案(done/error 但该行无译文=覆盖缺口/降级) → 优雅显原文，不再永久转圈(症状1)。
-    var flags = Core.clipDisplayFlags(trans, st);
+    // fallback 技术 cue 从不翻译，因此译文层必须保持空白，不得误显示「翻译中…」。
+    var flags = state.segmentationMode === "semantic" ? Core.clipDisplayFlags(trans, st) : {
+      failed: false,
+      pending: false,
+    };
     var failed = flags.failed;
     var pending = flags.pending;
 

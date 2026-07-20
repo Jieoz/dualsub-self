@@ -608,7 +608,7 @@
     //                  reasoning 14-103 token。取值 low|medium|high；空串或 "default" = 不发该字段。
     minLineChars: 10,
     // 字幕行目标上限（字）。后处理 splitLongLines 用；只在短语标记边界拆，绝不切词。
-    maxLineChars: 20, // 最小行长（可视字符）：模型偶尔吐出过短碎行时，把短行【整行】并入相邻行
+    maxLineChars: 16, // 简体中文每行上限；16 字以内保持完整，超出时只在自然短语边界换行。
     //                  （只在行边界落点，绝不切词）。<=0 关闭合并。规则2「每行不要过分短」的兜底。
     tailTrimMs: 120, // 句间视觉尾缩(ms)：连续语流句单元 end 回缩此值制造句间断点(修字幕墙)。
     //                  0=关闭。仅长句(duration>2×)缩，缩后保留 >=300ms 可视；真停顿不受影响。
@@ -735,9 +735,10 @@
    * 「隔三差/五」斩断（用户最痛的切词 bug 的根因），还堆了 16 个职责重叠的
    * 切割/对齐函数（splitTranslation/splitTransIntoN/alignOriginalToScreens…）。
    *
-   * v0.5.1 让模型结合 clip 上下文并按编号把每个已重组 cue 翻成一条自然中文字幕，输出与 cue 1:1：
-   *  - 时间轴与英文原文直接沿用对应 cue，不再做跨行猜测或二次切词。
-   *  - 超长译文只允许在安全短语边界形成同一字幕单元内的两行显示，不硬切词。
+   * semantic 主路径先把英文恢复成可独立翻译的完整语义单元，再按编号翻成自然中文字幕，输出与单元 1:1：
+   *  - fallback 技术 cue 只显示原文，不进入翻译，避免生成六字左右的碎中文。
+   *  - 时间轴与英文原文直接沿用对应语义单元，不再做跨行猜测或二次切词。
+   *  - 中文默认单行；超过 16 字才在安全短语边界形成同一单元内最多两行，不硬切词。
    *  - reasoning 爆点用 reasoning_effort:low + 把规则写死进 prompt + 「直接给结果
    *    不要思考过程」压住（实测延迟 4.5-6.7s 稳定、reasoning 14-103 token）。
    * 后处理兜底：按编号落槽、保留必要中文标点并清洗格式噪声；缺槽拒绝缓存并交给调用方退避重试。
@@ -746,12 +747,12 @@
   // 已验证 system prompt（直接写死规则 + 压 reasoning）。{TARGET_LANG} 仅在调用方
   // 传自定义 prompt 时替换；默认 prompt 面向简体中文，无占位符（替换为 no-op）。
   var DEFAULT_SYSTEM_PROMPT =
-    "你是专业中文字幕翻译。输入是同一段连续语流中带序号的源字幕 cue。请先结合前后行理解整段，再严格按相同序号输出简体中文。\n" +
+    "你是专业中文字幕翻译。输入是同一段连续语流中带序号的完整英文语义单元。请先结合前后文理解整段，再严格按相同序号输出简体中文。\n" +
     "规则如下：\n" +
     "1) 输出行数、序号和顺序必须与输入完全一致；每行以相同序号开头，例如 `1. …`。\n" +
-    "2) 第 N 行只承载第 N 个 cue 在连续语流中的信息，不把信息挪到相邻编号，不合并、不遗漏、不重复。\n" +
-    "3) 若源 cue 是半句或语法续接片段，译文也应自然承接前后行；不要为了让单行完整而补入源文没有的意思。\n" +
-    "4) 译文应简洁、自然、适合字幕显示；绝不把一个中文词切成两半，同一 cue 过长时只在安全短语边界换行。\n" +
+    "2) 第 N 行只承载第 N 个完整语义单元的信息，不把信息挪到相邻编号，不合并、不遗漏、不重复。\n" +
+    "3) 每条译文必须是该英文语义单元完整、自然的中文表达，不得输出悬空或截断的半句话，也不得补入源文没有的意思。\n" +
+    "4) 译文应简洁、自然、适合字幕显示；绝不把一个中文词切成两半。中文默认单行，超过 16 个汉字时才在安全短语边界换为最多两行。\n" +
     "5) 保留必要的中文标点，包括逗号、句号、问号和感叹号，避免两句话或话语标记粘连。\n" +
     "6) 不要输出英文、其它字母、解释或思考过程。只输出带编号的中文字幕行。直接给结果。";
 
@@ -878,10 +879,21 @@
     var max = maxChars > 0 ? maxChars : DEFAULT_CONFIG.maxLineChars || 20;
     if (charLen(s) <= max) return s;
     var parts = splitLongLines([s], max, 4);
-    if (!parts || !parts.length) return s;
-    if (parts.length === 1) return parts[0];
-    if (parts.length === 2) return parts[0] + "\n" + parts[1];
-    return parts[0] + "\n" + parts.slice(1).join("");
+    if (!parts || !parts.length) return "";
+    // 统一验证所有路径：候选只能组成一行或两行，且每行都不超过上限。
+    // 找不到合法自然边界就拒绝该译文，绝不返回超限行、截断或造第三行。
+    var best = null;
+    for (var i = 1; i <= parts.length; i++) {
+      var left = parts.slice(0, i).join("");
+      var right = parts.slice(i).join("");
+      var ll = charLen(left);
+      var rl = charLen(right);
+      if (!left || ll > max || (right && rl > max)) continue;
+      var score = right ? Math.abs(ll - rl) : ll;
+      if (!best || score < best.score) best = { left: left, right: right, score: score };
+    }
+    if (!best) return "";
+    return best.right ? best.left + "\n" + best.right : best.left;
   }
 
   function sanitizeSubtitleLine(line) {
@@ -1022,16 +1034,14 @@
   function splitLongLines(lines, maxChars, minPart) {
     var max = maxChars > 0 ? maxChars : 0;
     var minP = minPart > 0 ? minPart : 4;
-    // 粘句门槛：即使总长未超过 max，只要 >= glueMin 也尝试在话语标记处拆（一句一意）。
-    var glueMin = Math.min(10, max > 0 ? max : 10);
     var src = (lines || []).slice();
     if (!max || !src.length) return src;
 
     function trySplit(line) {
       var s = String(line == null ? "" : line);
       var n = charLen(s);
-      // 太短不拆；刚好舒适且无强粘句需求时，后面找不到好切点也会原样返回。
-      if (n < glueMin) return [s];
+      // 中文规范优先保持完整一行；只有超过每行上限才进入安全断行。
+      if (n <= max) return [s];
       var best = null; // {left, right, score, leftLen}
       for (var m = 0; m < LONG_LINE_SPLIT_MARKERS.length; m++) {
         var mk = LONG_LINE_SPLIT_MARKERS[m];
@@ -1653,8 +1663,12 @@
     // 仅当完全没有可用编号槽、且未编号输出数量严格等于 cue 数时，才可安全顺序接受。
     if (complete === 0 && loose.length === n) {
       var shapedLoose = [];
-      for (var l = 0; l < n; l++) shapedLoose.push(shapeAlignedLine(loose[l], maxLine));
-      return shapedLoose;
+      for (var l = 0; l < n; l++) {
+        var looseLine = shapeAlignedLine(loose[l], maxLine);
+        if (!looseLine || !String(looseLine).trim()) break;
+        shapedLoose.push(looseLine);
+      }
+      if (shapedLoose.length === n) return shapedLoose;
     }
     // 真正空响应沿用既有语义：返回 []，由渲染层暂显原文并进入重试。
     if (complete === 0 && loose.length === 0) return [];
@@ -2112,7 +2126,7 @@
   function makeCacheKey(parts) {
     parts = parts || {};
     return [
-      "dsc-v53",
+      "dsc-v55",
       parts.segmentationMode || "fallback",
       parts.videoId || "",
       parts.trackCode || "",
