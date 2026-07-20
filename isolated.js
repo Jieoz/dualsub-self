@@ -143,7 +143,8 @@
         reasoningEffort: config.reasoningEffort,
         chunkWords: 120,
         overlapWords: 30,
-        maxWords: 24,
+        preferredMaxWords: 16,
+        maxWords: 20,
         attempts: 2,
         timeoutMs: 20000,
         fetchImpl: function (u, o) { return fetch(u, o); },
@@ -155,6 +156,12 @@
     }
   }
 
+  function clipCueFingerprint(clip) {
+    return (clip && clip.cues || []).map(function (cue) {
+      return [cue.start, cue.end, String(cue.content || "").replace(/\s+/g, " ").trim()].join(":");
+    }).join("~");
+  }
+
   function clipCacheKey(clip) {
     return Core.makeCacheKey({
       videoId: state.videoId,
@@ -163,6 +170,7 @@
       apiModel: config.apiModel,
       segmentationMode: state.segmentationMode,
       clipStartMs: clip.startMs,
+      cueFingerprint: clipCueFingerprint(clip),
     });
   }
 
@@ -362,7 +370,7 @@
 
   function translatePreparedClip(clip) {
     return ensureGate().run(function () {
-      return Core.translateClipLines({
+      return Core.translateClipWithBoundaryRepair({
         cues: clip.cues,
         apiBaseUrl: config.apiBaseUrl,
         apiKey: config.apiKey,
@@ -390,13 +398,16 @@
       var currentIdx = clipIdxAtIn(clips, currentTimeMs());
       if (currentIdx < 0) return false;
       if (!seeds[currentIdx]) {
-        var lines = await translatePreparedClip(clips[currentIdx]);
-        if (loadEpoch !== state.timelineEpoch || !lines || !lines.length) return false;
-        seeds[currentIdx] = lines;
+        var translated = await translatePreparedClip(clips[currentIdx]);
+        if (loadEpoch !== state.timelineEpoch || !translated || !translated.lines || !translated.lines.length) return false;
+        if (translated.repaired) clips[currentIdx].cues = translated.cues;
+        seeds[currentIdx] = translated.lines;
       }
       var installIdx = clipIdxAtIn(clips, currentTimeMs());
       if (installIdx === currentIdx && seeds[installIdx]) {
-        return installCueTimeline(cues, "semantic", { clips: clips, seeds: seeds });
+        var installedCues = [];
+        for (var ci = 0; ci < clips.length; ci++) installedCues = installedCues.concat(clips[ci].cues || []);
+        return installCueTimeline(installedCues, "semantic", { clips: clips, seeds: seeds });
       }
     }
     return false;
@@ -585,6 +596,9 @@
       var cached = await readCache();
       if (timelineEpoch !== state.timelineEpoch) return;
       if (cached[key] && Array.isArray(cached[key].lines)) {
+        if (Array.isArray(cached[key].cues) && cached[key].cues.length === cached[key].lines.length) {
+          clip.cues = cached[key].cues;
+        }
         state.clipUnits[idx] = Core.buildClipUnits(
           cached[key].lines,
           clip.startMs,
@@ -604,10 +618,10 @@
 
       // 主路径（v0.4.0）：一次 translateClipLines，模型直接吐「自然分行的中文字幕行」。
       // 代码只用 buildClipUnits 按字符占比配时间轴，绝不切译文（切词 bug 根治）。
-      var lines;
+      var translationResult;
       try {
-        lines = await ensureGate().run(function () {
-          return Core.translateClipLines({
+        translationResult = await ensureGate().run(function () {
+          return Core.translateClipWithBoundaryRepair({
             cues: clip.cues,
             apiBaseUrl: config.apiBaseUrl,
             apiKey: config.apiKey,
@@ -633,7 +647,12 @@
       }
 
       if (timelineEpoch !== state.timelineEpoch) return;
-      applyClipLines(idx, clip, key, lines);
+      if (translationResult && translationResult.repaired) {
+        // 缓存仍写入本次请求的输入 key；下次以同一原始 cue 查询即可命中，
+        // value 内携带回修后的 cues，命中后原子恢复同批时间轴。
+        clip.cues = translationResult.cues;
+      }
+      applyClipLines(idx, clip, key, translationResult ? translationResult.lines : []);
     } catch (e) {
       if (timelineEpoch !== state.timelineEpoch) return;
       // applyClipLines / readCache / rebuildRenderTimeline 等意外抛出：绝不让 clip 卡死。
@@ -668,7 +687,7 @@
       state.clipState[idx] = "done";
       if (idx === 0) maybeResumeAfterFirstTranslation(0);
       backoff.reset();
-      writeCache(key, { lines: lines });
+      writeCache(key, { lines: lines, cues: clip.cues });
       rebuildRenderTimeline();
       requestRender();
     } else {
@@ -838,21 +857,16 @@
       "  position:absolute; left:0; right:0; bottom:var(--ds-bottom,90px);",
       "  z-index:60; text-align:center; pointer-events:none;",
       "  display:flex; flex-direction:column; align-items:center; gap:2px;",
-      "  width:100%; padding:0 4%; box-sizing:border-box;",
+      "  width:100%; padding:0 2%; box-sizing:border-box;",
       "}",
       ".dualsub-subtitle{",
-      "  display:inline-block; max-width:96%; line-height:1.25;",
-      "  font-size:var(--ds-fontsize,22px);",
+      "  display:inline-block; max-width:100%; line-height:1.25;",
+      "  font-size:calc(var(--ds-fontsize,22px) * var(--ds-fit-scale,1));",
       "  font-family:var(--ds-fontfamily,'YouTube Noto',Roboto,Arial,sans-serif);",
       "  font-weight:var(--ds-fontweight,500);",
-      "  white-space:pre-wrap; word-break:break-word;",
+      "  white-space:nowrap; overflow:visible;",
       "}",
-      ".dualsub-subtitle.dualsub-orig{",
-      "  color:var(--ds-orig-color,#fff);",
-      // 原文最多约 2 行：防长英文折行堆成字幕墙盖住画面（显示层，不改数据）
-      "  display:-webkit-box !important; -webkit-box-orient:vertical; -webkit-line-clamp:2;",
-      "  overflow:hidden; text-overflow:ellipsis; max-height:calc(1.25em * 2 + 2px);",
-      "}",
+      ".dualsub-subtitle.dualsub-orig{ color:var(--ds-orig-color,#fff); }",
       ".dualsub-trans{ color:var(--ds-trans-color,#7fdfff); }",
       // 描边/阴影改为变量驱动（width=0 即无描边，无需 class 开关）。
       // paint-order:stroke fill 让描边描在文字下方，不啃掉字形。
@@ -924,6 +938,21 @@
    * fontSize 配置语义为"基准高度(480)下的字号"，Core.computeFontPx 同比缩放并 clamp。
    * 取不到高度（加载早期）时回落基准字号。每次调用顺带确保 ResizeObserver 已挂在当前播放器。
    */
+  function fitSubtitleRows() {
+    var r = state.renderer;
+    if (!r) return;
+    var available = Math.max(1, r.clientWidth * 0.96);
+    [r._orig, r._trans].forEach(function (row) {
+      if (!row) return;
+      row.style.setProperty("--ds-fit-scale", "1");
+      var natural = row.scrollWidth;
+      // 保持两行和字形比例：超宽时等比缩小该行字号；0.72 是可读底线，低于则显式标记溢出。
+      var scale = natural > available ? Math.max(0.72, available / natural) : 1;
+      row.style.setProperty("--ds-fit-scale", String(Math.round(scale * 1000) / 1000));
+      row.classList.toggle("dualsub-overflow", natural * scale > available + 1);
+    });
+  }
+
   function applyFontSize() {
     var r = state.renderer;
     if (!r) return;
@@ -931,6 +960,7 @@
     var h = player ? player.clientHeight : 0;
     var px = Core.computeFontPx(h, config.fontSize);
     r.style.setProperty("--ds-fontsize", px + "px");
+    fitSubtitleRows();
     setupFontObserver(player);
   }
 
@@ -952,6 +982,7 @@
       var p = playerEl();
       var px = Core.computeFontPx(p ? p.clientHeight : 0, config.fontSize);
       rr.style.setProperty("--ds-fontsize", px + "px");
+      fitSubtitleRows();
     });
     try {
       ro.observe(player);
@@ -1193,6 +1224,7 @@
       r._trans.classList.add("dualsub-hidden");
       r._trans.classList.remove("dualsub-pending", "dualsub-failed");
     }
+    fitSubtitleRows();
   }
 
   /**

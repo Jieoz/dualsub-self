@@ -221,13 +221,33 @@
   var CONTINUATION_START_WORDS = {
     from: true, to: true, of: true, in: true, on: true, at: true, with: true, for: true, by: true,
     into: true, over: true, under: true, through: true, during: true, after: true, before: true, without: true,
-    and: true, or: true, but: true, although: true, because: true, which: true, who: true, whose: true,
+    and: true, or: true, but: true, because: true, which: true, who: true, whose: true,
     when: true, while: true, if: true, than: true, as: true,
   };
   function isContinuationStart(word) {
     return !!CONTINUATION_START_WORDS[String(word || "").toLowerCase()];
   }
   var DANGLING_END_RE = /\b(?:to|of|for|with|from|at|in|on|by|about|into|over|under|between|through|and|or|but|because|that|which|who|whose|when|while|if|than|as|the|a|an)$/i;
+  var REPORTING_CLAUSE_PREFIX_RE = /^(?:let\s+(?:me|us)\s+(?:reiterate|say|note|explain|emphasize|stress|point\s+out|remind\s+you)\s+that|i\s+(?:think|believe|know|mean|guess|suppose)\s+that)\b/i;
+  var SUBORDINATE_CLAUSE_PREFIX_RE = /^(?:if|unless|although|though|even\s+if|because|when|while|before|after)\b/i;
+
+  function normalizeBoundaryText(text) {
+    return collapseWhitespace(String(text || "")).replace(/[|.!?]+$/g, "");
+  }
+
+  function classifySemanticBoundary(leftText, rightText) {
+    var left = normalizeBoundaryText(leftText);
+    var right = normalizeBoundaryText(rightText);
+    if (!left || !right) return { safe: false, reason: "empty-side" };
+    var first = String(restoredWords(right)[0] || "").toLowerCase();
+    if (isContinuationStart(first)) return { safe: false, reason: "continuation-start" };
+    if (DANGLING_END_RE.test(left)) return { safe: false, reason: "dangling-end" };
+    if (SUBORDINATE_CLAUSE_PREFIX_RE.test(left)) return { safe: false, reason: "subordinate-clause-missing-main" };
+    if (REPORTING_CLAUSE_PREFIX_RE.test(left) && /^(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did)\b/i.test(right)) {
+      return { safe: false, reason: "reporting-clause-missing-predicate" };
+    }
+    return { safe: true, reason: "ok" };
+  }
 
   function unitWordCount(unit) {
     return restoredWords(unit && unit.content).length;
@@ -260,13 +280,40 @@
     for (var i = 0; i < (units || []).length; i++) {
       var current = Object.assign({}, units[i]);
       if (!current.content) continue;
-      var first = restoredWords(current.content)[0] || "";
+      // ASR 常漏句号，但保留句首大写。一个单元内出现 “And + 完整主谓” 时，
+      // 按 token 时间拆成两个真实 cue，避免把 1800W 与 20A/2400W 偷塞进同一屏。
+      var currentWords = restoredWords(current.content);
+      var capitalAnd = -1;
+      for (var ai = 4; ai < currentWords.length - 4; ai++) {
+        if (currentWords[ai] === "And" && /^(?:on|the|a|an|this|that|it|we|you|they|there)$/i.test(currentWords[ai + 1] || "")) { capitalAnd = ai; break; }
+      }
+      if (capitalAnd > 0 && Array.isArray(current.tokens) && current.tokens.length === currentWords.length) {
+        var left = Object.assign({}, current, {
+          content: currentWords.slice(0, capitalAnd).join(" "),
+          tokens: current.tokens.slice(0, capitalAnd),
+          end: toInt(current.tokens[capitalAnd - 1].end, current.end),
+        });
+        left.duration = Math.max(0, left.end - toInt(left.start, 0));
+        var right = Object.assign({}, current, {
+          content: currentWords.slice(capitalAnd).join(" "),
+          tokens: current.tokens.slice(capitalAnd),
+          start: toInt(current.tokens[capitalAnd].start, left.end),
+        });
+        right.duration = Math.max(0, toInt(right.end, right.start) - right.start);
+        // 这是句内强边界，不再送回“续接词自动合并”，否则 although 又会被并回 And 句。
+        out.push(left);
+        out.push(right);
+        continue;
+      }
+      var first = currentWords[0] || "";
       var startsContinuation = first === first.toLowerCase() && isContinuationStart(first);
       var isLowercaseOrphan = first === first.toLowerCase() && unitWordCount(current) <= 2;
       var previous = out[out.length - 1];
       var previousTail = previous && DANGLING_END_RE.test(String(previous.content || "").replace(/[.,;:!?]+$/, ""));
+      var previousIsSubordinate = previous && SUBORDINATE_CLAUSE_PREFIX_RE.test(normalizeBoundaryText(previous.content));
+      var previousIsAndAdverbial = previous && /^And\s+(?:on|in|at|with|for|by)\b/i.test(String(previous.content || "")) && /^\d/.test(String(current.content || ""));
       var gapMs = previous ? Math.max(0, toInt(current.start, 0) - toInt(previous.end, 0)) : Infinity;
-      if (previous && gapMs <= maxJoinGapMs && (startsContinuation || isLowercaseOrphan || previousTail) && unitWordCount(previous) + unitWordCount(current) <= maxNaturalWords) {
+      if (previous && gapMs <= maxJoinGapMs && (startsContinuation || isLowercaseOrphan || previousTail || previousIsSubordinate || previousIsAndAdverbial) && unitWordCount(previous) + unitWordCount(current) <= maxNaturalWords) {
         out[out.length - 1] = mergeNaturalUnits(previous, current);
       } else {
         out.push(current);
@@ -608,7 +655,7 @@
     //                  reasoning 14-103 token。取值 low|medium|high；空串或 "default" = 不发该字段。
     minLineChars: 10,
     // 字幕行目标上限（字）。后处理 splitLongLines 用；只在短语标记边界拆，绝不切词。
-    maxLineChars: 16, // 简体中文每行上限；16 字以内保持完整，超出时只在自然短语边界换行。
+    maxLineChars: 0, // 双语对照固定一行：不在中文语义单元内部插入换行。
     //                  （只在行边界落点，绝不切词）。<=0 关闭合并。规则2「每行不要过分短」的兜底。
     tailTrimMs: 120, // 句间视觉尾缩(ms)：连续语流句单元 end 回缩此值制造句间断点(修字幕墙)。
     //                  0=关闭。仅长句(duration>2×)缩，缩后保留 >=300ms 可视；真停顿不受影响。
@@ -738,7 +785,7 @@
    * semantic 主路径先把英文恢复成可独立翻译的完整语义单元，再按编号翻成自然中文字幕，输出与单元 1:1：
    *  - fallback 技术 cue 只显示原文，不进入翻译，避免生成六字左右的碎中文。
    *  - 时间轴与英文原文直接沿用对应语义单元，不再做跨行猜测或二次切词。
-   *  - 中文默认单行；超过 16 字才在安全短语边界形成同一单元内最多两行，不硬切词。
+   *  - 双语对照固定两行：英文一行、中文一行；任一语言内部都不折行。
    *  - reasoning 爆点用 reasoning_effort:low + 把规则写死进 prompt + 「直接给结果
    *    不要思考过程」压住（实测延迟 4.5-6.7s 稳定、reasoning 14-103 token）。
    * 后处理兜底：按编号落槽、保留必要中文标点并清洗格式噪声；缺槽拒绝缓存并交给调用方退避重试。
@@ -752,7 +799,7 @@
     "1) 输出行数、序号和顺序必须与输入完全一致；每行以相同序号开头，例如 `1. …`。\n" +
     "2) 第 N 行只承载第 N 个完整语义单元的信息，不把信息挪到相邻编号，不合并、不遗漏、不重复。\n" +
     "3) 每条译文必须是该英文语义单元完整、自然的中文表达，不得输出悬空或截断的半句话，也不得补入源文没有的意思。\n" +
-    "4) 译文应简洁、自然、适合字幕显示；绝不把一个中文词切成两半。中文默认单行，超过 16 个汉字时才在安全短语边界换为最多两行。\n" +
+    "4) 译文应简洁、自然、适合字幕显示；绝不把一个中文词切成两半。每条中文必须严格保持单行，不得在单元内部换行。若某输入无法脱离相邻行独立自然翻译，必须只返回 [MERGE_PREV]，不得硬翻成逗号半句。若当前英文以从属连接词开头（如 but/although/than/despite），只有它自身具备完整主谓、能改写成自然完整中文时才翻译；否则返回 [MERGE_PREV]。\n" +
     "5) 保留必要的中文标点，包括逗号、句号、问号和感叹号，避免两句话或话语标记粘连。\n" +
     "6) 不要输出英文、其它字母、解释或思考过程。只输出带编号的中文字幕行。直接给结果。";
 
@@ -858,7 +905,11 @@
       var body = "", idx = -1;
       if (m) { idx = parseInt(m[1], 10) - 1; body = m[2]; } else { body = line; }
       body = cleanSubtitleBody(body);
-      body = sanitizeSubtitleLine(body);
+      if (isMergePrevMarker(body)) {
+        body = "[MERGE_PREV]";
+      } else {
+        body = sanitizeSubtitleLine(body);
+      }
       if (!body) continue;
       if (idx >= 0 && idx < n) { if (!slots[idx]) slots[idx] = body; }
       else sequential.push(body);
@@ -873,27 +924,10 @@
     return slots;
   }
 
-  function shapeAlignedLine(line, maxChars) {
-    var s = collapseWhitespace(line);
-    if (!s) return "";
-    var max = maxChars > 0 ? maxChars : DEFAULT_CONFIG.maxLineChars || 20;
-    if (charLen(s) <= max) return s;
-    var parts = splitLongLines([s], max, 4);
-    if (!parts || !parts.length) return "";
-    // 统一验证所有路径：候选只能组成一行或两行，且每行都不超过上限。
-    // 找不到合法自然边界就拒绝该译文，绝不返回超限行、截断或造第三行。
-    var best = null;
-    for (var i = 1; i <= parts.length; i++) {
-      var left = parts.slice(0, i).join("");
-      var right = parts.slice(i).join("");
-      var ll = charLen(left);
-      var rl = charLen(right);
-      if (!left || ll > max || (right && rl > max)) continue;
-      var score = right ? Math.abs(ll - rl) : ll;
-      if (!best || score < best.score) best = { left: left, right: right, score: score };
-    }
-    if (!best) return "";
-    return best.right ? best.left + "\n" + best.right : best.left;
+  function shapeAlignedLine(line) {
+    // 双语对照的显示契约：每个英文语义 cue 对应一条中文，二者各占一行。
+    // 这里只清洗模型偶发的空白/换行，不再做中文单元内的视觉折行。
+    return collapseWhitespace(line);
   }
 
   function sanitizeSubtitleLine(line) {
@@ -933,6 +967,39 @@
     if (/[0-9A-Za-z]/.test(lastCh) && /[0-9A-Za-z]/.test(firstCh)) sep = " ";
     else if (/[.!?;,:%)]/.test(lastCh) && /[0-9A-Za-z"'(]/.test(firstCh)) sep = " ";
     return x + sep + y;
+  }
+
+  function validateChineseDisplayUnit(text) {
+    var raw = String(text == null ? "" : text);
+    var s = raw.trim();
+    if (!s) return { ok: false, reason: "empty" };
+    if (/\r|\n/.test(raw)) return { ok: false, reason: "internal-newline" };
+    if (/[，、：；,……]$/.test(s)) return { ok: false, reason: "non-terminal-punctuation" };
+    if (/(?:虽然|尽管|如果|因为|但是|但|可能|以及|而且|所以|就是|从|到|和|与|或|并且)$/.test(s)) {
+      return { ok: false, reason: "dangling-tail" };
+    }
+    return { ok: true, reason: "ok" };
+  }
+
+  function isMergePrevMarker(line) {
+    return /^\s*\[MERGE_PREV\]\s*$/i.test(String(line == null ? "" : line));
+  }
+
+  function mergeRejectedTranslationCues(cues, lines) {
+    var source = cues || [];
+    var translated = lines || [];
+    var out = [];
+    for (var i = 0; i < source.length; i++) {
+      var cue = Object.assign({}, source[i]);
+      cue.tokens = Array.isArray(source[i] && source[i].tokens) ? source[i].tokens.slice() : source[i] && source[i].tokens;
+      if (isMergePrevMarker(translated[i])) {
+        if (out.length) out[out.length - 1] = mergeNaturalUnits(out[out.length - 1], cue);
+        else out.push(cue);
+      } else {
+        out.push(cue);
+      }
+    }
+    return out;
   }
 
   /**
@@ -1471,7 +1538,7 @@
 
   var DEFAULT_RESTORATION_PROMPT =
     "恢复这段英语口语的句末标点。只返回原词，且原词的拼写、顺序和数量必须完全一致。\n" +
-    "你只能在词之间加入空格和 . ? ! |。 .?! 仅表示真实句末。对于超过约 20 词的句子，必须在自然、可独立翻译的从句边界加入 |，让每段不超过约 24 词。\n" +
+    "你只能在词之间加入空格和 . ? ! |。 .?! 仅表示真实句末。完整句超过约 16 词时，也必须在自然、两侧均可独立翻译的从句边界加入 |；优先形成约 6–16 词的屏幕单元，每段最多 20 词。\n" +
     "不得在名词短语、动词短语、短语动词、复合词、限定词+名词、介词短语、不定式、助动词+动词之间加入 |。不得添加、删除、替换、合并、拆分或重排任何词。不要解释。";
 
   function tokenWords(tokens) {
@@ -1562,8 +1629,22 @@
     var out = (marks || []).slice();
     for (var i = 0; i < out.length - 1; i++) {
       if (out[i] !== "|") continue;
-      var next = String(words[i + 1] || "").toLowerCase();
-      if (isContinuationStart(next)) out[i] = "";
+      var leftStart = 0;
+      for (var p = i - 1; p >= 0; p--) {
+        if (out[p] === "|" || out[p] === ".") { leftStart = p + 1; break; }
+      }
+      var rightEnd = words.length;
+      for (var n = i + 1; n < out.length; n++) {
+        if (out[n] === "|" || out[n] === ".") { rightEnd = n + 1; break; }
+      }
+      var leftText = words.slice(leftStart, i + 1).join(" ");
+      var rightText = words.slice(i + 1, rightEnd).join(" ");
+      var verdict = classifySemanticBoundary(leftText, rightText);
+      // Reporting prefixes such as “let me reiterate that …” are intentionally allowed as a
+      // subtitle clause: Chinese can render them as a complete discourse unit. Merging them
+      // with the predicate creates a visibly worse 20+ word single row. Other subordinate
+      // clauses (If/Because/When…) still require their main clause.
+      if (!verdict.safe && !(REPORTING_CLAUSE_PREFIX_RE.test(leftText) && (verdict.reason === "reporting-clause-missing-predicate" || verdict.reason === "dangling-end"))) out[i] = "";
     }
     return out;
   }
@@ -1571,18 +1652,19 @@
   async function restoreAndPackTokens(opts) {
     opts = opts || {};
     var restored = await restoreTokenBoundaries(opts);
-    var maxWords = opts.maxWords || 24;
+    var maxWords = opts.maxWords || 20;
+    var preferredMaxWords = opts.preferredMaxWords || 16;
     var units = packRestoredTokens(restored.tokens, restored.marks, { maxWords: maxWords });
     // 第一轮保守只恢复全文句末；少数仍超长的完整句才做局部 clause rescue。
     // 同样只接受逐词完全等价的结果，且每个 rescue 至多一次，避免无界模型调用。
     var prompt = opts.oversizeSystemPrompt ||
       "以下是一条已验证的英语长句。只返回完全相同的词，拼写、顺序、数量均不得变化。\n" +
-      "只在自然、两侧均可独立翻译的字幕从句边界加入 |，使每段不超过约 " + maxWords + " 词。\n" +
+      "只在自然、两侧均可独立翻译的字幕从句边界加入 |；优先形成约 6–" + preferredMaxWords + " 词的屏幕单元，每段最多 " + maxWords + " 词。\n" +
       "不得在名词短语、动词短语、短语动词、复合词、限定词+名词、介词短语、不定式、助动词+动词之间加入 |。不得解释。";
     for (var ui = 0; ui < units.length; ui++) {
       var unit = units[ui];
       var unitWords = restoredWords(unit.content);
-      if (unitWords.length <= maxWords) continue;
+      if (unitWords.length <= preferredMaxWords) continue;
       var begin = -1;
       for (var i = 0; i < restored.tokens.length; i++) {
         if (restored.tokens[i].start === unit.start && restored.tokens[i].end <= unit.end) { begin = i; break; }
@@ -1675,6 +1757,44 @@
     // 部分编号/数量异常绝不接受、猜填或缓存；抛给既有 clip 退避调度整包重试。
     throw new Error("incomplete translation: " + complete + "/" + n + " aligned lines");
   }
+  async function translateClipWithBoundaryRepair(opts) {
+    opts = opts || {};
+    var cues = (opts.cues || []).slice();
+    if (!cues.length) return { cues: [], lines: [], repaired: false };
+    var first = await translateClipLines(Object.assign({}, opts, { cues: cues }));
+    var repairLines = first.slice();
+    var needsMerge = false;
+    for (var i = 0; i < first.length; i++) {
+      var verdict = validateChineseDisplayUnit(first[i]);
+      if (isMergePrevMarker(first[i])) {
+        repairLines[i] = "[MERGE_PREV]";
+        needsMerge = true;
+      } else if (!verdict.ok) {
+        // 中文硬门禁失败与模型显式拒绝同义：当前英文边界不能独立承载自然译文。
+        // 只向前合并相邻 cue，并整包重翻一次；首行无前项可并时才保留原错误。
+        if (i === 0) {
+          // 下一 cue 已显式要求向前合并时，首行会随之被修复，无需提前失败。
+          if (!(first.length > 1 && isMergePrevMarker(first[1]))) {
+            throw new Error("invalid translation unit 1: " + verdict.reason);
+          }
+        } else {
+          repairLines[i] = "[MERGE_PREV]";
+        }
+        needsMerge = true;
+      }
+    }
+    if (!needsMerge) return { cues: cues, lines: first, repaired: false };
+    var merged = mergeRejectedTranslationCues(cues, repairLines);
+    if (merged.length >= cues.length) throw new Error("boundary repair made no progress");
+    var second = await translateClipLines(Object.assign({}, opts, { cues: merged }));
+    if (second.some(isMergePrevMarker)) throw new Error("boundary repair still rejected after one retry");
+    for (var j = 0; j < second.length; j++) {
+      var finalVerdict = validateChineseDisplayUnit(second[j]);
+      if (!finalVerdict.ok) throw new Error("invalid repaired translation unit " + (j + 1) + ": " + finalVerdict.reason);
+    }
+    return { cues: merged, lines: second, repaired: true };
+  }
+
   /**
    * 发一次 chat/completions 并返回 message.content 字符串。
    * translateClipLines 复用：构造请求、AbortController 超时、
@@ -2119,20 +2239,20 @@
    * ------------------------------------------------------------- */
 
   /**
-   * 生成缓存 key：架构版本 + videoId + 轨道 code + 目标语言 + model + clip 起始毫秒。
-   * v0.5 改为 cue 1:1 后必须换 namespace，避免读取 v0.4 可变行数缓存造成错位。
-   * 同一视频/轨道/语言/模型下，clip 起点稳定 → 重看/拖回/刷新可命中不重翻。
+   * 生成缓存 key：架构版本 + 视频/轨道/语言/model + clip 起点 + cue 边界/正文指纹。
+   * cue 指纹确保语义边界回修前后不碰撞，缓存中的译文与共享时间轴始终同批 1:1。
    */
   function makeCacheKey(parts) {
     parts = parts || {};
     return [
-      "dsc-v55",
+      "dsc-v58",
       parts.segmentationMode || "fallback",
       parts.videoId || "",
       parts.trackCode || "",
       parts.targetLang || "",
       parts.apiModel || "",
       parts.clipStartMs != null ? parts.clipStartMs : "",
+      parts.cueFingerprint || "",
     ].join("|");
   }
 
@@ -2448,6 +2568,7 @@
     packRestoredTokens: packRestoredTokens,
     repairNaturalUnitBoundaries: repairNaturalUnitBoundaries,
     filterUnsafeRescueMarks: filterUnsafeRescueMarks,
+    classifySemanticBoundary: classifySemanticBoundary,
     collapseWhitespace: collapseWhitespace,
     normalizeColor: normalizeColor,
     shadowCss: shadowCss,
@@ -2468,6 +2589,8 @@
     parseAlignedSubtitleLines: parseAlignedSubtitleLines,
     shapeAlignedLine: shapeAlignedLine,
     sanitizeSubtitleLine: sanitizeSubtitleLine,
+    validateChineseDisplayUnit: validateChineseDisplayUnit,
+    mergeRejectedTranslationCues: mergeRejectedTranslationCues,
     mergeShortLines: mergeShortLines,
     mergeDanglingLines: mergeDanglingLines,
     splitLongLines: splitLongLines,
@@ -2479,6 +2602,7 @@
     isChineseLangCode: isChineseLangCode,
     shouldSkipChineseSource: shouldSkipChineseSource,
     translateClipLines: translateClipLines,
+    translateClipWithBoundaryRepair: translateClipWithBoundaryRepair,
     restoreTokenBoundaries: restoreTokenBoundaries,
     restoreAndPackTokens: restoreAndPackTokens,
     chatCompletion: chatCompletion,
