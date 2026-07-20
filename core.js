@@ -240,6 +240,8 @@
     var right = normalizeBoundaryText(rightText);
     if (!left || !right) return { safe: false, reason: "empty-side" };
     var first = String(restoredWords(right)[0] || "").toLowerCase();
+    // 字幕屏是连续语流，不要求每屏都是脱离上下文的书面句。允许有明确内容的
+    // 谓语/补充从句继续上一屏；但介词、连词和比较词等弱起点仍不能单独开屏。
     if (isContinuationStart(first)) return { safe: false, reason: "continuation-start" };
     if (DANGLING_END_RE.test(left)) return { safe: false, reason: "dangling-end" };
     if (SUBORDINATE_CLAUSE_PREFIX_RE.test(left)) return { safe: false, reason: "subordinate-clause-missing-main" };
@@ -307,13 +309,18 @@
       }
       var first = currentWords[0] || "";
       var startsContinuation = first === first.toLowerCase() && isContinuationStart(first);
+      // despite + being + 过去分词构成可自然译成“尽管受到……”的完整让步字幕片段；
+      // 它有自己的非限定谓语，不是需要并回前屏的孤立介词短语。
+      if (/^despite\s+being\s+\w+/i.test(String(current.content || "")) && unitWordCount(current) >= 5) startsContinuation = false;
       var isLowercaseOrphan = first === first.toLowerCase() && unitWordCount(current) <= 2;
       var previous = out[out.length - 1];
       var previousTail = previous && DANGLING_END_RE.test(String(previous.content || "").replace(/[.,;:!?]+$/, ""));
       var previousIsSubordinate = previous && SUBORDINATE_CLAUSE_PREFIX_RE.test(normalizeBoundaryText(previous.content));
       var previousIsAndAdverbial = previous && /^And\s+(?:on|in|at|with|for|by)\b/i.test(String(previous.content || "")) && /^\d/.test(String(current.content || ""));
+      var isPredicateContinuation = /^(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did)\b/i.test(String(current.content || ""));
+      var previousIsReportingUnit = previous && REPORTING_CLAUSE_PREFIX_RE.test(normalizeBoundaryText(previous.content));
       var gapMs = previous ? Math.max(0, toInt(current.start, 0) - toInt(previous.end, 0)) : Infinity;
-      if (previous && gapMs <= maxJoinGapMs && (startsContinuation || isLowercaseOrphan || previousTail || previousIsSubordinate || previousIsAndAdverbial) && unitWordCount(previous) + unitWordCount(current) <= maxNaturalWords) {
+      if (previous && gapMs <= maxJoinGapMs && (startsContinuation || isLowercaseOrphan || previousTail || previousIsSubordinate || previousIsAndAdverbial) && !(previousIsReportingUnit && isPredicateContinuation) && unitWordCount(previous) + unitWordCount(current) <= maxNaturalWords) {
         out[out.length - 1] = mergeNaturalUnits(previous, current);
       } else {
         out.push(current);
@@ -798,9 +805,9 @@
     "规则如下：\n" +
     "1) 输出行数、序号和顺序必须与输入完全一致；每行以相同序号开头，例如 `1. …`。\n" +
     "2) 第 N 行只承载第 N 个完整语义单元的信息，不把信息挪到相邻编号，不合并、不遗漏、不重复。\n" +
-    "3) 每条译文必须是该英文语义单元完整、自然的中文表达，不得输出悬空或截断的半句话，也不得补入源文没有的意思。\n" +
-    "4) 译文应简洁、自然、适合字幕显示；绝不把一个中文词切成两半。每条中文必须严格保持单行，不得在单元内部换行。若某输入无法脱离相邻行独立自然翻译，必须只返回 [MERGE_PREV]，不得硬翻成逗号半句。若当前英文以从属连接词开头（如 but/although/than/despite），只有它自身具备完整主谓、能改写成自然完整中文时才翻译；否则返回 [MERGE_PREV]。\n" +
-    "5) 保留必要的中文标点，包括逗号、句号、问号和感叹号，避免两句话或话语标记粘连。\n" +
+    "3) 每条译文必须是该英文字幕屏在连续语流中的自然中文表达，不得输出悬空或截断的半句话，也不得补入源文没有的意思；允许用“它/这/尽管”等承接相邻屏，使每屏简洁可读。\n" +
+    "4) 译文应简洁、自然、适合字幕显示；绝不把一个中文词切成两半。每条中文必须严格保持单行，不得在单元内部换行。若某输入结合相邻行仍无法译成自然可读的连续字幕片段，必须只返回 [MERGE_PREV]，不得硬翻成逗号半句。若当前英文以从属连接词开头（如 but/although/than/despite），只有它自身具备完整主谓、能改写成自然完整中文时才翻译；否则返回 [MERGE_PREV]。\n" +
+    "5) 每条都必须在本屏收束并以句号、问号或感叹号结束；即使英文语法延续到下一屏，也要用代词或自然改写让本屏中文完整，绝不能以逗号、顿号、冒号、分号或省略号结尾。\n" +
     "6) 不要输出英文、其它字母、解释或思考过程。只输出带编号的中文字幕行。直接给结果。";
 
   /** 是否中文相关 BCP47 / YouTube languageCode（zh, zh-Hans, zh-CN, yue, cmn…） */
@@ -1644,7 +1651,90 @@
       // subtitle clause: Chinese can render them as a complete discourse unit. Merging them
       // with the predicate creates a visibly worse 20+ word single row. Other subordinate
       // clauses (If/Because/When…) still require their main clause.
-      if (!verdict.safe && !(REPORTING_CLAUSE_PREFIX_RE.test(leftText) && (verdict.reason === "reporting-clause-missing-predicate" || verdict.reason === "dangling-end"))) out[i] = "";
+      var naturalDespite = /^despite\s+being\s+\w+/i.test(rightText) && restoredWords(rightText).length >= 5;
+      if (!verdict.safe && !naturalDespite && !(REPORTING_CLAUSE_PREFIX_RE.test(leftText) && (verdict.reason === "reporting-clause-missing-predicate" || verdict.reason === "dangling-end"))) out[i] = "";
+    }
+    return out;
+  }
+
+  /**
+   * 对已确认过长的单句做确定性显示分区。候选只能来自已验收的模型 |，或两类
+   * 可验证的连续字幕边界：长主语→限定谓语、完整主句→despite being 让步附加语。
+   * 动态规划有界于 O(n * hardWords)，无额外模型调用；找不到全程安全路径就返回 null。
+   */
+  function partitionReadableTokenUnit(tokens, marks, opts) {
+    opts = opts || {};
+    var words = tokenWords(tokens || []);
+    var n = words.length;
+    var preferred = Math.max(1, Math.floor(Number(opts.preferredWords) || 14));
+    var hard = Math.max(preferred, Math.floor(Number(opts.hardWords) || 16));
+    var min = Math.max(1, Math.min(hard, Math.floor(Number(opts.minWords) || 6)));
+    if (!n || n <= hard) return (marks || []).slice();
+    var sourceMarks = (marks || []).slice();
+    while (sourceMarks.length < n) sourceMarks.push("");
+    var candidates = {};
+    for (var i = 0; i < n - 1; i++) {
+      if (sourceMarks[i] === "|") candidates[i + 1] = 0;
+      var left = words.slice(0, i + 1).join(" ");
+      var right = words.slice(i + 1).join(" ");
+      var rightFirst = words[i + 1] || "";
+      var longSubjectPredicate = i + 1 >= min && REPORTING_CLAUSE_PREFIX_RE.test(left) &&
+        /^(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did)$/i.test(rightFirst) &&
+        /(?:get|got)\s+(?:my|our|your|their|his|her)\s+hands\s+on$/i.test(left);
+      var trailingAdjunct = i + 1 >= min && /^(?:despite\s+being|although|though)\b/i.test(right) &&
+        /\b(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did)\b/i.test(left);
+      if (longSubjectPredicate || trailingAdjunct) {
+        var penalty = longSubjectPredicate ? 1 : 2;
+        if (candidates[i + 1] == null || penalty < candidates[i + 1]) candidates[i + 1] = penalty;
+      }
+    }
+    var dp = new Array(n + 1).fill(null);
+    dp[0] = { score: 0, prev: -1 };
+    for (var end = 1; end <= n; end++) {
+      if (end !== n && candidates[end] == null) continue;
+      for (var start = Math.max(0, end - hard); start < end; start++) {
+        if (!dp[start]) continue;
+        var len = end - start;
+        if (len < min && end !== n) continue;
+        if (end === n && len < min && start !== 0) continue;
+        var boundaryPenalty = end === n ? 0 : candidates[end];
+        var score = dp[start].score + Math.pow(len - preferred, 2) + boundaryPenalty;
+        if (!dp[end] || score < dp[end].score) dp[end] = { score: score, prev: start };
+      }
+    }
+    if (!dp[n]) return null;
+    var cuts = [];
+    for (var at = n; at > 0;) {
+      var prev = dp[at].prev;
+      if (prev < 0) return null;
+      if (at < n) cuts.push(at);
+      at = prev;
+    }
+    var out = sourceMarks.map(function (m) { return m === "." ? "." : ""; });
+    cuts.forEach(function (cut) { out[cut - 1] = "|"; });
+    return out;
+  }
+
+  function normalizeOversizeSentenceMarks(tokens, marks, opts) {
+    opts = opts || {};
+    var out = (marks || []).slice();
+    var hard = Math.max(1, Math.floor(Number(opts.hardWords) || 16));
+    var sentenceStart = 0;
+    for (var i = 0; i <= out.length; i++) {
+      if (i < out.length && out[i] !== ".") continue;
+      var sentenceEnd = i < out.length ? i + 1 : out.length;
+      if (sentenceEnd <= sentenceStart) { sentenceStart = sentenceEnd; continue; }
+      var run = 0, oversize = false;
+      for (var j = sentenceStart; j < sentenceEnd; j++) {
+        run++;
+        if (out[j] === "|" || out[j] === ".") { if (run > hard) oversize = true; run = 0; }
+      }
+      if (run > hard) oversize = true;
+      if (oversize) {
+        var local = partitionReadableTokenUnit(tokens.slice(sentenceStart, sentenceEnd), out.slice(sentenceStart, sentenceEnd), opts);
+        if (local) for (var k = 0; k < local.length; k++) out[sentenceStart + k] = local[k];
+      }
+      sentenceStart = sentenceEnd;
     }
     return out;
   }
@@ -1654,12 +1744,17 @@
     var restored = await restoreTokenBoundaries(opts);
     var maxWords = opts.maxWords || 20;
     var preferredMaxWords = opts.preferredMaxWords || 16;
+    // 先按整句纠正模型的“4词碎屏 + 21词长屏”等坏组合。确定性分区能同时看见
+    // reporting 主语、限定谓语与 trailing adjunct，避免局部 rescue 丢失句首上下文。
+    restored.marks = normalizeOversizeSentenceMarks(restored.tokens, restored.marks, {
+      preferredWords: Math.min(preferredMaxWords, 14), hardWords: Math.min(maxWords, 16), minWords: 6,
+    });
     var units = packRestoredTokens(restored.tokens, restored.marks, { maxWords: maxWords });
     // 第一轮保守只恢复全文句末；少数仍超长的完整句才做局部 clause rescue。
     // 同样只接受逐词完全等价的结果，且每个 rescue 至多一次，避免无界模型调用。
     var prompt = opts.oversizeSystemPrompt ||
       "以下是一条已验证的英语长句。只返回完全相同的词，拼写、顺序、数量均不得变化。\n" +
-      "只在自然、两侧均可独立翻译的字幕从句边界加入 |；优先形成约 6–" + preferredMaxWords + " 词的屏幕单元，每段最多 " + maxWords + " 词。\n" +
+      "只在自然、连续可读且可译成自然中文字幕片段的边界加入 |；字幕屏是连续语流，不要求每段脱离上下文成为完整书面句。优先形成约 6–" + preferredMaxWords + " 词的屏幕单元，每段最多 " + maxWords + " 词。\n" +
       "不得在名词短语、动词短语、短语动词、复合词、限定词+名词、介词短语、不定式、助动词+动词之间加入 |。不得解释。";
     for (var ui = 0; ui < units.length; ui++) {
       var unit = units[ui];
@@ -1688,6 +1783,12 @@
           run++;
           if (localMarks[mi] === "." || localMarks[mi] === "|") run = 0;
           if (run > maxWords) { safe = false; break; }
+        }
+        if (!safe) {
+          localMarks = partitionReadableTokenUnit(restored.tokens.slice(begin, end), localMarks, {
+            preferredWords: Math.min(preferredMaxWords, 14), hardWords: Math.min(maxWords, 16), minWords: 6,
+          });
+          safe = !!localMarks;
         }
         if (safe) { marked = localMarks; break; }
       }
@@ -2245,7 +2346,7 @@
   function makeCacheKey(parts) {
     parts = parts || {};
     return [
-      "dsc-v58",
+      "dsc-v59",
       parts.segmentationMode || "fallback",
       parts.videoId || "",
       parts.trackCode || "",
@@ -2568,6 +2669,8 @@
     packRestoredTokens: packRestoredTokens,
     repairNaturalUnitBoundaries: repairNaturalUnitBoundaries,
     filterUnsafeRescueMarks: filterUnsafeRescueMarks,
+    partitionReadableTokenUnit: partitionReadableTokenUnit,
+    normalizeOversizeSentenceMarks: normalizeOversizeSentenceMarks,
     classifySemanticBoundary: classifySemanticBoundary,
     collapseWhitespace: collapseWhitespace,
     normalizeColor: normalizeColor,

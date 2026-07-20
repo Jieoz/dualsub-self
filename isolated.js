@@ -946,8 +946,8 @@
       if (!row) return;
       row.style.setProperty("--ds-fit-scale", "1");
       var natural = row.scrollWidth;
-      // 保持两行和字形比例：超宽时等比缩小该行字号；0.72 是可读底线，低于则显式标记溢出。
-      var scale = natural > available ? Math.max(0.72, available / natural) : 1;
+      // 字号只做小幅安全调整；0.85 以下属于分段失败，必须显式标记，不能用小字掩盖。
+      var scale = natural > available ? Math.max(0.85, available / natural) : 1;
       row.style.setProperty("--ds-fit-scale", String(Math.round(scale * 1000) / 1000));
       row.classList.toggle("dualsub-overflow", natural * scale > available + 1);
     });
