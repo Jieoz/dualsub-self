@@ -221,28 +221,95 @@
   var CONTINUATION_START_WORDS = {
     from: true, to: true, of: true, in: true, on: true, at: true, with: true, for: true, by: true,
     into: true, over: true, under: true, through: true, during: true, after: true, before: true, without: true,
-    and: true, or: true, but: true, because: true, which: true, who: true, whose: true,
+    up: true, down: true, out: true, off: true, away: true, back: true, around: true, apart: true,
+    forward: true, forth: true, ahead: true, along: true, across: true, together: true, aside: true,
+    past: true, round: true, behind: true, beyond: true, through: true,
+    and: true, or: true, but: true, because: true, that: true, which: true, who: true, whose: true,
     when: true, while: true, if: true, than: true, as: true,
   };
   function isContinuationStart(word) {
     return !!CONTINUATION_START_WORDS[String(word || "").toLowerCase()];
   }
-  var DANGLING_END_RE = /\b(?:to|of|for|with|from|at|in|on|by|about|into|over|under|between|through|and|or|but|because|that|which|who|whose|when|while|if|than|as|the|a|an)$/i;
+  var DANGLING_END_RE = /\b(?:to|of|for|with|from|at|in|on|by|about|into|over|under|between|through|and|or|but|because|that|which|who|whose|when|while|if|than|as|more|less|the|a|an)$/i;
+  var NUMBER_END_RE = /(?:^|\s)[+-]?\d[\d,.]*(?:%|[a-z]+)?$/i;
+  var NUMBER_WORD_END_RE = /\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million|billion)$/i;
+  var UNIT_START_RE = /^(?:volts?|watts?|amps?|amperes?|hertz|hz|degrees?|celsius|fahrenheit|seconds?|minutes?|hours?|milliseconds?|kilometers?|metres?|meters?|miles?|kilograms?|grams?|pounds?|ohms?|pascals?|psi|newtons?|joules?|kelvin|liters?|litres?|gallons?|inches?|feet|yards?|mph|kph|rpm|decibels?|bytes?|kilobytes?|megabytes?|gigabytes?|terabytes?|percent|dollars?|euros?|yuan)\b/i;
+  var MULTIPLIER_END_RE = /\b(?:once|twice|times)$/i;
+  var COMPARATIVE_START_RE = /^(?:the|a|an|this|that|these|those|my|our|your|their|his|her|previous|original|more|less|better|worse|faster|slower|higher|lower|larger|smaller|greater|fewer|\w+er)\b/i;
   var REPORTING_CLAUSE_PREFIX_RE = /^(?:let\s+(?:me|us)\s+(?:reiterate|say|note|explain|emphasize|stress|point\s+out|remind\s+you)\s+that|i\s+(?:think|believe|know|mean|guess|suppose)\s+that)\b/i;
   var SUBORDINATE_CLAUSE_PREFIX_RE = /^(?:if|unless|although|though|even\s+if|because|when|while|before|after)\b/i;
+  var RELATIVE_SUBJECT_PREFIX_RE = /^(?:the|a|an|this|that|these|those|my|our|your|their|his|her)\b.+\b(?:that|which|who)\b/i;
+  var COMPLEMENT_THAT_RE = /\b(?:mean|means|meant|say|says|said|think|thinks|thought|believe|believes|believed|know|knows|knew|show|shows|showed|indicate|indicates|indicated|suggest|suggests|suggested|confirm|confirms|confirmed|ensure|ensures|ensured|explain|explains|explained|report|reports|reported|note|notes|noted)\s+that\b/i;
+  var CONTACT_RELATIVE_PRONOUN_RE = /^(?:the|a|an|this|that|these|those|my|our|your|their|his|her)\b.+\b(?:i|we|you|they|he|she)\s+(?:(?:\w+)\s+){0,3}(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did|\w+(?:s|ed))\b/i;
+  var CONTACT_RELATIVE_PROPER_RE = /^(?:the|a|an|this|that|these|those|my|our|your|their|his|her)\b.+\b[A-Z][a-z]+\s+(?:(?:\w+)\s+){0,3}(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did|\w+(?:s|ed))\b/;
+  var MAIN_PREDICATE_START_RE = /^(?:(?:still|also|already|actually|usually|generally|typically|often|sometimes|never|always|then)\s+)?(?!(?:whereas|thus|perhaps|besides)\b)(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did|\w+(?:s|ed))\b/i;
+  // 只识别省略关系代词的 contact clause（如 “camera we tested”）。
+  // 显式 that/which/who 从句仍属于主语，不得被 reporting 例外覆盖。
+  var EMBEDDED_RELATIVE_PREDICATE_RE = /\b(?:i|we|you|they|he|she)\s+(?:(?:\w+)\s+){0,3}(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did|\w+(?:s|ed))\b/i;
+  var DETERMINER_END_RE = /\b(?:the|a|an|this|that|these|those|my|our|your|their|his|her)$/i;
+
+  function completedReportingSubjectBoundary(leftText, rightText) {
+    if (!REPORTING_CLAUSE_PREFIX_RE.test(leftText) || !MAIN_PREDICATE_START_RE.test(rightText)) return false;
+    var tail = leftText.replace(REPORTING_CLAUSE_PREFIX_RE, "").trim();
+    return !DETERMINER_END_RE.test(tail) &&
+      /^(?:the|a|an|this|that|these|those|my|our|your|their|his|her)\b/i.test(tail) &&
+      !RELATIVE_SUBJECT_PREFIX_RE.test(tail) &&
+      EMBEDDED_RELATIVE_PREDICATE_RE.test(tail);
+  }
 
   function normalizeBoundaryText(text) {
     return collapseWhitespace(String(text || "")).replace(/[|.!?]+$/g, "");
+  }
+
+  function hasFinitePredicateText(text) {
+    var value = String(text || "");
+    if (/\b(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did)\b/i.test(value)) return true;
+    // 并列边界宁可保守：s/ed 也可能是复数名词或分词形容词。只有紧邻 -ly 副词
+    // （runs quietly / worked reliably）时才把它当作强谓语证据。
+    return /\b\w+(?:s|ed)\s+\w+ly\b/i.test(value);
+  }
+
+  function hasComparisonPredicateText(text) {
+    return hasFinitePredicateText(text) || /\b\w+(?:s|ed)\b.*\b(?:faster|slower|higher|lower|more|less|better|worse)\b/i.test(String(text || ""));
+  }
+
+  function hasExplicitRelativeSubject(text) {
+    var value = normalizeBoundaryText(text);
+    var complement = value.match(COMPLEMENT_THAT_RE);
+    if (!complement) return RELATIVE_SUBJECT_PREFIX_RE.test(value);
+    var nested = value.slice((complement.index || 0) + complement[0].length).trim();
+    return RELATIVE_SUBJECT_PREFIX_RE.test(nested);
+  }
+
+  function isCoordinatedIndependentBoundary(leftText, rightText) {
+    var right = normalizeBoundaryText(rightText);
+    if (!hasFinitePredicateText(leftText)) return false;
+    var pronounClause = /^(?:and|but|or)\s+(?:i|you|he|she|it|we|they|there)\s+(?:(?:still|also|already|actually|usually|generally|typically|often|sometimes|never|always|then)\s+){0,2}(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did|\w+(?:s|ed))\b/i.test(right);
+    var properClause = /^(?:and|but|or)\s+[A-Z][a-z]+\s+(?:(?:still|also|already|actually|usually|generally|typically|often|sometimes|never|always|then)\s+){0,2}(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did|\w+(?:s|ed))\b/.test(right);
+    return pronounClause || properClause;
   }
 
   function classifySemanticBoundary(leftText, rightText) {
     var left = normalizeBoundaryText(leftText);
     var right = normalizeBoundaryText(rightText);
     if (!left || !right) return { safe: false, reason: "empty-side" };
+    var reportingLeft = REPORTING_CLAUSE_PREFIX_RE.test(left);
+    var structuralLeft = reportingLeft ? left.replace(REPORTING_CLAUSE_PREFIX_RE, "").trim() : left;
+    var lowerInitialStructuralLeft = structuralLeft ? structuralLeft.charAt(0).toLowerCase() + structuralLeft.slice(1) : structuralLeft;
+    var contactRelativeSubject = CONTACT_RELATIVE_PRONOUN_RE.test(structuralLeft) || CONTACT_RELATIVE_PROPER_RE.test(lowerInitialStructuralLeft);
+    // that 也可能是 means/says/thinks 后的宾语从句引导词；只豁免外层 complement，
+    // 继续检查其内部的 “the controller which ...” 显式关系主语。
+    var explicitRelativeSubject = hasExplicitRelativeSubject(structuralLeft);
+    // 关系主语保护优先于 and/but/or 例外；否则 conjunction 会把仍缺主谓的左屏伪装成完整并列句。
+    if (explicitRelativeSubject || (!reportingLeft && contactRelativeSubject)) {
+      return { safe: false, reason: "relative-subject-missing-predicate" };
+    }
     var first = String(restoredWords(right)[0] || "").toLowerCase();
-    // 字幕屏是连续语流，不要求每屏都是脱离上下文的书面句。允许有明确内容的
-    // 谓语/补充从句继续上一屏；但介词、连词和比较词等弱起点仍不能单独开屏。
-    if (isContinuationStart(first)) return { safe: false, reason: "continuation-start" };
+    // 字幕屏是连续语流，不要求每屏都是脱离上下文的书面句。只有左右均有强谓语证据时，
+    // 才允许 and/but/or 开启第二个完整并列分句。
+    if (isContinuationStart(first) && !isCoordinatedIndependentBoundary(left, right)) return { safe: false, reason: "continuation-start" };
+    if (NUMBER_END_RE.test(left) || (NUMBER_WORD_END_RE.test(left) && UNIT_START_RE.test(right))) return { safe: false, reason: "number-quantity" };
+    if (MULTIPLIER_END_RE.test(left) && COMPARATIVE_START_RE.test(right)) return { safe: false, reason: "comparison-continuation" };
     if (DANGLING_END_RE.test(left)) return { safe: false, reason: "dangling-end" };
     if (SUBORDINATE_CLAUSE_PREFIX_RE.test(left)) return { safe: false, reason: "subordinate-clause-missing-main" };
     if (REPORTING_CLAUSE_PREFIX_RE.test(left) && /^(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did)\b/i.test(right)) {
@@ -1635,7 +1702,7 @@
   function filterUnsafeRescueMarks(words, marks) {
     var out = (marks || []).slice();
     for (var i = 0; i < out.length - 1; i++) {
-      if (out[i] !== "|") continue;
+      if (out[i] !== "|" && out[i] !== ".") continue;
       var leftStart = 0;
       for (var p = i - 1; p >= 0; p--) {
         if (out[p] === "|" || out[p] === ".") { leftStart = p + 1; break; }
@@ -1647,12 +1714,19 @@
       var leftText = words.slice(leftStart, i + 1).join(" ");
       var rightText = words.slice(i + 1, rightEnd).join(" ");
       var verdict = classifySemanticBoundary(leftText, rightText);
-      // Reporting prefixes such as “let me reiterate that …” are intentionally allowed as a
-      // subtitle clause: Chinese can render them as a complete discourse unit. Merging them
-      // with the predicate creates a visibly worse 20+ word single row. Other subordinate
-      // clauses (If/Because/When…) still require their main clause.
+      // Reporting 例外只允许“... get my hands on | 主谓”这种已完成修饰链的边界。
+      // 不能泛化放过“... adapter | I could get ...”等仍悬空的名词短语。
+      var reportingPrefix = REPORTING_CLAUSE_PREFIX_RE.test(leftText);
+      var reportingObjectBoundary = completedReportingSubjectBoundary(leftText, rightText);
+      var reportingTail = reportingPrefix ? leftText.replace(REPORTING_CLAUSE_PREFIX_RE, "") : "";
+      var reportingHasPredicate = MAIN_PREDICATE_START_RE.test(reportingTail) ||
+        /\b(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did|\w+(?:s|ed))\b/i.test(reportingTail);
       var naturalDespite = /^despite\s+being\s+\w+/i.test(rightText) && restoredWords(rightText).length >= 5;
-      if (!verdict.safe && !naturalDespite && !(REPORTING_CLAUSE_PREFIX_RE.test(leftText) && (verdict.reason === "reporting-clause-missing-predicate" || verdict.reason === "dangling-end"))) out[i] = "";
+      if (reportingPrefix && !reportingHasPredicate && !reportingObjectBoundary) {
+        out[i] = "";
+      } else if (!verdict.safe && !naturalDespite && !reportingObjectBoundary) {
+        out[i] = "";
+      }
     }
     return out;
   }
@@ -1678,13 +1752,12 @@
       var left = words.slice(0, i + 1).join(" ");
       var right = words.slice(i + 1).join(" ");
       var rightFirst = words[i + 1] || "";
-      var longSubjectPredicate = i + 1 >= min && REPORTING_CLAUSE_PREFIX_RE.test(left) &&
-        /^(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did)$/i.test(rightFirst) &&
-        /(?:get|got)\s+(?:my|our|your|their|his|her)\s+hands\s+on$/i.test(left);
-      var trailingAdjunct = i + 1 >= min && /^(?:despite\s+being|although|though)\b/i.test(right) &&
-        /\b(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did)\b/i.test(left);
-      if (longSubjectPredicate || trailingAdjunct) {
-        var penalty = longSubjectPredicate ? 1 : 2;
+      var longSubjectPredicate = i + 1 >= min && completedReportingSubjectBoundary(left, right);
+      var trailingAdjunct = i + 1 >= min && /^(?:despite\s+being|although|though|even\s+(?:during|after|before)|during|after|before)\b/i.test(right) &&
+        hasComparisonPredicateText(left);
+      var coordinatedClause = i + 1 >= min && isCoordinatedIndependentBoundary(left, right);
+      if (longSubjectPredicate || trailingAdjunct || coordinatedClause) {
+        var penalty = longSubjectPredicate ? 1 : (coordinatedClause ? 2 : 3);
         if (candidates[i + 1] == null || penalty < candidates[i + 1]) candidates[i + 1] = penalty;
       }
     }
@@ -1744,6 +1817,9 @@
     var restored = await restoreTokenBoundaries(opts);
     var maxWords = opts.maxWords || 20;
     var preferredMaxWords = opts.preferredMaxWords || 16;
+    // 首轮模型的 | 与局部 rescue 使用同一安全门禁；不能让 which/because/than 等
+    // 弱续接开屏仅因它来自首轮恢复就绕过运行时验证。
+    restored.marks = filterUnsafeRescueMarks(tokenWords(restored.tokens), restored.marks);
     // 先按整句纠正模型的“4词碎屏 + 21词长屏”等坏组合。确定性分区能同时看见
     // reporting 主语、限定谓语与 trailing adjunct，避免局部 rescue 丢失句首上下文。
     restored.marks = normalizeOversizeSentenceMarks(restored.tokens, restored.marks, {
@@ -1766,6 +1842,7 @@
       }
       if (begin < 0) continue;
       var end = begin + unitWords.length;
+      var outerBoundary = restored.marks[end - 1];
       var source = tokenWords(restored.tokens.slice(begin, end)).join(" ");
       var marked = null;
       var attempts = opts.attempts != null ? Math.max(1, Number(opts.attempts)) : 2;
@@ -1794,12 +1871,20 @@
       }
       if (!marked) continue; // 宁可保持完整句，也不接受未校验/仍过长的局部模型输出。
       for (var m = 0; m < marked.length; m++) restored.marks[begin + m] = marked[m];
+      // 局部 rescue 只能细分当前单元，不能删除它与后一单元之间已确认的外边界。
+      if (outerBoundary === "." || outerBoundary === "|") restored.marks[end - 1] = outerBoundary;
       units = packRestoredTokens(restored.tokens, restored.marks, { maxWords: maxWords });
     }
-    return repairNaturalUnitBoundaries(units, {
+    var repairedUnits = repairNaturalUnitBoundaries(units, {
       preferredMaxWords: maxWords,
-      maxNaturalWords: opts.maxNaturalWords || maxWords,
+      maxNaturalWords: Math.min(maxWords, opts.maxNaturalWords || maxWords),
     });
+    for (var ri = 0; ri < repairedUnits.length; ri++) {
+      if (unitWordCount(repairedUnits[ri]) > maxWords) {
+        throw new Error("unresolved oversized semantic unit: " + unitWordCount(repairedUnits[ri]) + " words");
+      }
+    }
+    return repairedUnits;
   }
 
   /**
@@ -1887,6 +1972,12 @@
     if (!needsMerge) return { cues: cues, lines: first, repaired: false };
     var merged = mergeRejectedTranslationCues(cues, repairLines);
     if (merged.length >= cues.length) throw new Error("boundary repair made no progress");
+    var maxSourceWords = Math.max(1, Math.floor(Number(opts.maxSourceWords) || 16));
+    for (var mi = 0; mi < merged.length; mi++) {
+      if (unitWordCount(merged[mi]) > maxSourceWords) {
+        throw new Error("oversized source unit after boundary repair: " + unitWordCount(merged[mi]) + " words");
+      }
+    }
     var second = await translateClipLines(Object.assign({}, opts, { cues: merged }));
     if (second.some(isMergePrevMarker)) throw new Error("boundary repair still rejected after one retry");
     for (var j = 0; j < second.length; j++) {

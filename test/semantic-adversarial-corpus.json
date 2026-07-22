@@ -1,0 +1,54 @@
+[
+  {
+    "name": "fast-speech-safe-clause",
+    "marked": "The presenter moved quickly through the setup steps | then paused briefly so everyone could verify the final configuration",
+    "outcome": "success"
+  },
+  {
+    "name": "punctuation-free-conversation",
+    "marked": "I mean that the smaller model works well for daily use | you only need the larger one for heavy workloads",
+    "outcome": "success"
+  },
+  {
+    "name": "comparison-keeps-than-phrase",
+    "marked": "This compact kettle heats water significantly faster than the stove top model | even during repeated tests in the cold laboratory",
+    "outcome": "success"
+  },
+  {
+    "name": "numbers-and-electrical-units",
+    "marked": "Our electrical system limits ordinary outlets to 120 volts and 1500 watts | specialized circuits can safely provide 240 volts and 3000 watts",
+    "outcome": "success"
+  },
+  {
+    "name": "dense-enumeration",
+    "marked": "The kit includes two filters three adapters and a short charging cable | each component fits inside the supplied carrying case",
+    "outcome": "success"
+  },
+  {
+    "name": "relative-clause",
+    "marked": "The controller that monitors battery temperature adjusts the charging current automatically | which prevents excessive heat during long summer drives",
+    "outcome": "fallback"
+  },
+  {
+    "name": "phrasal-verb-reporting-clause",
+    "marked": "Let me point out that the least expensive adapter I could get my hands on | still handled every device in our overnight test",
+    "outcome": "success",
+    "exactSegments": true
+  },
+  {
+    "name": "causal-clause",
+    "marked": "The backup service remained online throughout the outage | because its batteries had finished charging before the storm arrived",
+    "outcome": "fallback"
+  },
+  {
+    "name": "parenthetical",
+    "marked": "The newer unit unlike the original prototype runs quietly on the desk | and it consumes much less power during routine operation",
+    "outcome": "success",
+    "exactSegments": true
+  },
+  {
+    "name": "no-safe-boundary-fallback",
+    "marked": "If the network connection disappears while the firmware update is still being installed the recovery process may take several additional minutes",
+    "outcome": "fallback"
+  }
+]

@@ -29,8 +29,12 @@ jobs:
           node --check test/e2e-harness.js
           node --check test/browser-replay/run.js
           node --check test/run-tests.js
+          node --check test/run-semantic-corpus.js
+          node --check test/run-real-semantic-corpus.js
       - name: Unit and regression tests
         run: node test/run-tests.js
+      - name: Semantic adversarial corpus
+        run: node test/run-semantic-corpus.js
       - name: Offline structural E2E
         run: node test/e2e-harness.js --full
       - name: Setup Chrome

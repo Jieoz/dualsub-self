@@ -156,9 +156,67 @@ test("classifySemanticBoundary 拒绝条件从句与介词续接，但允许完�
     "whereas 1800 watts is allowed elsewhere"
   ), { safe: true, reason: "ok" });
   assert.deepStrictEqual(Core.classifySemanticBoundary(
+    "The controller that monitors battery temperature",
+    "adjusts the charging current automatically"
+  ), { safe: false, reason: "relative-subject-missing-predicate" });
+  assert.deepStrictEqual(Core.classifySemanticBoundary(
     "the cheapest kettle is faster despite being limited",
     "by our 120 volt electrical system"
   ), { safe: false, reason: "continuation-start" });
+  assert.deepStrictEqual(Core.classifySemanticBoundary(
+    "Let me point out",
+    "that the adapter still works"
+  ), { safe: false, reason: "continuation-start" });
+  assert.deepStrictEqual(Core.classifySemanticBoundary("rated at 120", "volts under load"), { safe: false, reason: "number-quantity" });
+  assert.deepStrictEqual(Core.classifySemanticBoundary("please look", "up the value"), { safe: false, reason: "continuation-start" });
+  assert.deepStrictEqual(Core.classifySemanticBoundary("this model is much more", "efficient than before"), { safe: false, reason: "dangling-end" });
+  assert.deepStrictEqual(Core.classifySemanticBoundary("please carry", "forward the result"), { safe: false, reason: "continuation-start" });
+  assert.deepStrictEqual(Core.classifySemanticBoundary("rated at one hundred twenty", "volts under load"), { safe: false, reason: "number-quantity" });
+  assert.deepStrictEqual(Core.classifySemanticBoundary("this unit is three times", "faster than before"), { safe: false, reason: "comparison-continuation" });
+  assert.deepStrictEqual(Core.classifySemanticBoundary("The cameras that monitor temperature", "regulate charging current"), { safe: false, reason: "relative-subject-missing-predicate" });
+  assert.deepStrictEqual(Core.classifySemanticBoundary("The controllers which monitor temperature", "cut power"), { safe: false, reason: "relative-subject-missing-predicate" });
+  assert.deepStrictEqual(Core.classifySemanticBoundary("The compact camera we tested yesterday", "records clear video"), { safe: false, reason: "relative-subject-missing-predicate" });
+  assert.deepStrictEqual(Core.classifySemanticBoundary("The compact camera John tested yesterday", "records clear video"), { safe: false, reason: "relative-subject-missing-predicate" });
+  assert.deepStrictEqual(Core.classifySemanticBoundary("the compact camera John tested yesterday", "records clear video"), { safe: false, reason: "relative-subject-missing-predicate" });
+  assert.deepStrictEqual(Core.classifySemanticBoundary("please move", "ahead with the plan"), { safe: false, reason: "continuation-start" });
+  assert.deepStrictEqual(Core.classifySemanticBoundary("rated at one hundred twenty", "ohms under load"), { safe: false, reason: "number-quantity" });
+  assert.deepStrictEqual(Core.classifySemanticBoundary("this unit is three times", "the previous speed"), { safe: false, reason: "comparison-continuation" });
+  assert.deepStrictEqual(Core.classifySemanticBoundary(
+    "The newer unit unlike the original prototype runs quietly on the desk",
+    "and it consumes much less power during routine operation"
+  ), { safe: true, reason: "ok" });
+  assert.deepStrictEqual(Core.classifySemanticBoundary(
+    "The box includes several tools",
+    "and the replacement cables for the camera"
+  ), { safe: false, reason: "continuation-start" });
+  assert.deepStrictEqual(Core.classifySemanticBoundary(
+    "The box of tools",
+    "and it works reliably"
+  ), { safe: false, reason: "continuation-start" });
+  assert.deepStrictEqual(Core.classifySemanticBoundary(
+    "The assorted tools",
+    "and it works reliably"
+  ), { safe: false, reason: "continuation-start" });
+  assert.deepStrictEqual(Core.classifySemanticBoundary(
+    "The report says that the controller which monitors battery temperature",
+    "adjusts the charging current automatically"
+  ), { safe: false, reason: "relative-subject-missing-predicate" });
+  assert.deepStrictEqual(Core.classifySemanticBoundary(
+    "The compact camera that we tested yesterday",
+    "and it still works reliably"
+  ), { safe: false, reason: "relative-subject-missing-predicate" });
+  assert.deepStrictEqual(Core.classifySemanticBoundary(
+    "The compact camera John tested yesterday",
+    "and it still works reliably"
+  ), { safe: false, reason: "relative-subject-missing-predicate" });
+  assert.deepStrictEqual(Core.classifySemanticBoundary(
+    "Let me explain that the controller which monitors temperature",
+    "adjusts charging current automatically"
+  ), { safe: false, reason: "relative-subject-missing-predicate" });
+  assert.deepStrictEqual(Core.classifySemanticBoundary(
+    "Let me explain that the compact camera that we tested yesterday",
+    "still works reliably"
+  ), { safe: false, reason: "relative-subject-missing-predicate" });
 });
 
 test("repairNaturalUnitBoundaries 合并条件主句和介词续接，但不把完整对比从句硬塞进前屏", () => {
@@ -187,24 +245,52 @@ test("filterUnsafeRescueMarks 保留可配自然中文的引导片段，只拒�
   marks[19] = "|"; // boiling water | than this ...：右侧比较从句续接
   marks[24] = "|"; // kettle | despite being limited：可自然译成让步字幕片段
   const filtered = Core.filterUnsafeRescueMarks(words, marks);
-  assert.strictEqual(filtered[13], "|", "引导片段可由中文完整改写，不能因此制造 34 词超长屏");
+  assert.strictEqual(filtered[13], "|", "引导片段只有完成 get my hands on 后才允许接主谓屏");
   assert.strictEqual(filtered[19], "", "than 比较结构不能另起字幕");
   assert.strictEqual(filtered[24], "|", "despite being + 分词是可连续阅读的自然字幕片段");
+
+  const badWords = "Let me point out that the least expensive adapter I could get my hands on still handled every device".split(" ");
+  const badMarks = badWords.map(() => "");
+  badMarks[8] = "|"; // ... adapter | I could get ...：reporting 名词短语仍悬空
+  const badFiltered = Core.filterUnsafeRescueMarks(badWords, badMarks);
+  assert.strictEqual(badFiltered[8], "", "reporting 例外不得放过普通名词短语边界");
+
+  for (const [source, cut] of [
+    ["the outlet is rated at 120 volts under load", 5],
+    ["please look up the value before continuing", 1],
+    ["this model is much more efficient than before", 4],
+    ["Let me explain that the controller which monitors temperature adjusts charging current automatically", 8],
+    ["please carry forward the result after checking", 1],
+    ["the outlet is rated at one hundred twenty volts under load", 7],
+    ["this unit is three times faster than before", 4],
+    ["The compact camera we tested yesterday records clear video", 5],
+    ["The compact camera John tested yesterday records clear video", 5],
+    ["please move ahead with the plan now", 1],
+    ["rated at one hundred twenty ohms under load", 4],
+    ["this unit is three times the previous speed", 4],
+    ["Let me explain that the compact camera that we tested yesterday still works reliably", 10],
+    ["the compact camera John tested yesterday records clear video", 5],
+  ]) {
+    const ws = source.split(" "), ms = ws.map(() => ""); ms[cut] = "|";
+    assert.strictEqual(Core.filterUnsafeRescueMarks(ws, ms)[cut], "", `危险候选边界必须拒绝: ${source}`);
+  }
+  const periodWords = "Let me explain that the compact camera that we tested yesterday still works reliably".split(" ");
+  const periodMarks = periodWords.map(() => ""); periodMarks[10] = ".";
+  assert.strictEqual(Core.filterUnsafeRescueMarks(periodWords, periodMarks)[10], "", "内部句点也不得绕过显式关系主语保护");
 });
 
-test("restoreAndPackTokens 首段条件从句不能为缩短显示而切成两条半句", async () => {
+asyncTest("restoreAndPackTokens 条件从句无安全短边界时显式回退而不是制造 21 词屏", async () => {
   const source = "If you're a human person one of those things you're going to want to do with some regularity is boil water";
   const tokens = source.split(" ").map((text, i) => ({ text, start: i * 200, end: (i + 1) * 200 }));
   let call = 0;
-  const units = await Core.restoreAndPackTokens({
+  await assert.rejects(() => Core.restoreAndPackTokens({
     tokens, apiBaseUrl: "https://example.test", apiKey: "k", apiModel: "m", chunkWords: 80,
+    preferredMaxWords: 16, maxWords: 16, attempts: 1,
     fetchImpl: async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: (++call === 1)
       ? source + "."
       : "If you're a human person | one of those things you're going to want to do with some regularity is boil water." } }] }) }),
-  });
-  assert.strictEqual(call, 2, "超过舒适显示长度的完整句必须触发自然从句 rescue");
-  assert.deepStrictEqual(units.map((u) => u.content), [source], "条件从句和主句必须作为同一自然语义单元");
-  assert.deepStrictEqual(units.map((u) => [u.start, u.end]), [[0, 4200]], "合并后必须保留完整词级时间范围");
+  }), /unresolved oversized semantic unit/i);
+  assert.strictEqual(call, 2, "超过硬上限且无自然边界时只做一次有界 rescue 后回退");
 });
 
 test("restoreAndPackTokens 对已验证超长句做一次局部 clause rescue", async () => {
@@ -234,6 +320,66 @@ test("partitionReadableTokenUnit 有界恢复 14/11/9 屏并拒绝无安全候�
   const units = Core.packRestoredTokens(tokens, marks, { maxWords: 16 });
   assert.deepStrictEqual(units.map((u) => u.content.split(/\s+/).length), [14, 11, 9]);
   assert.strictEqual(Core.partitionReadableTokenUnit("these words provide no recognized safe boundary for deterministic partitioning whatsoever today".split(" ").map((text, i) => ({ text, start: i, end: i + 1 })), [], { preferredWords: 6, hardWords: 8, minWords: 4 }), null);
+});
+
+asyncTest("restoreAndPackTokens 对无安全边界的超长句显式失败而不是返回超长显示单元", async () => {
+  const source = "these deliberately opaque tokens provide no recognized semantic boundary and remain impossible to partition safely without fabricating a hard cut today";
+  const tokens = source.split(" ").map((text, i) => ({ text, start: i * 100, end: (i + 1) * 100, nativeTiming: true }));
+  let calls = 0;
+  await assert.rejects(() => Core.restoreAndPackTokens({
+    tokens, apiBaseUrl: "https://example.test", apiKey: "x", apiModel: "m",
+    preferredMaxWords: 16, maxWords: 16, attempts: 1,
+    fetchImpl: async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: (++calls, source + ".") } }] }) }),
+  }), /unresolved oversized semantic unit/i);
+  assert.strictEqual(calls, 2, "只允许首轮恢复加一次有界 rescue");
+});
+
+asyncTest("restoreAndPackTokens 局部 rescue 无标点返回也不得删除既有外边界", async () => {
+  const source = "Let me point out that the least expensive adapter I could get my hands on still handled every device in our overnight test";
+  const tokens = source.split(" ").map((text, i) => ({ text, start: i * 100, end: (i + 1) * 100 }));
+  let call = 0;
+  const units = await Core.restoreAndPackTokens({
+    tokens, apiBaseUrl: "https://example.test", apiKey: "x", apiModel: "m",
+    preferredMaxWords: 14, maxWords: 16, attempts: 1,
+    fetchImpl: async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: (++call === 1)
+      ? "Let me point out that the least expensive adapter I could get my hands on | still handled every device in our overnight test."
+      : "Let me point out that the least expensive adapter I could get my hands on" } }] }) }),
+  });
+  assert.strictEqual(call, 2);
+  assert.deepStrictEqual(units.map(u => u.content.split(/\s+/).length), [15, 8]);
+  assert.strictEqual(units.map(u => u.content).join(" "), source);
+});
+
+test("partitionReadableTokenUnit 识别 reporting 主语后的副词加实义谓语", () => {
+  const source = "Let me point out that the least expensive adapter I could get my hands on still handled every device in our overnight test";
+  const tokens = source.split(" ").map((text, i) => ({ text, start: i * 100, end: (i + 1) * 100 }));
+  const marks = Core.partitionReadableTokenUnit(tokens, tokens.map(() => ""), { preferredWords: 14, hardWords: 16, minWords: 6 });
+  assert.ok(marks, "15/8 自然边界必须能确定性恢复");
+  assert.deepStrictEqual(Core.packRestoredTokens(tokens, marks, { maxWords: 16 }).map(u => u.content.split(/\s+/).length), [15, 8]);
+});
+
+
+test("partitionReadableTokenUnit 泛化识别 reporting 后的嵌入关系从句主语", () => {
+  const source = "Let me explain that the compact camera we tested during yesterday's rehearsal still records clear video throughout the entire night";
+  const tokens = source.split(" ").map((text, i) => ({ text, start: i * 100, end: (i + 1) * 100 }));
+  const marks = Core.partitionReadableTokenUnit(tokens, tokens.map(() => ""), { preferredWords: 14, hardWords: 16, minWords: 6 });
+  assert.ok(marks, "不得把规则绑死到 get my hands on 这一条目标句");
+  const units = Core.packRestoredTokens(tokens, marks, { maxWords: 16 });
+  assert.strictEqual(units.map(u => u.content).join(" "), source);
+  assert.ok(units.every(u => u.content.split(/\s+/).length <= 16));
+});
+
+test("partitionReadableTokenUnit 确定性识别完整并列分句与 trailing adjunct", () => {
+  for (const source of [
+    "The newer unit unlike the original prototype runs quietly on the desk and it consumes much less power during routine operation",
+    "This compact kettle heats water significantly faster than the stove top model even during repeated tests in the cold laboratory",
+  ]) {
+    const tokens = source.split(" ").map((text, i) => ({ text, start: i * 100, end: (i + 1) * 100 }));
+    const marks = Core.partitionReadableTokenUnit(tokens, tokens.map(() => ""), { preferredWords: 14, hardWords: 16, minWords: 6 });
+    assert.ok(marks, source);
+    const units = Core.packRestoredTokens(tokens, marks, { maxWords: 16 });
+    assert.ok(units.length >= 2 && units.every(u => u.content.split(/\s+/).length <= 16), source);
+  }
 });
 
 test("normalizeOversizeSentenceMarks 覆盖模型 4/21/9 坏切并恢复 14/11/9", () => {
@@ -641,6 +787,19 @@ test("mergeRejectedTranslationCues 只将 MERGE_PREV 与前一相邻 cue 合并�
   assert.deepStrictEqual(merged[0].tokens.map((t) => t.text), ["let", "is"]);
 });
 
+asyncTest("translateClipWithBoundaryRepair 拒绝 MERGE_PREV 重新制造超过 16 词的显示单元", async () => {
+  const cues = [
+    { start: 0, end: 1600, content: "the compact electric kettle that we tested this morning", tokens: [] },
+    { start: 1600, end: 3200, content: "is substantially faster than every stove top model in this comparison", tokens: [] },
+  ];
+  let calls = 0;
+  await assert.rejects(() => Core.translateClipWithBoundaryRepair({
+    cues, apiBaseUrl: "https://example.test", apiKey: "x", apiModel: "m", maxSourceWords: 16,
+    fetchImpl: async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: (++calls, "1. 这款紧凑型电热水壶，\n2. [MERGE_PREV]") } }] }) }),
+  }), /oversized source unit after boundary repair/i);
+  assert.strictEqual(calls, 1, "发现合并会重新制造超长屏时不得浪费第二次翻译调用");
+});
+
 
 test("默认翻译 prompt 要求从属开头且不能独立翻译时返回 MERGE_PREV", () => {
   assert.ok(Core.DEFAULT_SYSTEM_PROMPT.includes("[MERGE_PREV]"));
@@ -870,7 +1029,7 @@ test("makeCacheKey 同输入稳定、异输入不同", () => {
   assert.notStrictEqual(a, c, "目标语言不同 key 不同 → 不误命中");
 });
 
-test("makeCacheKey v0.5.7 隔离旧缓存与 fallback/semantic 分段", () => {
+test("makeCacheKey v0.5.8 隔离旧缓存与 fallback/semantic 分段", () => {
   const fallback = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", segmentationMode: "fallback", clipStartMs: 0 });
   const semantic = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", segmentationMode: "semantic", clipStartMs: 0 });
   assert.ok(fallback.startsWith("dsc-v59|fallback|"), "双语严格单行与英文自然分屏必须隔离旧缓存");
@@ -2161,7 +2320,7 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     const raw = fs.readFileSync(path.join(ROOT, "manifest.json"), "utf8");
     const m = JSON.parse(raw);
     assert.strictEqual(m.manifest_version, 3);
-    assert.strictEqual(m.version, "0.5.7", "安装测试包版本必须递增，不能覆盖 v0.5.6");
+    assert.strictEqual(m.version, "0.5.8", "安装测试包版本必须递增，不能覆盖 v0.5.7");
     assert.ok(Array.isArray(m.content_scripts) && m.content_scripts.length === 2);
     const worlds = m.content_scripts.map((c) => c.world).sort();
     assert.deepStrictEqual(worlds, ["ISOLATED", "MAIN"]);
