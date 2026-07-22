@@ -29,6 +29,8 @@
   var STORAGE_KEY = "dualsub:" + location.origin; // 按 origin 存
   var CACHE_KEY = "dualsub:cache"; // 翻译缓存（全 origin 共享，按 videoId/轨道/语言/model 区分）
   var CACHE_MAX_ENTRIES = 800; // 缓存条目上限（LRU 裁剪，防配额溢出）
+  var SEMANTIC_CACHE_KEY = "dualsub:semantic-cache"; // 严格词流语义恢复结果，避免刷新后整轨重跑模型
+  var SEMANTIC_CACHE_MAX_ENTRIES = 24; // 语义轨道体积较大，独立小型 LRU 防 storage 配额增长
   var DEFAULT_CONFIG = Core.DEFAULT_CONFIG;
 
   // 跨 clip 的全局 in-flight 翻译请求上限（每个内容脚本实例一个信号量）。
@@ -86,6 +88,7 @@
     waitPausedByUs: false,
     waitTimer: null,
     firstClipReady: false,
+    apiUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0, reasoningTokens: 0, requests: 0 },
   };
 
   // 渲染/预取节拍（ms）。渲染 250ms 人眼无感；预取 1s 一次（比渲染低频，但比旧 1.5s 更跟手），与渲染解耦。
@@ -129,11 +132,77 @@
    * ===================================================== */
   // v0.5.2：JSON3 词级时间可用时，先做严格词流等价的句子/从句恢复。
   // 所有失败都整轨回落，绝不把模型改写或半段边界混进字幕时间轴。
+  function recordApiUsage(usage) {
+    if (!usage || typeof usage !== "object") return;
+    var prompt = Number(usage.prompt_tokens != null ? usage.prompt_tokens : usage.input_tokens) || 0;
+    var completion = Number(usage.completion_tokens != null ? usage.completion_tokens : usage.output_tokens) || 0;
+    var total = Number(usage.total_tokens) || (prompt + completion);
+    var details = usage.completion_tokens_details || usage.output_tokens_details || {};
+    var reasoning = Number(details.reasoning_tokens) || 0;
+    state.apiUsage.promptTokens += prompt;
+    state.apiUsage.completionTokens += completion;
+    state.apiUsage.totalTokens += total;
+    state.apiUsage.reasoningTokens += reasoning;
+    state.apiUsage.requests++;
+  }
+
+  function readSemanticCache() {
+    return new Promise(function (resolve) {
+      try {
+        chrome.storage.local.get([SEMANTIC_CACHE_KEY], function (res) {
+          var cache = res && res[SEMANTIC_CACHE_KEY];
+          resolve(cache && typeof cache === "object" ? cache : {});
+        });
+      } catch (e) { resolve({}); }
+    });
+  }
+
+  function writeSemanticCache(key, cues) {
+    return readSemanticCache().then(function (cache) {
+      cache[key] = {
+        t: Date.now(),
+        cues: (cues || []).map(function (cue) {
+          return { start: cue.start, end: cue.end, content: cue.content };
+        }),
+      };
+      var obj = {};
+      obj[SEMANTIC_CACHE_KEY] = Core.pruneCache(cache, SEMANTIC_CACHE_MAX_ENTRIES);
+      return new Promise(function (resolve) {
+        try { chrome.storage.local.set(obj, resolve); } catch (e) { resolve(); }
+      });
+    });
+  }
+
+  function cachedSemanticCues(entry, tokens) {
+    if (!entry || !Array.isArray(entry.cues) || !entry.cues.length) return null;
+    var cleaned = Core.cleanupCues(entry.cues);
+    if (!cleaned.length) return null;
+    var sourceWords = Core.restoredWords((tokens || []).map(function (t) { return t.text || ""; }).join(" "));
+    var cachedText = cleaned.map(function (cue) { return cue.content || ""; }).join(" ");
+    return Core.sameRestoredWords(sourceWords, cachedText) ? cleaned : null;
+  }
+
   async function restoreSemanticCuesIfAvailable(cues) {
     if (!config.apiBaseUrl || !config.apiKey || !config.apiModel) return null;
     if (!Core.hasNativeTokenTiming(cues, 0.8)) return null;
     var tokens = Core.collectSemanticTokens(cues);
     if (!tokens.length) return null;
+    var restorationPrompt = Core.DEFAULT_RESTORATION_PROMPT;
+    var cacheKey = Core.makeSemanticCacheKey({
+      videoId: state.videoId,
+      trackCode: state.activeTrack ? state.activeTrack.code : "",
+      apiBaseUrl: config.apiBaseUrl,
+      apiModel: config.apiModel,
+      tokens: tokens,
+      systemPrompt: restorationPrompt,
+      chunkWords: 120,
+      overlapWords: 30,
+      preferredMaxWords: 14,
+      maxWords: 16,
+    });
+    var cache = await readSemanticCache();
+    var cached = cachedSemanticCues(cache[cacheKey], tokens);
+    if (cached) return cached;
     try {
       var restored = await Core.restoreAndPackTokens({
         tokens: tokens,
@@ -141,6 +210,7 @@
         apiKey: config.apiKey,
         apiModel: config.apiModel,
         reasoningEffort: config.reasoningEffort,
+        systemPrompt: restorationPrompt,
         chunkWords: 120,
         overlapWords: 30,
         preferredMaxWords: 14,
@@ -148,8 +218,11 @@
         attempts: 2,
         timeoutMs: 20000,
         fetchImpl: function (u, o) { return fetch(u, o); },
+        onUsage: recordApiUsage,
       });
-      return restored && restored.length ? Core.cleanupCues(restored) : null;
+      var cleaned = restored && restored.length ? Core.cleanupCues(restored) : null;
+      if (cleaned && cleaned.length) await writeSemanticCache(cacheKey, cleaned);
+      return cleaned;
     } catch (e) {
       console.warn("[dualsub] 语义恢复未通过词流契约，回退 ASR 重组：", e && e.message);
       return null;
@@ -381,6 +454,7 @@
         maxLineChars: config.maxLineChars,
         timeoutMs: 20000,
         fetchImpl: function (u, o) { return fetch(u, o); },
+        onUsage: recordApiUsage,
       });
     });
   }
@@ -634,6 +708,7 @@
             fetchImpl: function (u, o) {
               return fetch(u, o);
             },
+            onUsage: recordApiUsage,
           });
         });
       } catch (e) {
@@ -1286,6 +1361,7 @@
           return { code: t.code, name: t.name, languageCode: t.languageCode, kind: t.kind };
         }),
         videoId: state.videoId,
+        apiUsage: Object.assign({}, state.apiUsage),
       });
       return true;
     }
@@ -1401,6 +1477,7 @@
       return { ok: false, error: "请先填写 apiBaseUrl 和 apiModel" };
     }
     try {
+      var connectionUsage = null;
       var lines = await Core.translateClipLines({
         cues: [{ content: "hello world" }],
         apiBaseUrl: cfg.apiBaseUrl,
@@ -1409,8 +1486,9 @@
         targetLang: cfg.targetLang || "zh-Hans",
         systemPrompt: cfg.systemPrompt,
         reasoningEffort: cfg.reasoningEffort,
+        onUsage: function (usage) { connectionUsage = usage; },
       });
-      return { ok: true, sample: lines && lines[0] ? lines[0] : "(空响应)" };
+      return { ok: true, sample: lines && lines[0] ? lines[0] : "(空响应)", usage: connectionUsage };
     } catch (e) {
       return { ok: false, error: String(e && e.message ? e.message : e) };
     }

@@ -220,10 +220,10 @@
   // 可验证却不适合阅读的边界。这里只合并相邻源 token，绝不改写、重排或删词。
   var CONTINUATION_START_WORDS = {
     from: true, to: true, of: true, in: true, on: true, at: true, with: true, for: true, by: true,
-    into: true, over: true, under: true, through: true, during: true, after: true, before: true, without: true,
+    into: true, over: true, under: true, through: true, throughout: true, during: true, after: true, before: true, without: true,
     up: true, down: true, out: true, off: true, away: true, back: true, around: true, apart: true,
     forward: true, forth: true, ahead: true, along: true, across: true, together: true, aside: true,
-    past: true, round: true, behind: true, beyond: true, through: true,
+    past: true, round: true, behind: true, beyond: true,
     and: true, or: true, but: true, because: true, that: true, which: true, who: true, whose: true,
     when: true, while: true, if: true, than: true, as: true,
   };
@@ -1688,6 +1688,7 @@
           userContent: source,
           timeoutMs: opts.timeoutMs,
           fetchImpl: opts.fetchImpl,
+          onUsage: opts.onUsage,
         });
         chunkMarks = restoredBoundaryMarks(tokenWords(chunk), restored);
         if (chunkMarks) break;
@@ -1916,6 +1917,7 @@
       userContent: userContent,
       timeoutMs: opts.timeoutMs,
       fetchImpl: opts.fetchImpl,
+      onUsage: opts.onUsage,
     });
     var n = cues.length;
     var maxLine = opts.maxLineChars != null ? opts.maxLineChars : DEFAULT_CONFIG.maxLineChars || 20;
@@ -1999,7 +2001,7 @@
     var fetchImpl = opts.fetchImpl || (typeof fetch !== "undefined" ? fetch : null);
     if (!fetchImpl) throw new Error("no fetch implementation available");
 
-    var url = joinUrl(opts.apiBaseUrl, "/chat/completions");
+    var url = chatCompletionsUrl(opts.apiBaseUrl);
     var body = {
       model: opts.apiModel,
       temperature: typeof opts.temperature === "number" ? opts.temperature : 0.3,
@@ -2046,22 +2048,86 @@
     }
     if (timer) clearTimeout(timer);
 
-    if (!resp.ok) {
-      var errText = "";
+    var data = null;
+    var responseText = "";
+    if (typeof resp.text === "function") {
+      try { responseText = await resp.text(); } catch (e) {}
+    } else if (typeof resp.json === "function") {
+      // 兼容离线测试和少数只暴露 json() 的 fetch shim；真实 Response 始终先读 text()。
+      try { data = await resp.json(); } catch (e) {
+        throw malformedApiResponseError(resp, "");
+      }
+    }
+    if (data == null) {
+      var contentType = responseContentType(resp);
+      if (/text\/html|application\/xhtml/i.test(contentType) || /^\s*</.test(responseText)) {
+        throw htmlApiResponseError(resp, contentType);
+      }
       try {
-        errText = await resp.text();
-      } catch (e) {}
-      // HTTP 429（限流）单独打标，便于自适应 gate 识别并降并发（第3层）。
-      var httpErr = new Error("translate HTTP " + resp.status + " " + (errText || "").slice(0, 200));
+        if (responseText) data = JSON.parse(responseText);
+        else if (typeof resp.json === "function") data = await resp.json();
+      } catch (e) {
+        throw malformedApiResponseError(resp, contentType);
+      }
+    }
+    if (!resp.ok) {
+      var apiMessage = data && data.error && (data.error.message || data.error.code) || "";
+      var httpErr = new Error("translate HTTP " + resp.status + (apiMessage ? " " + String(apiMessage).slice(0, 200) : ""));
       if (resp.status === 429) httpErr.code = "429";
       throw httpErr;
     }
-
-    var data = await resp.json();
+    if (typeof opts.onUsage === "function" && data && data.usage) {
+      try { opts.onUsage(data.usage); } catch (e) {}
+    }
     return data && data.choices && data.choices[0] && data.choices[0].message
       ? data.choices[0].message.content
       : "";
   }
+
+  function responseContentType(resp) {
+    try { return String(resp && resp.headers && resp.headers.get("content-type") || ""); } catch (e) { return ""; }
+  }
+
+  function safeResponsePath(resp) {
+    try { return new URL(String(resp && resp.url || "")).pathname || "/"; } catch (e) { return ""; }
+  }
+
+  function responseMeta(resp, contentType) {
+    var status = Number(resp && resp.status) || 0;
+    var path = safeResponsePath(resp);
+    var bits = ["HTTP " + status];
+    if (contentType) bits.push(contentType.split(";")[0]);
+    if (path) bits.push("路径 " + path);
+    if (resp && resp.redirected) bits.push("发生重定向");
+    return bits.join("，");
+  }
+
+  function responseError(message, resp) {
+    var err = new Error(message);
+    var status = Number(resp && resp.status) || 0;
+    if (status) err.code = String(status);
+    return err;
+  }
+
+  function htmlApiResponseError(resp, contentType) {
+    return responseError(
+      "API 返回 HTML 而不是 JSON（" + responseMeta(resp, contentType) + "）。" +
+      "请确认填写的是 OpenAI 兼容 API Base URL（通常以 /v1 结尾），不要填写控制台或网站首页",
+      resp
+    );
+  }
+
+  function malformedApiResponseError(resp, contentType) {
+    return responseError("API 返回的不是有效 JSON（" + responseMeta(resp, contentType) + "）", resp);
+  }
+
+  /** 允许填写 API Base URL 或完整 /chat/completions 地址，避免重复拼接。 */
+  function chatCompletionsUrl(base) {
+    var b = String(base || "").trim().replace(/\/+$/, "");
+    if (/\/chat\/completions$/i.test(b)) return b;
+    return joinUrl(b, "/chat/completions");
+  }
+
   /** 拼接 base 和 path，避免重复/缺失斜杠 */
   function joinUrl(base, path) {
     var b = String(base || "").replace(/\/+$/, "");
@@ -2436,6 +2502,48 @@
    * 生成缓存 key：架构版本 + 视频/轨道/语言/model + clip 起点 + cue 边界/正文指纹。
    * cue 指纹确保语义边界回修前后不碰撞，缓存中的译文与共享时间轴始终同批 1:1。
    */
+  function hashCacheIdentity(value) {
+    var text = String(value == null ? "" : value);
+    var h1 = 0x811c9dc5;
+    var h2 = 0x9e3779b9;
+    for (var i = 0; i < text.length; i++) {
+      var code = text.charCodeAt(i);
+      h1 = Math.imul(h1 ^ code, 0x01000193);
+      h2 = Math.imul(h2 ^ code, 0x85ebca6b);
+    }
+    return (h1 >>> 0).toString(36) + (h2 >>> 0).toString(36);
+  }
+
+  function semanticTokenFingerprint(tokens) {
+    var parts = [];
+    (tokens || []).forEach(function (token) {
+      parts.push([
+        String(token && token.text || ""),
+        Number(token && token.start) || 0,
+        Number(token && token.end) || 0,
+      ].join("\x1f"));
+    });
+    return parts.length + ":" + hashCacheIdentity(parts.join("\x1e"));
+  }
+
+  /** 严格词流语义恢复缓存 key；不把网关 URL 原文写入 storage key。 */
+  function makeSemanticCacheKey(parts) {
+    parts = parts || {};
+    return [
+      "dss-v1",
+      parts.videoId || "",
+      parts.trackCode || "",
+      parts.apiModel || "",
+      hashCacheIdentity(String(parts.apiBaseUrl || "").replace(/\/+$/, "")),
+      semanticTokenFingerprint(parts.tokens || []),
+      hashCacheIdentity(parts.systemPrompt || DEFAULT_RESTORATION_PROMPT),
+      Number(parts.chunkWords) || 120,
+      Number(parts.overlapWords) || 30,
+      Number(parts.preferredMaxWords) || 14,
+      Number(parts.maxWords) || 16,
+    ].join("|");
+  }
+
   function makeCacheKey(parts) {
     parts = parts || {};
     return [
@@ -2802,9 +2910,11 @@
     restoreTokenBoundaries: restoreTokenBoundaries,
     restoreAndPackTokens: restoreAndPackTokens,
     chatCompletion: chatCompletion,
+    chatCompletionsUrl: chatCompletionsUrl,
     sliceClips: sliceClips,
     sliceClipsByCue: sliceClipsByCue,
     makeCacheKey: makeCacheKey,
+    makeSemanticCacheKey: makeSemanticCacheKey,
     pruneCache: pruneCache,
     makeBackoff: makeBackoff,
     joinUrl: joinUrl,

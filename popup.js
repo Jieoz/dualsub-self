@@ -35,6 +35,22 @@
     el.className = kind || "";
   }
 
+  function updateUsageInfo(usage) {
+    var el = $("usageInfo");
+    if (!el) return;
+    usage = usage || {};
+    var requests = Number(usage.requests) || 0;
+    if (!requests) {
+      el.textContent = "本页尚无可统计的 API Token";
+      return;
+    }
+    el.textContent =
+      "本页 API：" + requests + " 次请求 · 输入 " + (Number(usage.promptTokens) || 0) +
+      " · 输出 " + (Number(usage.completionTokens) || 0) +
+      " · 总计 " + (Number(usage.totalTokens) || 0) + " Token" +
+      ((Number(usage.reasoningTokens) || 0) ? "（含推理 " + Number(usage.reasoningTokens) + "）" : "");
+  }
+
   /** 获取当前活动标签页 */
   function activeTab() {
     return new Promise(function (resolve) {
@@ -246,6 +262,7 @@
       if (resp && resp.tracks) {
         fillTracks(resp.tracks);
         trySetSelect("sourceLang", stored.sourceLang || "auto");
+        updateUsageInfo(resp.apiUsage);
       }
     }
   }
@@ -289,7 +306,9 @@
       if (!resp) {
         setStatus("无响应：请在 YouTube 标签页打开并刷新后重试", "err");
       } else if (resp.ok) {
-        setStatus("连接成功 ✓\n示例翻译： " + (resp.sample || ""), "ok");
+        var usage = resp.usage || {};
+        var tokenText = usage.total_tokens != null ? "\n本次请求 Token：" + usage.total_tokens : "";
+        setStatus("连接成功 ✓\n示例翻译： " + (resp.sample || "") + tokenText, "ok");
       } else {
         setStatus("连接失败：" + (resp.error || "未知错误"), "err");
       }
