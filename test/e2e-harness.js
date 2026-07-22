@@ -28,6 +28,7 @@
 const fs = require("fs");
 const path = require("path");
 const Core = require("../core.js");
+const EXT_VERSION = require("../manifest.json").version;
 
 /* ----------------------------- 参数解析 ----------------------------- */
 function parseArgs(argv) {
@@ -92,7 +93,7 @@ function loadOriginalCues(limit) {
 
 /* ---------------- mock 模型：按源 cue 编号 1:1 返回中文 ---------------- */
 function structuralMockZh(index) {
-  return "完整译文" + String(index + 1);
+  return "完整译文" + String(index + 1) + "。";
 }
 
 function makeMockFetch(clipLinesResolver, stats, opts) {
@@ -177,7 +178,7 @@ async function run() {
     mode = "MOCK (offline structural 1:1; no legacy translation remapping)";
   }
 
-  console.log("\n=== dualsub E2E harness (v0.5.1) ===");
+  console.log("\n=== dualsub E2E harness (v" + EXT_VERSION + ") ===");
   console.log("mode      :", mode);
   console.log("cues      :", originalCues.length, "original →", reseg.length, "resegmented →", clips.length, "clips");
   console.log("tuning    : clipSeconds=" + a.clipSeconds + " firstClipSeconds=" + a.firstClipSeconds +
@@ -229,8 +230,10 @@ async function run() {
   const audit = auditWordCuts(renderUnits);
   const oneToOneOk = renderUnits.length === reseg.length &&
     renderUnits.every((u) => u.originalText && u.translation && u.start < u.end);
+  const noChineseFullStop = renderUnits.every((u) => !(u.translation || "").includes("。"));
   console.log("结构 1:1      :", oneToOneOk ? "PASS" : "FAIL");
-  if (!detectorOk || !oneToOneOk || (a.real && !audit.pass)) process.exitCode = 1;
+  console.log("中文字幕无句号:", noChineseFullStop ? "PASS" : "FAIL");
+  if (!detectorOk || !oneToOneOk || !noChineseFullStop || (a.real && !audit.pass)) process.exitCode = 1;
   if (!a.real) {
     console.log("说明          : MOCK 使用确定性占位译文，只验证 1:1/时轴/空响应；不冒充真实模型语言质量。" );
   }
@@ -279,7 +282,7 @@ function writeOutputs(renderUnits, stats, a, mode) {
     "td.n{color:#999;text-align:right;width:40px}td.t{color:#888;white-space:nowrap;font-family:monospace;width:170px}" +
     "td.o{color:#555;width:42%}td.z{color:#06c;font-weight:600}" +
     "tr:nth-child(even){background:#fafafa}</style></head><body>" +
-    "<h1>dualsub E2E review (v0.5.0)</h1><div class=meta>mode: " + htmlEscape(mode) +
+    "<h1>dualsub E2E review (v" + htmlEscape(EXT_VERSION) + ")</h1><div class=meta>mode: " + htmlEscape(mode) +
     " &nbsp;|&nbsp; render units: " + renderUnits.length +
     " &nbsp;|&nbsp; clipSeconds=" + a.clipSeconds + " minLineChars=" + a.minLineChars + "</div>" +
     "<table><thead><tr><th>#</th><th>时间轴</th><th>原文</th><th>译文</th></tr></thead><tbody>" +

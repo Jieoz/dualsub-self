@@ -19,7 +19,7 @@ function tokensOf(text) { return text.split(/\s+/).map((word, i) => ({ text: wor
       if (cues.map(c => c.content).join(" ") !== source) throw new Error("source word stream changed");
       const translated = await Core.translateClipWithBoundaryRepair({ cues, apiBaseUrl: base, apiKey: key, apiModel: model, reasoningEffort: "low", targetLang: "简体中文", maxSourceWords: 16, timeoutMs: 60000 });
       if (translated.cues.length !== translated.lines.length) throw new Error("bilingual alignment mismatch");
-      translated.lines.forEach((line, i) => { const v = Core.validateChineseDisplayUnit(line); if (!v.ok) throw new Error(`invalid Chinese ${i + 1}: ${v.reason}`); });
+      translated.lines.forEach((line, i) => { const v = Core.validateChineseDisplayUnit(line); if (!v.ok) throw new Error(`invalid Chinese ${i + 1}: ${v.reason}`); if (line.includes("。")) throw new Error(`Chinese full stop escaped in line ${i + 1}`); });
       if (translated.cues.some(c => c.content.split(/\s+/).length > 16)) throw new Error("translation repair recreated oversized cue");
       const actualSegments = translated.cues.map(c => c.content);
       if (item.exactSegments) assert.deepStrictEqual(actualSegments, markedSegments(item.marked), `${item.name}: semantic boundary drift`);
@@ -32,7 +32,7 @@ function tokensOf(text) { return text.split(/\s+/).map((word, i) => ({ text: wor
     assert.strictEqual(results[i].outcome, corpus[i].outcome === "success" ? "translated" : "fallback", `${corpus[i].name}: unexpected ${results[i].outcome}`);
   }
   const out = { generatedAt: new Date().toISOString(), model, results };
-  fs.writeFileSync(process.env.DUALSUB_AUDIT_OUT || "/tmp/dualsub-v058-real-corpus.json", JSON.stringify(out, null, 2));
+  fs.writeFileSync(process.env.DUALSUB_AUDIT_OUT || "/tmp/dualsub-v059-real-corpus.json", JSON.stringify(out, null, 2));
   const translated = results.filter(x => x.outcome === "translated").length;
   console.log(`REAL_CORPUS translated=${translated} fallback=${results.length - translated} total=${results.length}`);
   if (!translated) process.exit(2);
