@@ -378,12 +378,12 @@
         return;
       }
       if (!resp.ok || !resp.units || !resp.units.length) {
-        setStatus("当前视频还没有可导出的译文，请先播放并等待翻译出现", "err");
+        setStatus("当前视频还没有全部翻译完成，不能导出半成品 SRT。请继续播放/等待译文补齐后再导出", "err");
         return;
       }
-      var srt = Core.buildSrt ? Core.buildSrt(resp.units, { mode: mode }) : "";
+      var srt = Core.buildSrt ? Core.buildSrt(resp.units, { mode: mode, requireTranslations: true }) : "";
       if (!srt) {
-        setStatus("生成 SRT 为空（无有效字幕单元）", "err");
+        setStatus("生成 SRT 为空：仍存在未翻译字幕单元，已阻止导出半成品", "err");
         return;
       }
       try {

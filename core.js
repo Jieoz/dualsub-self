@@ -2887,6 +2887,13 @@
         return u.originalText || u.translation;
       });
 
+    if (opts.requireTranslations) {
+      var hasMissingTranslation = units.some(function (u) {
+        return u.originalText && String(u.translation || "").trim() === "";
+      });
+      if (hasMissingTranslation) return "";
+    }
+
     units.sort(function (a, b) {
       var d = (a.startMs || 0) - (b.startMs || 0);
       return d !== 0 ? d : a._i - b._i;

@@ -74,6 +74,7 @@
     clipBackoff: {}, // clipIndex -> backoff 控制器（失败退避）
     clipInflight: {}, // clipIndex -> bool：translateClip 进行中（重入互斥，防同 clip 并发）
     retryTimer: null, // 后台失败重试调度器 id（第2层；只在有 error clip 时活跃）
+    semanticFallbackTimer: null, // 语义恢复过慢时先翻 fallback，避免 1–2 分钟只有英文
     renderer: null, // 叠加层 DOM
     videoEl: null,
     fontObserver: null, // ResizeObserver：观察播放器高度变化，同比缩放字号（全屏放大）
@@ -327,7 +328,16 @@
     state.clipInflight = {};
     state.lastHitCueIdx = -1;
     state.lastPrefetchMs = -1e9;
+    clearSemanticFallbackTimer();
+    restoreNativeCaptions();
     clearRenderer();
+  }
+
+  function clearSemanticFallbackTimer() {
+    if (state.semanticFallbackTimer != null) {
+      clearTimeout(state.semanticFallbackTimer);
+      state.semanticFallbackTimer = null;
+    }
   }
 
   /**
@@ -406,10 +416,17 @@
         return;
       }
       // 完整验证成功后才原子切换到语义时间轴；失败保持已工作的 fallback。
+      // 但语义恢复慢不能阻塞首屏中文字幕：短阈值后先翻 fallback，后续 semantic 准备好再升级。
       var loadEpoch = state.timelineEpoch;
+      clearSemanticFallbackTimer();
+      state.semanticFallbackTimer = setTimeout(function () {
+        state.semanticFallbackTimer = null;
+        enableFallbackTranslation(loadEpoch);
+      }, 700);
       setTimeout(function () {
         restoreSemanticCuesIfAvailable(cues).then(async function (semanticCues) {
           if (loadEpoch !== state.timelineEpoch) return;
+          clearSemanticFallbackTimer();
           if (!semanticCues || !semanticCues.length) {
             enableFallbackTranslation(loadEpoch);
             return;
@@ -419,6 +436,7 @@
         }).catch(function (e) {
           // Semantic restoration is optional. If it fails, translate the already resegmented
           // fallback timeline instead of leaving the page permanently English-only.
+          clearSemanticFallbackTimer();
           console.warn("[dualsub] semantic restore failed; translating fallback timeline", e);
           enableFallbackTranslation(loadEpoch);
         });
@@ -429,7 +447,10 @@
   }
 
   function enableFallbackTranslation(loadEpoch) {
-    if (loadEpoch !== state.timelineEpoch || state.segmentationMode !== "fallback") return false;
+    if (loadEpoch !== state.timelineEpoch) return false;
+    if (state.segmentationMode === "semantic") return false;
+    if (state.segmentationMode === "fallback-translation") return false;
+    if (state.segmentationMode !== "fallback") return false;
     state.segmentationMode = "fallback-translation";
     // The English fallback is already visible, so degraded translation must never pause playback.
     state.firstClipReady = true;
@@ -534,6 +555,7 @@
     }
 
     state.timelineEpoch++;
+    clearSemanticFallbackTimer();
     // fallback 已经给用户可播放首屏；后台语义切换绝不再次暂停视频等翻译。
     if (mode === "semantic") state.firstClipReady = true;
     state.segmentationMode = mode;
@@ -671,6 +693,7 @@
 
   async function translateClip(idx) {
     var timelineEpoch = state.timelineEpoch;
+    var segmentationModeAtStart = state.segmentationMode;
     var clip = state.clips[idx];
     if (!clip) return;
     if (state.clipState[idx] === "done") return;
@@ -696,7 +719,7 @@
       // 命中后重跑 buildClipUnits 按当前 clip 时间窗配时间轴（时间轴不入缓存，避免跨会话漂移）。
       var key = clipCacheKey(clip);
       var cached = await readCache();
-      if (timelineEpoch !== state.timelineEpoch) return;
+      if (timelineEpoch !== state.timelineEpoch || segmentationModeAtStart !== state.segmentationMode) return;
       if (cached[key] && Array.isArray(cached[key].lines)) {
         if (Array.isArray(cached[key].cues) && cached[key].cues.length === cached[key].lines.length) {
           clip.cues = cached[key].cues;
@@ -750,7 +773,7 @@
         return;
       }
 
-      if (timelineEpoch !== state.timelineEpoch) return;
+      if (timelineEpoch !== state.timelineEpoch || segmentationModeAtStart !== state.segmentationMode) return;
       if (translationResult && translationResult.repaired) {
         // 缓存仍写入本次请求的输入 key；下次以同一原始 cue 查询即可命中，
         // value 内携带回修后的 cues，命中后原子恢复同批时间轴。
@@ -758,7 +781,7 @@
       }
       applyClipLines(idx, clip, key, translationResult ? translationResult.lines : []);
     } catch (e) {
-      if (timelineEpoch !== state.timelineEpoch) return;
+      if (timelineEpoch !== state.timelineEpoch || segmentationModeAtStart !== state.segmentationMode) return;
       // applyClipLines / readCache / rebuildRenderTimeline 等意外抛出：绝不让 clip 卡死。
       // 降级为 error + 退避，交后台调度器重试（达 maxFails 才 failed），不再永久 pending。
       console.warn("[dualsub] clip", idx, "translateClip 意外异常 → 降级 error 重试：", e && e.message);
@@ -766,7 +789,7 @@
       getBackoff(idx).fail();
       ensureRetryScheduler();
     } finally {
-      if (timelineEpoch !== state.timelineEpoch) return;
+      if (timelineEpoch !== state.timelineEpoch || segmentationModeAtStart !== state.segmentationMode) return;
       state.clipInflight[idx] = false;
       // 兜底：跑完后仍残留 pending（任何路径漏写终态）→ 当作可重试 error，杜绝永久「翻译中…」。
       if (state.clipState[idx] === "pending") {
@@ -885,6 +908,7 @@
       }
     }
     state.renderUnits = units;
+    updateNativeCaptionVisibility();
     // 时间轴重建后旧的命中下标失效（单元数/边界变了）
     state.lastHitCueIdx = -1;
   }
@@ -985,6 +1009,7 @@
       ".dualsub-trans.dualsub-pending{ opacity:0.55; font-style:italic; }",
       ".dualsub-trans.dualsub-failed{ opacity:0.6; font-style:italic; color:#ff8a8a; }",
       ".dualsub-hidden{ display:none !important; }",
+      ".dualsub-hide-native-captions .ytp-caption-window-container{ display:none !important; }",
     ].join("\n");
     var styleEl = document.createElement("style");
     styleEl.id = STYLE_ID;
@@ -1035,6 +1060,28 @@
         r.insertBefore(r._orig, r._trans);
       }
     }
+  }
+
+  function updateNativeCaptionVisibility() {
+    var player = playerEl();
+    if (!player) return;
+    if (!config.enabled || !state.renderer) {
+      player.classList.remove("dualsub-hide-native-captions");
+      return;
+    }
+    var domHasDualsubText = state.renderer && (
+      String(state.renderer._orig && state.renderer._orig.textContent || "").trim() !== "" ||
+      String(state.renderer._trans && state.renderer._trans.textContent || "").trim() !== ""
+    );
+    var timelineHasDualsubText = state.renderUnits.some(function (u) {
+      return u && (String(u.originalText || "").trim() !== "" || String(u.translation || "").trim() !== "");
+    });
+    player.classList.toggle("dualsub-hide-native-captions", !!(domHasDualsubText || timelineHasDualsubText));
+  }
+
+  function restoreNativeCaptions() {
+    var player = playerEl();
+    if (player) player.classList.remove("dualsub-hide-native-captions");
   }
 
   /**
@@ -1329,6 +1376,7 @@
       r._trans.classList.add("dualsub-hidden");
       r._trans.classList.remove("dualsub-pending", "dualsub-failed");
     }
+    updateNativeCaptionVisibility();
     fitSubtitleRows();
   }
 
@@ -1359,6 +1407,7 @@
     state.lastHitCueIdx = -1;
     if (full) {
       clearRenderer();
+      restoreNativeCaptions();
       lastRenderedKey = "";
     }
   }
@@ -1467,11 +1516,14 @@
       // popup 请求导出当前视频双语 SRT：返回已翻译的渲染单元（clip 渲染单元优先、原文兜底）+ 元信息。
       // 时间轴重建一次确保最新；renderUnits 内部用 start/end，转成 startMs/endMs 供 Core.buildSrt。
       rebuildRenderTimeline();
-      var hasTrans = state.renderUnits.some(function (u) {
-        return u.translation != null && String(u.translation).trim() !== "";
+      var realUnits = state.renderUnits.filter(function (u) {
+        return u && String(u.originalText || "").trim() !== "";
+      });
+      var allTranslated = realUnits.length > 0 && realUnits.every(function (u) {
+        return String(u.translation || "").trim() !== "";
       });
       sendResponse({
-        ok: state.renderUnits.length > 0 && hasTrans,
+        ok: allTranslated,
         videoId: state.videoId,
         targetLang: config.targetLang,
         units: state.renderUnits.map(function (u) {

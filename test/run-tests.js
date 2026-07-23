@@ -2019,7 +2019,7 @@ async function main() {
     assert.match(src, /translationResult = await[\s\S]*?segmentationMode:\s*state\.segmentationMode/, "运行翻译必须传入真实 segmentation mode");
     assert.strictEqual((src.match(/Core\.translateClipLines\s*\(/g) || []).length, 1, "除 testConnection 单行探针外不得绕过 repair/source-cap 门禁直调 translateClipLines");
     assert.match(src, /function testConnection[\s\S]*?Core\.translateClipLines\s*\(\{[\s\S]*?cues:\s*\[\{ content:\s*"hello world"/, "唯一直调必须受限于 testConnection 的单行连接探针");
-    assert.match(src, /function enableFallbackTranslation[\s\S]*?state\.segmentationMode !== "fallback"[\s\S]*?state\.segmentationMode = "fallback-translation"/, "只有显式状态迁移可进入 14 词 fallback translation");
+    assert.match(src, /function enableFallbackTranslation[\s\S]*?state\.segmentationMode === "semantic"[\s\S]*?state\.segmentationMode === "fallback-translation"[\s\S]*?state\.segmentationMode !== "fallback"[\s\S]*?state\.segmentationMode = "fallback-translation"/, "只有 fallback 可显式迁移进入 14 词 fallback translation，且不得覆盖 semantic 或重复进入");
     assert.ok(!src.includes("maxSourceWords"), "生产调用不得自行计算 12/14 数值上限");
     assert.match(src, /Core\.resegmentCues\(cues, \{ tailTrimMs: config\.tailTrimMs, maxWords: 12, continuationMaxWords: 14 \}\)/, "生产 fallback 必须显式区分 12 词目标与 14 词续接硬上限");
     assert.strictEqual((src.match(/Core\.resegmentCues\(/g) || []).length, 1, "isolated 中 resegmentCues 只能用于 fallback，semantic 必须走 restoreAndPackTokens");
@@ -2213,6 +2213,37 @@ async function main() {
     assert.strictEqual(blocks.length, 2, "空单元被跳过");
     assert.ok(/\n甲$/.test(blocks[0]), "A 在前（startMs 小）");
     assert.ok(/^2\n/.test(blocks[1]) && /\n乙$/.test(blocks[1]), "B 在后、序号连续");
+  });
+
+  test("buildSrt 导出门禁：requireTranslations=true 时任何空译文都拒绝生成半成品 SRT", () => {
+    const partial = [
+      { startMs: 0, endMs: 1000, originalText: "translated", translation: "已翻译" },
+      { startMs: 1000, endMs: 2000, originalText: "english only", translation: "" },
+      { startMs: 2000, endMs: 3000, originalText: "translated again", translation: "再次翻译" },
+    ];
+    assert.strictEqual(Core.buildSrt(partial, { mode: "bilingual_orig_top", requireTranslations: true }), "");
+    assert.strictEqual(Core.buildSrt(partial, { mode: "only_translated", requireTranslations: true }), "");
+    assert.strictEqual(Core.buildSrt([{ startMs: 0, endMs: 1000, originalText: "source", translation: "   " }], { mode: "bilingual_orig_top", requireTranslations: true }), "");
+    assert.strictEqual(Core.buildSrt([{ startMs: 0, endMs: 1000, originalText: "source" }], { mode: "bilingual_orig_top", requireTranslations: true }), "");
+  });
+
+  test("isolated 导出与原生字幕隐藏契约：按有原文单元完整性判断，英文 fallback 也隐藏 YouTube 原生字幕", () => {
+    const src = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
+    assert.match(src, /var realUnits = state\.renderUnits\.filter[\s\S]*?String\(u\.originalText \|\| ""\)\.trim\(\) !== ""[\s\S]*?var allTranslated = realUnits\.length > 0 && realUnits\.every/, "导出必须按所有有原文单元检查译文完整性");
+    assert.match(src, /function updateNativeCaptionVisibility[\s\S]*?!config\.enabled \|\| !state\.renderer[\s\S]*?classList\.remove\("dualsub-hide-native-captions"\)[\s\S]*?domHasDualsubText[\s\S]*?timelineHasDualsubText[\s\S]*?dualsub-hide-native-captions/, "只要 DualSub 任一 DOM 或时间轴文本层出现，就必须隐藏 YouTube 原生字幕；禁用或 renderer 清除时必须恢复原生字幕");
+    assert.match(src, /function setRendererText[\s\S]*?updateNativeCaptionVisibility\(\)[\s\S]*?fitSubtitleRows\(\)/, "写入字幕 DOM 的同一 tick 必须同步更新原生字幕隐藏状态，避免首帧双字幕窗口");
+    assert.match(src, /function installCueTimeline[\s\S]*?state\.timelineEpoch\+\+[\s\S]*?clearSemanticFallbackTimer\(\)/, "semantic 原子接管必须递增 epoch 并取消慢 fallback 定时器，使旧 fallback 请求失效");
+    assert.match(src, /function translateClip[\s\S]*?segmentationModeAtStart = state\.segmentationMode[\s\S]*?timelineEpoch !== state\.timelineEpoch \|\| segmentationModeAtStart !== state\.segmentationMode[\s\S]*?applyClipLines/, "translateClip 必须用 epoch+segmentationMode 双重快照拒绝 stale fallback 写入 semantic 时间轴");
+  });
+
+  test("buildSrt 导出门禁：requireTranslations=true 时完整双语才允许生成", () => {
+    const complete = [
+      { startMs: 0, endMs: 1000, originalText: "translated", translation: "已翻译" },
+      { startMs: 1000, endMs: 2000, originalText: "translated again", translation: "再次翻译" },
+    ];
+    const srt = Core.buildSrt(complete, { mode: "bilingual_orig_top", requireTranslations: true });
+    assert.ok(srt.includes("translated\n已翻译"));
+    assert.ok(srt.includes("translated again\n再次翻译"));
   });
 
   test("buildSrt 保留字幕单元内安全换行，不把换行压成异常空格", () => {
@@ -2822,7 +2853,7 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     const raw = fs.readFileSync(path.join(ROOT, "manifest.json"), "utf8");
     const m = JSON.parse(raw);
     assert.strictEqual(m.manifest_version, 3);
-    assert.strictEqual(m.version, "0.5.12", "10/12 舒适短屏必须使用新版本，不能覆盖 v0.5.11");
+    assert.strictEqual(m.version, "0.5.13", "SRT 完整性门禁与首屏 fallback 修复必须使用新版本，不能覆盖 v0.5.12");
     assert.ok(Array.isArray(m.content_scripts) && m.content_scripts.length === 2);
     const worlds = m.content_scripts.map((c) => c.world).sort();
     assert.deepStrictEqual(worlds, ["ISOLATED", "MAIN"]);

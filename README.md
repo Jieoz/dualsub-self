@@ -21,7 +21,7 @@
 
 ## 安装（加载已解压的扩展程序）
 
-当前正式版：**v0.5.12**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.5.12) 下载 Chrome MV3 安装包。
+当前正式版：**v0.5.13**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.5.13) 下载 Chrome MV3 安装包。
 
 1. 下载 / clone 本仓库到本地。
 2. 打开 Chrome / Edge，地址栏进入 `chrome://extensions`（Edge 为 `edge://extensions`）。
@@ -75,7 +75,7 @@
 5. 模型缺号或数量不符时拒绝部分结果，绝不猜填或缓存；运行层按既有退避机制整包重试。真正空响应仍暂显原文并重试。
 6. 每个字幕单元直接沿用对应 semantic unit 的英文与起止时间；英文和中文各自严格保持一行，组成固定两行的双语对照，不在任一语言内部折行。
 7. 缓存 namespace 为 `dsc-v61`，并按 `fallback` / `fallback-translation` / `semantic` 分段模式隔离，避免不同时间轴或降级质量的译文相互污染。
-8. 首屏不再等待整轨语义恢复：先安装只显示英文原文的 fallback 时间轴，语义恢复在后台完成。semantic 时间轴会先预热实时播放位置对应的译文，且每次异步等待后重新核对播放头；只有当前段已经准备好时才原子切换。若后台恢复链失败，则原地切换为 `fallback-translation`，立即翻译当前段并继续预取，但不会暂停已在播放的视频。
+8. 首屏不再等待整轨语义恢复：先安装只显示英文原文的 fallback 时间轴，语义恢复在后台完成；若语义恢复超过短阈值仍未就绪，会自动进入 `fallback-translation` 先翻当前播放位置，避免 1–2 分钟只有英文。semantic 时间轴会先预热实时播放位置对应的译文，且每次异步等待后重新核对播放头；只有当前段已经准备好时才原子切换。若后台恢复链失败，则原地切换为 `fallback-translation`，立即翻译当前段并继续预取，但不会暂停已在播放的视频。
 9. v0.5.12 将英文 semantic 屏收紧为 **10 词舒适目标、11 词直接接受、12 词硬上限**；长 reporting 句允许把 `Let me point out that` 一类完整引导语单独作为渐进屏，再显示主语与谓语。不得在短语、`than` 比较结构、关系从句主谓、介词续接（含 `throughout`）或短语动词内部硬切；没有可信边界时显式回退，且不改写、不重排、不丢词。若翻译模型要求把 semantic 渐进屏向前合并，扩展始终锁定原英文与 token 时间重译一次，不把已验证的短屏重新拼成长行。fallback 默认同样以 12 词切分，只有保全自然续接时最多放宽到 14 词；fallback 合并会突破 14 词时也改走锁边重译。只有显式的 `fallback-translation` 模式可使用 14 词上限；未知或省略模式一律按 semantic 的 12 词上限锁边并安全失败关闭。
 
 首包默认最多等待 8 秒：扩展只会暂停自己触发的播放，翻译就绪或超时后自动继续；切视频、禁用或运行时重建也会解除这次暂停，避免视频被遗留在暂停状态。后台语义恢复或预热失败时继续保留已可看的 fallback，并启动降级翻译；不会二次暂停或清空字幕。
@@ -142,9 +142,9 @@ ASR 滚动事件几乎每条都与下一条时间重叠，`resegmentCues` 去重
 | --- | --- |
 | `bilingual_orig_top` | 原文在上、译文在下 |
 | `bilingual_trans_top` | 译文在上、原文在下 |
-| `only_translated` | 仅译文（空译文自动回退原文） |
+| `only_translated` | 仅译文（导出前要求全部字幕单元已有译文，不再用英文补空槽） |
 
-时间戳为标准 `HH:MM:SS,mmm`，按起始时间升序、跳过空单元，可直接喂给任意播放器 / 剪辑软件。
+时间戳为标准 `HH:MM:SS,mmm`，按起始时间升序、跳过空单元，可直接喂给任意播放器 / 剪辑软件。导出双语 SRT 时启用完整性门禁：只要仍有原文字幕单元缺少译文，就拒绝生成文件，避免导出大量英文兜底的半成品字幕。
 
 
 ---
@@ -201,7 +201,7 @@ node test/run-tests.js
 node test/run-semantic-corpus.js
 
 # Chromium 状态机回放（需有 CDP 9222；可用 DUALSUB_CDP_URL / DUALSUB_REPLAY_HOST 覆盖）
-# 覆盖正常接管、语义恢复失败后 fallback 双语降级、partial semantic install 自恢复、预热失败和等待期间 seek
+# 覆盖正常接管、语义恢复过慢先 fallback 翻译、语义恢复失败后 fallback 双语降级、partial semantic install 自恢复、预热失败和等待期间 seek
 node test/browser-replay/run.js
 
 # 全量离线结构 E2E（373 条真实字幕样本；输出目录可用 DUALSUB_E2E_OUT 覆盖）
