@@ -61,7 +61,7 @@
     tracks: [], // main.js 推来的轨道清单
     activeTrack: null, // 当前选中的轨道
     cues: [], // 最终原文 cue（优先严格词流语义恢复，否则稳定回退 resegmentCues）
-    segmentationMode: "fallback", // 'semantic' | 'fallback'，用于缓存隔离与可观测性
+    segmentationMode: "fallback", // 'semantic' | 'fallback' | 'fallback-translation'，用于缓存隔离与可观测性
     timelineEpoch: 0, // 每次整轨切换递增，拒绝旧异步翻译结果写入新分段
     clips: [], // 按 cue 边界切的 clip
     cueMap: [], // 全局 cue 下标 -> {clipIdx,cueIdx}（cueClipIndexMap 建表）
@@ -408,17 +408,35 @@
       // 完整验证成功后才原子切换到语义时间轴；失败保持已工作的 fallback。
       var loadEpoch = state.timelineEpoch;
       setTimeout(function () {
-        restoreSemanticCuesIfAvailable(cues).then(function (semanticCues) {
-          if (loadEpoch !== state.timelineEpoch || !semanticCues || !semanticCues.length) return;
-          return stageSemanticTimeline(Core.applyTailTrim(semanticCues, config.tailTrimMs), loadEpoch);
+        restoreSemanticCuesIfAvailable(cues).then(async function (semanticCues) {
+          if (loadEpoch !== state.timelineEpoch) return;
+          if (!semanticCues || !semanticCues.length) {
+            enableFallbackTranslation(loadEpoch);
+            return;
+          }
+          var installed = await stageSemanticTimeline(Core.applyTailTrim(semanticCues, config.tailTrimMs), loadEpoch);
+          if (!installed) enableFallbackTranslation(loadEpoch);
         }).catch(function (e) {
-          // The fallback timeline is already active; unexpected semantic errors are non-fatal.
-          console.warn("[dualsub] semantic restore failed; keeping fallback timeline", e);
+          // Semantic restoration is optional. If it fails, translate the already resegmented
+          // fallback timeline instead of leaving the page permanently English-only.
+          console.warn("[dualsub] semantic restore failed; translating fallback timeline", e);
+          enableFallbackTranslation(loadEpoch);
         });
       }, 0);
     } catch (e) {
       console.warn("[dualsub] loadTrack 出错", e);
     }
+  }
+
+  function enableFallbackTranslation(loadEpoch) {
+    if (loadEpoch !== state.timelineEpoch || state.segmentationMode !== "fallback") return false;
+    state.segmentationMode = "fallback-translation";
+    // The English fallback is already visible, so degraded translation must never pause playback.
+    state.firstClipReady = true;
+    state.lastPrefetchMs = -1e9;
+    prefetchAround(currentTimeMs(), true);
+    requestRender();
+    return true;
   }
 
   function sliceTimelineClips(cues) {
@@ -490,33 +508,42 @@
   // 仅在完整 cue 集合准备好时切换。递增 epoch 使旧分段的翻译请求自然失效。
   function installCueTimeline(cues, mode, prepared) {
     if (!cues || !cues.length) return false;
-    state.timelineEpoch++;
-    // fallback 已经给用户可播放首屏；后台语义切换绝不再次暂停视频等翻译。
-    if (mode === "semantic") state.firstClipReady = true;
-    state.segmentationMode = mode;
-    state.cues = cues;
-    state.clips = prepared && prepared.clips ? prepared.clips : sliceTimelineClips(cues);
-    state.cueMap = Core.cueClipIndexMap(state.clips);
-    state.clipUnits = {};
-    state.renderUnits = [];
-    state.clipState = {};
-    state.clipBackoff = {};
-    state.clipInflight = {};
+
+    // Prepare the complete candidate before changing epoch, mode, or any live timeline state.
+    // In particular, model-derived seed construction may throw. A failure must leave the working
+    // fallback timeline intact so the caller can enable fallback translation safely.
+    var nextClips = prepared && prepared.clips ? prepared.clips : sliceTimelineClips(cues);
+    var nextCueMap = Core.cueClipIndexMap(nextClips);
+    var nextClipUnits = {};
+    var nextClipState = {};
     if (prepared && prepared.seeds) {
       for (var preparedIdx in prepared.seeds) {
         var seedIdx = parseInt(preparedIdx, 10);
         var seedLines = prepared.seeds[preparedIdx];
-        var seedClip = state.clips[seedIdx];
+        var seedClip = nextClips[seedIdx];
         if (!seedClip || !seedLines || !seedLines.length) continue;
-        state.clipUnits[seedIdx] = Core.buildClipUnits(
+        nextClipUnits[seedIdx] = Core.buildClipUnits(
           seedLines,
           seedClip.startMs,
           seedClip.endMs,
           seedClip.cues
         );
-        state.clipState[seedIdx] = "done";
+        nextClipState[seedIdx] = "done";
       }
     }
+
+    state.timelineEpoch++;
+    // fallback 已经给用户可播放首屏；后台语义切换绝不再次暂停视频等翻译。
+    if (mode === "semantic") state.firstClipReady = true;
+    state.segmentationMode = mode;
+    state.cues = cues;
+    state.clips = nextClips;
+    state.cueMap = nextCueMap;
+    state.clipUnits = nextClipUnits;
+    state.renderUnits = [];
+    state.clipState = nextClipState;
+    state.clipBackoff = {};
+    state.clipInflight = {};
     state.lastHitCueIdx = -1;
     rebuildRenderTimeline();
     ensureRenderer();
@@ -593,9 +620,9 @@
 
   function prefetchAround(ms, force) {
     if (!config.enabled || !state.clips.length) return;
-    // fallback 只保证原文立即可见；技术 cue 不得送翻译，否则会生成六字左右的碎中文。
-    // semantic 当前 clip 由 stageSemanticTimeline 直接预热，接管后才启用常规预取。
-    if (state.segmentationMode !== "semantic") return;
+    // 语义恢复尚未结束时，纯 fallback 只保证原文立即可见，避免与整轨恢复抢请求。
+    // 若恢复失败，enableFallbackTranslation 切到 fallback-translation，翻译已重组的稳定 cue。
+    if (state.segmentationMode === "fallback") return;
     // 节流：预取循环低频(1.5s)调用，位置没明显移动就不重复跑昂贵逻辑
     if (!force && Math.abs(ms - state.lastPrefetchMs) < 1000) return;
     state.lastPrefetchMs = ms;
@@ -1254,8 +1281,9 @@
     //  - 无译文 + failed(达 maxFails) → 显「翻译失败」。
     //  - 无译文 + 未结案(undefined=未翻 / pending=在翻) → 显「翻译中…」。
     //  - 无译文 + 已结案(done/error 但该行无译文=覆盖缺口/降级) → 优雅显原文，不再永久转圈(症状1)。
-    // fallback 技术 cue 从不翻译，因此译文层必须保持空白，不得误显示「翻译中…」。
-    var flags = state.segmentationMode === "semantic" ? Core.clipDisplayFlags(trans, st) : {
+    // 纯 fallback 尚在等待语义恢复，译文层保持空白；fallback-translation 与 semantic
+    // 都走真实 clip 翻译状态，避免恢复失败后页面永久只有英文。
+    var flags = state.segmentationMode !== "fallback" ? Core.clipDisplayFlags(trans, st) : {
       failed: false,
       pending: false,
     };

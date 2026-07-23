@@ -1611,6 +1611,31 @@ async function main() {
     });
   });
 
+  await asyncTest("chatCompletion 正确 API 路径收到伪 JSON HTML 时不再误判 Base URL", async () => {
+    await assert.rejects(() => Core.chatCompletion({
+      apiBaseUrl: "https://gateway.example/v1",
+      apiKey: "fixture-value",
+      apiModel: "m",
+      systemContent: "system",
+      userContent: "hello",
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        url: "https://gateway.example/v1/chat/completions",
+        redirected: false,
+        headers: { get: () => "application/json; charset=utf-8" },
+        text: async () => "<!doctype html><html><title>upstream failure</title></html>",
+      }),
+    }), (err) => {
+      assert.match(err.message, /路径正确/);
+      assert.match(err.message, /网关|上游/);
+      assert.match(err.message, /模型路由|重试/);
+      assert.doesNotMatch(err.message, /确认填写的是.*Base URL/);
+      assert.doesNotMatch(err.message, /<html>|doctype/i);
+      return true;
+    });
+  });
+
   await asyncTest("chatCompletion 对 HTML 包装的 HTTP 429 仍保留限流分类", async () => {
     await assert.rejects(
       () => Core.chatCompletion({
@@ -2059,9 +2084,12 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     assert.ok(/cueFingerprint/.test(cacheKeyBody), "clip 缓存键必须包含当前 cue 边界与文本指纹；边界回修前后不得碰撞");
     assert.ok(/"dsc-v60"/.test(fs.readFileSync(path.join(ROOT, "core.js"), "utf8")), "无句号输出、双语严格单行与英文自然分屏必须升级缓存 namespace");
     const prefetch = src.slice(src.indexOf("function prefetchAround"), src.indexOf("function getBackoff"));
-    assert.ok(/state\.segmentationMode !== "semantic"/.test(prefetch), "fallback 只显原文，不得翻译技术 cue 产生碎中文");
+    assert.ok(/state\.segmentationMode === "fallback"/.test(prefetch), "语义恢复尚未结束时 fallback 只显原文，不应抢跑重复翻译");
+    assert.ok(/function enableFallbackTranslation\(loadEpoch\)/.test(src), "语义恢复失败后必须有显式 fallback 翻译降级入口");
+    assert.ok(/!semanticCues[\s\S]{0,160}enableFallbackTranslation\(loadEpoch\)/.test(load), "语义恢复不适用或失败时必须启动 fallback 翻译");
+    assert.ok(/stageSemanticTimeline[\s\S]{0,240}if \(!installed\) enableFallbackTranslation\(loadEpoch\)/.test(load), "semantic 当前段预热失败时必须启动 fallback 翻译");
     const render = src.slice(src.indexOf("function onRenderTick"), src.indexOf("function setRendererText"));
-    assert.ok(/state\.segmentationMode === "semantic" \? Core\.clipDisplayFlags/.test(render), "fallback 中文层必须为空，不得显示翻译中");
+    assert.ok(/state\.segmentationMode !== "fallback" \? Core\.clipDisplayFlags/.test(render), "启用翻译降级后的 fallback 必须显示中文或翻译状态");
   });
 
   test("isolated.js 只在可靠 JSON3 token 时序下启用语义恢复，失败完整回退", () => {
@@ -2075,7 +2103,9 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     assert.ok(/var installIdx = clipIdxAtIn\(clips, currentTimeMs\(\)\)/.test(src), "翻译 await 后必须重验当前 clip");
     assert.ok(/return installCueTimeline\(installedCues, "semantic", \{ clips: clips, seeds: seeds \}\)/.test(src), "只有当前段已有 seed 且回修 cue 已汇总的 semantic 候选才能原子接管屏幕");
     const install = src.slice(src.indexOf("function installCueTimeline"), src.indexOf("/* =====================================================\n   * 翻译编排"));
-    assert.ok(install.indexOf("state.clipUnits[seedIdx]") < install.indexOf("rebuildRenderTimeline();"), "semantic seeds 必须在首帧重建前写入，禁止闪回翻译中");
+    assert.ok(install.indexOf("nextClipUnits[seedIdx]") < install.indexOf("state.timelineEpoch++"), "semantic seed 必须在 epoch/mode 切换前事务化构建；异常时保留工作中的 fallback");
+    assert.ok(install.indexOf("nextClipUnits[seedIdx]") < install.indexOf("state.segmentationMode = mode"), "semantic seed 构建失败不得留下半安装 semantic mode");
+    assert.ok(install.indexOf("state.clipUnits = nextClipUnits") < install.indexOf("rebuildRenderTimeline();"), "semantic seeds 必须在首帧重建前原子写入，禁止闪回翻译中");
     assert.ok(/if \(ms < clips\[i\]\.startMs\) return i/.test(src), "播放头在 gap 时应预热下一段而不是末段");
     assert.ok(/installCueTimeline\(fallbackCues, "fallback"\)/.test(src), "回退路径应安装可诊断 fallback 模式");
   });
@@ -2526,7 +2556,7 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     const raw = fs.readFileSync(path.join(ROOT, "manifest.json"), "utf8");
     const m = JSON.parse(raw);
     assert.strictEqual(m.manifest_version, 3);
-    assert.strictEqual(m.version, "0.5.10", "API 诊断与 Token 缓存修订必须使用新版本，不能覆盖 v0.5.9");
+    assert.strictEqual(m.version, "0.5.11", "fallback 双语降级与伪 JSON HTML 诊断必须使用新版本，不能覆盖 v0.5.10");
     assert.ok(Array.isArray(m.content_scripts) && m.content_scripts.length === 2);
     const worlds = m.content_scripts.map((c) => c.world).sort();
     assert.deepStrictEqual(worlds, ["ISOLATED", "MAIN"]);

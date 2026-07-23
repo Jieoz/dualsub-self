@@ -2110,6 +2110,16 @@
   }
 
   function htmlApiResponseError(resp, contentType) {
+    var path = safeResponsePath(resp);
+    var correctChatPath = /\/chat\/completions\/?$/.test(path);
+    var claimsJson = /application\/json/i.test(String(contentType || ""));
+    if (resp && resp.ok && correctChatPath && claimsJson) {
+      return responseError(
+        "API 请求路径正确，但网关或上游返回了被错误标记为 JSON 的 HTML（" + responseMeta(resp, contentType) + "）。" +
+        "请检查所选模型的上游路由，或稍后重试",
+        resp
+      );
+    }
     return responseError(
       "API 返回 HTML 而不是 JSON（" + responseMeta(resp, contentType) + "）。" +
       "请确认填写的是 OpenAI 兼容 API Base URL（通常以 /v1 结尾），不要填写控制台或网站首页",
