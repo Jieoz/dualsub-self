@@ -242,7 +242,7 @@
   var COMPLEMENT_THAT_RE = /\b(?:mean|means|meant|say|says|said|think|thinks|thought|believe|believes|believed|know|knows|knew|show|shows|showed|indicate|indicates|indicated|suggest|suggests|suggested|confirm|confirms|confirmed|ensure|ensures|ensured|explain|explains|explained|report|reports|reported|note|notes|noted)\s+that\b/i;
   var CONTACT_RELATIVE_PRONOUN_RE = /^(?:the|a|an|this|that|these|those|my|our|your|their|his|her)\b.+\b(?:i|we|you|they|he|she)\s+(?:(?:\w+)\s+){0,3}(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did|\w+(?:s|ed))\b/i;
   var CONTACT_RELATIVE_PROPER_RE = /^(?:the|a|an|this|that|these|those|my|our|your|their|his|her)\b.+\b[A-Z][a-z]+\s+(?:(?:\w+)\s+){0,3}(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did|\w+(?:s|ed))\b/;
-  var MAIN_PREDICATE_START_RE = /^(?:(?:still|also|already|actually|usually|generally|typically|often|sometimes|never|always|then)\s+)?(?!(?:whereas|thus|perhaps|besides)\b)(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did|\w+(?:s|ed))\b/i;
+  var MAIN_PREDICATE_START_RE = /^(?:(?:still|also|already|actually|usually|generally|typically|often|sometimes|never|always|then)\s+)?(?!(?:whereas|thus|perhaps|besides|this|these|those|the|a|an|my|our|your|their|his|her|its)\b)(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did|\w+(?:s|ed))\b/i;
   // 只识别省略关系代词的 contact clause（如 “camera we tested”）。
   // 显式 that/which/who 从句仍属于主语，不得被 reporting 例外覆盖。
   var EMBEDDED_RELATIVE_PREDICATE_RE = /\b(?:i|we|you|they|he|she)\s+(?:(?:\w+)\s+){0,3}(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did|\w+(?:s|ed))\b/i;
@@ -519,7 +519,11 @@
   function resegmentCues(cues, opts) {
     opts = opts || {};
     var maxDur = opts.maxDurationMs != null ? opts.maxDurationMs : 6000;
-    var maxWords = opts.maxWords != null ? opts.maxWords : 16;
+    var hasExplicitMaxWords = opts.maxWords != null;
+    var maxWords = hasExplicitMaxWords ? opts.maxWords : 12;
+    var hasExplicitContinuationMaxWords = opts.continuationMaxWords != null;
+    var continuationMaxWords = hasExplicitContinuationMaxWords
+      ? Math.max(maxWords, Math.floor(Number(opts.continuationMaxWords) || maxWords)) : null;
     var minWords = opts.minWords != null ? opts.minWords : 3;
     var longPauseMs = opts.longPauseMs != null ? opts.longPauseMs : 700;
     var grammarContinuationMaxGapMs = opts.grammarContinuationMaxGapMs != null
@@ -630,16 +634,21 @@
         var ended = SENTENCE_END_RE.test(cur.words.join(" "));
         var wouldWords = cur.words.length + added.length;
         var wouldDur = c.end - cur.start;
+        var orphanCap = hasExplicitContinuationMaxWords
+          ? continuationMaxWords : maxWords + (hasExplicitMaxWords ? 8 : 2);
         var orphanPrepMerge = ended && startsOrphanPrepositionalPhrase(words) &&
-          gap < grammarContinuationMaxGapMs && wouldWords <= maxWords + 8 &&
+          gap < grammarContinuationMaxGapMs && wouldWords <= orphanCap &&
           wouldDur <= grammarContinuationMaxDurationMs;
         var canMerge = !ended || cur.words.length < minWords || orphanPrepMerge;
         var normalMerge = gap < longPauseMs && wouldWords <= maxWords && wouldDur <= maxDur;
-        var continuationCap = maxWords + Math.max(4, Math.ceil(maxWords * 0.75));
+        var continuationCap = hasExplicitContinuationMaxWords
+          ? continuationMaxWords
+          : (hasExplicitMaxWords ? maxWords + Math.max(4, Math.ceil(maxWords * 0.75)) : maxWords + 2);
         // 下一 cue 若在内部很快出现句号，只需把第一个完整句并入；其后的新句已由
         // splitCueAtSentenceEnds 拆成独立 piece，不应计入这次续接的词数预算。
         var addedEndsSentence = SENTENCE_END_RE.test(added.join(" "));
-        var effectiveContinuationCap = addedEndsSentence ? continuationCap + 4 : continuationCap;
+        var effectiveContinuationCap = !hasExplicitContinuationMaxWords && hasExplicitMaxWords && addedEndsSentence
+          ? continuationCap + 4 : continuationCap;
         var nextStartsNewSentence = /^(?:And|But|Or|So)\b/.test(c.content || "") &&
           !hasEnglishContinuationTail(cur.words) && !cur.fragmentChain;
         var baseGrammarNeeded = hasEnglishContinuationTail(cur.words) ||
@@ -868,12 +877,12 @@
   // 已验证 system prompt（直接写死规则 + 压 reasoning）。{TARGET_LANG} 仅在调用方
   // 传自定义 prompt 时替换；默认 prompt 面向简体中文，无占位符（替换为 no-op）。
   var DEFAULT_SYSTEM_PROMPT =
-    "你是专业中文字幕翻译。输入是同一段连续语流中带序号的完整英文语义单元。请先结合前后文理解整段，再严格按相同序号输出简体中文。\n" +
+    "你是专业中文字幕翻译。输入是同一段连续语流中带序号、已经过本地边界验证的英文字幕屏。请先结合前后文理解整段，再严格按相同序号输出简体中文。\n" +
     "规则如下：\n" +
     "1) 输出行数、序号和顺序必须与输入完全一致；每行以相同序号开头，例如 `1. …`。\n" +
-    "2) 第 N 行只承载第 N 个完整语义单元的信息，不把信息挪到相邻编号，不合并、不遗漏、不重复。\n" +
+    "2) 第 N 行只承载第 N 个英文屏的信息，不把信息挪到相邻编号，不合并、不遗漏、不重复。\n" +
     "3) 每条译文必须是该英文字幕屏在连续语流中的自然中文表达，不得输出悬空或截断的半句话，也不得补入源文没有的意思；允许用“它/这/尽管”等承接相邻屏，使每屏简洁可读。\n" +
-    "4) 译文应简洁、自然、适合字幕显示；绝不把一个中文词切成两半。每条中文必须严格保持单行，不得在单元内部换行。若某输入结合相邻行仍无法译成自然可读的连续字幕片段，必须只返回 [MERGE_PREV]，不得硬翻成逗号半句。若当前英文以从属连接词开头（如 but/although/than/despite），只有它自身具备完整主谓、能改写成自然完整中文时才翻译；否则返回 [MERGE_PREV]。\n" +
+    "4) 译文应简洁、自然、适合字幕显示；绝不把一个中文词切成两半。每条中文必须严格保持单行，不得在单元内部换行。对于为舒适行长而形成且已经本地验证的渐进短屏（如 Let me point out that / despite being limited），应结合相邻行译为自然闭合中文（如“我先说明一点”/“即使受限也一样”），不要返回 [MERGE_PREV]。除此之外，若某输入结合相邻行仍无法译成自然可读的连续字幕片段，必须只返回 [MERGE_PREV]，不得硬翻成逗号半句。若其他英文以从属连接词开头（如 but/although/than/despite），只有它自身具备完整主谓、能改写成自然完整中文时才翻译；否则返回 [MERGE_PREV]。\n" +
     "5) 每条都必须在本屏自然收束；中文字幕不得输出中文句号“。”，陈述句直接以文字结束，疑问句和感叹句保留问号或感叹号。即使英文语法延续到下一屏，也要用代词或自然改写让本屏中文完整，绝不能以逗号、顿号、冒号、分号或省略号结尾。\n" +
     "6) 不要输出英文、其它字母、解释或思考过程。只输出带编号的中文字幕行。直接给结果。";
 
@@ -1614,7 +1623,8 @@
 
   var DEFAULT_RESTORATION_PROMPT =
     "恢复这段英语口语的句末标点。只返回原词，且原词的拼写、顺序和数量必须完全一致。\n" +
-    "你只能在词之间加入空格和 . ? ! |。 .?! 仅表示真实句末。完整句超过约 16 词时，也必须在自然、两侧均可独立翻译的从句边界加入 |；优先形成约 6–16 词的屏幕单元，每段最多 20 词。\n" +
+    "你只能在词之间加入空格和 . ? ! |。 .?! 仅表示真实句末。完整句超过约 11 词时，也必须在自然、适合渐进阅读的边界加入 |；优先形成约 4–11 词的屏幕单元，每段最多 12 词。\n" +
+    "长 reporting 句可把完整引导语（如 Let me point out that）单独作为渐进屏，再显示主语与谓语；不得在 than 与比较对象之间加入 |。\n" +
     "不得在名词短语、动词短语、短语动词、复合词、限定词+名词、介词短语、不定式、助动词+动词之间加入 |。不得添加、删除、替换、合并、拆分或重排任何词。不要解释。";
 
   function tokenWords(tokens) {
@@ -1755,12 +1765,18 @@
       var left = words.slice(0, i + 1).join(" ");
       var right = words.slice(i + 1).join(" ");
       var rightFirst = words[i + 1] || "";
+      var reportingMatch = left.match(REPORTING_CLAUSE_PREFIX_RE);
+      // 行长优先时，允许把完整 reporting 引导语（Let me point out that / I think that）
+      // 单独作为渐进屏。后续长主语仍必须落在 completedReportingSubjectBoundary，
+      // 因而这里只新增 5/10/8 这类可读路径，不泛化放过名词短语或关系从句硬切。
+      var progressiveReportingIntro = i + 1 >= min && reportingMatch &&
+        normalizeBoundaryText(left).toLowerCase() === normalizeBoundaryText(reportingMatch[0]).toLowerCase();
       var longSubjectPredicate = i + 1 >= min && completedReportingSubjectBoundary(left, right);
       var trailingAdjunct = i + 1 >= min && /^(?:despite\s+being|although|though|even\s+(?:during|after|before)|during|after|before)\b/i.test(right) &&
         hasComparisonPredicateText(left);
       var coordinatedClause = i + 1 >= min && isCoordinatedIndependentBoundary(left, right);
-      if (longSubjectPredicate || trailingAdjunct || coordinatedClause) {
-        var penalty = longSubjectPredicate ? 1 : (coordinatedClause ? 2 : 3);
+      if (progressiveReportingIntro || longSubjectPredicate || trailingAdjunct || coordinatedClause) {
+        var penalty = longSubjectPredicate ? 1 : (progressiveReportingIntro || coordinatedClause ? 2 : 3);
         if (candidates[i + 1] == null || penalty < candidates[i + 1]) candidates[i + 1] = penalty;
       }
     }
@@ -1772,7 +1788,9 @@
         if (!dp[start]) continue;
         var len = end - start;
         if (len < min && end !== n) continue;
-        if (end === n && len < min && start !== 0) continue;
+        var shortNaturalTail = end === n && len >= 3 &&
+          /^despite\s+being\s+\w+/i.test(words.slice(start, end).join(" "));
+        if (end === n && len < min && start !== 0 && !shortNaturalTail) continue;
         var boundaryPenalty = end === n ? 0 : candidates[end];
         var score = dp[start].score + Math.pow(len - preferred, 2) + boundaryPenalty;
         if (!dp[end] || score < dp[end].score) dp[end] = { score: score, prev: start };
@@ -1818,15 +1836,15 @@
   async function restoreAndPackTokens(opts) {
     opts = opts || {};
     var restored = await restoreTokenBoundaries(opts);
-    var maxWords = opts.maxWords || 20;
-    var preferredMaxWords = opts.preferredMaxWords || 16;
+    var maxWords = opts.maxWords || 12;
+    var preferredMaxWords = opts.preferredMaxWords || 10;
     // 首轮模型的 | 与局部 rescue 使用同一安全门禁；不能让 which/because/than 等
     // 弱续接开屏仅因它来自首轮恢复就绕过运行时验证。
     restored.marks = filterUnsafeRescueMarks(tokenWords(restored.tokens), restored.marks);
     // 先按整句纠正模型的“4词碎屏 + 21词长屏”等坏组合。确定性分区能同时看见
     // reporting 主语、限定谓语与 trailing adjunct，避免局部 rescue 丢失句首上下文。
     restored.marks = normalizeOversizeSentenceMarks(restored.tokens, restored.marks, {
-      preferredWords: Math.min(preferredMaxWords, 14), hardWords: Math.min(maxWords, 16), minWords: 6,
+      preferredWords: Math.min(preferredMaxWords, 10), hardWords: Math.min(maxWords, 12), minWords: 4,
     });
     var units = packRestoredTokens(restored.tokens, restored.marks, { maxWords: maxWords });
     // 第一轮保守只恢复全文句末；少数仍超长的完整句才做局部 clause rescue。
@@ -1838,7 +1856,9 @@
     for (var ui = 0; ui < units.length; ui++) {
       var unit = units[ui];
       var unitWords = restoredWords(unit.content);
-      if (unitWords.length <= preferredMaxWords) continue;
+      // 10 词是舒适目标，不是为 11 词自然屏再花一次模型调用的硬断点；
+      // 12 词屏才进入一次有界 rescue，最终仍受 hard maxWords 门禁。
+      if (unitWords.length <= Math.min(maxWords, preferredMaxWords + 1)) continue;
       var begin = -1;
       for (var i = 0; i < restored.tokens.length; i++) {
         if (restored.tokens[i].start === unit.start && restored.tokens[i].end <= unit.end) { begin = i; break; }
@@ -1866,7 +1886,7 @@
         }
         if (!safe) {
           localMarks = partitionReadableTokenUnit(restored.tokens.slice(begin, end), localMarks, {
-            preferredWords: Math.min(preferredMaxWords, 14), hardWords: Math.min(maxWords, 16), minWords: 6,
+            preferredWords: Math.min(preferredMaxWords, 10), hardWords: Math.min(maxWords, 12), minWords: 4,
           });
           safe = !!localMarks;
         }
@@ -1920,6 +1940,12 @@
       onUsage: opts.onUsage,
     });
     var n = cues.length;
+    function acceptAlignedLines(candidateLines) {
+      if (opts.boundaryLock && candidateLines.some(isMergePrevMarker)) {
+        throw new Error("fixed-boundary translation still rejected after one retry");
+      }
+      return candidateLines;
+    }
     var maxLine = opts.maxLineChars != null ? opts.maxLineChars : DEFAULT_CONFIG.maxLineChars || 20;
     var aligned = parseAlignedSubtitleLines(content, n);
     var lines = [];
@@ -1929,7 +1955,7 @@
       lines.push(shaped);
       if (shaped && String(shaped).trim()) complete++;
     }
-    if (complete === n) return lines;
+    if (complete === n) return acceptAlignedLines(lines);
 
     var loose = parseSubtitleLines(content);
     // 仅当完全没有可用编号槽、且未编号输出数量严格等于 cue 数时，才可安全顺序接受。
@@ -1940,7 +1966,7 @@
         if (!looseLine || !String(looseLine).trim()) break;
         shapedLoose.push(looseLine);
       }
-      if (shapedLoose.length === n) return shapedLoose;
+      if (shapedLoose.length === n) return acceptAlignedLines(shapedLoose);
     }
     // 真正空响应沿用既有语义：返回 []，由渲染层暂显原文并进入重试。
     if (complete === 0 && loose.length === 0) return [];
@@ -1951,6 +1977,19 @@
     opts = opts || {};
     var cues = (opts.cues || []).slice();
     if (!cues.length) return { cues: [], lines: [], repaired: false };
+    // 只有唯一、显式的 fallback-translation 模式可使用 14 词 envelope；
+    // semantic、未知或省略模式一律按 12 词且锁定原边界，安全失败关闭。
+    var isFallbackTranslation = opts.segmentationMode === "fallback-translation";
+    var maxSourceWords = isFallbackTranslation ? 14 : 12;
+    function assertSourceUnitsWithinCap(sourceCues, stage) {
+      for (var ci = 0; ci < sourceCues.length; ci++) {
+        var sourceWords = unitWordCount(sourceCues[ci]);
+        if (sourceWords > maxSourceWords) {
+          throw new Error("oversized " + stage + ": " + sourceWords + " words (cap " + maxSourceWords + ")");
+        }
+      }
+    }
+    assertSourceUnitsWithinCap(cues, "original source unit before fixed-boundary retry");
     var first = await translateClipLines(Object.assign({}, opts, { cues: cues }));
     var repairLines = first.slice();
     var needsMerge = false;
@@ -1976,12 +2015,34 @@
     if (!needsMerge) return { cues: cues, lines: first, repaired: false };
     var merged = mergeRejectedTranslationCues(cues, repairLines);
     if (merged.length >= cues.length) throw new Error("boundary repair made no progress");
-    var maxSourceWords = Math.max(1, Math.floor(Number(opts.maxSourceWords) || 16));
+    var oversizedMerge = false;
     for (var mi = 0; mi < merged.length; mi++) {
       if (unitWordCount(merged[mi]) > maxSourceWords) {
-        throw new Error("oversized source unit after boundary repair: " + unitWordCount(merged[mi]) + " words");
+        oversizedMerge = true;
+        break;
       }
     }
+    var lockOriginalBoundaries = !isFallbackTranslation || oversizedMerge;
+    if (lockOriginalBoundaries) {
+      // 在锁边分支局部再守一次相同 cap，避免未来调用链重构绕过首次请求前门禁。
+      assertSourceUnitsWithinCap(cues, "original source unit before locked-boundary retry");
+      // semantic 边界已经过语义验证，任何 MERGE_PREV 都只能锁边重译；fallback 仅在
+      // 合并会超过 14 词时锁边。原边界自身仍必须满足 mode 对应的 12/14 上限。
+      // 用锁定边界的强约束重译一次；仍拒绝时 fail-closed，绝不猜填中文。
+      var lockedPrompt = buildSystemPrompt(opts.targetLang, opts.systemPrompt) +
+        "\n\n边界修复重试：当前编号和英文边界已经锁定。每个编号必须分别译成自然闭合的中文字幕；不得合并编号，不得返回 [MERGE_PREV]。";
+      var fixed = await translateClipLines(Object.assign({}, opts, { cues: cues, systemPrompt: lockedPrompt, boundaryLock: true }));
+      // translateClipLines 已保证此条件；这里在边界修复出口再显式守住英文/中文 1:1。
+      if (fixed.length !== cues.length) throw new Error("fixed-boundary translation alignment mismatch");
+      if (fixed.some(isMergePrevMarker)) throw new Error("fixed-boundary translation still rejected after one retry");
+      for (var fi = 0; fi < fixed.length; fi++) {
+        var fixedVerdict = validateChineseDisplayUnit(fixed[fi]);
+        if (!fixedVerdict.ok) throw new Error("invalid fixed-boundary translation unit " + (fi + 1) + ": " + fixedVerdict.reason);
+      }
+      return { cues: cues, lines: fixed, repaired: true };
+    }
+    // fallback 的 in-cap merge 在第二次请求前再次守住 mode 上限。
+    assertSourceUnitsWithinCap(merged, "source unit before fallback merge retry");
     var second = await translateClipLines(Object.assign({}, opts, { cues: merged }));
     if (second.some(isMergePrevMarker)) throw new Error("boundary repair still rejected after one retry");
     for (var j = 0; j < second.length; j++) {
@@ -2557,7 +2618,7 @@
   function makeCacheKey(parts) {
     parts = parts || {};
     return [
-      "dsc-v60",
+      "dsc-v61",
       parts.segmentationMode || "fallback",
       parts.videoId || "",
       parts.trackCode || "",

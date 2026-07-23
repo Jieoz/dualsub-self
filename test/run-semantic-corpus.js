@@ -15,7 +15,7 @@ function tokensOf(text) { return text.split(/\s+/).map((word, i) => ({ text: wor
     let calls = 0;
     const invoke = () => Core.restoreAndPackTokens({
       tokens, apiBaseUrl: "https://example.test", apiKey: "x", apiModel: "m",
-      preferredMaxWords: 14, maxWords: 16, attempts: 1,
+      preferredMaxWords: 10, maxWords: 12, attempts: 1,
       fetchImpl: async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: (++calls, modelLine(item.marked)) } }] }) }),
     });
     if (item.outcome === "fallback") {
@@ -27,7 +27,7 @@ function tokensOf(text) { return text.split(/\s+/).map((word, i) => ({ text: wor
     const units = await invoke();
     assert.strictEqual(units.map(u => u.content).join(" "), source, `${item.name}: word stream changed`);
     assert.ok(units.length >= 2, `${item.name}: long source was not split`);
-    assert.ok(units.every(u => u.content.split(/\s+/).length <= 16), `${item.name}: unit exceeds hard word cap`);
+    assert.ok(units.every(u => u.content.split(/\s+/).length <= 12), `${item.name}: unit exceeds hard word cap`);
     assert.strictEqual(units[0].start, tokens[0].start, `${item.name}: start timing changed`);
     assert.strictEqual(units[units.length - 1].end, tokens[tokens.length - 1].end, `${item.name}: end timing changed`);
     for (let i = 1; i < units.length; i++) assert.strictEqual(units[i - 1].end, units[i].start, `${item.name}: timeline is not contiguous`);
@@ -38,8 +38,9 @@ function tokensOf(text) { return text.split(/\s+/).map((word, i) => ({ text: wor
     });
     for (const { left, leftText, right, rightText } of boundaries) {
       const completePhrasalVerb = /(?:get|got) (?:my|our|your|their|his|her) hands on$/.test(leftText);
-      assert.ok(Core.classifySemanticBoundary(leftText, rightText).safe || completePhrasalVerb, `${item.name}: unsafe semantic boundary: ${left} | ${right}`);
-      assert.ok(completePhrasalVerb || !/^(?:and|or|but|because|that|which|who|when|while|if|than|as|from|to|of|in|on|at|with|for|by|the|a|an)$/.test(left), `${item.name}: dangling word ends screen: ${left}`);
+      const progressiveReportingIntro = /^(?:let me|i want to|i would like to) (?:point out|reiterate|explain|mention|note|emphasize|stress)(?: here)? that$/.test(leftText);
+      assert.ok(Core.classifySemanticBoundary(leftText, rightText).safe || completePhrasalVerb || progressiveReportingIntro, `${item.name}: unsafe semantic boundary: ${left} | ${right}`);
+      assert.ok(completePhrasalVerb || progressiveReportingIntro || !/^(?:and|or|but|because|that|which|who|when|while|if|than|as|from|to|of|in|on|at|with|for|by|the|a|an)$/.test(left), `${item.name}: dangling word ends screen: ${left}`);
       assert.ok(!/^\d+(?:\.\d+)?$/.test(left) || !/^(?:volts?|watts?|amps?|percent|milliseconds?|seconds?)$/.test(right), `${item.name}: number/unit pair split`);
     }
     success++;

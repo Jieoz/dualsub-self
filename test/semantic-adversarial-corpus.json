@@ -31,7 +31,7 @@
   },
   {
     "name": "phrasal-verb-reporting-clause",
-    "marked": "Let me point out that the least expensive adapter I could get my hands on | still handled every device in our overnight test",
+    "marked": "Let me point out that | the least expensive adapter I could get my hands on | still handled every device in our overnight test",
     "outcome": "success",
     "exactSegments": true
   },

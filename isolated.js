@@ -4,7 +4,7 @@
  * 职责：
  *  1. 接收 main.js 推来的字幕轨道清单（RPC）。
  *  2. 拉取并解析字幕（json3 / vtt），清洗时间轴。
- *  3. 调用用户配置的 OpenAI 兼容翻译 API：每个 clip 一次 translateClipLines（模型一步到位
+ *  3. 调用用户配置的 OpenAI 兼容翻译 API：每个 clip 进入 translateClipWithBoundaryRepair（模型先尝试一步到位
  *     直接吐自然分行的中文字幕行）→ buildClipUnits 配时间轴；预取 + 缓存 + 失败退避重试。
  *  4. 渲染双语叠加层，跟随 <video> 的 timeupdate 显示当前 cue。
  *  5. 读写 chrome.storage.local（按 origin 存配置）。
@@ -35,7 +35,7 @@
 
   // 跨 clip 的全局 in-flight 翻译请求上限（每个内容脚本实例一个信号量）。
   // 滑动窗口预取(planPrefetch)会让当前/下一个/下下个… clip 几乎同时各发起一次
-  // translateClipLines（v0.4.0：一个 clip = 一次请求）。若不封顶，瞬时并发可达窗口深度
+  // translateClipWithBoundaryRepair（通常一个 clip = 一次请求，边界拒绝时仅再试一次）。若不封顶，瞬时并发可达窗口深度
   // → 网关 429 → 退避 → 反而更卡。这里把所有 clip 的请求收敛到一个全局上限下排队，
   // 在 cap 内仍尽量保持最大领先，但绝不冲垮网关。可被 config.globalConcurrency 覆盖。
   var GLOBAL_INFLIGHT_DEFAULT = 4;
@@ -65,7 +65,7 @@
     timelineEpoch: 0, // 每次整轨切换递增，拒绝旧异步翻译结果写入新分段
     clips: [], // 按 cue 边界切的 clip
     cueMap: [], // 全局 cue 下标 -> {clipIdx,cueIdx}（cueClipIndexMap 建表）
-    // v0.4.0：每个 clip 一次 translateClipLines → buildClipUnits 得到渲染单元，按 clip 存这里。
+    // 每个 clip 先经 translateClipWithBoundaryRepair 的 source-cap/锁边门禁，再由 buildClipUnits 得到渲染单元。
     // 单元结构 [{srcStart,srcEnd,originalText,translation,startMs,endMs}]（buildClipUnits 产物）。
     // 统一了旧的 clipCache(逐行)/clipSentences(句级) 两套语义 —— 新架构只有这一种。
     clipUnits: {}, // clipIndex -> 渲染单元数组（成功翻译才有；缺失=未翻/翻译中→回退显原文）
@@ -197,8 +197,8 @@
       systemPrompt: restorationPrompt,
       chunkWords: 120,
       overlapWords: 30,
-      preferredMaxWords: 14,
-      maxWords: 16,
+      preferredMaxWords: 10,
+      maxWords: 12,
     });
     var cache = await readSemanticCache();
     var cached = cachedSemanticCues(cache[cacheKey], tokens);
@@ -213,8 +213,8 @@
         systemPrompt: restorationPrompt,
         chunkWords: 120,
         overlapWords: 30,
-        preferredMaxWords: 14,
-        maxWords: 16,
+        preferredMaxWords: 10,
+        maxWords: 12,
         attempts: 2,
         timeoutMs: 20000,
         fetchImpl: function (u, o) { return fetch(u, o); },
@@ -400,7 +400,7 @@
       }
       cues = Core.cleanupCues(cues);
       // 先立即建立稳定 fallback 原文时间轴；技术 cue 不翻译。语义恢复是整轨模型工作，不能阻塞首字幕。
-      var fallbackCues = Core.resegmentCues(cues, { tailTrimMs: config.tailTrimMs });
+      var fallbackCues = Core.resegmentCues(cues, { tailTrimMs: config.tailTrimMs, maxWords: 12, continuationMaxWords: 14 });
       if (!installCueTimeline(fallbackCues, "fallback")) {
         console.warn("[dualsub] 解析后无有效字幕");
         return;
@@ -470,6 +470,7 @@
         systemPrompt: config.systemPrompt || "",
         reasoningEffort: config.reasoningEffort,
         maxLineChars: config.maxLineChars,
+        segmentationMode: "semantic",
         timeoutMs: 20000,
         fetchImpl: function (u, o) { return fetch(u, o); },
         onUsage: recordApiUsage,
@@ -717,8 +718,8 @@
       state.clipState[idx] = "pending";
       if (idx === 0) maybePauseForFirstTranslation(0);
 
-      // 主路径（v0.4.0）：一次 translateClipLines，模型直接吐「自然分行的中文字幕行」。
-      // 代码只用 buildClipUnits 按字符占比配时间轴，绝不切译文（切词 bug 根治）。
+      // 主路径：所有字幕 clip 都经 translateClipWithBoundaryRepair；除 testConnection 的单行探针外绝不直调 translateClipLines。
+      // wrapper 在 API 前守住模式词数上限，并对模型拒绝执行有界合并或锁边重译；buildClipUnits 只负责按时间轴安装。
       var translationResult;
       try {
         translationResult = await ensureGate().run(function () {
@@ -731,6 +732,7 @@
             systemPrompt: config.systemPrompt || "",
             reasoningEffort: config.reasoningEffort,
             maxLineChars: config.maxLineChars,
+            segmentationMode: state.segmentationMode,
             timeoutMs: 20000,
             fetchImpl: function (u, o) {
               return fetch(u, o);
@@ -1389,6 +1391,7 @@
           return { code: t.code, name: t.name, languageCode: t.languageCode, kind: t.kind };
         }),
         videoId: state.videoId,
+        segmentationMode: state.segmentationMode,
         apiUsage: Object.assign({}, state.apiUsage),
       });
       return true;
