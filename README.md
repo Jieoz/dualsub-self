@@ -21,7 +21,8 @@
 
 ## 安装（加载已解压的扩展程序）
 
-当前正式版：**v0.5.13**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.5.13) 下载 Chrome MV3 安装包。
+当前正式版：**v0.5.14**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.5.14) 下载 Chrome MV3 安装包。
+- 跨 cue 名词短语借位修复：例如 `go into a` + `cold kettle` 会显示为「倒入冷水壶 / 然后计时」，避免「水壶 / 冷水壶」重复。
 
 1. 下载 / clone 本仓库到本地。
 2. 打开 Chrome / Edge，地址栏进入 `chrome://extensions`（Edge 为 `edge://extensions`）。

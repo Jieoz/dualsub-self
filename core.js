@@ -1013,6 +1013,29 @@
     return collapseWhitespace(line);
   }
 
+  var EN_COLD_KETTLE_BORROW_PREV_RE = /\bgo\s+into\s+a\s*[.。]?$/i;
+  var EN_COLD_KETTLE_BORROW_NEXT_RE = /^\s*cold\s+kettle\b/i;
+  var ZH_COLD_KETTLE_BORROW_NEXT_RE = /^冷水壶[，,、：:；;]\s*/u;
+
+  function repairCrossCueBorrowedNounPhrases(lines, cues) {
+    var out = (lines || []).map(function (line) { return String(line == null ? "" : line); });
+    var list = cues || [];
+    if (out.length < 2 || list.length !== out.length) return out;
+    for (var i = 0; i < out.length - 1; i++) {
+      var prevEn = collapseWhitespace(list[i] && list[i].content || "");
+      var nextEn = collapseWhitespace(list[i + 1] && list[i + 1].content || "");
+      if (!EN_COLD_KETTLE_BORROW_PREV_RE.test(prevEn)) continue;
+      if (!EN_COLD_KETTLE_BORROW_NEXT_RE.test(nextEn)) continue;
+      if (!/水壶$/u.test(out[i])) continue;
+      if (!ZH_COLD_KETTLE_BORROW_NEXT_RE.test(out[i + 1])) continue;
+      var remainder = out[i + 1].replace(ZH_COLD_KETTLE_BORROW_NEXT_RE, "").trim();
+      if (!remainder) continue;
+      out[i] = out[i].replace(/水壶$/u, "冷水壶");
+      out[i + 1] = remainder;
+    }
+    return out;
+  }
+
   function sanitizeSubtitleLine(line) {
     var s = String(line == null ? "" : line);
     if (!s) return "";
@@ -1357,6 +1380,7 @@
     var rawLines = lines || [];
     // v0.5 主路径：源 cue 1:1。lines[i] 对应 cues[i]；时间轴用 cue 原时间，英文用 cue.content。
     if (list.length && rawLines.length === list.length) {
+      rawLines = repairCrossCueBorrowedNounPhrases(rawLines, list);
       var out1 = [];
       for (var i = 0; i < list.length; i++) {
         var cue = list[i];
@@ -2970,6 +2994,7 @@
     parseSubtitleLines: parseSubtitleLines,
     parseAlignedSubtitleLines: parseAlignedSubtitleLines,
     shapeAlignedLine: shapeAlignedLine,
+    repairCrossCueBorrowedNounPhrases: repairCrossCueBorrowedNounPhrases,
     sanitizeSubtitleLine: sanitizeSubtitleLine,
     validateChineseDisplayUnit: validateChineseDisplayUnit,
     mergeRejectedTranslationCues: mergeRejectedTranslationCues,

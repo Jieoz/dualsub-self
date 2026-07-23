@@ -829,6 +829,65 @@ test("validateChineseDisplayUnit 拒绝逗号半句、悬空词和内部换行",
   assert.strictEqual(Core.validateChineseDisplayUnit("第一行\n第二行").reason, "internal-newline");
 });
 
+
+
+test("buildClipUnits 跨 cue 名词短语借位：go into a + cold kettle 不重复翻译", () => {
+  const cues = [
+    { start: 112988, end: 116200, content: "The water will come straight from the tap and will go into a" },
+    { start: 116320, end: 119267, content: "cold kettle, and we'll time how long it takes to boil." },
+  ];
+  const units = Core.buildClipUnits([
+    "水会直接从水龙头接出并倒入水壶",
+    "冷水壶，然后我们计时看多久烧开",
+  ], 112988, 119267, cues);
+  assert.strictEqual(units.length, 2);
+  assert.strictEqual(units[0].translation, "水会直接从水龙头接出并倒入冷水壶");
+  assert.strictEqual(units[1].translation, "然后我们计时看多久烧开");
+  assert.strictEqual(units[0].originalText, cues[0].content);
+  assert.strictEqual(units[1].originalText, cues[1].content);
+  assert.strictEqual(units[0].startMs, 112988);
+  assert.strictEqual(units[1].startMs, 116320);
+});
+
+test("buildClipUnits 跨 cue 名词短语借位安全边界：只修真实 cold kettle 模式", () => {
+  const cases = [
+    {
+      name: "different english",
+      lines: ["把它倒入水壶", "冷水壶，然后等待"],
+      cues: [{ start: 0, end: 1, content: "pour it into a" }, { start: 1, end: 2, content: "cold kettle, then wait" }],
+    },
+    {
+      name: "missing zh punctuation",
+      lines: ["水会直接从水龙头接出并倒入水壶", "冷水壶然后我们计时"],
+      cues: [{ start: 0, end: 1, content: "The water will come straight from the tap and will go into a" }, { start: 1, end: 2, content: "cold kettle, then wait" }],
+    },
+    {
+      name: "would empty next line",
+      lines: ["水会直接从水龙头接出并倒入水壶", "冷水壶，"],
+      cues: [{ start: 0, end: 1, content: "The water will come straight from the tap and will go into a" }, { start: 1, end: 2, content: "cold kettle" }],
+    },
+    {
+      name: "already correct",
+      lines: ["水会直接从水龙头接出并倒入冷水壶", "然后我们计时看多久烧开"],
+      cues: [{ start: 0, end: 1, content: "The water will come straight from the tap and will go into a" }, { start: 1, end: 2, content: "cold kettle, then wait" }],
+    },
+    {
+      name: "length mismatch",
+      lines: ["甲"],
+      cues: [{ start: 0, end: 1, content: "The water will come straight from the tap and will go into a" }, { start: 1, end: 2, content: "cold kettle, then wait" }],
+    },
+  ];
+  for (const c of cases) {
+    const before = c.lines.slice();
+    const units = Core.buildClipUnits(c.lines, 0, 2, c.cues);
+    if (before.length === c.cues.length) {
+      assert.deepStrictEqual(units.map((u) => u.translation), before, c.name);
+    } else {
+      assert.deepStrictEqual(Core.repairCrossCueBorrowedNounPhrases(c.lines, c.cues), before, c.name);
+    }
+  }
+});
+
 asyncTest("translateClipWithBoundaryRepair 中文硬门禁在 12 词内向前合并后只重翻一次", async () => {
   const cues = [
     { start: 0, end: 1000, content: "The answer is simple", tokens: [{ text: "The" }] },
@@ -2853,7 +2912,7 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     const raw = fs.readFileSync(path.join(ROOT, "manifest.json"), "utf8");
     const m = JSON.parse(raw);
     assert.strictEqual(m.manifest_version, 3);
-    assert.strictEqual(m.version, "0.5.13", "SRT 完整性门禁与首屏 fallback 修复必须使用新版本，不能覆盖 v0.5.12");
+    assert.strictEqual(m.version, "0.5.14", "SRT 完整性门禁与首屏 fallback 修复必须使用新版本，不能覆盖 v0.5.12");
     assert.ok(Array.isArray(m.content_scripts) && m.content_scripts.length === 2);
     const worlds = m.content_scripts.map((c) => c.world).sort();
     assert.deepStrictEqual(worlds, ["ISOLATED", "MAIN"]);
