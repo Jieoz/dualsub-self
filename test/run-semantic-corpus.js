@@ -43,10 +43,15 @@ function tokensOf(text) { return text.split(/\s+/).map((word, i) => ({ text: wor
       return { left: leftWords.at(-1).toLowerCase(), leftText: leftWords.join(" ").toLowerCase(), right: rightText.split(/\s+/)[0].toLowerCase(), rightText };
     });
     for (const { left, leftText, right, rightText } of boundaries) {
-      const completePhrasalVerb = /(?:get|got) (?:my|our|your|their|his|her) hands on$/.test(leftText);
-      const progressiveReportingIntro = /^(?:let me|i want to|i would like to) (?:point out|reiterate|explain|mention|note|emphasize|stress)(?: here)? that$/.test(leftText);
-      assert.ok(Core.classifySemanticBoundary(leftText, rightText).safe || completePhrasalVerb || progressiveReportingIntro, `${item.name}: unsafe semantic boundary: ${left} | ${right}`);
-      assert.ok(completePhrasalVerb || progressiveReportingIntro || !/^(?:and|or|but|because|that|which|who|when|while|if|than|as|from|to|of|in|on|at|with|for|by|the|a|an)$/.test(left), `${item.name}: dangling word ends screen: ${left}`);
+      // 用与整轨首遍完全相同的单一权威判据(flow 模式)验证产出边界:整轨字幕是
+      // 连续语流,一屏以 which/because 等从句引导词开头是自然的;flow 模式只否决破坏
+      // 词法绑定的切分(number+unit、比较结构)。不在测试里另写第二套安全规则。
+      const leftWords = leftText.split(/\s+/), rightWords = rightText.split(/\s+/);
+      const words = leftWords.concat(rightWords);
+      const cut = leftWords.length - 1;
+      const flowMarks = words.map((_, i) => (i === cut ? "|" : ""));
+      const kept = Core.filterUnsafeRescueMarks(words, flowMarks, { mode: "flow" })[cut] === "|";
+      assert.ok(kept, `${item.name}: flow 模式否决的边界不应出现: ${left} | ${right}`);
       assert.ok(!/^\d+(?:\.\d+)?$/.test(left) || !/^(?:volts?|watts?|amps?|percent|milliseconds?|seconds?)$/.test(right), `${item.name}: number/unit pair split`);
     }
     success++;

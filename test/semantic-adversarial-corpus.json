@@ -27,7 +27,8 @@
   {
     "name": "relative-clause",
     "marked": "The controller that monitors battery temperature adjusts the charging current automatically | which prevents excessive heat during long summer drives",
-    "outcome": "fallback"
+    "outcome": "success",
+    "exactSegments": true
   },
   {
     "name": "phrasal-verb-reporting-clause",
@@ -38,7 +39,8 @@
   {
     "name": "causal-clause",
     "marked": "The backup service remained online throughout the outage | because its batteries had finished charging before the storm arrived",
-    "outcome": "fallback"
+    "outcome": "success",
+    "exactSegments": true
   },
   {
     "name": "parenthetical",
@@ -47,8 +49,8 @@
     "exactSegments": true
   },
   {
-    "name": "no-safe-boundary-fallback",
+    "name": "continuous-clause-flow-partition",
     "marked": "If the network connection disappears while the firmware update is still being installed the recovery process may take several additional minutes",
-    "outcome": "fallback"
+    "outcome": "success"
   }
 ]

@@ -532,7 +532,10 @@
 
   // 语义恢复协议：模型只可在源词之间加入 .?!|，绝不拥有正文所有权。
   // 逐词归一化后必须完全相等，否则整个 chunk 无效并由调用方重试/回退。
-  var RESTORE_WORD_RE = /[A-Za-z0-9]+(?:['’][A-Za-z]+)?/g;
+  // 连字符复合词(purpose-built / old-fashioned / plug-in)在屏上显示为一个词,
+  // 词数计量必须当一个:否则「切分/DP 按 token 数=1」与「最终校验按正则=2」口径不一,
+  // 一个显示 12 词的合格屏会被算成 13 词而误触发 oversize 抛错,拖垮整轨 semantic。
+  var RESTORE_WORD_RE = /[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*/g;
 
   function restoredWords(text) {
     return String(text || "").match(RESTORE_WORD_RE) || [];
@@ -1515,8 +1518,17 @@
   // 局部 rescue 的 | 只在两侧都可作为连续字幕阅读时保留。
   // 模型偶尔会给出 "boiling water | than this ..."；删掉这个坏边界后，
   // 同一句仍可保留前面的自然 14/20 分屏，而不是整句退化成 34 词。
-  function filterUnsafeRescueMarks(words, marks) {
+  // flow 模式(整轨首遍)只保留破坏词法绑定的硬否决:数字+单位、比较结构。
+  // 字幕是连续语流,一屏以介词/连词/从句引导词开头是自然的,首遍必须信任模型
+  // 已遵守短语规则的分屏,不能用「每屏都要是独立完整句」的从句级判据整屏否决。
+  var FLOW_INTEGRITY_REASONS = { "number-quantity": true, "comparison-continuation": true };
+  function filterUnsafeRescueMarks(words, marks, opts) {
+    opts = opts || {};
+    var flowMode = opts.mode === "flow";
     var out = (marks || []).slice();
+    // 先按「原始」边界布局判定全部,再统一应用。绝不读一个改到一半的数组:
+    // 边删边读时,删掉一个边界会撑大相邻边界的左右跨度,级联把每个边界都删光。
+    var drop = [];
     for (var i = 0; i < out.length - 1; i++) {
       if (out[i] !== "|" && out[i] !== ".") continue;
       var leftStart = 0;
@@ -1538,11 +1550,54 @@
       var reportingHasPredicate = MAIN_PREDICATE_START_RE.test(reportingTail) ||
         /\b(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did|\w+(?:s|ed))\b/i.test(reportingTail);
       var naturalDespite = /^despite\s+being\s+\w+/i.test(rightText) && restoredWords(rightText).length >= 5;
-      if (reportingPrefix && !reportingHasPredicate && !reportingObjectBoundary) {
-        out[i] = "";
-      } else if (!verdict.safe && !naturalDespite && !reportingObjectBoundary) {
-        out[i] = "";
+      var clauseDrop = reportingPrefix && !reportingHasPredicate && !reportingObjectBoundary;
+      var verdictDrop = !verdict.safe && !naturalDespite && !reportingObjectBoundary;
+      if (!clauseDrop && !verdictDrop) continue;
+      if (flowMode) {
+        // 首遍信任模型的从句级分屏;仅当切分破坏 number+unit / 比较结构等硬绑定才否决。
+        if (clauseDrop) continue;
+        if (!FLOW_INTEGRITY_REASONS[verdict.reason]) continue;
       }
+      drop.push(i);
+    }
+    for (var d = 0; d < drop.length; d++) out[drop[d]] = "";
+    return out;
+  }
+
+  // 连续语流保底切分:当 strict DP 找不到「书面完整句」切点时,用与整轨首遍相同的
+  // flow 判据强制把过长单元切到硬上限内。连续字幕本就靠介词/连词/从句引导承接,
+  // 一个 13-14 词从句找不到 strict 安全点不该让整轨作废——但绝不在破坏词法硬绑定
+  // (number+unit、比较结构、数字)处下刀。只在已验证的原始 token 词边界放 |,不改正文。
+  function forceFlowPartition(words, hard, preferred) {
+    var n = (words || []).length;
+    var out = new Array(n).fill("");
+    if (n <= hard) return out;
+    // 先按需要的段数均匀定位理想切点,避免贪心切出「... water」这种孤字尾屏。
+    var segments = Math.ceil(n / Math.max(1, Math.min(hard, preferred || hard)));
+    var ideal = Math.ceil(n / segments);
+    var runStart = 0;
+    for (var seg = 1; seg < segments; seg++) {
+      var aim = runStart + ideal;
+      if (aim >= n) break;
+      // 在理想切点附近找不破坏硬绑定(number+unit/比较结构/数字)的词边界,
+      // 优先靠近 aim;硬上限前必须落刀,绝不产生超过 hard 的屏。
+      var chosen = -1;
+      var maxCut = runStart + hard; // 该屏最远只能到 hard 词
+      for (var off = 0; off <= hard; off++) {
+        var cands = off === 0 ? [aim] : [aim - off, aim + off];
+        for (var c = 0; c < cands.length; c++) {
+          var i = cands[c];
+          if (i < runStart + 1 || i >= n || i > maxCut) continue;
+          var verdict = classifySemanticBoundary(words.slice(runStart, i + 1).join(" "), words.slice(i + 1).join(" "));
+          if (!FLOW_INTEGRITY_REASONS[verdict.reason]) { chosen = i; break; }
+        }
+        if (chosen >= 0) break;
+      }
+      // 实在找不到安全边界(整段都是硬绑定),退到硬上限-1 处强切,守住不超长。
+      if (chosen < 0) chosen = Math.min(maxCut - 1, n - 2);
+      if (chosen <= runStart || chosen >= n - 1) break;
+      out[chosen] = "|";
+      runStart = chosen + 1;
     }
     return out;
   }
@@ -1599,13 +1654,22 @@
         if (!dp[end] || score < dp[end].score) dp[end] = { score: score, prev: start };
       }
     }
-    if (!dp[n]) return null;
     var cuts = [];
-    for (var at = n; at > 0;) {
-      var prev = dp[at].prev;
-      if (prev < 0) return null;
-      if (at < n) cuts.push(at);
-      at = prev;
+    var dpOk = !!dp[n];
+    if (dpOk) {
+      for (var at = n; at > 0;) {
+        var prev = dp[at].prev;
+        if (prev < 0) { dpOk = false; break; }
+        if (at < n) cuts.push(at);
+        at = prev;
+      }
+    }
+    // strict DP 找不到全程「书面完整句」路径时,不再返回 null 让整轨作废;
+    // 改用连续语流保底切分把过长单元切到硬上限内(保留原句末 . 边界)。
+    if (!dpOk) {
+      var forced = forceFlowPartition(words, hard, preferred);
+      for (var si = 0; si < n; si++) if (sourceMarks[si] === ".") forced[si] = ".";
+      return forced;
     }
     var out = sourceMarks.map(function (m) { return m === "." ? "." : ""; });
     cuts.forEach(function (cut) { out[cut - 1] = "|"; });
@@ -1641,9 +1705,10 @@
     var restored = await restoreTokenBoundaries(opts);
     var maxWords = opts.maxWords || 12;
     var preferredMaxWords = opts.preferredMaxWords || 10;
-    // 首轮模型的 | 与局部 rescue 使用同一安全门禁；不能让 which/because/than 等
-    // 弱续接开屏仅因它来自首轮恢复就绕过运行时验证。
-    restored.marks = filterUnsafeRescueMarks(tokenWords(restored.tokens), restored.marks);
+    // 整轨首遍:信任模型已遵守短语规则的从句级分屏(字幕是连续语流,一屏以介词/
+    // 连词/从句引导词开头是自然的)。flow 模式只否决破坏词法绑定的切分(数字+单位、
+    // 比较结构),不做「每屏都要独立成句」的整屏否决——否则连续语流会被整段删光。
+    restored.marks = filterUnsafeRescueMarks(tokenWords(restored.tokens), restored.marks, { mode: "flow" });
     // 先按整句纠正模型的“4词碎屏 + 21词长屏”等坏组合。确定性分区能同时看见
     // reporting 主语、限定谓语与 trailing adjunct，避免局部 rescue 丢失句首上下文。
     restored.marks = normalizeOversizeSentenceMarks(restored.tokens, restored.marks, {
