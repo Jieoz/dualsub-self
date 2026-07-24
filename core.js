@@ -145,6 +145,325 @@
     return out;
   }
 
+
+  function appendTimelineTokens(out, incoming) {
+    var next = (incoming || []).filter(function (token) { return token && collapseWhitespace(token.text || ""); });
+    if (!next.length) return;
+    // 滚动 ASR 会把任意长度的旧前缀连同原词级时间再次发出。只有文本相等且
+    // 每个对应 token 的时间区间真实重叠时才去重；相邻 cue 合法重复同一个词时
+    // 时间不重叠，必须保留。不能用固定 8 词或纯文本后缀猜测 canonical source。
+    var max = Math.min(out.length, next.length);
+    var cut = 0;
+    for (var n = max; n >= 1; n--) {
+      var sameRollingSpan = true;
+      for (var j = 0; j < n; j++) {
+        var prior = out[out.length - n + j];
+        var current = next[j];
+        var sameText = String(prior.text).toLowerCase() === String(current.text).toLowerCase();
+        var priorStart = Number(prior.start), priorEnd = Number(prior.end);
+        var currentStart = Number(current.start), currentEnd = Number(current.end);
+        var timedOverlap = Number.isFinite(priorStart) && Number.isFinite(priorEnd) &&
+          Number.isFinite(currentStart) && Number.isFinite(currentEnd) &&
+          Math.max(priorStart, currentStart) < Math.min(priorEnd, currentEnd);
+        if (!sameText || !timedOverlap) { sameRollingSpan = false; break; }
+      }
+      if (sameRollingSpan) { cut = n; break; }
+    }
+    for (var i = cut; i < next.length; i++) out.push(next[i]);
+  }
+
+  function fallbackCueTokens(cue) {
+    var words = restoredWords(cue && cue.content || "");
+    if (!words.length) return [];
+    var start = Number(cue && cue.start);
+    var end = Number(cue && cue.end);
+    if (!Number.isFinite(start)) start = 0;
+    if (!Number.isFinite(end) || end < start) end = start;
+    return words.map(function (word, index) {
+      return {
+        text: word,
+        start: start + Math.round((end - start) * index / words.length),
+        end: start + Math.round((end - start) * (index + 1) / words.length),
+        nativeTiming: false,
+      };
+    });
+  }
+
+  /**
+   * 建立唯一 canonical token 流。正文、顺序和时间只来自源轨；滚动字幕的首尾
+   * 重叠在这里去重一次，后续 unit、renderer、cache 和 SRT 都只能引用 token span。
+   */
+  function timelineTokensForCue(cue) {
+    var native = (cue && cue.tokens || []).filter(function (token) {
+      return token && collapseWhitespace(token.text || "");
+    }).map(function (token) {
+      var cueStart = Number(cue && cue.start);
+      var start = Number(token.start);
+      var end = Number(token.end);
+      if (!Number.isFinite(start)) start = Number.isFinite(cueStart) ? cueStart : 0;
+      if (!Number.isFinite(end) || end < start) end = start;
+      return {
+        text: collapseWhitespace(token.text),
+        start: Math.round(start),
+        end: Math.round(end),
+        nativeTiming: token.nativeTiming !== false,
+      };
+    });
+    return native.length ? native : fallbackCueTokens(cue);
+  }
+
+  function buildCanonicalTokenTimeline(cues) {
+    var raw = [];
+    (cues || []).forEach(function (cue) {
+      appendTimelineTokens(raw, timelineTokensForCue(cue));
+    });
+
+    var canonical = raw.map(function (token) {
+      return {
+        text: collapseWhitespace(token.text),
+        startMs: toInt(token.start, 0),
+        endMs: Math.max(toInt(token.end, 0), toInt(token.start, 0)),
+        nativeTiming: token.nativeTiming === true,
+      };
+    });
+    var identity = canonical.map(function (token) {
+      return [token.text, token.startMs, token.endMs, token.nativeTiming ? 1 : 0].join("\x1f");
+    }).join("\x1e");
+    var fingerprint = hashCacheIdentity("token-v1\x1d" + identity);
+    var tokens = canonical.map(function (token, index) {
+      return {
+        id: fingerprint + ":" + index,
+        index: index,
+        text: token.text,
+        startMs: token.startMs,
+        endMs: token.endMs,
+        nativeTiming: token.nativeTiming,
+      };
+    });
+    return { version: "token-v1", sourceFingerprint: fingerprint, tokens: tokens };
+  }
+
+  function buildCueTokenSpanUnits(timeline, cues) {
+    var accumulated = [];
+    var boundaries = [];
+    (cues || []).forEach(function (cue) {
+      var before = accumulated.length;
+      appendTimelineTokens(accumulated, timelineTokensForCue(cue));
+      if (accumulated.length > before) boundaries.push(accumulated.length - 1);
+    });
+    var tokens = timeline && Array.isArray(timeline.tokens) ? timeline.tokens : [];
+    if (accumulated.length !== tokens.length) throw new Error("cue tokens do not match canonical timeline");
+    for (var i = 0; i < tokens.length; i++) {
+      if (collapseWhitespace(accumulated[i].text) !== tokens[i].text) {
+        throw new Error("cue token provenance mismatch at " + i);
+      }
+    }
+    return buildTokenSpanUnits(timeline, boundaries);
+  }
+
+  function buildTokenSpanUnits(timeline, boundaries) {
+    var tokens = timeline && Array.isArray(timeline.tokens) ? timeline.tokens : [];
+    if (!tokens.length) return [];
+    var ends = [];
+    var previous = -1;
+    (boundaries || []).forEach(function (value) {
+      var end = Number(value);
+      if (!Number.isInteger(end) || end < 0 || end >= tokens.length || end <= previous) {
+        throw new Error("invalid token boundary");
+      }
+      ends.push(end);
+      previous = end;
+    });
+    if (ends[ends.length - 1] !== tokens.length - 1) ends.push(tokens.length - 1);
+    var first = 0;
+    return ends.map(function (last, index) {
+      var span = tokens.slice(first, last + 1);
+      var unit = {
+        id: timeline.sourceFingerprint + ":u" + index + ":" + first + "-" + (last + 1),
+        sourceFingerprint: timeline.sourceFingerprint,
+        tokenStart: first,
+        tokenEnd: last + 1,
+        startMs: span[0].startMs,
+        endMs: Math.max(span[span.length - 1].endMs, span[0].startMs),
+        originalText: collapseWhitespace(span.map(function (token) { return token.text; }).join(" ")),
+      };
+      first = last + 1;
+      return unit;
+    });
+  }
+
+  function invalidCoverage(reason, coveredTokens) {
+    return { ok: false, coveredTokens: coveredTokens || 0, error: reason };
+  }
+
+  function validateTokenSpanCoverage(timeline, units) {
+    var tokens = timeline && Array.isArray(timeline.tokens) ? timeline.tokens : [];
+    var list = Array.isArray(units) ? units : [];
+    if (!tokens.length) return list.length ? invalidCoverage("units without tokens", 0) : { ok: true, coveredTokens: 0 };
+    if (!list.length) return invalidCoverage("missing units", 0);
+    var cursor = 0;
+    var ids = {};
+    for (var i = 0; i < list.length; i++) {
+      var unit = list[i] || {};
+      if (unit.sourceFingerprint !== timeline.sourceFingerprint) return invalidCoverage("source fingerprint mismatch", cursor);
+      if (!unit.id || ids[unit.id]) return invalidCoverage("duplicate or missing unit id", cursor);
+      ids[unit.id] = true;
+      if (!Number.isInteger(unit.tokenStart) || !Number.isInteger(unit.tokenEnd) || unit.tokenStart !== cursor || unit.tokenEnd <= unit.tokenStart || unit.tokenEnd > tokens.length) {
+        return invalidCoverage(unit.tokenStart < cursor ? "token overlap" : "token gap", cursor);
+      }
+      var span = tokens.slice(unit.tokenStart, unit.tokenEnd);
+      var original = collapseWhitespace(span.map(function (token) { return token.text; }).join(" "));
+      if (collapseWhitespace(unit.originalText || "") !== original) return invalidCoverage("source text mismatch", cursor);
+      if (Number(unit.startMs) !== Number(span[0].startMs) || Number(unit.endMs) !== Math.max(Number(span[span.length - 1].endMs), Number(span[0].startMs))) {
+        return invalidCoverage("source timing mismatch", cursor);
+      }
+      cursor = unit.tokenEnd;
+    }
+    if (cursor !== tokens.length) return invalidCoverage("token gap at end", cursor);
+    return { ok: true, coveredTokens: cursor };
+  }
+
+  function clonePlain(value) {
+    return JSON.parse(JSON.stringify(value));
+  }
+
+  function deepFreeze(value) {
+    if (!value || typeof value !== "object" || Object.isFrozen(value)) return value;
+    Object.keys(value).forEach(function (key) { deepFreeze(value[key]); });
+    return Object.freeze(value);
+  }
+
+  function createTimelineSnapshot(opts) {
+    opts = opts || {};
+    var timeline = clonePlain(opts.timeline || { version: "token-v1", sourceFingerprint: "", tokens: [] });
+    var units = clonePlain(opts.units || []);
+    var coverage = validateTokenSpanCoverage(timeline, units);
+    if (!coverage.ok) throw new Error("timeline coverage invalid: " + coverage.error);
+    var translations = opts.translations || {};
+    var translationMap = {};
+    var renderUnits = units.map(function (unit) {
+      var translation = String(translations[unit.id] == null ? "" : translations[unit.id]);
+      translationMap[unit.id] = translation;
+      return {
+        unitId: unit.id,
+        sourceFingerprint: unit.sourceFingerprint,
+        tokenStart: unit.tokenStart,
+        tokenEnd: unit.tokenEnd,
+        originalText: unit.originalText,
+        translation: translation,
+        startMs: unit.startMs,
+        endMs: unit.endMs,
+      };
+    });
+    var snapshot = {
+      version: "timeline-snapshot-v1",
+      revision: Math.max(0, toInt(opts.revision, 0)),
+      videoId: String(opts.videoId || ""),
+      trackCode: String(opts.trackCode || ""),
+      sourceFingerprint: timeline.sourceFingerprint,
+      status: renderUnits.every(function (unit) { return unit.translation.trim(); }) ? "verified" : "provisional",
+      timeline: timeline,
+      units: units,
+      translations: translationMap,
+      renderUnits: renderUnits,
+      coverage: coverage,
+    };
+    return deepFreeze(snapshot);
+  }
+
+  function cuesFromTimelineSnapshot(snapshot) {
+    if (!snapshot || !snapshot.timeline || !Array.isArray(snapshot.units)) return [];
+    return snapshot.units.map(function (unit) {
+      var span = snapshot.timeline.tokens.slice(unit.tokenStart, unit.tokenEnd);
+      return {
+        start: unit.startMs,
+        end: unit.endMs,
+        duration: Math.max(0, unit.endMs - unit.startMs),
+        content: unit.originalText,
+        unitId: unit.unitId,
+        tokenStart: unit.tokenStart,
+        tokenEnd: unit.tokenEnd,
+        sourceFingerprint: unit.sourceFingerprint,
+        tokens: span.map(function (token) {
+          return {
+            id: token.id,
+            index: token.index,
+            text: token.text,
+            start: token.startMs,
+            end: token.endMs,
+            nativeTiming: token.nativeTiming,
+          };
+        }),
+      };
+    });
+  }
+
+  function resegmentTimelineSnapshot(snapshot, unitStart, unitEnd, replacementCues) {
+    if (!snapshot || !snapshot.timeline || !Array.isArray(snapshot.units)) throw new Error("timeline snapshot required");
+    var firstUnit = Number(unitStart);
+    var afterUnit = Number(unitEnd);
+    if (!Number.isInteger(firstUnit) || !Number.isInteger(afterUnit) || firstUnit < 0 || afterUnit <= firstUnit || afterUnit > snapshot.units.length) {
+      throw new Error("replacement unit range invalid");
+    }
+    var tokenStart = snapshot.units[firstUnit].tokenStart;
+    var tokenEnd = snapshot.units[afterUnit - 1].tokenEnd;
+    var sourceWords = snapshot.timeline.tokens.slice(tokenStart, tokenEnd).map(function (token) { return token.text; });
+    var replacementWords = [];
+    var localEnds = [];
+    (replacementCues || []).forEach(function (cue) {
+      var words = restoredWords(cue && cue.content || "");
+      if (!words.length) throw new Error("replacement token unit empty");
+      for (var i = 0; i < words.length; i++) replacementWords.push(words[i]);
+      localEnds.push(tokenStart + replacementWords.length - 1);
+    });
+    if (replacementWords.length !== sourceWords.length) throw new Error("replacement token coverage mismatch");
+    for (var w = 0; w < sourceWords.length; w++) {
+      if (String(replacementWords[w]).toLowerCase() !== String(sourceWords[w]).toLowerCase()) {
+        throw new Error("replacement token text mismatch at " + w);
+      }
+    }
+    if (!localEnds.length || localEnds[localEnds.length - 1] !== tokenEnd - 1) throw new Error("replacement token coverage mismatch");
+    var boundaries = [];
+    for (var left = 0; left < firstUnit; left++) boundaries.push(snapshot.units[left].tokenEnd - 1);
+    boundaries = boundaries.concat(localEnds);
+    for (var right = afterUnit; right < snapshot.units.length; right++) boundaries.push(snapshot.units[right].tokenEnd - 1);
+    var nextUnits = buildTokenSpanUnits(snapshot.timeline, boundaries);
+    var oldBySpan = {};
+    snapshot.units.forEach(function (unit) {
+      oldBySpan[unit.tokenStart + ":" + unit.tokenEnd] = snapshot.translations && snapshot.translations[unit.id] || "";
+    });
+    var nextTranslations = {};
+    nextUnits.forEach(function (unit) {
+      nextTranslations[unit.id] = oldBySpan[unit.tokenStart + ":" + unit.tokenEnd] || "";
+    });
+    return createTimelineSnapshot({
+      revision: Number(snapshot.revision || 0) + 1,
+      videoId: snapshot.videoId,
+      trackCode: snapshot.trackCode,
+      timeline: snapshot.timeline,
+      units: nextUnits,
+      translations: nextTranslations,
+    });
+  }
+
+  function withTimelineTranslations(snapshot, updates) {
+    if (!snapshot || !snapshot.timeline || !Array.isArray(snapshot.units)) throw new Error("timeline snapshot required");
+    var next = {};
+    var current = snapshot.translations || {};
+    snapshot.units.forEach(function (unit) {
+      var value = Object.prototype.hasOwnProperty.call(updates || {}, unit.id) ? updates[unit.id] : current[unit.id];
+      next[unit.id] = String(value == null ? "" : value);
+    });
+    return createTimelineSnapshot({
+      revision: Number(snapshot.revision || 0) + 1,
+      videoId: snapshot.videoId,
+      trackCode: snapshot.trackCode,
+      timeline: snapshot.timeline,
+      units: snapshot.units,
+      translations: next,
+    });
+  }
+
   // 语义恢复协议：模型只可在源词之间加入 .?!|，绝不拥有正文所有权。
   // 逐词归一化后必须完全相等，否则整个 chunk 无效并由调用方重试/回退。
   var RESTORE_WORD_RE = /[A-Za-z0-9]+(?:['’][A-Za-z]+)?/g;
@@ -737,8 +1056,8 @@
     //                  「直接给结果不要思考过程」压住 reasoning 爆点；"low" 时实测延迟 4.5-6.7s 稳定、
     //                  reasoning 14-103 token。取值 low|medium|high；空串或 "default" = 不发该字段。
     minLineChars: 10,
-    // 字幕行目标上限（字）。后处理 splitLongLines 用；只在短语标记边界拆，绝不切词。
-    maxLineChars: 0, // 双语对照固定一行：不在中文语义单元内部插入换行。
+    // 双语对照固定一行；该值属于翻译 identity，不触发本地中文切分。
+    maxLineChars: 0,
     //                  （只在行边界落点，绝不切词）。<=0 关闭合并。规则2「每行不要过分短」的兜底。
     tailTrimMs: 120, // 句间视觉尾缩(ms)：连续语流句单元 end 回缩此值制造句间断点(修字幕墙)。
     //                  0=关闭。仅长句(duration>2×)缩，缩后保留 >=300ms 可视；真停顿不受影响。
@@ -790,8 +1109,15 @@
    *  - 仅在新字段缺失时迁移，已显式设置新字段的不动（用户改过就尊重）。
    * 返回新对象，不改入参。读取/合并配置后调用一次即可，让老配置不会炸掉。
    */
+  function normalizeTargetLang(value) {
+    var raw = String(value == null ? "" : value).trim().toLowerCase().replace(/_/g, "-");
+    if (raw === "zh" || raw === "zh-cn" || raw === "zh-hans" || raw === "cmn" || raw === "简体中文") return "zh-Hans";
+    return null;
+  }
+
   function migrateConfig(config) {
     var c = Object.assign({}, config || {});
+    c.targetLang = normalizeTargetLang(c.targetLang) || DEFAULT_CONFIG.targetLang;
     if (c.strokeWidth == null) {
       // 旧 stroke 显式 false → 无描边(0)；否则用默认粗细
       c.strokeWidth = c.stroke === false ? 0 : DEFAULT_CONFIG.strokeWidth;
@@ -877,14 +1203,12 @@
   // 已验证 system prompt（直接写死规则 + 压 reasoning）。{TARGET_LANG} 仅在调用方
   // 传自定义 prompt 时替换；默认 prompt 面向简体中文，无占位符（替换为 no-op）。
   var DEFAULT_SYSTEM_PROMPT =
-    "你是专业中文字幕翻译。输入是同一段连续语流中带序号、已经过本地边界验证的英文字幕屏。请先结合前后文理解整段，再严格按相同序号输出简体中文。\n" +
-    "规则如下：\n" +
-    "1) 输出行数、序号和顺序必须与输入完全一致；每行以相同序号开头，例如 `1. …`。\n" +
-    "2) 第 N 行只承载第 N 个英文屏的信息，不把信息挪到相邻编号，不合并、不遗漏、不重复。\n" +
-    "3) 每条译文必须是该英文字幕屏在连续语流中的自然中文表达，不得输出悬空或截断的半句话，也不得补入源文没有的意思；允许用“它/这/尽管”等承接相邻屏，使每屏简洁可读。\n" +
-    "4) 译文应简洁、自然、适合字幕显示；绝不把一个中文词切成两半。每条中文必须严格保持单行，不得在单元内部换行。对于为舒适行长而形成且已经本地验证的渐进短屏（如 Let me point out that / despite being limited），应结合相邻行译为自然闭合中文（如“我先说明一点”/“即使受限也一样”），不要返回 [MERGE_PREV]。除此之外，若某输入结合相邻行仍无法译成自然可读的连续字幕片段，必须只返回 [MERGE_PREV]，不得硬翻成逗号半句。若其他英文以从属连接词开头（如 but/although/than/despite），只有它自身具备完整主谓、能改写成自然完整中文时才翻译；否则返回 [MERGE_PREV]。\n" +
-    "5) 每条都必须在本屏自然收束；中文字幕不得输出中文句号“。”，陈述句直接以文字结束，疑问句和感叹句保留问号或感叹号。即使英文语法延续到下一屏，也要用代词或自然改写让本屏中文完整，绝不能以逗号、顿号、冒号、分号或省略号结尾。\n" +
-    "6) 不要输出英文、其它字母、解释或思考过程。只输出带编号的中文字幕行。直接给结果。";
+    "你是专业中文字幕翻译。输入是同一段连续语流中已经过本地 token 边界验证的英文字幕单元。先结合前后文理解整段，再逐单元翻译为简体中文。\n" +
+    "每条译文只能承载对应 sourceText 的信息，不得把信息挪到相邻单元，不得遗漏、重复或补入源文没有的意思。\n" +
+    "每条译文必须自然闭合、简洁、适合单行字幕；可用代词或自然改写承接上下文，但不得返回悬空逗号半句。\n" +
+    "中文字幕不得输出中文句号“。”；疑问句和感叹句保留问号或感叹号。不要输出英文、解释或思考过程。\n" +
+    "只返回严格 JSON：{\"translations\":[{\"unitId\":\"...\",\"coverFrom\":0,\"coverTo\":1,\"translation\":\"...\"}]}。" +
+    "每个输入 unitId 必须恰好返回一次，coverFrom/coverTo 必须原样复制，不得返回其它字段。";
 
   /** 是否中文相关 BCP47 / YouTube languageCode（zh, zh-Hans, zh-CN, yue, cmn…） */
   function isChineseLangCode(code) {
@@ -923,119 +1247,6 @@
     return tpl.replace(/\{TARGET_LANG\}/g, targetLang || "简体中文");
   }
 
-  /** 把 cue 拼成带序号的 user message；模型必须按相同序号 1:1 返回。 */
-  function buildNumberedSourceLines(lines) {
-    return (lines || [])
-      .map(function (t, i) {
-        return i + 1 + ". " + collapseWhitespace(t);
-      })
-      .join("\n");
-  }
-
-  // 保留有语义的行尾标点，仅折叠模型偶发重复输出的同类尾部标点与空白。
-  var TRAILING_SPACE_RE = /\s+$/u;
-  var REPEATED_TRAILING_PUNCT_RE = /([，。！？,.!?])\1+$/u;
-
-  function cleanSubtitleBody(text) {
-    var body = collapseWhitespace(text).replace(TRAILING_SPACE_RE, "").trim();
-    body = body.replace(/([，。！？、：；,.!?:;])\s+/gu, "$1");
-    while (REPEATED_TRAILING_PUNCT_RE.test(body)) {
-      body = body.replace(REPEATED_TRAILING_PUNCT_RE, "$1");
-    }
-    return body;
-  }
-  // 漏网的行号前缀（模型偶尔违反规则4）：「1. 」「1、」「1) 」「1）」等。
-  var LEADING_NUM_RE = /^\s*\d{1,3}\s*[.、)）:：]\s*/u;
-
-  /**
-   * 解析模型输出为「干净的中文字幕行数组」（后处理兜底，纯函数）。
-   *  - 按换行切；逐行剥离漏网行号前缀、保留必要标点并折叠格式噪声、trim。
-   *  - 丢空行；合并连续完全相同的重复行（ASR 回声/模型复读兜底）。
-   * 不做任何按词/按字切割 —— 模型已分好行，代码只清洗，不动行边界。
-   */
-  function parseSubtitleLines(text) {
-    if (typeof text !== "string") return [];
-    var raw = text.replace(/\r/g, "").split("\n");
-    var out = [];
-    for (var i = 0; i < raw.length; i++) {
-      var ln = raw[i].replace(LEADING_NUM_RE, "");
-      ln = cleanSubtitleBody(ln);
-      ln = sanitizeSubtitleLine(ln);
-      if (!ln) continue; // 丢空行
-      if (out.length && out[out.length - 1] === ln) continue; // 合并连续重复行
-      out.push(ln);
-    }
-    return out;
-  }
-
-  /**
-   * 译文行杂质清洗（v0.4.1）：模型偶发夹带非目标脚本（如马拉雅拉姆字母）或英文专名。
-   *  - 去掉 CJK/数字/空白/常用中文标点以外的字符（含拉丁字母、其它 Unicode 脚本）。
-   *  - 折叠空白；若洗完为空则返回空串（上层 parse/merge 会丢空行）。
-   * 绝不在 CJK 词中间插入/删除汉字——只剥杂质。
-   */
-
-  function parseAlignedSubtitleLines(text, expectedCount) {
-    var n = expectedCount > 0 ? expectedCount : 0;
-    var slots = new Array(n).fill("");
-    if (!n || typeof text !== "string") return slots;
-    var raw = text.replace(/\r/g, "").split("\n");
-    var sequential = [];
-    for (var i = 0; i < raw.length; i++) {
-      var line = raw[i];
-      if (line == null) continue;
-      var m = String(line).match(/^\s*(\d{1,3})\s*[.、)）:：]\s*(.*)$/u);
-      var body = "", idx = -1;
-      if (m) { idx = parseInt(m[1], 10) - 1; body = m[2]; } else { body = line; }
-      body = cleanSubtitleBody(body);
-      if (isMergePrevMarker(body)) {
-        body = "[MERGE_PREV]";
-      } else {
-        body = sanitizeSubtitleLine(body);
-      }
-      if (!body) continue;
-      if (idx >= 0 && idx < n) { if (!slots[idx]) slots[idx] = body; }
-      else sequential.push(body);
-    }
-    var filled = 0;
-    for (var k = 0; k < n; k++) if (slots[k]) filled++;
-    // 无编号输出只有在数量恰好等于 cue 数时才可按顺序接受；数量不足/过多
-    // 都无法证明对应关系。只要已有编号行，也绝不拿未编号行猜填缺号。
-    if (filled === 0 && sequential.length === n) {
-      for (var s = 0; s < n; s++) slots[s] = sequential[s];
-    }
-    return slots;
-  }
-
-  function shapeAlignedLine(line) {
-    // 双语对照的显示契约：每个英文语义 cue 对应一条中文，二者各占一行。
-    // 这里只清洗模型偶发的空白/换行，不再做中文单元内的视觉折行。
-    return collapseWhitespace(line);
-  }
-
-  var EN_COLD_KETTLE_BORROW_PREV_RE = /\bgo\s+into\s+a\s*[.。]?$/i;
-  var EN_COLD_KETTLE_BORROW_NEXT_RE = /^\s*cold\s+kettle\b/i;
-  var ZH_COLD_KETTLE_BORROW_NEXT_RE = /^冷水壶[，,、：:；;]\s*/u;
-
-  function repairCrossCueBorrowedNounPhrases(lines, cues) {
-    var out = (lines || []).map(function (line) { return String(line == null ? "" : line); });
-    var list = cues || [];
-    if (out.length < 2 || list.length !== out.length) return out;
-    for (var i = 0; i < out.length - 1; i++) {
-      var prevEn = collapseWhitespace(list[i] && list[i].content || "");
-      var nextEn = collapseWhitespace(list[i + 1] && list[i + 1].content || "");
-      if (!EN_COLD_KETTLE_BORROW_PREV_RE.test(prevEn)) continue;
-      if (!EN_COLD_KETTLE_BORROW_NEXT_RE.test(nextEn)) continue;
-      if (!/水壶$/u.test(out[i])) continue;
-      if (!ZH_COLD_KETTLE_BORROW_NEXT_RE.test(out[i + 1])) continue;
-      var remainder = out[i + 1].replace(ZH_COLD_KETTLE_BORROW_NEXT_RE, "").trim();
-      if (!remainder) continue;
-      out[i] = out[i].replace(/水壶$/u, "冷水壶");
-      out[i + 1] = remainder;
-    }
-    return out;
-  }
-
   function sanitizeSubtitleLine(line) {
     var s = String(line == null ? "" : line);
     if (!s) return "";
@@ -1047,34 +1258,6 @@
     // 去掉拉丁串后可能留下「个 瓶子」：仅压 CJK 之间的空格，数字两侧空格保留（「功率是 8.8 千瓦」）。
     s = s.replace(/([一-鿿])\s+([一-鿿])/gu, "$1$2");
     return s;
-  }
-
-  // 可视长度（按码点计，CJK/拉丁字符各计 1）。用于最小行长判定 + 时间轴占比权重。
-  function charLen(s) {
-    var n = 0;
-    var str = String(s == null ? "" : s);
-    for (var i = 0; i < str.length; i++) {
-      var c = str.charCodeAt(i);
-      // 跳过代理对低位，避免 emoji/扩展区算两次
-      if (c >= 0xdc00 && c <= 0xdfff) continue;
-      n++;
-    }
-    return n;
-  }
-
-  // 拼接两行：边界两侧都是拉丁/数字时插一个空格（不粘连英文词），否则直接相连（CJK 不加空格）。
-  function joinLine(a, b) {
-    var x = String(a || "");
-    var y = String(b || "");
-    if (!x) return y;
-    if (!y) return x;
-    var lastCh = x[x.length - 1];
-    var firstCh = y[0];
-    // 拉丁词之间、句读后接下一段英文，都要空格；CJK 相连不加空格。
-    var sep = "";
-    if (/[0-9A-Za-z]/.test(lastCh) && /[0-9A-Za-z]/.test(firstCh)) sep = " ";
-    else if (/[.!?;,:%)]/.test(lastCh) && /[0-9A-Za-z"'(]/.test(firstCh)) sep = " ";
-    return x + sep + y;
   }
 
   function validateChineseDisplayUnit(text) {
@@ -1089,567 +1272,65 @@
     return { ok: true, reason: "ok" };
   }
 
-  function isMergePrevMarker(line) {
-    return /^\s*\[MERGE_PREV\]\s*$/i.test(String(line == null ? "" : line));
-  }
-
-  function mergeRejectedTranslationCues(cues, lines) {
-    var source = cues || [];
-    var translated = lines || [];
-    var out = [];
-    for (var i = 0; i < source.length; i++) {
-      var cue = Object.assign({}, source[i]);
-      cue.tokens = Array.isArray(source[i] && source[i].tokens) ? source[i].tokens.slice() : source[i] && source[i].tokens;
-      if (isMergePrevMarker(translated[i])) {
-        if (out.length) out[out.length - 1] = mergeNaturalUnits(out[out.length - 1], cue);
-        else out.push(cue);
-      } else {
-        out.push(cue);
-      }
-    }
-    return out;
-  }
-
-  /**
-   * 最小行长兜底（规则2：每行不要过分短）。把短于 minChars 的行【整行】合并到相邻行 ——
-   * 只在【行边界】落点，绝不切词（这是与旧架构的根本区别）。
-   *  - 贪心：某行短于阈值 → 把它后面的行并进来，直到达标或并完。
-   *  - 末行若仍短 → 向前并入前一行。
-   *  - 全部都短（原文内容本来就少）→ 合并成一行，宁可一行也不切碎。
-   * minChars<=0 关闭合并，原样返回（便于 A/B 与单测）。
-   */
-  function mergeShortLines(lines, minChars) {
-    var min = minChars > 0 ? minChars : 0;
-    var src = (lines || []).slice();
-    if (!min || src.length <= 1) return src;
-    var out = [];
-    for (var i = 0; i < src.length; i++) {
-      if (out.length && charLen(out[out.length - 1]) < min) {
-        out[out.length - 1] = joinLine(out[out.length - 1], src[i]);
-      } else {
-        out.push(src[i]);
-      }
-    }
-    // 末行仍短 → 向前并（>=2 行时）。
-    while (out.length >= 2 && charLen(out[out.length - 1]) < min) {
-      var last = out.pop();
-      out[out.length - 1] = joinLine(out[out.length - 1], last);
-    }
-    return out;
-  }
-
-  // 强连接尾（几乎总是半截）：和/与/或/及/而/以/把/被/让/从/在
-  // 「的」单独处理：很多完整短语以「的」结尾（这根本不是真的 / 一步步运作的），不能一律并。
-  var STRONG_DANGLING_TAIL_RE = /(?:[和与或及而以把被让从在]|以至于)$/u;
-  // 「的」后接的下一行若像定语中心语（东西/地方/时候…）才合并，避免误并完整句。
-  var DE_NOMINAL_HEAD_RE = /^(东西|事情|地方|时候|人|原因|问题|方法|方式|样子|结果|情况|部分|内容|时间|过程|作用|意义|感觉|声音|颜色|味道|温度|速度|功率|电压|电流|水壶|电热|炉灶)/u;
-
-  function isDanglingLine(line, nextLine) {
-    var s = String(line == null ? "" : line);
-    if (!s) return false;
-    if (STRONG_DANGLING_TAIL_RE.test(s)) return true;
-    if (/的$/u.test(s)) {
-      // 末行「…的」通常是完整收尾（不是真的/运作的）→ 不并
-      if (nextLine == null) return false;
-      var nxt = String(nextLine);
-      if (!nxt) return false;
-      // 下一行是名词中心语开头 → 典型半截定语（专门烧水的 + 东西…）
-      if (DE_NOMINAL_HEAD_RE.test(nxt)) return true;
-      // 下一行很短（<=4 字）且整行像名词尾巴时也并（东西叫水壶 会更长，靠 head re）
-      return false;
-    }
-    return false;
-  }
-
-  /**
-   * 合并半截连接尾行（v0.4.1 观感打磨）。
-   *  - 强连接尾（和/与/…）整行并入下一行。
-   *  - 「的」仅在下一行像定语中心语时并入（防「不是真的」「运作的」误并）。
-   *  - 末行强连接尾 → 向前并；末行「…的」不并。
-   *  - 只在行边界落点，绝不切词；空/单行/无半截原样返回。
-   */
-  function mergeDanglingLines(lines) {
-    var src = (lines || []).slice();
-    if (src.length <= 1) return src;
-    var out = [];
-    for (var i = 0; i < src.length; i++) {
-      var cur = String(src[i] == null ? "" : src[i]);
-      if (!cur) continue;
-      if (out.length && isDanglingLine(out[out.length - 1], cur)) {
-        out[out.length - 1] = joinLine(out[out.length - 1], cur);
-      } else {
-        out.push(cur);
-      }
-    }
-    // 末行仅强连接尾才向前并（「…的」完整收尾保留）
-    while (out.length >= 2 && STRONG_DANGLING_TAIL_RE.test(out[out.length - 1])) {
-      var last = out.pop();
-      out[out.length - 1] = joinLine(out[out.length - 1], last);
-    }
-    return out;
-  }
-
-  // 超长粘句安全拆分点：只在这些「话语标记」之前断开，标记本身完整保留到下一行。
-  // 绝不在字/词中间切开——找不到安全点就整行保留。
-  var LONG_LINE_SPLIT_MARKERS = [
-    "就是", "我们", "你们", "他们", "咱们",
-    "从", "比如", "例如", "还有", "而且", "并且",
-    "但是", "不过", "所以", "因为", "如果", "然后",
-    "以及", "以至于", "其实", "总之", "也许", "可能",
-    "一个", "这种", "那个",
-  ];
-
-  /**
-   * 拆超长/粘句字幕行（v0.4.3 可读性打磨）。
-   *  - 仅当 charLen(line) > maxChars 时尝试拆。
-   *  - 只在 LONG_LINE_SPLIT_MARKERS 之前断开，且左右两边都 >= minPart（默认 4）。
-   *  - 优先选使左段落在 8–maxChars 的切点；找不到安全点 → 原样保留（宁可不切词）。
-   *  - maxChars<=0 关闭。可递归拆到都不再超长或无法再拆。
-   */
-  function splitLongLines(lines, maxChars, minPart) {
-    var max = maxChars > 0 ? maxChars : 0;
-    var minP = minPart > 0 ? minPart : 4;
-    var src = (lines || []).slice();
-    if (!max || !src.length) return src;
-
-    function trySplit(line) {
-      var s = String(line == null ? "" : line);
-      var n = charLen(s);
-      // 中文规范优先保持完整一行；只有超过每行上限才进入安全断行。
-      if (n <= max) return [s];
-      var best = null; // {left, right, score, leftLen}
-      for (var m = 0; m < LONG_LINE_SPLIT_MARKERS.length; m++) {
-        var mk = LONG_LINE_SPLIT_MARKERS[m];
-        var from = 0;
-        while (from < s.length) {
-          var at = s.indexOf(mk, from);
-          if (at < 0) break;
-          if (at === 0) {
-            from = mk.length;
-            continue; // 行首标记不拆
-          }
-          var left = s.slice(0, at);
-          var right = s.slice(at);
-          var ll = charLen(left);
-          var rl = charLen(right);
-          if (ll >= minP && rl >= minP) {
-            // 超长行：任何安全切点都可；未超长粘句：左段应是完整短句（<=max 且不宜过长）。
-            if (n <= max && ll > max) {
-              from = at + mk.length;
-              continue;
-            }
-            var score = 0;
-            if (ll >= 4 && ll <= max) score += 100 - Math.abs(8 - ll); // 左段 4–max，越近 8 越好
-            else if (ll > max) score += Math.max(0, 30 - (ll - max));
-            else score += ll;
-            // 总长越超 max 越倾向拆
-            if (n > max) score += 20;
-            if (!best || score > best.score || (score === best.score && Math.abs(8 - ll) < Math.abs(8 - best.leftLen))) {
-              best = { leftLen: ll, score: score, left: left, right: right };
-            }
-          }
-          from = at + mk.length;
-        }
-      }
-      // 未超长且没找到像样切点 → 不拆
-      if (!best) return [s];
-      if (n <= max && best.score < 90) return [s]; // 粘句只接受左段舒适的高分切点
-      return trySplit(best.left).concat(trySplit(best.right));
-    }
-
-    var out = [];
-    for (var i = 0; i < src.length; i++) {
-      var parts = trySplit(src[i]);
-      for (var j = 0; j < parts.length; j++) {
-        if (parts[j]) out.push(parts[j]);
-      }
-    }
-    return out;
-  }
-
-  /* ---------------------------------------------------------------
-   * 4a. 时间轴排布常量（layoutTimeline 用）。
-   * ------------------------------------------------------------- */
-  // 每段至少可视这么久(ms)，也是「一屏可视时长地板」：除整段太短放不下的退化情形外，
-  // 任何一行 endMs-startMs >= 此值（不闪现）。
-  var SEG_MIN_VISIBLE_MS = 800;
-  // 目标阅读速度（字/秒）：每行「该显示多久」= ceil(字数/TARGET_CPS*1000)，剩余 slot 留白成停顿。
-  var TARGET_CPS = 7;
-  // 行与行之间的最小可见间隙(ms)：非末行终点往回扣此值，露出停顿（让位于可视地板）。
-  var INTER_SEG_GAP_MS = 120;
-
-  /**
-   * 给定各段字数 lens 与时间区间，算出每段 { startMs, endMs }（缺陷5+7）。
-   *  - 屏起点：按字数占比线性排布的「时隙边界」(slotStart)，贴合语音、不漏过、单调不回退。
-   *  - 屏终点：endMs = min(slotStart + idealMs, slotEnd)，idealMs = max(地板, ceil(字数/CPS*1000))。
-   *    剩余 slot 时间留白成句间停顿（缺陷5：不慢飘）。语音密(slot 比 ideal 还短)则顶到 slotEnd。
-   *  - 地板兜底（缺陷7）：若某 slot 本身 < 地板，向后顺移借时间补足；整段总时长太短放不下时
-   *    （sum(地板) > span）按比例缩放地板让步——优先级：不丢字 > 不超cap > 可视地板 > 目标速度。
-   */
-  function layoutTimeline(lens, startMs, endMs, minVisible, targetCps) {
-    var n = lens.length;
-    var span = Math.max(0, endMs - startMs);
-    var total = 0;
-    for (var i = 0; i < n; i++) total += lens[i] || 1;
-    // slot 边界（字数占比），单调不回退、首=startMs、末=endMs。
-    var slotStart = new Array(n);
-    var slotEnd = new Array(n);
-    var acc = 0;
-    var prev = startMs;
-    for (var j = 0; j < n; j++) {
-      slotStart[j] = prev;
-      acc += lens[j] || 1;
-      var e = j === n - 1 ? endMs : startMs + Math.round((span * acc) / total);
-      if (e < prev) e = prev;
-      slotEnd[j] = e;
-      prev = e;
-    }
-    // 地板兜底：保证每个 slot 时长 >= minVisible（最后一个 slot 终点固定为 endMs）。
-    // 若 n*minVisible > span（整段太短放不下）→ 缩放地板让步（可视地板让位给不丢字/不超cap）。
-    var floor = minVisible;
-    if (n * floor > span && n > 0) floor = Math.floor(span / n);
-    if (floor > 0) {
-      // 从前往后：若 slot 太短，向后推它的终点（顺移后续 slotStart），保持单调全覆盖。
-      for (var k = 0; k < n; k++) {
-        var dur = slotEnd[k] - slotStart[k];
-        if (dur < floor) {
-          var want = slotStart[k] + floor;
-          if (k === n - 1) want = endMs; // 末段终点锁死
-          if (want > slotEnd[k]) {
-            slotEnd[k] = Math.min(want, endMs);
-            if (k < n - 1 && slotEnd[k] > slotStart[k + 1]) slotStart[k + 1] = slotEnd[k];
-          }
-        }
-      }
-      // 反向兜底：末段可能被压短，向前借（把前一段终点提前）。
-      for (var m = n - 1; m > 0; m--) {
-        var d2 = slotEnd[m] - slotStart[m];
-        if (d2 < floor) {
-          var need = floor - d2;
-          var newStart = Math.max(slotEnd[m - 1] - need, slotStart[m - 1] + Math.max(1, floor));
-          if (newStart < slotStart[m]) {
-            slotStart[m] = Math.max(newStart, slotStart[m - 1] + Math.min(floor, slotEnd[m - 1] - slotStart[m - 1]));
-            slotEnd[m - 1] = slotStart[m];
-          }
-        }
-      }
-    }
-    // 每段终点提前到 起点+idealMs，剩余留白（缺陷5）。语音密则顶到 slotEnd。
-    // v0.3.1：非末屏强制保留 INTER_SEG_GAP_MS 句间断点（治「无间隙一直显示」），
-    // 但句间断点让位于可视地板——slot 太短放不下断点时优先保 SEG_MIN_VISIBLE_MS，不闪现。
-    var out = [];
-    for (var p = 0; p < n; p++) {
-      var sStart = slotStart[p];
-      var sEnd = slotEnd[p];
-      var slotDur = sEnd - sStart;
-      var ideal = Math.max(minVisible, Math.ceil(((lens[p] || 1) / targetCps) * 1000));
-      // idealMs 不得超过本 slot 可用时长（不能挤占下一屏语音位置）。
-      var dispEnd = sStart + Math.min(ideal, slotDur);
-      if (p < n - 1) {
-        // 非末屏：从 slotEnd 往回扣一个断点，使本屏与下屏之间出现可见间隙。
-        // 优先级：不超 slotEnd > 可视地板(minVisible) > 句间断点。
-        var gapped = sEnd - INTER_SEG_GAP_MS;
-        var floorEnd = sStart + minVisible;
-        var want = Math.max(floorEnd, Math.min(dispEnd, gapped));
-        if (want < dispEnd) dispEnd = want;
-      }
-      if (dispEnd > sEnd) dispEnd = sEnd;
-      if (dispEnd < sStart) dispEnd = sStart;
-      out.push({ startMs: sStart, endMs: dispEnd });
-    }
-    return out;
-  }
-  /* ---------------------------------------------------------------
-   * 4b. 按字符比例配时间轴（v0.4.0 核心）：把模型吐出的「不可再切的整行」
-   *     字幕行铺到该 clip 覆盖的总时间上。代码只配时间，绝不切译文。
-   * ------------------------------------------------------------- */
-
-  /**
-   * 把 N 行字幕（每行已是不可再切的整行）铺到 [startMs,endMs] 时间窗，按各行字符数
-   * 占比分配显示区间，并为每行就近配上原文（仅供双语显示/对照，按时间重叠归并 cue）。
-   *  - lines: 模型输出并清洗后的中文字幕行数组（行边界即时间轴边界，不切词）。
-   *  - startMs/endMs: 该 clip 覆盖的总时间（取自 clip.startMs / clip.endMs）。
-   *  - cues: 该 clip 的原始 cue（v0.4.4：标点切段后按时序分配到各输出行 + 空槽最近邻回填；可空）。
-   * 复用 layoutTimeline（字符数为占比权重 + SEG_MIN_VISIBLE_MS 可视地板 + 句间留白），
-   * 但输入是【不可再切的整行】—— 行长就是权重，layoutTimeline 不会、也无需碰行内字符。
-   * 返回：[{ srcStart, srcEnd, originalText, translation, startMs, endMs }]（与渲染单元同构）。
-   *   srcStart/srcEnd 为 1-based 输出行号（仅排序用，不再回映 cue 时间）。
-   */
+  /** Materialize already-verified 1:1 translations on immutable source cue timing. */
   function buildClipUnits(lines, startMs, endMs, cues) {
     var list = cues || [];
     var rawLines = lines || [];
-    // v0.5 主路径：源 cue 1:1。lines[i] 对应 cues[i]；时间轴用 cue 原时间，英文用 cue.content。
-    if (list.length && rawLines.length === list.length) {
-      rawLines = repairCrossCueBorrowedNounPhrases(rawLines, list);
-      var out1 = [];
-      for (var i = 0; i < list.length; i++) {
-        var cue = list[i];
-        var zh = rawLines[i] == null ? "" : String(rawLines[i]);
-        var cStart = Number(cue.start);
-        var cEnd = Number(cue.end);
-        if (!Number.isFinite(cStart)) cStart = startMs;
-        if (!Number.isFinite(cEnd)) cEnd = endMs;
-        if (cEnd < cStart) { var tmp = cStart; cStart = cEnd; cEnd = tmp; }
-        out1.push({
-          srcStart: i + 1,
-          srcEnd: i + 1,
-          originalText: collapseWhitespace(cue.content || ""),
-          translation: zh,
-          startMs: cStart,
-          endMs: cEnd,
-        });
-      }
-      return out1;
-    }
-    var arr = rawLines.filter(function (l) { return l != null && String(l).trim() !== ""; });
-    if (!arr.length) return [];
-    var lens = arr.map(function (l) { return Math.max(1, charLen(String(l).replace(/\n/g, ""))); });
-    var times = layoutTimeline(lens, startMs, endMs, SEG_MIN_VISIBLE_MS, TARGET_CPS);
-    var origByLine = assignOriginalsToLines(times, list, arr.length, startMs, endMs);
-    var out = [];
-    for (var j = 0; j < arr.length; j++) {
-      out.push({
-        srcStart: j + 1,
-        srcEnd: j + 1,
-        originalText: origByLine[j] || "",
-        translation: arr[j],
-        startMs: times[j].startMs,
-        endMs: times[j].endMs,
-      });
-    }
-    return out;
-  }
-
-  /**
-   * 英文/原文显示切段（本地、零 token）：在句读标点后断开。
-   *  - 强切：. ! ? ;（保留标点在左段；不在小数 12.5 处切；... 视为一体）
-   *  - 弱切：单段超过 maxChunk 时在逗号后补切
-   *  - 仍过长：按词边界硬切到 maxChunk（只断空格，不拆单词）
-   */
-  function splitOriginalByPunct(text, maxChunk) {
-    var s = collapseWhitespace(text);
-    if (!s) return [];
-    var limit = maxChunk > 0 ? maxChunk : 64;
-
-    function strongSplit(str) {
-      var parts = [];
-      var buf = "";
-      for (var i = 0; i < str.length; i++) {
-        var ch = str[i];
-        buf += ch;
-        var isStrong = ch === "!" || ch === "?" || ch === ";";
-        if (ch === ".") {
-          var prev = i > 0 ? str[i - 1] : "";
-          var next = i + 1 < str.length ? str[i + 1] : "";
-          if (/\d/.test(prev) && /\d/.test(next)) {
-            // 小数点
-          } else {
-            while (i + 1 < str.length && str[i + 1] === ".") {
-              i++;
-              buf += ".";
-            }
-            isStrong = true;
-          }
-        }
-        if (isStrong) {
-          while (i + 1 < str.length && /["')\]]/.test(str[i + 1])) {
-            i++;
-            buf += str[i];
-          }
-          parts.push(buf.trim());
-          buf = "";
-          while (i + 1 < str.length && /\s/.test(str[i + 1])) i++;
-        }
-      }
-      if (buf.trim()) parts.push(buf.trim());
-      return parts.length ? parts : [str];
-    }
-
-    function commaSplit(str) {
-      if (str.length <= limit) return [str];
-      var pieces = [];
-      var b = "";
-      for (var j = 0; j < str.length; j++) {
-        b += str[j];
-        if (str[j] === "," && b.length >= Math.floor(limit * 0.4)) {
-          var nextCh = j + 1 < str.length ? str[j + 1] : "";
-          if (!nextCh || /\s/.test(nextCh)) {
-            pieces.push(b.trim());
-            b = "";
-            while (j + 1 < str.length && /\s/.test(str[j + 1])) j++;
-          }
-        }
-      }
-      if (b.trim()) pieces.push(b.trim());
-      return pieces.length ? pieces : [str];
-    }
-
-    function wordWrap(str) {
-      if (str.length <= limit) return [str];
-      var words = str.split(/\s+/).filter(Boolean);
-      if (words.length <= 1) return [str];
-      var out = [];
-      var b = "";
-      for (var w = 0; w < words.length; w++) {
-        var cand = b ? b + " " + words[w] : words[w];
-        if (b && cand.length > limit) {
-          out.push(b);
-          b = words[w];
-        } else {
-          b = cand;
-        }
-      }
-      if (b) out.push(b);
-      // 吞掉过短尾巴（如 "water."），避免 "…boil" / "water." 这种难看硬切
-      if (out.length >= 2) {
-        var last = out[out.length - 1];
-        var prev = out[out.length - 2];
-        if (last.length <= 12 && prev.length + 1 + last.length <= Math.floor(limit * 1.25)) {
-          out[out.length - 2] = prev + " " + last;
-          out.pop();
-        }
-      }
-      return out;
-    }
-
-    var out = [];
-    var strong = strongSplit(s);
-    for (var a = 0; a < strong.length; a++) {
-      var mid = commaSplit(strong[a]);
-      for (var b = 0; b < mid.length; b++) {
-        var wrap = wordWrap(mid[b]);
-        for (var c = 0; c < wrap.length; c++) if (wrap[c]) out.push(wrap[c]);
-      }
-    }
-    return out;
-  }
-
-  // 把 cue 归到输出行（v0.4.4）：标点/逗号/词边界切段 → 按时间比例落到时隙 → 空槽填最近邻段。
-  // 目标：长英文不再「全文复制到每一行中文」；本地零 token。
-  function assignOriginalsToLines(times, cues, n, startMs, endMs) {
-    var origByLine = new Array(n).fill("");
-    var list = cues || [];
-    if (!list.length || n <= 0) return origByLine;
-
-    var bound = [];
-    for (var k = 0; k < n; k++) bound.push(times[k].startMs);
-    bound.push(endMs);
-
-    function slotIndexAt(ms) {
-      var idx = 0;
-      for (var j = 0; j < n; j++) {
-        if (ms >= bound[j]) idx = j;
-        else break;
-      }
-      if (idx > n - 1) idx = n - 1;
-      if (idx < 0) idx = 0;
-      return idx;
-    }
-
-    function put(i, piece) {
-      if (i < 0 || i >= n || !piece) return;
-      if (!origByLine[i]) origByLine[i] = piece;
-      else if (origByLine[i].indexOf(piece) === -1) origByLine[i] = joinLine(origByLine[i], piece);
-    }
-
-    // 收集带时间戳的原文段
-    var timed = []; // {text, mid, start, end}
-    for (var c = 0; c < list.length; c++) {
-      var cue = list[c];
-      var text = collapseWhitespace(cue.content);
-      if (!text) continue;
+    if (rawLines.length !== list.length) throw new Error("translation coverage alignment mismatch");
+    return list.map(function (cue, index) {
       var cStart = Number(cue.start);
       var cEnd = Number(cue.end);
-      if (!Number.isFinite(cStart) || !Number.isFinite(cEnd)) continue;
-      if (cEnd < cStart) {
-        var tmp = cStart;
-        cStart = cEnd;
-        cEnd = tmp;
+      if (!Number.isFinite(cStart) || !Number.isFinite(cEnd) || cEnd < cStart) {
+        throw new Error("translation coverage cue timing invalid");
       }
-      if (cEnd === cStart) cEnd = cStart + 1;
-      var segs = splitOriginalByPunct(text);
-      if (!segs.length) continue;
-      var totalW = 0;
-      var weights = [];
-      for (var s0 = 0; s0 < segs.length; s0++) {
-        var w = Math.max(1, segs[s0].length);
-        weights.push(w);
-        totalW += w;
-      }
-      var acc = 0;
-      for (var s = 0; s < segs.length; s++) {
-        var frac0 = acc / totalW;
-        acc += weights[s];
-        var frac1 = acc / totalW;
-        var segStart = cStart + frac0 * (cEnd - cStart);
-        var segEnd = cStart + frac1 * (cEnd - cStart);
-        timed.push({
-          text: segs[s],
-          mid: (segStart + segEnd) / 2,
-          start: segStart,
-          end: segEnd,
-        });
-      }
-    }
-
-    // 按时序把每段落到对应时隙
-    for (var t = 0; t < timed.length; t++) {
-      put(slotIndexAt(timed[t].mid), timed[t].text);
-    }
-
-    // 空槽回填：优先最近「未占用」段，减少相邻行全文重复；实在没有再退回邻行。
-    var used = {};
-    for (var z = 0; z < n; z++) {
-      if (origByLine[z]) used[origByLine[z]] = true;
-    }
-    for (var e = 0; e < n; e++) {
-      if (origByLine[e]) continue;
-      var slotMid = (bound[e] + bound[e + 1]) / 2;
-      var best = null;
-      var bestDist = Infinity;
-      var bestAny = null;
-      var bestAnyDist = Infinity;
-      for (var u = 0; u < timed.length; u++) {
-        var d = Math.abs(timed[u].mid - slotMid);
-        if (d < bestAnyDist) {
-          bestAnyDist = d;
-          bestAny = timed[u].text;
-        }
-        if (!used[timed[u].text] && d < bestDist) {
-          bestDist = d;
-          best = timed[u].text;
-        }
-      }
-      var pick = best || bestAny || "";
-      if (!pick) {
-        for (var p = e - 1; p >= 0; p--) {
-          if (origByLine[p]) {
-            pick = origByLine[p];
-            break;
-          }
-        }
-      }
-      if (!pick) {
-        for (var q = e + 1; q < n; q++) {
-          if (origByLine[q]) {
-            pick = origByLine[q];
-            break;
-          }
-        }
-      }
-      if (pick) {
-        origByLine[e] = pick;
-        used[pick] = true;
-      }
-    }
-    return origByLine;
+      var translation = String(rawLines[index] == null ? "" : rawLines[index]);
+      if (!translation.trim()) throw new Error("translation coverage empty materialized unit");
+      return {
+        unitId: cue.unitId || "",
+        sourceFingerprint: cue.sourceFingerprint || "",
+        tokenStart: Number.isInteger(cue.tokenStart) ? cue.tokenStart : null,
+        tokenEnd: Number.isInteger(cue.tokenEnd) ? cue.tokenEnd : null,
+        srcStart: index + 1,
+        srcEnd: index + 1,
+        originalText: collapseWhitespace(cue.content || ""),
+        translation: translation,
+        startMs: cStart,
+        endMs: cEnd,
+      };
+    });
   }
 
   var DEFAULT_RESTORATION_PROMPT =
-    "恢复这段英语口语的句末标点。只返回原词，且原词的拼写、顺序和数量必须完全一致。\n" +
-    "你只能在词之间加入空格和 . ? ! |。 .?! 仅表示真实句末。完整句超过约 11 词时，也必须在自然、适合渐进阅读的边界加入 |；优先形成约 4–11 词的屏幕单元，每段最多 12 词。\n" +
-    "长 reporting 句可把完整引导语（如 Let me point out that）单独作为渐进屏，再显示主语与谓语；不得在 than 与比较对象之间加入 |。\n" +
-    "不得在名词短语、动词短语、短语动词、复合词、限定词+名词、介词短语、不定式、助动词+动词之间加入 |。不得添加、删除、替换、合并、拆分或重排任何词。不要解释。";
+    "你是英语字幕边界规划器。输入是按顺序排列的不可修改 token，每个 token 都有唯一 id 和 text。\n" +
+    "只决定应在哪些 token 之后结束一个字幕单元；不得回显、改写、添加、删除、合并、拆分或重排任何 token。\n" +
+    "每个单元优先 4–11 词，最多 12 词。不得切开限定词+名词、名词短语、动词短语、短语动词、介词短语、不定式、助动词+动词、比较结构、数字+单位、专名、URL 或复合词。\n" +
+    "只返回严格 JSON：{\"cutsAfter\":[\"token-id\",...]}; cutsAfter 必须按输入顺序严格递增，不要返回其它字段、正文、Markdown 或解释。";
+
+  function parseBoundaryCutsResponse(raw, allowedTokenIds) {
+    var text = String(raw || "").trim();
+    var fenced = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+    if (fenced) text = fenced[1].trim();
+    var value;
+    try { value = JSON.parse(text); } catch (_) { throw new Error("invalid boundary response JSON"); }
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("boundary response must be an object");
+    Object.keys(value).forEach(function (key) {
+      if (key !== "cutsAfter") throw new Error("unexpected boundary response field: " + key);
+    });
+    if (!Array.isArray(value.cutsAfter)) throw new Error("cutsAfter must be an array");
+    var allowed = (allowedTokenIds || []).map(String);
+    var positions = {};
+    allowed.forEach(function (id, index) { positions[id] = index; });
+    var previous = -1;
+    return value.cutsAfter.map(function (rawId) {
+      if (typeof rawId !== "string" && typeof rawId !== "number") throw new Error("cut token ID must be a string or number");
+      var id = String(rawId);
+      if (!Object.prototype.hasOwnProperty.call(positions, id)) throw new Error("unknown cut token ID: " + id);
+      var position = positions[id];
+      if (position <= previous) throw new Error("cutsAfter must be strictly increasing");
+      previous = position;
+      return id;
+    });
+  }
 
   function tokenWords(tokens) {
     var out = [];
@@ -1700,35 +1381,59 @@
    */
   async function restoreTokenBoundaries(opts) {
     opts = opts || {};
-    var tokens = (opts.tokens || []).filter(function (t) { return t && t.text; });
+    var tokens = (opts.tokens || []).filter(function (t) { return t && t.text; }).map(function (token, index) {
+      var copy = Object.assign({}, token);
+      copy.tokenId = String(token.tokenId != null ? token.tokenId : "t" + index);
+      return copy;
+    });
     if (!tokens.length) return { tokens: [], marks: [] };
+    var seenIds = {};
+    tokens.forEach(function (token) {
+      if (seenIds[token.tokenId]) throw new Error("duplicate boundary token ID: " + token.tokenId);
+      seenIds[token.tokenId] = true;
+    });
     var ranges = chunkTokenRanges(tokens, opts.chunkWords || 120, opts.overlapWords || 30);
     var marks = new Array(tokens.length).fill("");
     var prompt = opts.systemPrompt || DEFAULT_RESTORATION_PROMPT;
     for (var ri = 0; ri < ranges.length; ri++) {
       var range = ranges[ri];
       var chunk = tokens.slice(range.start, range.end);
-      var source = tokenWords(chunk).join(" ");
-      var chunkMarks = null;
+      var ids = chunk.map(function (token) { return token.tokenId; });
+      var request = JSON.stringify({
+        tokens: chunk.map(function (token) { return { id: token.tokenId, text: String(token.text) }; }),
+        preferredWords: Math.max(1, Math.floor(Number(opts.preferredMaxWords) || 10)),
+        maxWords: Math.max(1, Math.floor(Number(opts.maxWords) || 12)),
+      });
+      var cuts = null;
       var attempts = opts.attempts != null ? Math.max(1, Number(opts.attempts)) : 2;
       for (var attempt = 0; attempt < attempts; attempt++) {
-        var restored = await chatCompletion({
-          apiBaseUrl: opts.apiBaseUrl,
-          apiKey: opts.apiKey,
-          apiModel: opts.apiModel,
-          temperature: opts.temperature,
-          reasoningEffort: opts.reasoningEffort,
-          systemContent: prompt,
-          userContent: source,
-          timeoutMs: opts.timeoutMs,
-          fetchImpl: opts.fetchImpl,
-          onUsage: opts.onUsage,
-        });
-        chunkMarks = restoredBoundaryMarks(tokenWords(chunk), restored);
-        if (chunkMarks) break;
+        try {
+          var response = await chatCompletion({
+            apiBaseUrl: opts.apiBaseUrl,
+            apiKey: opts.apiKey,
+            apiModel: opts.apiModel,
+            temperature: opts.temperature,
+            reasoningEffort: opts.reasoningEffort,
+            systemContent: prompt,
+            userContent: request,
+            timeoutMs: opts.timeoutMs,
+            fetchImpl: opts.fetchImpl,
+            onUsage: opts.onUsage,
+            signal: opts.signal,
+          });
+          cuts = parseBoundaryCutsResponse(response, ids);
+          break;
+        } catch (error) {
+          if (error && /translate aborted|translate timeout|translate network|translate HTTP/i.test(String(error.message || error))) throw error;
+          cuts = null;
+        }
       }
-      if (!chunkMarks) throw new Error("invalid sentence restoration chunk " + ri);
-      for (var pos = range.commitStart; pos < range.commitEnd; pos++) marks[pos] = chunkMarks[pos - range.start];
+      if (!cuts) throw new Error("invalid boundary cuts chunk " + ri);
+      var cutSet = {};
+      cuts.forEach(function (id) { cutSet[id] = true; });
+      for (var pos = range.commitStart; pos < range.commitEnd; pos++) {
+        if (cutSet[tokens[pos].tokenId]) marks[pos] = "|";
+      }
     }
     return { tokens: tokens, marks: marks };
   }
@@ -1874,9 +1579,9 @@
     // 第一轮保守只恢复全文句末；少数仍超长的完整句才做局部 clause rescue。
     // 同样只接受逐词完全等价的结果，且每个 rescue 至多一次，避免无界模型调用。
     var prompt = opts.oversizeSystemPrompt ||
-      "以下是一条已验证的英语长句。只返回完全相同的词，拼写、顺序、数量均不得变化。\n" +
-      "只在自然、连续可读且可译成自然中文字幕片段的边界加入 |；字幕屏是连续语流，不要求每段脱离上下文成为完整书面句。优先形成约 6–" + preferredMaxWords + " 词的屏幕单元，每段最多 " + maxWords + " 词。\n" +
-      "不得在名词短语、动词短语、短语动词、复合词、限定词+名词、介词短语、不定式、助动词+动词之间加入 |。不得解释。";
+      "你是长字幕单元的边界规划器。输入仍是不可修改的 {id,text} token 数组。\n" +
+      "只返回严格 JSON：{\"cutsAfter\":[\"token-id\",...]}; 不得回显正文或返回其它字段。优先形成约 6–" + preferredMaxWords + " 词的单元，每段最多 " + maxWords + " 词。\n" +
+      "不得切开名词短语、动词短语、短语动词、复合词、限定词+名词、介词短语、不定式、助动词+动词、比较结构、数字+单位、专名或 URL。";
     for (var ui = 0; ui < units.length; ui++) {
       var unit = units[ui];
       var unitWords = restoredWords(unit.content);
@@ -1890,31 +1595,23 @@
       if (begin < 0) continue;
       var end = begin + unitWords.length;
       var outerBoundary = restored.marks[end - 1];
-      var source = tokenWords(restored.tokens.slice(begin, end)).join(" ");
-      var marked = null;
-      var attempts = opts.attempts != null ? Math.max(1, Number(opts.attempts)) : 2;
-      for (var attempt = 0; attempt < attempts; attempt++) {
-        var answer = await chatCompletion({
-          apiBaseUrl: opts.apiBaseUrl, apiKey: opts.apiKey, apiModel: opts.apiModel,
-          temperature: opts.temperature, reasoningEffort: opts.reasoningEffort,
-          systemContent: prompt, userContent: source, timeoutMs: opts.timeoutMs, fetchImpl: opts.fetchImpl,
+      var rescue = await restoreTokenBoundaries(Object.assign({}, opts, {
+        tokens: restored.tokens.slice(begin, end),
+        systemPrompt: prompt,
+        preferredMaxWords: preferredMaxWords,
+        maxWords: maxWords,
+      }));
+      var marked = filterUnsafeRescueMarks(tokenWords(rescue.tokens), rescue.marks);
+      var safe = true;
+      for (var mi = 0, run = 0; mi < marked.length; mi++) {
+        run++;
+        if (marked[mi] === "." || marked[mi] === "|") run = 0;
+        if (run > maxWords) { safe = false; break; }
+      }
+      if (!safe) {
+        marked = partitionReadableTokenUnit(restored.tokens.slice(begin, end), marked, {
+          preferredWords: Math.min(preferredMaxWords, 10), hardWords: Math.min(maxWords, 12), minWords: 4,
         });
-        var localMarks = restoredBoundaryMarks(tokenWords(restored.tokens.slice(begin, end)), answer);
-        if (!localMarks) continue;
-        localMarks = filterUnsafeRescueMarks(tokenWords(restored.tokens.slice(begin, end)), localMarks);
-        var safe = true;
-        for (var mi = 0, run = 0; mi < localMarks.length; mi++) {
-          run++;
-          if (localMarks[mi] === "." || localMarks[mi] === "|") run = 0;
-          if (run > maxWords) { safe = false; break; }
-        }
-        if (!safe) {
-          localMarks = partitionReadableTokenUnit(restored.tokens.slice(begin, end), localMarks, {
-            preferredWords: Math.min(preferredMaxWords, 10), hardWords: Math.min(maxWords, 12), minWords: 4,
-          });
-          safe = !!localMarks;
-        }
-        if (safe) { marked = localMarks; break; }
       }
       if (!marked) continue; // 宁可保持完整句，也不接受未校验/仍过长的局部模型输出。
       for (var m = 0; m < marked.length; m++) restored.marks[begin + m] = marked[m];
@@ -1934,23 +1631,99 @@
     return repairedUnits;
   }
 
-  /**
-   * 翻译一个 clip：一次 chat 调用，让模型按 cue 编号 1:1 返回中文字幕。
-   * 入参（opts）：
-   *  - cues: 该 clip 的碎片 cue[]（带 content，顺序即源行号）
-   *  - apiBaseUrl, apiKey, apiModel, targetLang
-   *  - systemPrompt: 可选自定义（覆盖默认行级 prompt）
-   *  - reasoningEffort: 透传 chatCompletion（默认配置 "low" 压 reasoning 爆点）
-   *  - maxLineChars: 单个字幕单元的建议显示行长；超长时只在安全短语边界换行
-   *  - temperature, timeoutMs, fetchImpl
-   * 返回：string[] 中文字幕行（可能为空数组=模型空响应，调用方兜底显原文）。
-   * 网络/HTTP/超时错误向上抛出（与旧 chatCompletion 一致），调用方兜底 + 退避。
-   */
+  function translationCoverageUnitsFromCues(cues) {
+    var cursor = 0;
+    return (cues || []).map(function (cue, index) {
+      var count = Math.max(1, tokenWords(cue && cue.tokens || []).length || restoredWords(cue && cue.content || "").length);
+      var start = Number.isInteger(cue && cue.tokenStart) ? cue.tokenStart : cursor;
+      var end = Number.isInteger(cue && cue.tokenEnd) ? cue.tokenEnd : start + count;
+      cursor = end;
+      return {
+        unitId: String(cue && cue.unitId || "clip:u" + index + ":" + start + "-" + end),
+        tokenStart: start,
+        tokenEnd: end,
+        sourceText: collapseWhitespace(cue && cue.content || ""),
+        sourceFingerprint: String(cue && cue.sourceFingerprint || ""),
+      };
+    });
+  }
+
+  function parseTranslationCoverageResponse(raw, expectedUnits, opts) {
+    opts = opts || {};
+    var text = String(raw || "").trim();
+    var fenced = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+    if (fenced) text = fenced[1].trim();
+    var payload;
+    try { payload = JSON.parse(text); } catch (_) { throw new Error("translation coverage invalid JSON"); }
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error("translation coverage response must be an object");
+    var outerKeys = Object.keys(payload);
+    if (outerKeys.length !== 1 || outerKeys[0] !== "translations" || !Array.isArray(payload.translations)) {
+      throw new Error("translation coverage response must contain only translations");
+    }
+    var expected = (expectedUnits || []).map(function (unit) {
+      return {
+        unitId: String(unit && unit.unitId || ""),
+        tokenStart: Number(unit && unit.tokenStart),
+        tokenEnd: Number(unit && unit.tokenEnd),
+      };
+    });
+    var expectedById = {};
+    var previousEnd = null;
+    expected.forEach(function (unit) {
+      if (!unit.unitId || !Number.isInteger(unit.tokenStart) || !Number.isInteger(unit.tokenEnd) || unit.tokenStart < 0 || unit.tokenEnd <= unit.tokenStart) {
+        throw new Error("translation coverage expected unit invalid");
+      }
+      if (expectedById[unit.unitId]) throw new Error("translation coverage duplicate expected unit");
+      if (previousEnd != null && unit.tokenStart !== previousEnd) throw new Error("translation coverage expected units have gap or overlap");
+      previousEnd = unit.tokenEnd;
+      expectedById[unit.unitId] = unit;
+    });
+    if (payload.translations.length !== expected.length) throw new Error("translation coverage incomplete unit count");
+    var translatedById = {};
+    payload.translations.forEach(function (item) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("translation coverage entry invalid");
+      var keys = Object.keys(item).sort();
+      if (keys.join("|") !== "coverFrom|coverTo|translation|unitId") throw new Error("translation coverage entry fields invalid");
+      var unitId = String(item.unitId || "");
+      var source = expectedById[unitId];
+      if (!source || translatedById[unitId]) throw new Error("translation coverage unknown or duplicate unit");
+      if (!Number.isInteger(item.coverFrom) || !Number.isInteger(item.coverTo) || item.coverFrom !== source.tokenStart || item.coverTo !== source.tokenEnd) {
+        throw new Error("translation coverage span mismatch");
+      }
+      var translation = sanitizeSubtitleLine(String(item.translation == null ? "" : item.translation));
+      if (!translation.trim()) throw new Error("translation coverage empty translation");
+      var verdict = validateChineseDisplayUnit(translation);
+      if (!verdict.ok) throw new Error("translation coverage invalid Chinese unit: " + verdict.reason);
+      translatedById[unitId] = {
+        unitId: unitId,
+        coverFrom: source.tokenStart,
+        coverTo: source.tokenEnd,
+        translation: translation,
+      };
+    });
+    return expected.map(function (unit) {
+      if (!translatedById[unit.unitId]) throw new Error("translation coverage missing unit: " + unit.unitId);
+      return translatedById[unit.unitId];
+    });
+  }
+
+  /** Translate one immutable token-span clip with an exact coverage ledger. */
   async function translateClipLines(opts) {
+    opts = opts || {};
     var cues = opts.cues || [];
     if (!cues.length) return [];
-    var sys = buildSystemPrompt(opts.targetLang, opts.systemPrompt);
-    var userContent = buildNumberedSourceLines(cues.map(function (c) { return c.content; }));
+    var units = translationCoverageUnitsFromCues(cues);
+    var fingerprints = {};
+    units.forEach(function (unit) { if (unit.sourceFingerprint) fingerprints[unit.sourceFingerprint] = true; });
+    if (Object.keys(fingerprints).length > 1) throw new Error("translation coverage source fingerprint mismatch");
+    var sys = buildSystemPrompt(opts.targetLang, opts.systemPrompt) +
+      "\n协议硬约束：只返回 translations JSON；unitId、coverFrom、coverTo 必须逐项原样复制，所有输入单元必须恰好覆盖一次。";
+    var userContent = JSON.stringify({
+      sourceFingerprint: Object.keys(fingerprints)[0] || "",
+      units: units.map(function (unit) {
+        return { unitId: unit.unitId, coverFrom: unit.tokenStart, coverTo: unit.tokenEnd, sourceText: unit.sourceText };
+      }),
+    });
     var content = await chatCompletion({
       apiBaseUrl: opts.apiBaseUrl,
       apiKey: opts.apiKey,
@@ -1962,118 +1735,28 @@
       timeoutMs: opts.timeoutMs,
       fetchImpl: opts.fetchImpl,
       onUsage: opts.onUsage,
+      signal: opts.signal,
     });
-    var n = cues.length;
-    function acceptAlignedLines(candidateLines) {
-      if (opts.boundaryLock && candidateLines.some(isMergePrevMarker)) {
-        throw new Error("fixed-boundary translation still rejected after one retry");
-      }
-      return candidateLines;
-    }
-    var maxLine = opts.maxLineChars != null ? opts.maxLineChars : DEFAULT_CONFIG.maxLineChars || 20;
-    var aligned = parseAlignedSubtitleLines(content, n);
-    var lines = [];
-    var complete = 0;
-    for (var i = 0; i < n; i++) {
-      var shaped = shapeAlignedLine(aligned[i] || "", maxLine);
-      lines.push(shaped);
-      if (shaped && String(shaped).trim()) complete++;
-    }
-    if (complete === n) return acceptAlignedLines(lines);
-
-    var loose = parseSubtitleLines(content);
-    // 仅当完全没有可用编号槽、且未编号输出数量严格等于 cue 数时，才可安全顺序接受。
-    if (complete === 0 && loose.length === n) {
-      var shapedLoose = [];
-      for (var l = 0; l < n; l++) {
-        var looseLine = shapeAlignedLine(loose[l], maxLine);
-        if (!looseLine || !String(looseLine).trim()) break;
-        shapedLoose.push(looseLine);
-      }
-      if (shapedLoose.length === n) return acceptAlignedLines(shapedLoose);
-    }
-    // 真正空响应沿用既有语义：返回 []，由渲染层暂显原文并进入重试。
-    if (complete === 0 && loose.length === 0) return [];
-    // 部分编号/数量异常绝不接受、猜填或缓存；抛给既有 clip 退避调度整包重试。
-    throw new Error("incomplete translation: " + complete + "/" + n + " aligned lines");
+    var coverage = parseTranslationCoverageResponse(content, units, { maxLineChars: opts.maxLineChars });
+    var lines = coverage.map(function (entry) { return entry.translation; });
+    Object.defineProperty(lines, "coverage", { value: coverage, enumerable: false });
+    return lines;
   }
+
   async function translateClipWithBoundaryRepair(opts) {
     opts = opts || {};
     var cues = (opts.cues || []).slice();
-    if (!cues.length) return { cues: [], lines: [], repaired: false };
-    // 只有唯一、显式的 fallback-translation 模式可使用 14 词 envelope；
-    // semantic、未知或省略模式一律按 12 词且锁定原边界，安全失败关闭。
-    var isFallbackTranslation = opts.segmentationMode === "fallback-translation";
-    var maxSourceWords = isFallbackTranslation ? 14 : 12;
-    function assertSourceUnitsWithinCap(sourceCues, stage) {
-      for (var ci = 0; ci < sourceCues.length; ci++) {
-        var sourceWords = unitWordCount(sourceCues[ci]);
-        if (sourceWords > maxSourceWords) {
-          throw new Error("oversized " + stage + ": " + sourceWords + " words (cap " + maxSourceWords + ")");
-        }
-      }
+    if (!cues.length) return { cues: [], lines: [], coverage: [], repaired: false };
+    var maxSourceWords = opts.segmentationMode === "fallback-translation" ? 14 : 12;
+    for (var i = 0; i < cues.length; i++) {
+      var sourceWords = unitWordCount(cues[i]);
+      if (sourceWords > maxSourceWords) throw new Error("oversized source unit before translation: " + sourceWords + " words (cap " + maxSourceWords + ")");
     }
-    assertSourceUnitsWithinCap(cues, "original source unit before fixed-boundary retry");
-    var first = await translateClipLines(Object.assign({}, opts, { cues: cues }));
-    var repairLines = first.slice();
-    var needsMerge = false;
-    for (var i = 0; i < first.length; i++) {
-      var verdict = validateChineseDisplayUnit(first[i]);
-      if (isMergePrevMarker(first[i])) {
-        repairLines[i] = "[MERGE_PREV]";
-        needsMerge = true;
-      } else if (!verdict.ok) {
-        // 中文硬门禁失败与模型显式拒绝同义：当前英文边界不能独立承载自然译文。
-        // 只向前合并相邻 cue，并整包重翻一次；首行无前项可并时才保留原错误。
-        if (i === 0) {
-          // 下一 cue 已显式要求向前合并时，首行会随之被修复，无需提前失败。
-          if (!(first.length > 1 && isMergePrevMarker(first[1]))) {
-            throw new Error("invalid translation unit 1: " + verdict.reason);
-          }
-        } else {
-          repairLines[i] = "[MERGE_PREV]";
-        }
-        needsMerge = true;
-      }
+    var lines = await translateClipLines(Object.assign({}, opts, { cues: cues }));
+    if (lines.length !== cues.length || !Array.isArray(lines.coverage) || lines.coverage.length !== cues.length) {
+      throw new Error("translation coverage alignment mismatch");
     }
-    if (!needsMerge) return { cues: cues, lines: first, repaired: false };
-    var merged = mergeRejectedTranslationCues(cues, repairLines);
-    if (merged.length >= cues.length) throw new Error("boundary repair made no progress");
-    var oversizedMerge = false;
-    for (var mi = 0; mi < merged.length; mi++) {
-      if (unitWordCount(merged[mi]) > maxSourceWords) {
-        oversizedMerge = true;
-        break;
-      }
-    }
-    var lockOriginalBoundaries = !isFallbackTranslation || oversizedMerge;
-    if (lockOriginalBoundaries) {
-      // 在锁边分支局部再守一次相同 cap，避免未来调用链重构绕过首次请求前门禁。
-      assertSourceUnitsWithinCap(cues, "original source unit before locked-boundary retry");
-      // semantic 边界已经过语义验证，任何 MERGE_PREV 都只能锁边重译；fallback 仅在
-      // 合并会超过 14 词时锁边。原边界自身仍必须满足 mode 对应的 12/14 上限。
-      // 用锁定边界的强约束重译一次；仍拒绝时 fail-closed，绝不猜填中文。
-      var lockedPrompt = buildSystemPrompt(opts.targetLang, opts.systemPrompt) +
-        "\n\n边界修复重试：当前编号和英文边界已经锁定。每个编号必须分别译成自然闭合的中文字幕；不得合并编号，不得返回 [MERGE_PREV]。";
-      var fixed = await translateClipLines(Object.assign({}, opts, { cues: cues, systemPrompt: lockedPrompt, boundaryLock: true }));
-      // translateClipLines 已保证此条件；这里在边界修复出口再显式守住英文/中文 1:1。
-      if (fixed.length !== cues.length) throw new Error("fixed-boundary translation alignment mismatch");
-      if (fixed.some(isMergePrevMarker)) throw new Error("fixed-boundary translation still rejected after one retry");
-      for (var fi = 0; fi < fixed.length; fi++) {
-        var fixedVerdict = validateChineseDisplayUnit(fixed[fi]);
-        if (!fixedVerdict.ok) throw new Error("invalid fixed-boundary translation unit " + (fi + 1) + ": " + fixedVerdict.reason);
-      }
-      return { cues: cues, lines: fixed, repaired: true };
-    }
-    // fallback 的 in-cap merge 在第二次请求前再次守住 mode 上限。
-    assertSourceUnitsWithinCap(merged, "source unit before fallback merge retry");
-    var second = await translateClipLines(Object.assign({}, opts, { cues: merged }));
-    if (second.some(isMergePrevMarker)) throw new Error("boundary repair still rejected after one retry");
-    for (var j = 0; j < second.length; j++) {
-      var finalVerdict = validateChineseDisplayUnit(second[j]);
-      if (!finalVerdict.ok) throw new Error("invalid repaired translation unit " + (j + 1) + ": " + finalVerdict.reason);
-    }
-    return { cues: merged, lines: second, repaired: true };
+    return { cues: cues, lines: lines, coverage: lines.coverage, repaired: false };
   }
 
   /**
@@ -2085,7 +1768,6 @@
   async function chatCompletion(opts) {
     var fetchImpl = opts.fetchImpl || (typeof fetch !== "undefined" ? fetch : null);
     if (!fetchImpl) throw new Error("no fetch implementation available");
-
     var url = chatCompletionsUrl(opts.apiBaseUrl);
     var body = {
       model: opts.apiModel,
@@ -2095,78 +1777,90 @@
         { role: "user", content: opts.userContent },
       ],
     };
-    // 推理模型限流：reasoning_effort=low 把句级重断 prompt 的 reasoning token 从 2000+ 砍到
-    // ~70（延迟 40s→7s，质量不降）。空串/"default"/"none" → 不发该字段（兼容非推理模型与老网关）。
     var re = opts.reasoningEffort;
     if (re && re !== "default" && re !== "none") body.reasoning_effort = String(re);
-
-    // 超时控制：AbortController 在 timeoutMs 后中断请求，按失败走兜底 + 退避，
-    // 避免网关无响应时 clip 永久挂在 pending、占着并发位。
     var timeoutMs = typeof opts.timeoutMs === "number" ? opts.timeoutMs : 20000;
     var fetchOpts = {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: "Bearer " + (opts.apiKey || ""),
-      },
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + (opts.apiKey || "") },
       body: JSON.stringify(body),
     };
     var timer = null;
+    var timeoutTriggered = false;
+    var externalSignal = opts.signal || null;
+    var externalAbortHandler = null;
     if (timeoutMs > 0 && typeof AbortController !== "undefined") {
       var ac = new AbortController();
       fetchOpts.signal = ac.signal;
+      if (externalSignal) {
+        externalAbortHandler = function () { try { ac.abort(); } catch (_) {} };
+        if (externalSignal.aborted) externalAbortHandler();
+        else if (typeof externalSignal.addEventListener === "function") externalSignal.addEventListener("abort", externalAbortHandler, { once: true });
+      }
       timer = setTimeout(function () {
-        try {
-          ac.abort();
-        } catch (e) {}
+        timeoutTriggered = true;
+        try { ac.abort(); } catch (_) {}
       }, timeoutMs);
+    } else if (externalSignal) {
+      fetchOpts.signal = externalSignal;
     }
-
-    var resp;
-    try {
-      resp = await fetchImpl(url, fetchOpts);
-    } catch (e) {
+    function cleanupAbortContext() {
       if (timer) clearTimeout(timer);
-      // AbortError（超时）与网络异常统一抛出，调用方兜底显示原文
+      if (externalSignal && externalAbortHandler && typeof externalSignal.removeEventListener === "function") {
+        try { externalSignal.removeEventListener("abort", externalAbortHandler); } catch (_) {}
+      }
+    }
+    var headersReceived = false;
+    try {
+      var resp = await fetchImpl(url, fetchOpts);
+      headersReceived = true;
+      var data = null;
+      var responseText = "";
+      if (typeof resp.text === "function") {
+        responseText = await resp.text();
+      } else if (typeof resp.json === "function") {
+        try { data = await resp.json(); } catch (_) { throw malformedApiResponseError(resp, ""); }
+      }
+      if (externalSignal && externalSignal.aborted) throw runtimeAbortErrorForCore();
+      if (data == null) {
+        var contentType = responseContentType(resp);
+        if (/text\/html|application\/xhtml/i.test(contentType) || /^\s*</.test(responseText)) throw htmlApiResponseError(resp, contentType);
+        try {
+          if (responseText) data = JSON.parse(responseText);
+          else if (typeof resp.json === "function") data = await resp.json();
+        } catch (e) {
+          if (e && e.name === "AbortError") throw e;
+          throw malformedApiResponseError(resp, contentType);
+        }
+      }
+      if (!resp.ok) {
+        var apiMessage = data && data.error && (data.error.message || data.error.code) || "";
+        var httpErr = new Error("translate HTTP " + resp.status + (apiMessage ? " " + String(apiMessage).slice(0, 200) : ""));
+        if (resp.status === 429) httpErr.code = "429";
+        throw httpErr;
+      }
+      if (externalSignal && externalSignal.aborted) throw runtimeAbortErrorForCore();
+      if (typeof opts.onUsage === "function" && data && data.usage) {
+        try { opts.onUsage(data.usage); } catch (_) {}
+      }
+      return data && data.choices && data.choices[0] && data.choices[0].message ? data.choices[0].message.content : "";
+    } catch (e) {
       var aborted = e && (e.name === "AbortError" || /abort/i.test(String(e.message || "")));
-      throw new Error(aborted ? "translate timeout (" + timeoutMs + "ms)" : "translate network error: " + (e && e.message ? e.message : e));
+      if (aborted) {
+        if (externalSignal && externalSignal.aborted && !timeoutTriggered) throw new Error("translate aborted");
+        throw new Error("translate timeout (" + timeoutMs + "ms)");
+      }
+      if (!headersReceived && !(e && e.code)) throw new Error("translate network error: " + (e && e.message ? e.message : e));
+      throw e;
+    } finally {
+      cleanupAbortContext();
     }
-    if (timer) clearTimeout(timer);
+  }
 
-    var data = null;
-    var responseText = "";
-    if (typeof resp.text === "function") {
-      try { responseText = await resp.text(); } catch (e) {}
-    } else if (typeof resp.json === "function") {
-      // 兼容离线测试和少数只暴露 json() 的 fetch shim；真实 Response 始终先读 text()。
-      try { data = await resp.json(); } catch (e) {
-        throw malformedApiResponseError(resp, "");
-      }
-    }
-    if (data == null) {
-      var contentType = responseContentType(resp);
-      if (/text\/html|application\/xhtml/i.test(contentType) || /^\s*</.test(responseText)) {
-        throw htmlApiResponseError(resp, contentType);
-      }
-      try {
-        if (responseText) data = JSON.parse(responseText);
-        else if (typeof resp.json === "function") data = await resp.json();
-      } catch (e) {
-        throw malformedApiResponseError(resp, contentType);
-      }
-    }
-    if (!resp.ok) {
-      var apiMessage = data && data.error && (data.error.message || data.error.code) || "";
-      var httpErr = new Error("translate HTTP " + resp.status + (apiMessage ? " " + String(apiMessage).slice(0, 200) : ""));
-      if (resp.status === 429) httpErr.code = "429";
-      throw httpErr;
-    }
-    if (typeof opts.onUsage === "function" && data && data.usage) {
-      try { opts.onUsage(data.usage); } catch (e) {}
-    }
-    return data && data.choices && data.choices[0] && data.choices[0].message
-      ? data.choices[0].message.content
-      : "";
+  function runtimeAbortErrorForCore() {
+    var err = new Error("translate aborted");
+    err.name = "AbortError";
+    return err;
   }
 
   function responseContentType(resp) {
@@ -2382,6 +2076,33 @@
     return out;
   }
 
+  /** 将连续任务合成不超过 maxUnits 个 source units 的后台批次；超大单项 fail-closed。 */
+  function planCoverageBatches(items, maxUnits) {
+    var limit = Math.floor(Number(maxUnits) || 8);
+    if (limit < 1) limit = 1;
+    var out = [];
+    var batch = [];
+    var size = 0;
+    (items || []).forEach(function (item) {
+      var count = item && Array.isArray(item.cues) ? item.cues.length : 0;
+      if (count > limit) throw new Error("item exceeds coverage batch limit");
+      if (batch.length && size + count > limit) {
+        out.push(batch);
+        batch = [];
+        size = 0;
+      }
+      batch.push(item);
+      size += count;
+      if (size >= limit) {
+        out.push(batch);
+        batch = [];
+        size = 0;
+      }
+    });
+    if (batch.length) out.push(batch);
+    return out;
+  }
+
   /* ---------------------------------------------------------------
    * 5c. 全局并发信号量（跨 clip 的 in-flight 请求上限）
    * -------------------------------------------------------------
@@ -2502,6 +2223,7 @@
     var cap = max;
     var inFlight = 0;
     var waiters = [];
+    var waiterSeq = 0;
     var okStreak = 0;
     var coolUntil = 0;
 
@@ -2510,16 +2232,17 @@
       while (inFlight < cap && waiters.length > 0) {
         var next = waiters.shift();
         inFlight++;
-        next();
+        next.resolve();
       }
     }
-    function acquire() {
+    function acquire(priority) {
       if (inFlight < cap) {
         inFlight++;
         return Promise.resolve();
       }
       return new Promise(function (resolve) {
-        waiters.push(resolve);
+        waiters.push({ resolve: resolve, priority: Number(priority) || 0, seq: waiterSeq++ });
+        waiters.sort(function (a, b) { return b.priority - a.priority || a.seq - b.seq; });
       });
     }
     function release() {
@@ -2548,8 +2271,8 @@
       cap = next;
       // cap 缩小不主动放行；在途 release 时按新 cap 自然收敛
     }
-    function run(fn) {
-      return acquire().then(function () {
+    function run(fn, priority) {
+      return acquire(priority).then(function () {
         var p;
         try {
           p = Promise.resolve(fn());
@@ -2639,18 +2362,87 @@
     ].join("|");
   }
 
+  function normalizeEndpointIdentity(value) {
+    var raw = String(value || "").trim();
+    try {
+      var parsed = new URL(raw);
+      parsed.protocol = parsed.protocol.toLowerCase();
+      parsed.hostname = parsed.hostname.toLowerCase();
+      parsed.hash = "";
+      if (parsed.pathname !== "/") parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+      return parsed.toString().replace(/\/$/, "");
+    } catch (e) {
+      // 非 URL 配置最终会在请求层失败；身份层仍保留大小写，绝不制造碰撞。
+      return raw.replace(/\/+$/, "");
+    }
+  }
+
   function makeCacheKey(parts) {
     parts = parts || {};
+    var normalizedBase = normalizeEndpointIdentity(parts.apiBaseUrl);
     return [
-      "dsc-v61",
+      "dsc-v70",
+      parts.contractVersion || "cue-v1",
       parts.segmentationMode || "fallback",
       parts.videoId || "",
       parts.trackCode || "",
       parts.targetLang || "",
       parts.apiModel || "",
+      hashCacheIdentity(normalizedBase),
+      hashCacheIdentity(parts.systemPrompt || DEFAULT_SYSTEM_PROMPT),
+      parts.reasoningEffort || "default",
+      parts.maxLineChars != null ? Number(parts.maxLineChars) : "",
       parts.clipStartMs != null ? parts.clipStartMs : "",
       parts.cueFingerprint || "",
     ].join("|");
+  }
+
+  /**
+   * 校验 MAIN world 送来的字幕轨道清单。DOM CustomEvent 是不可信边界：
+   * 这里只允许 YouTube HTTPS timedtext URL，并限制所有字段和数组大小。
+   * 返回去除未知字段的新对象；任一轨道非法时整包拒绝。
+   */
+  function validateTrackManifest(content, options) {
+    options = options || {};
+    if (!content || typeof content !== "object" || !Array.isArray(content.files)) return null;
+    var videoId = String(content.videoId == null ? "" : content.videoId);
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(videoId)) return null;
+    if (options.expectedVideoId != null && String(options.expectedVideoId) !== videoId) return null;
+    if (!content.files.length || content.files.length > 64) return null;
+    var files = [];
+    var identities = {};
+    for (var i = 0; i < content.files.length; i++) {
+      var raw = content.files[i];
+      if (!raw || typeof raw !== "object") return null;
+      var rawUrl = String(raw.url == null ? "" : raw.url);
+      if (!rawUrl || rawUrl.length > 8192) return null;
+      var parsed;
+      try { parsed = new URL(rawUrl); } catch (e) { return null; }
+      var host = String(parsed.hostname || "").toLowerCase();
+      var trustedHost = host === "youtube.com" || /\.youtube\.com$/.test(host);
+      if (parsed.protocol !== "https:" || !trustedHost || !/^\/api\/timedtext\/?$/.test(parsed.pathname)) return null;
+      var code = String(raw.code == null ? "" : raw.code);
+      var languageCode = String(raw.languageCode == null ? "" : raw.languageCode);
+      var name = String(raw.name == null ? code : raw.name);
+      var kind = String(raw.kind == null ? "" : raw.kind);
+      if (!/^[A-Za-z0-9_.-]{1,64}$/.test(languageCode) || name.length > 256 || (kind !== "" && kind !== "asr")) return null;
+      var urlVideo = parsed.searchParams.getAll("v");
+      var urlLang = parsed.searchParams.getAll("lang");
+      var urlKind = parsed.searchParams.getAll("kind");
+      var pot = parsed.searchParams.get("pot");
+      if (urlVideo.length !== 1 || urlVideo[0] !== videoId || urlLang.length !== 1 || urlLang[0] !== languageCode) return null;
+      if (!pot || parsed.searchParams.has("tlang")) return null;
+      if (kind === "asr") {
+        if (urlKind.length !== 1 || urlKind[0] !== "asr" || code !== languageCode + "-asr") return null;
+      } else if (urlKind.length !== 0 || code !== languageCode) {
+        return null;
+      }
+      var identity = [code, languageCode, kind].join("\x1f");
+      if (identities[identity]) return null;
+      identities[identity] = true;
+      files.push({ name: name, code: code, languageCode: languageCode, kind: kind, url: parsed.toString() });
+    }
+    return { videoId: videoId, files: files };
   }
 
   /**
@@ -2803,11 +2595,13 @@
    * 导入：解析 JSON，只接受 DEFAULT_CONFIG 已知的键，类型不符的回落默认。
    * 纯函数（不碰 storage/DOM），round-trip 后配置应等价。
    */
-  function exportConfig(config) {
+  function exportConfig(config, opts) {
+    opts = opts || {};
     var out = {};
     var keys = Object.keys(DEFAULT_CONFIG);
     for (var i = 0; i < keys.length; i++) {
       var k = keys[i];
+      if (k === "apiKey" && !opts.includeSecrets) continue;
       out[k] = config && config[k] != null ? config[k] : DEFAULT_CONFIG[k];
     }
     return JSON.stringify({ __dualsub: 1, config: out }, null, 2);
@@ -2837,7 +2631,12 @@
       if (src[k] == null) continue;
       var def = DEFAULT_CONFIG[k];
       var v = src[k];
-      if (typeof def === "number") {
+      if (k === "targetLang") {
+        var normalizedTarget = normalizeTargetLang(v);
+        if (!normalizedTarget) return { ok: false, error: "当前版本仅支持简体中文译文（zh-Hans）" };
+        out[k] = normalizedTarget;
+        any = true;
+      } else if (typeof def === "number") {
         // 用 Number 而非 parseInt：保留小数字段（如 strokeWidth=1.2）；整数字段不受影响。
         var num = Number(v);
         if (Number.isFinite(num)) {
@@ -2896,8 +2695,8 @@
           startMs: u.startMs != null ? u.startMs : u.start,
           endMs: u.endMs != null ? u.endMs : u.end,
           originalText: collapseWhitespace(u.originalText || ""),
-          // shapeAlignedLine 会在安全短语边界插入同一字幕单元内的换行；SRT 必须保留它，
-          // 否则 collapseWhitespace 会把换行压成空格，形成「， 就是」这类伪异常。
+          // Translation coverage units are immutable single-line strings; preserve any explicit
+          // safe line break from imported snapshots rather than collapsing it during export.
           translation: String(u.translation || "")
             .replace(/\r/g, "")
             .split("\n")
@@ -2963,6 +2762,14 @@
     applyTailTrim: applyTailTrim,
     resegmentCues: resegmentCues,
     segmentTokensByBoundaries: segmentTokensByBoundaries,
+    buildCanonicalTokenTimeline: buildCanonicalTokenTimeline,
+    buildCueTokenSpanUnits: buildCueTokenSpanUnits,
+    buildTokenSpanUnits: buildTokenSpanUnits,
+    cuesFromTimelineSnapshot: cuesFromTimelineSnapshot,
+    resegmentTimelineSnapshot: resegmentTimelineSnapshot,
+    withTimelineTranslations: withTimelineTranslations,
+    validateTokenSpanCoverage: validateTokenSpanCoverage,
+    createTimelineSnapshot: createTimelineSnapshot,
     hasNativeTokenTiming: hasNativeTokenTiming,
     collectSemanticTokens: collectSemanticTokens,
     restoredWords: restoredWords,
@@ -2979,10 +2786,12 @@
     normalizeColor: normalizeColor,
     shadowCss: shadowCss,
     normalizeStrokeWidth: normalizeStrokeWidth,
+    normalizeTargetLang: normalizeTargetLang,
     migrateConfig: migrateConfig,
     computeFontPx: computeFontPx,
     planPrefetch: planPrefetch,
     prioritizePrefetch: prioritizePrefetch,
+    planCoverageBatches: planCoverageBatches,
     makeSemaphore: makeSemaphore,
     makeAdaptiveGate: makeAdaptiveGate,
     errorKind: errorKind,
@@ -2990,26 +2799,16 @@
     DEFAULT_SYSTEM_PROMPT: DEFAULT_SYSTEM_PROMPT,
     DEFAULT_RESTORATION_PROMPT: DEFAULT_RESTORATION_PROMPT,
     buildSystemPrompt: buildSystemPrompt,
-    buildNumberedSourceLines: buildNumberedSourceLines,
-    parseSubtitleLines: parseSubtitleLines,
-    parseAlignedSubtitleLines: parseAlignedSubtitleLines,
-    shapeAlignedLine: shapeAlignedLine,
-    repairCrossCueBorrowedNounPhrases: repairCrossCueBorrowedNounPhrases,
     sanitizeSubtitleLine: sanitizeSubtitleLine,
     validateChineseDisplayUnit: validateChineseDisplayUnit,
-    mergeRejectedTranslationCues: mergeRejectedTranslationCues,
-    mergeShortLines: mergeShortLines,
-    mergeDanglingLines: mergeDanglingLines,
-    splitLongLines: splitLongLines,
-    charLen: charLen,
-    layoutTimeline: layoutTimeline,
     buildClipUnits: buildClipUnits,
-    splitOriginalByPunct: splitOriginalByPunct,
-    joinLine: joinLine,
     isChineseLangCode: isChineseLangCode,
     shouldSkipChineseSource: shouldSkipChineseSource,
+    translationCoverageUnitsFromCues: translationCoverageUnitsFromCues,
+    parseTranslationCoverageResponse: parseTranslationCoverageResponse,
     translateClipLines: translateClipLines,
     translateClipWithBoundaryRepair: translateClipWithBoundaryRepair,
+    parseBoundaryCutsResponse: parseBoundaryCutsResponse,
     restoreTokenBoundaries: restoreTokenBoundaries,
     restoreAndPackTokens: restoreAndPackTokens,
     chatCompletion: chatCompletion,
@@ -3018,6 +2817,7 @@
     sliceClipsByCue: sliceClipsByCue,
     makeCacheKey: makeCacheKey,
     makeSemanticCacheKey: makeSemanticCacheKey,
+    validateTrackManifest: validateTrackManifest,
     pruneCache: pruneCache,
     makeBackoff: makeBackoff,
     joinUrl: joinUrl,

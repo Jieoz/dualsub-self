@@ -21,8 +21,13 @@
 
 ## 安装（加载已解压的扩展程序）
 
-当前正式版：**v0.5.14**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.5.14) 下载 Chrome MV3 安装包。
-- 跨 cue 名词短语借位修复：例如 `go into a` + `cold kettle` 会显示为「倒入冷水壶 / 然后计时」，避免「水壶 / 冷水壶」重复。
+当前版本：**v0.6.0**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.6.0) 下载 Chrome MV3 安装包。
+
+v0.6.0 的主要变化：
+- 英文、顺序和词级时间统一来自不可变 canonical token timeline；模型只能返回 token 边界 ID，不能回显或改写英文。
+- 翻译响应改为严格的 unit/span coverage JSON；缺项、重复、错 span、空译文或旧结果全部 fail-closed，不再依靠 `cold kettle` 等短语特判搬移中文。
+- 当前播放段拥有最高调度优先级；全轨 SRT 必须明确确认费用，后台按最多 8 个 source units 批处理，并显示进度、Token 和取消按钮。
+- 配置、轨道或视频变化会主动取消旧请求；stale 结果不能写 cache、usage、snapshot、state 或 DOM。
 
 1. 下载 / clone 本仓库到本地。
 2. 打开 Chrome / Edge，地址栏进入 `chrome://extensions`（Edge 为 `edge://extensions`）。
@@ -47,7 +52,7 @@
 
 ### 语言
 - **源语言**：从当前视频可用的字幕轨道里选；`自动` = 优先用自动生成字幕（ASR），否则第一条。**源语言不限英文**——取决于该视频提供哪些字幕轨道（日语、韩语、西语等都可，只要 YouTube 有对应轨道）。
-- **译文语言**：任意填，如 `zh-Hans`（简体中文）、`ja`、`en`、`ko` 等，直接作为目标语言传给翻译模型。
+- **译文语言**：v0.6.0 当前只开放 `zh-Hans`（简体中文）。其它目标语言会 fail-closed，避免中文专用清洗规则误伤日文、韩文或英文。
 
 ### 显示
 字号（基准值，全屏/影院模式会按播放器高度同比放大，详见下）、字重、字体族（留空=内置默认；仅用本地/系统已安装字体，不远程加载）、底部间距、原文颜色、译文颜色、描边（粗细 0–3px 滑块 + 颜色）、阴影强度（无/弱/中/强四档）、背景框、双语顺序（译文在上 / 原文在上）、是否显示原文行、译文未到时是否显示"翻译中…"。
@@ -65,21 +70,20 @@
 
 ---
 
-## 翻译质量：自然双语语义屏、上下文感知且严格 1:1
+## 翻译质量：canonical token timeline + 严格 coverage
 
-主路径先为带可靠词级时间的 YouTube JSON3 自动字幕恢复自然句界和舒适短屏，再保持“英文屏逐词保真 / 中文自然闭合 / 同一起止时间”严格 1:1：
+v0.6.0 将英文事实、边界决策和中文翻译拆成三个互不越权的层：
 
-1. fallback 时间线先用于立即显示英文原文，语义恢复进行中不抢跑翻译；若语义恢复不适用、失败或当前 semantic clip 预热失败，自 v0.5.11 起会自动翻译已由本地 ASR 重组器整理过的 fallback cue，避免页面永久只有英文。
-2. semantic 时间线把经过本地边界验证的英文字幕屏按编号一次送入 `/chat/completions`；第 N 条中文必须完整、自然地表达第 N 个英文单元，不得悬空、截断、跨编号搬运或补意。
-3. JSON3 原生 token 时间覆盖率达到 80% 时，模型只可在连续源词之间标出句末或自然从句边界；本地严格验证词数、拼写和顺序完全相等，再由原始 token 生成显示文本与时间轴。模型改词、漏词、重排、超时或返回不合法时，整轨回退到既有 ASR 重组，不会混入半成品。
-4. 中文字幕统一移除中文句号 `。`，保留有语义的逗号、问号和感叹号；清理重复尾标点、标点后的异常空格以及 ASR 行首孤立英文句点。
-5. 模型缺号或数量不符时拒绝部分结果，绝不猜填或缓存；运行层按既有退避机制整包重试。真正空响应仍暂显原文并重试。
-6. 每个字幕单元直接沿用对应 semantic unit 的英文与起止时间；英文和中文各自严格保持一行，组成固定两行的双语对照，不在任一语言内部折行。
-7. 缓存 namespace 为 `dsc-v61`，并按 `fallback` / `fallback-translation` / `semantic` 分段模式隔离，避免不同时间轴或降级质量的译文相互污染。
-8. 首屏不再等待整轨语义恢复：先安装只显示英文原文的 fallback 时间轴，语义恢复在后台完成；若语义恢复超过短阈值仍未就绪，会自动进入 `fallback-translation` 先翻当前播放位置，避免 1–2 分钟只有英文。semantic 时间轴会先预热实时播放位置对应的译文，且每次异步等待后重新核对播放头；只有当前段已经准备好时才原子切换。若后台恢复链失败，则原地切换为 `fallback-translation`，立即翻译当前段并继续预取，但不会暂停已在播放的视频。
-9. v0.5.12 将英文 semantic 屏收紧为 **10 词舒适目标、11 词直接接受、12 词硬上限**；长 reporting 句允许把 `Let me point out that` 一类完整引导语单独作为渐进屏，再显示主语与谓语。不得在短语、`than` 比较结构、关系从句主谓、介词续接（含 `throughout`）或短语动词内部硬切；没有可信边界时显式回退，且不改写、不重排、不丢词。若翻译模型要求把 semantic 渐进屏向前合并，扩展始终锁定原英文与 token 时间重译一次，不把已验证的短屏重新拼成长行。fallback 默认同样以 12 词切分，只有保全自然续接时最多放宽到 14 词；fallback 合并会突破 14 词时也改走锁边重译。只有显式的 `fallback-translation` 模式可使用 14 词上限；未知或省略模式一律按 semantic 的 12 词上限锁边并安全失败关闭。
+1. **Canonical token timeline**：本地从字幕轨道建立稳定 token ID、原文、顺序和 timing；滚动 ASR 重叠也在这一层压成无重叠词流。后续 renderer、seek、cache 和 SRT 都读取同一 immutable `TimelineSnapshot`。
+2. **结构化边界规划**：语义模型只能返回 `{"cutsAfter":["token-id"]}`。本地拒绝未知、重复、乱序或额外字段，再从 canonical tokens 重建英文；正常恢复和 oversize rescue 都没有自由英文回显后门。
+3. **结构化翻译 coverage**：翻译模型只返回 `{unitId, coverFrom, coverTo, translation}`。本地要求每个 unit/span 恰好覆盖一次、顺序和指纹一致、译文非空；任一错误整包拒绝，不安装或缓存半成品。
+4. **不可变提交**：resegment 和 translation 都创建新 snapshot revision，旧 snapshot 不原地修改。异步等待后会重新检查 video、track、source language、API Base、model、target language、prompt、generation 和 AbortSignal。
+5. **快速 fallback**：semantic 尚未完成时只服务当前播放段；若恢复慢或失败，当前段立即使用 fallback translation，不让中文字幕等待 1–2 分钟。semantic 只有在实时播放位置的译文准备好后才原子接管。
+6. **舒适短屏**：semantic 以 10 词为舒适目标、12 词为硬上限；fallback 只有为保全自然短语时才可放宽到 14 词。没有安全边界时显式回退，绝不硬切悬空冠词、介词、助动词、短语动词、比较结构或名词短语。
+7. **缓存隔离**：翻译缓存 namespace 为 `dsc-v70`，身份包含 endpoint、model、target language、prompt/contract、segmentation mode 和 source fingerprint；语义恢复缓存同时绑定严格词流，不复用旧协议结果。
+8. **中文显示清洗**：简体中文译文移除中文句号 `。`，保留逗号、问号、感叹号、数字和必要标点。清洗只在当前受支持的 `zh-Hans` 目标上运行。
 
-首包默认最多等待 8 秒：扩展只会暂停自己触发的播放，翻译就绪或超时后自动继续；切视频、禁用或运行时重建也会解除这次暂停，避免视频被遗留在暂停状态。后台语义恢复或预热失败时继续保留已可看的 fallback，并启动降级翻译；不会二次暂停或清空字幕。
+首包默认最多等待 8 秒：扩展只会暂停自己触发的播放，翻译就绪或超时后自动继续；切视频、禁用或运行时重建也会解除这次暂停。
 
 ### 原文断句：ASR 语义重组
 
@@ -97,14 +101,14 @@ YouTube 自动字幕（ASR）的事件是按滚动时间片切的：一句话常
 ASR 滚动事件几乎每条都与下一条时间重叠，`resegmentCues` 去重叠时会把前句 `end` 精确压到后句 `start`，于是连续语流的句单元首尾相接、间隙恒为 0，字幕像一堵「墙」永不消隐；而 LLM 又常把多行 ASR 合并成超长完整句（实测 6 行 → 一句 78 字占屏 5.4s），整句堆 3–4 行盖住画面。v0.4.0 用尾缩 + 模型自然分行专门修这两类节奏问题：
 
 - **句间尾缩（`tailTrimMs`，默认 120ms）**：对每个输出句单元的 `end` 做一个小的视觉回缩，让「原本紧贴」的句子之间也出现 ~120ms 断点，字幕该消隐时能消隐。仅当 `duration > tailTrimMs*2` 时才缩（短句不缩，避免缩没），缩后保证 `end - start ≥ 300ms`、绝不 `end < start`；**真停顿（本就有间隙）不受影响**，只缩本句尾不动下一句 `start`。`tailTrimMs = 0` 完全关闭（向后兼容）。
-- **译文 1:1 对齐**：模型按编号返回与完整 semantic unit 等量的译文，每个中英文单元共享同一起止时间；英文原文和中文译文各自严格单行，固定组成两行双语对照。`maxCharsPerScreen` / `maxDurPerScreen` 仍仅用于旧配置 round-trip。
+- **译文 1:1 对齐**：模型按 unit ID/token span 返回结构化 coverage；每个中英文单元共享同一起止时间，renderer 与 SRT 读取同一个 snapshot fingerprint。`maxCharsPerScreen` / `maxDurPerScreen` 仅保留旧配置 round-trip。
 - 「句间空隙」仍在 popup「字幕节奏」区可调；单屏字数/时长控件仅作旧配置兼容提示。
 
 ### 边播边翻：预取 + 并发 gate + 缓存
 
 - **整 clip 一次请求**：semantic 与恢复失败后的 `fallback-translation` 模式都按 clip 调用 `translateClipLines`；纯 fallback 仅在后台语义恢复尚未结束时暂显英文，不重复抢占请求。
 - **clip 按 cue 边界切**（默认目标 ~12s/clip，v0.4.1）：绝不在句子中间断、clip 之间不重叠不重复，同时让单次 prompt 更短、延迟更稳。
-- **更早预取 + 动态加深**：进入某 clip 就启动后续多段（默认当前段 + 后 3 段）的预取；当播放头接近当前段尾（剩余 < 15s）时自动再多预取 1 段，避免播到段尾才发现下一段没翻好。拖动进度条停稳后立即翻目标位置所在 clip。预取与渲染**解耦**（独立 ~1s 低频循环），播放位置没明显移动不重复跑昂贵逻辑。
+- **分级优先预取**：当前播放段拥有最高优先级；临近段尾的下一段次之；普通预取更低；显式全轨 SRT 后台批次最低。高优先级请求可越过已排队的后台任务。拖动进度条停稳后立即翻目标 clip，预取与渲染保持解耦。
 - **加载态**：semantic 某句译文还没到时，按需显示轻量"翻译中…"（半透明斜体，可在设置里关）。原文照常显示，译文到了平滑补上，不闪烁。
 
 ### 低配电脑运行占用优化
@@ -121,19 +125,19 @@ ASR 滚动事件几乎每条都与下一条时间重叠，`resegmentCues` 去重
 
 ### Token 优化与持久缓存
 
-- **翻译持久缓存**：已翻好的 clip 按 `videoId + 轨道 code + 译文语言 + 模型 + clip 起始毫秒` 为 key 存进 `chrome.storage.local`。重看、拖回、刷新页面整段命中缓存，**零重复翻译调用**。缓存按 LRU 裁剪（默认上限 800 条）防止占满配额。
+- **翻译持久缓存**：每个 clip 使用独立 storage entry，key 绑定视频、轨道、源语言、API endpoint、模型、目标语言、prompt/coverage contract、segmentation mode、source fingerprint 和 clip span。写入带 generation marker；写入期间身份失效会只回滚本次 entry，不覆盖其它标签页的新值。重看、拖回或刷新命中同身份缓存时零翻译调用。
 - **语义恢复持久缓存（v0.5.10）**：严格词流验收通过后，将整轨语义 cue 以独立 `dss-v1` namespace 缓存；key 同时绑定视频、轨道、网关、模型、恢复 prompt 和源 token 文本/时间指纹。刷新或切回同一视频时会再次验证缓存词流与源 token 完全等价，再直接复用，避免长视频重复执行约 100 次整轨断句请求。独立 LRU 最多保留 24 条语义轨道。
-- **真实 Token 计数（v0.5.10）**：若供应商返回 OpenAI-compatible `usage`，popup 会显示当前页面的请求数、输入、输出、总 Token 以及可用时的 reasoning token；不再只依赖字符数估算。
+- **提交后 Token 计数**：供应商返回的 OpenAI-compatible `usage` 先暂存；只有 coverage、代际、cache 和 snapshot 提交全部成功后才累计。stale、aborted 或验证失败的响应不污染当前页面统计。
 - **失败重试调度（v0.3.0）**：某 clip 翻译失败标记为可重试态，由一个后台调度器按指数退避（默认 base 2s / max 30s）**自动反复重翻**，直到成功；连续失败达上限（默认 6 次）才转为「翻译失败」终态并在 UI 上明确标示（而非静默当原文）。全部 clip 翻译完成时调度器自动停转，不空转烧 CPU。
 - **请求超时**：单次翻译请求加 `AbortController` 超时（默认 20s）。网关无响应时按失败兜底（显原文）+ 退避，不会让 clip 永久挂起占着并发位。
-- **短 prompt + reasoning_effort=low**：默认 prompt 写死上下文 1:1、半句自然承接、必要标点与只输出中文字幕行，并对支持的推理模型透传 `reasoning_effort: "low"`，减少 reasoning token 与长尾延迟。
+- **结构化短协议 + `reasoning_effort=low`**：边界调用只返回 token cuts，翻译调用只返回 coverage JSON；后台全轨准备最多把 8 个 source units 合成一批，减少重复固定 prompt。
 - **旧批处理参数兼容保留**：`batchLines`、`contextLines`、`sentencePrompt`、`maxCharsPerScreen`、`maxDurPerScreen` 仍可随配置导入导出 round-trip，但 v0.4.0 主路径不再使用它们。
 
 ### 配置导入 / 导出
 
 设置面板的"配置备份"区可把当前配置**导出**为 JSON 文件，换机器 / 重装扩展时**导入**即可，免去重填 API 配置。
 
-> **安全提示**：导出文件**包含 API Key** 等敏感信息，请妥善保管、勿随意分享或上传。导入后点"保存设置"才会生效。
+> **安全提示**：默认导出**不包含 API Key**；只有用户显式勾选“包含 API Key”时才写入凭据。含凭据文件请勿分享或上传。导入后点“保存设置”才会生效。
 
 ### 导出双语 SRT 字幕
 
@@ -145,7 +149,9 @@ ASR 滚动事件几乎每条都与下一条时间重叠，`resegmentCues` 去重
 | `bilingual_trans_top` | 译文在上、原文在下 |
 | `only_translated` | 仅译文（导出前要求全部字幕单元已有译文，不再用英文补空槽） |
 
-时间戳为标准 `HH:MM:SS,mmm`，按起始时间升序、跳过空单元，可直接喂给任意播放器 / 剪辑软件。导出双语 SRT 时启用完整性门禁：只要仍有原文字幕单元缺少译文，就拒绝生成文件，避免导出大量英文兜底的半成品字幕。
+时间戳为标准 `HH:MM:SS,mmm`，按起始时间升序、跳过空单元，可直接喂给任意播放器 / 剪辑软件。只要有原文单元缺少译文就拒绝生成，绝不输出半英文半中文成品。
+
+若全轨尚未翻完，popup 会先显示缺失单元数并明确确认可能产生的 API/Token 费用；确认后才以最低优先级、最多 8 个 source units 一批准备剩余轨道。界面显示单元/批次/Token 进度，可随时取消后续批次；只有 snapshot coverage 达到 100% 后才下载 SRT。
 
 
 ---
@@ -180,9 +186,9 @@ test/           离线测试（node 直接跑）
 ## 已知限制
 
 - 移动端 `m.youtube.com` 的播放器对象结构未经真机验证，按桌面端同套逻辑尽力支持。
-- 真实 YouTube 端到端效果（轨道抓取、`pot` 签名、渲染、颜色生效、断句质量、首句延迟、运行时占用、全屏/影院重定位、加载态）需在浏览器中验证；本仓库已通过语法检查与离线逻辑测试。
+- CI 会在 Chromium 中运行生产 `core.js` / `isolated.js` 的冻结 fixture 回放，并真实点击 popup 的全轨确认、进度、导出和取消流程；第三方 YouTube 页面本身的 `pot` 签名和站点 DOM 变化仍属于现场集成风险。
 - **自适应并发限流（v0.3.0）**：全局并发上限默认 4，gate 感知 429 / 超时——遇限流即把并发**减半收缩**（4→2→1，下限 1）并进入冷却窗,连续成功一段时间后**逐级恢复**到上限。从源头减少把网关打爆导致的整段断供，比静态并发更稳。
-- **缺槽失败关闭（v0.5.2）**：编号缺失或数量异常时不接受部分译文、不逐行猜填；该 clip 保持原文显示，并由统一退避调度整包重试。
+- **Coverage 失败关闭（v0.6.0）**：unit/span 缺失、重复、越界、错序或空译文都不接受部分结果；该 clip 保持原文显示，并由统一退避调度整包重试。
 - `resegmentCues` 的滚动重叠去重是**词级**比对，对英文等空格分词语言效果好；对中日韩等无空格语言，ASR 重叠本就少见，按整条事件处理。
 - 持久缓存按 `videoId+轨道+语言+模型+clip起点` 为 key；切换模型/译文语言会按新 key 重翻（旧缓存自然不命中，并按 LRU 逐步淘汰）。
 - 当前只支持 OpenAI 兼容的 `/chat/completions` 接口。
@@ -204,6 +210,9 @@ node test/run-semantic-corpus.js
 # Chromium 状态机回放（需有 CDP 9222；可用 DUALSUB_CDP_URL / DUALSUB_REPLAY_HOST 覆盖）
 # 覆盖正常接管、语义恢复过慢先 fallback 翻译、语义恢复失败后 fallback 双语降级、partial semantic install 自恢复、预热失败和等待期间 seek
 node test/browser-replay/run.js
+
+# popup 真实点击：全轨费用确认、进度、完整导出和取消
+node test/browser-popup/run.js
 
 # 全量离线结构 E2E（373 条真实字幕样本；输出目录可用 DUALSUB_E2E_OUT 覆盖）
 node test/e2e-harness.js --full

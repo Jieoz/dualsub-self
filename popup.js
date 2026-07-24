@@ -315,10 +315,14 @@
     });
 
     /* ---------------- 配置导入 / 导出 ---------------- */
-    // 导出：把当前表单配置序列化下载为 JSON 文件（含 key，已在 UI 提示用户）
+    // 导出：默认排除 API Key；核心导出器不可用时 fail-closed，绝不回退原始序列化。
     $("exportBtn").addEventListener("click", function () {
       var cfg = readForm();
-      var text = Core.exportConfig ? Core.exportConfig(cfg) : JSON.stringify({ config: cfg }, null, 2);
+      if (!Core.exportConfig) {
+        setStatus("导出失败：core.js 安全导出器未加载", "err");
+        return;
+      }
+      var text = Core.exportConfig(cfg);
       try {
         var blob = new Blob([text], { type: "application/json" });
         var url = URL.createObjectURL(blob);
@@ -331,7 +335,7 @@
         setTimeout(function () {
           URL.revokeObjectURL(url);
         }, 1000);
-        setStatus("已导出配置（文件含 API Key，请妥善保管）", "ok");
+        setStatus("已导出配置（默认不含 API Key）", "ok");
       } catch (e) {
         setStatus("导出失败：" + (e && e.message ? e.message : e), "err");
       }
@@ -366,41 +370,78 @@
     /* ---------------- 导出双语 SRT ---------------- */
     // 向当前 tab 的 isolated.js 取已翻译的渲染单元，用 Core.buildSrt 生成 SRT，
     // 走 a[download] + Blob 下载（不依赖 chrome.downloads，免加 manifest 权限）。
+    function sleep(ms) { return new Promise(function (resolve) { setTimeout(resolve, ms); }); }
+
+    function downloadSrtResponse(resp, mode) {
+      var srt = Core.buildSrt ? Core.buildSrt(resp.units, { mode: mode, requireTranslations: true }) : "";
+      if (!srt) throw new Error("仍存在未翻译字幕单元，已阻止导出半成品");
+      var blob = new Blob([srt], { type: "text/plain;charset=utf-8" });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement("a");
+      a.href = url;
+      a.download = makeSrtFilename(resp.videoId, resp.targetLang);
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+      return a.download;
+    }
+
+    $("cancelSrtBtn").addEventListener("click", async function () {
+      if (currentTabId != null) await sendToTab(currentTabId, { type: "cancel-full-srt" });
+      setStatus("正在取消：当前在途批次结束后不再产生新请求…", "");
+    });
+
     $("exportSrtBtn").addEventListener("click", async function () {
       if (currentTabId == null) {
         setStatus("请在 YouTube 播放页导出（字幕数据来自内容脚本）", "err");
         return;
       }
       var mode = $("srtMode") ? $("srtMode").value : "bilingual_orig_top";
-      var resp = await sendToTab(currentTabId, { type: "export-srt" });
-      if (!resp) {
-        setStatus("无响应：请在 YouTube 标签页打开并刷新后重试", "err");
-        return;
-      }
-      if (!resp.ok || !resp.units || !resp.units.length) {
-        setStatus("当前视频还没有全部翻译完成，不能导出半成品 SRT。请继续播放/等待译文补齐后再导出", "err");
-        return;
-      }
-      var srt = Core.buildSrt ? Core.buildSrt(resp.units, { mode: mode, requireTranslations: true }) : "";
-      if (!srt) {
-        setStatus("生成 SRT 为空：仍存在未翻译字幕单元，已阻止导出半成品", "err");
-        return;
-      }
+      var exportBtn = $("exportSrtBtn");
+      var cancelBtn = $("cancelSrtBtn");
+      exportBtn.disabled = true;
       try {
-        var blob = new Blob([srt], { type: "text/plain;charset=utf-8" });
-        var url = URL.createObjectURL(blob);
-        var a = document.createElement("a");
-        a.href = url;
-        a.download = makeSrtFilename(resp.videoId, resp.targetLang);
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        setTimeout(function () {
-          URL.revokeObjectURL(url);
-        }, 1000);
-        setStatus("已导出 SRT ✓（" + (a.download) + "）", "ok");
+        var resp = await sendToTab(currentTabId, { type: "export-srt" });
+        if (!resp) throw new Error("无响应：请在 YouTube 标签页打开并刷新后重试");
+        if (!resp.ok) {
+          var missing = Number(resp.missingUnits) || 0;
+          var confirmed = window.confirm(
+            "全轨尚有 " + missing + " 个字幕单元未翻译。\n\n" +
+            "继续会按最多 8 个单元/批请求翻译 API，并产生 Token 费用。是否开始？"
+          );
+          if (!confirmed) {
+            setStatus("已取消：未启动任何全轨翻译请求", "");
+            return;
+          }
+          var started = await sendToTab(currentTabId, { type: "prepare-full-srt", confirmed: true });
+          if (!started || !started.ok) throw new Error(started && started.error || "无法启动全轨翻译");
+          cancelBtn.style.display = "block";
+          while (true) {
+            var progress = await sendToTab(currentTabId, { type: "full-srt-status" });
+            if (!progress || !progress.ok) throw new Error("无法读取全轨翻译进度");
+            var usage = progress.usage || {};
+            setStatus(
+              "全轨翻译：" + progress.completedUnits + "/" + progress.totalUnits +
+              " 单元，批次 " + progress.completedBatches + "/" + progress.totalBatches +
+              "\n本次 Token：" + (usage.totalTokens || 0),
+              ""
+            );
+            if (progress.status === "completed") break;
+            if (progress.status === "cancelled") throw new Error("全轨翻译已取消");
+            if (progress.status === "failed") throw new Error("全轨翻译失败：" + (progress.error || "未知错误"));
+            await sleep(500);
+          }
+          resp = await sendToTab(currentTabId, { type: "export-srt" });
+        }
+        if (!resp || !resp.ok || !resp.units || !resp.units.length) throw new Error("全轨仍未完整翻译，拒绝导出半成品");
+        var filename = downloadSrtResponse(resp, mode);
+        setStatus("已导出 SRT ✓（" + filename + "）", "ok");
       } catch (e) {
         setStatus("导出失败：" + (e && e.message ? e.message : e), "err");
+      } finally {
+        exportBtn.disabled = false;
+        cancelBtn.style.display = "none";
       }
     });
   });
