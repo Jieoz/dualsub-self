@@ -5,7 +5,6 @@ const path = require("path");
 const Core = require("../core.js");
 const cases = JSON.parse(fs.readFileSync(path.join(__dirname, "semantic-adversarial-corpus.json"), "utf8"));
 function plain(marked) { return marked.replace(/\s*\|\s*/g, " ").replace(/\s+/g, " ").trim(); }
-function modelLine(marked) { return marked.trim().replace(/\.?$/, "."); }
 function tokensOf(text) { return text.split(/\s+/).map((word, i) => ({ text: word, start: i * 180, end: (i + 1) * 180, nativeTiming: true })); }
 (async () => {
   let success = 0, fallback = 0;
@@ -13,10 +12,17 @@ function tokensOf(text) { return text.split(/\s+/).map((word, i) => ({ text: wor
     const source = plain(item.marked);
     const tokens = tokensOf(source);
     let calls = 0;
+    const sourceMarks = Core.restoredBoundaryMarks(tokens.map(t => t.text), item.marked.trim().replace(/\.?$/, "."));
+    assert.ok(sourceMarks, `${item.name}: invalid corpus marks`);
+    const globalCuts = new Set(sourceMarks.map((mark, index) => mark ? `t${index}` : null).filter(Boolean));
     const invoke = () => Core.restoreAndPackTokens({
       tokens, apiBaseUrl: "https://example.test", apiKey: "x", apiModel: "m",
       preferredMaxWords: 10, maxWords: 12, attempts: 1,
-      fetchImpl: async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: (++calls, modelLine(item.marked)) } }] }) }),
+      fetchImpl: async (_url, req) => ({ ok: true, json: async () => {
+        calls++;
+        const body = JSON.parse(req.body), payload = JSON.parse(body.messages[1].content);
+        return { choices: [{ message: { content: JSON.stringify({ cutsAfter: payload.tokens.map(t => t.id).filter(id => globalCuts.has(id)) }) } }] };
+      } }),
     });
     if (item.outcome === "fallback") {
       await assert.rejects(invoke, /unresolved oversized semantic unit/i, item.name);

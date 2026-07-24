@@ -28,6 +28,7 @@ jobs:
           node --check popup.js
           node --check test/e2e-harness.js
           node --check test/browser-replay/run.js
+          node --check test/browser-popup/run.js
           node --check test/run-tests.js
           node --check test/run-semantic-corpus.js
           node --check test/run-real-semantic-corpus.js
@@ -51,3 +52,4 @@ jobs:
           done
           curl -fsS http://127.0.0.1:9222/json/version >/dev/null
           node test/browser-replay/run.js
+          node test/browser-popup/run.js

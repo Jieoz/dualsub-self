@@ -24,13 +24,15 @@
   // ---- RPC 通道（与 main.js 一致）----
   var CHANNEL = "__dualsub_rpc_8f3ad7c1b2e94__";
   var SENDER = "isolated";
+  var RPC_PEER = "main";
 
   // ---- 配置 ----
   var STORAGE_KEY = "dualsub:" + location.origin; // 按 origin 存
-  var CACHE_KEY = "dualsub:cache"; // 翻译缓存（全 origin 共享，按 videoId/轨道/语言/model 区分）
-  var CACHE_MAX_ENTRIES = 800; // 缓存条目上限（LRU 裁剪，防配额溢出）
-  var SEMANTIC_CACHE_KEY = "dualsub:semantic-cache"; // 严格词流语义恢复结果，避免刷新后整轨重跑模型
-  var SEMANTIC_CACHE_MAX_ENTRIES = 24; // 语义轨道体积较大，独立小型 LRU 防 storage 配额增长
+  // 每个缓存 entry 使用独立 storage key；不同标签页写不同 entry 不再共享对象 RMW 覆盖。
+  var CACHE_ENTRY_PREFIX = "dualsub:cache-entry-v72:";
+  var CACHE_MAX_ENTRIES = 800;
+  var SEMANTIC_CACHE_ENTRY_PREFIX = "dualsub:semantic-cache-entry-v71:";
+  var SEMANTIC_CACHE_MAX_ENTRIES = 24;
   var DEFAULT_CONFIG = Core.DEFAULT_CONFIG;
 
   // 跨 clip 的全局 in-flight 翻译请求上限（每个内容脚本实例一个信号量）。
@@ -60,9 +62,15 @@
     videoId: null,
     tracks: [], // main.js 推来的轨道清单
     activeTrack: null, // 当前选中的轨道
-    cues: [], // 最终原文 cue（优先严格词流语义恢复，否则稳定回退 resegmentCues）
+    cues: [], // 最终原文 cue（由 timelineSnapshot 的 token spans 唯一重建）
+    sourceTimeline: null, // 当前轨唯一 canonical token 流；fallback/semantic/renderer/SRT 共享
+    timelineSnapshot: null, // 不可变 TimelineSnapshot；所有译文提交均生成新 revision
     segmentationMode: "fallback", // 'semantic' | 'fallback' | 'fallback-translation'，用于缓存隔离与可观测性
     timelineEpoch: 0, // 每次整轨切换递增，拒绝旧异步翻译结果写入新分段
+    requestGeneration: 0, // 视频/轨道/翻译身份变化即递增；所有异步副作用都必须持有同代快照
+    requestControllers: [], // 当前代在途 fetch；身份失效时主动 abort，而非只拒绝迟到写入
+    translationInflight: {}, // 完整缓存身份 -> Promise；semantic/实时/seek 共享同一个请求
+    cacheWriteChain: Promise.resolve(), // chrome.storage read-modify-write 串行化，防并发覆盖
     clips: [], // 按 cue 边界切的 clip
     cueMap: [], // 全局 cue 下标 -> {clipIdx,cueIdx}（cueClipIndexMap 建表）
     // 每个 clip 先经 translateClipWithBoundaryRepair 的 source-cap/锁边门禁，再由 buildClipUnits 得到渲染单元。
@@ -75,6 +83,7 @@
     clipInflight: {}, // clipIndex -> bool：translateClip 进行中（重入互斥，防同 clip 并发）
     retryTimer: null, // 后台失败重试调度器 id（第2层；只在有 error clip 时活跃）
     semanticFallbackTimer: null, // 语义恢复过慢时先翻 fallback，避免 1–2 分钟只有英文
+    semanticPending: false, // semantic 未决时 fallback 只翻当前播放段，禁止投机预取浪费请求
     renderer: null, // 叠加层 DOM
     videoEl: null,
     fontObserver: null, // ResizeObserver：观察播放器高度变化，同比缩放字号（全屏放大）
@@ -90,7 +99,56 @@
     waitTimer: null,
     firstClipReady: false,
     apiUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0, reasoningTokens: 0, requests: 0 },
+    cacheWriteSeq: 0,
+    srtJob: null,
+    // MAIN world 与页面同权，事件 sender 字符串不是认证。首次通过 URL/video/track
+    // 严格绑定的清单会锁定本视频轨道身份，后续只允许同身份刷新签名 URL。
+    manifestIdentity: null,
   };
+
+
+  function beginRuntimeRequest() {
+    var controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+    var context = { generation: state.requestGeneration, controller: controller };
+    state.requestControllers.push(context);
+    return context;
+  }
+
+  function endRuntimeRequest(context) {
+    if (!context) return;
+    var next = [];
+    for (var i = 0; i < state.requestControllers.length; i++) {
+      if (state.requestControllers[i] !== context) next.push(state.requestControllers[i]);
+    }
+    state.requestControllers = next;
+  }
+
+  function isRuntimeRequestCurrent(context) {
+    return !!config.enabled && !!context && context.generation === state.requestGeneration &&
+      !(context.controller && context.controller.signal && context.controller.signal.aborted);
+  }
+
+  function invalidateRuntimeRequests() {
+    if (state.srtJob && (state.srtJob.status === "running" || state.srtJob.status === "cancelling")) {
+      state.srtJob.cancelRequested = true;
+      state.srtJob.status = "cancelled";
+      state.srtJob.error = "运行时身份已变化";
+    }
+    state.requestGeneration++;
+    var active = state.requestControllers.slice();
+    state.requestControllers = [];
+    for (var i = 0; i < active.length; i++) {
+      try { if (active[i].controller) active[i].controller.abort(); } catch (e) {}
+    }
+    state.clipInflight = {};
+    state.translationInflight = {};
+  }
+
+  function runtimeAbortError() {
+    var error = new Error("runtime request superseded");
+    error.name = "AbortError";
+    return error;
+  }
 
   // 渲染/预取节拍（ms）。渲染 250ms 人眼无感；预取 1s 一次（比渲染低频，但比旧 1.5s 更跟手），与渲染解耦。
   var RENDER_INTERVAL_MS = 250;
@@ -147,31 +205,77 @@
     state.apiUsage.requests++;
   }
 
-  function readSemanticCache() {
+  function commitPendingUsage(context, pendingUsage) {
+    if (!isRuntimeRequestCurrent(context)) return false;
+    (pendingUsage || []).forEach(recordApiUsage);
+    pendingUsage.length = 0;
+    return true;
+  }
+
+  function storageGet(keys) {
     return new Promise(function (resolve) {
-      try {
-        chrome.storage.local.get([SEMANTIC_CACHE_KEY], function (res) {
-          var cache = res && res[SEMANTIC_CACHE_KEY];
-          resolve(cache && typeof cache === "object" ? cache : {});
-        });
-      } catch (e) { resolve({}); }
+      try { chrome.storage.local.get(keys, function (res) { resolve(res && typeof res === "object" ? res : {}); }); }
+      catch (_) { resolve({}); }
     });
   }
 
-  function writeSemanticCache(key, cues) {
-    return readSemanticCache().then(function (cache) {
-      cache[key] = {
-        t: Date.now(),
-        cues: (cues || []).map(function (cue) {
-          return { start: cue.start, end: cue.end, content: cue.content };
-        }),
-      };
-      var obj = {};
-      obj[SEMANTIC_CACHE_KEY] = Core.pruneCache(cache, SEMANTIC_CACHE_MAX_ENTRIES);
-      return new Promise(function (resolve) {
-        try { chrome.storage.local.set(obj, resolve); } catch (e) { resolve(); }
-      });
+  function storageSet(obj) {
+    return new Promise(function (resolve) {
+      try { chrome.storage.local.set(obj, resolve); } catch (_) { resolve(); }
     });
+  }
+
+  function storageRemove(keys) {
+    return new Promise(function (resolve) {
+      try { chrome.storage.local.remove(keys, resolve); } catch (_) { resolve(); }
+    });
+  }
+
+  function entryStorageKey(prefix, key) { return prefix + String(key || ""); }
+
+  async function readEntry(prefix, key) {
+    var storageKey = entryStorageKey(prefix, key);
+    var values = await storageGet([storageKey]);
+    var entry = values[storageKey];
+    return entry && typeof entry === "object" ? entry : null;
+  }
+
+  async function pruneEntryNamespace(prefix, maxEntries) {
+    var all = await storageGet(null);
+    var entries = Object.keys(all).filter(function (key) { return key.indexOf(prefix) === 0; }).map(function (key) {
+      return { key: key, t: Number(all[key] && all[key].t) || 0 };
+    }).sort(function (a, b) { return b.t - a.t; });
+    var stale = entries.slice(Math.max(0, Number(maxEntries) || 0)).map(function (item) { return item.key; });
+    if (!stale.length || !chrome.storage.local.remove) return;
+    await new Promise(function (resolve) { try { chrome.storage.local.remove(stale, resolve); } catch (_) { resolve(); } });
+  }
+
+  async function removeEntryIfCurrentWrite(storageKey, marker) {
+    var current = await storageGet([storageKey]);
+    if (current[storageKey] && current[storageKey]._writeMarker === marker) await storageRemove([storageKey]);
+  }
+
+  async function writeEntry(prefix, key, value, maxEntries, generation, isAccepted) {
+    if (generation != null && (generation !== state.requestGeneration || !config.enabled)) return false;
+    if (isAccepted && !isAccepted()) return false;
+    var storageKey = entryStorageKey(prefix, key);
+    var marker = String(generation == null ? "free" : generation) + ":" + (++state.cacheWriteSeq) + ":" + Date.now();
+    var obj = {}; obj[storageKey] = Object.assign({ t: Date.now(), _writeMarker: marker }, value);
+    await storageSet(obj);
+    if ((generation != null && (generation !== state.requestGeneration || !config.enabled)) || (isAccepted && !isAccepted())) {
+      await removeEntryIfCurrentWrite(storageKey, marker);
+      return false;
+    }
+    pruneEntryNamespace(prefix, maxEntries).catch(function () {});
+    return true;
+  }
+
+  function readSemanticCacheEntry(key) { return readEntry(SEMANTIC_CACHE_ENTRY_PREFIX, key); }
+
+  function writeSemanticCache(key, cues, generation) {
+    return writeEntry(SEMANTIC_CACHE_ENTRY_PREFIX, key, {
+      cues: (cues || []).map(function (cue) { return { start: cue.start, end: cue.end, content: cue.content }; }),
+    }, SEMANTIC_CACHE_MAX_ENTRIES, generation);
   }
 
   function cachedSemanticCues(entry, tokens) {
@@ -201,11 +305,16 @@
       preferredMaxWords: 10,
       maxWords: 12,
     });
-    var cache = await readSemanticCache();
-    var cached = cachedSemanticCues(cache[cacheKey], tokens);
+    var semanticGeneration = state.requestGeneration;
+    var cached = cachedSemanticCues(await readSemanticCacheEntry(cacheKey), tokens);
+    if (semanticGeneration !== state.requestGeneration || !config.enabled) return null;
     if (cached) return cached;
     try {
-      var restored = await Core.restoreAndPackTokens({
+      var semanticRequest = beginRuntimeRequest();
+      var pendingUsage = [];
+      var restored;
+      try {
+        restored = await Core.restoreAndPackTokens({
         tokens: tokens,
         apiBaseUrl: config.apiBaseUrl,
         apiKey: config.apiKey,
@@ -219,10 +328,17 @@
         attempts: 2,
         timeoutMs: 20000,
         fetchImpl: function (u, o) { return fetch(u, o); },
-        onUsage: recordApiUsage,
-      });
+        onUsage: function (usage) { pendingUsage.push(usage); },
+        signal: semanticRequest.controller ? semanticRequest.controller.signal : undefined,
+        });
+      } finally {
+        endRuntimeRequest(semanticRequest);
+      }
+      if (!isRuntimeRequestCurrent(semanticRequest)) return null;
       var cleaned = restored && restored.length ? Core.cleanupCues(restored) : null;
-      if (cleaned && cleaned.length) await writeSemanticCache(cacheKey, cleaned);
+      if (cleaned && cleaned.length) await writeSemanticCache(cacheKey, cleaned, semanticRequest.generation);
+      if (!isRuntimeRequestCurrent(semanticRequest)) return null;
+      commitPendingUsage(semanticRequest, pendingUsage);
       return cleaned;
     } catch (e) {
       console.warn("[dualsub] 语义恢复未通过词流契约，回退 ASR 重组：", e && e.message);
@@ -236,65 +352,90 @@
     }).join("~");
   }
 
-  function clipCacheKey(clip) {
+  function translationIdentitySnapshot() {
+    return {
+      apiBaseUrl: config.apiBaseUrl,
+      apiKey: config.apiKey,
+      apiModel: config.apiModel,
+      targetLang: config.targetLang,
+      systemPrompt: config.systemPrompt || "",
+      reasoningEffort: config.reasoningEffort,
+      maxLineChars: config.maxLineChars,
+    };
+  }
+
+  function clipCacheKey(clip, segmentationMode, identity) {
+    identity = identity || translationIdentitySnapshot();
     return Core.makeCacheKey({
       videoId: state.videoId,
       trackCode: state.activeTrack ? state.activeTrack.code : "",
-      targetLang: config.targetLang,
-      apiModel: config.apiModel,
-      segmentationMode: state.segmentationMode,
+      targetLang: identity.targetLang,
+      apiModel: identity.apiModel,
+      apiBaseUrl: identity.apiBaseUrl,
+      systemPrompt: identity.systemPrompt || "",
+      reasoningEffort: identity.reasoningEffort,
+      maxLineChars: identity.maxLineChars,
+      contractVersion: "coverage-v1",
+      segmentationMode: segmentationMode || state.segmentationMode,
       clipStartMs: clip.startMs,
       cueFingerprint: clipCueFingerprint(clip),
     });
   }
 
-  function readCache() {
-    return new Promise(function (resolve) {
-      try {
-        chrome.storage.local.get([CACHE_KEY], function (res) {
-          var c = res && res[CACHE_KEY];
-          resolve(c && typeof c === "object" ? c : {});
-        });
-      } catch (e) {
-        resolve({});
-      }
-    });
+  function readCacheEntry(key) { return readEntry(CACHE_ENTRY_PREFIX, key); }
+
+  function writeCache(key, payload, generation, isAccepted) {
+    return writeEntry(CACHE_ENTRY_PREFIX, key, payload, CACHE_MAX_ENTRIES, generation, isAccepted);
   }
 
-  /** 把某 clip 的译文写进持久缓存（仅在翻译成功时调用）。
-   *  payload 为 { lines: string[] }（模型直接吐的自然中文字幕行；命中后重跑 buildClipUnits 配时间轴）。 */
-  function writeCache(key, payload) {
-    readCache().then(function (cacheObj) {
-      cacheObj[key] = Object.assign({ t: Date.now() }, payload);
-      var pruned = Core.pruneCache(cacheObj, CACHE_MAX_ENTRIES);
-      var obj = {};
-      obj[CACHE_KEY] = pruned;
-      try {
-        chrome.storage.local.set(obj);
-      } catch (e) {}
-    });
-  }
 
   /* =====================================================
    * RPC：接收 main.js 的轨道清单
    * ===================================================== */
   window.addEventListener(CHANNEL, function (ev) {
     var detail = ev && ev.detail;
-    if (!detail || detail.receiver !== SENDER) return;
-    if (detail.subject === "update-manifest") {
-      onManifest(detail.content);
-    }
+    // sender/receiver 只用于路由，不是认证：MAIN world 与页面脚本同权，所有 content 均不可信。
+    if (!detail || detail.sender !== RPC_PEER || detail.receiver !== SENDER || detail.subject !== "update-manifest") return;
+    onManifest(detail.content);
   });
 
-  function onManifest(content) {
-    if (!content || !Array.isArray(content.files)) return;
-    var changedVideo = content.videoId !== state.videoId;
-    state.videoId = content.videoId;
-    state.tracks = content.files;
+  function currentPageVideoId() {
+    try {
+      var url = new URL(location.href);
+      var queryId = url.searchParams.get("v");
+      if (queryId) return queryId;
+      var match = url.pathname.match(/^\/(?:shorts|live|embed)\/([A-Za-z0-9_-]{1,128})(?:\/|$)/);
+      return match ? match[1] : "";
+    } catch (e) { return ""; }
+  }
 
+  function manifestIdentity(manifest) {
+    return manifest.videoId + "|" + manifest.files.map(function (track) {
+      return [track.code, track.languageCode, track.kind].join("\x1f");
+    }).join("\x1e");
+  }
+
+  function onManifest(content) {
+    var pageVideoId = currentPageVideoId();
+    var manifest = Core.validateTrackManifest(content, { expectedVideoId: pageVideoId });
+    if (!manifest) {
+      console.warn("[dualsub] rejected subtitle manifest not bound to current page/video/track");
+      return;
+    }
+    var nextIdentity = manifestIdentity(manifest);
+    if (state.videoId === manifest.videoId && state.manifestIdentity && state.manifestIdentity !== nextIdentity) {
+      console.warn("[dualsub] rejected track-identity mutation for active video");
+      return;
+    }
+    var changedVideo = manifest.videoId !== state.videoId;
+    state.videoId = manifest.videoId;
+    state.tracks = manifest.files;
     if (changedVideo) {
-      // 切换视频：清空所有缓存与渲染
+      // 切换视频：清空所有缓存与渲染，并锁定当前页面实际视频的轨道身份。
       resetForNewVideo();
+      state.manifestIdentity = nextIdentity;
+    } else if (!state.manifestIdentity) {
+      state.manifestIdentity = nextIdentity;
     }
 
     // 通知 popup 轨道清单已更新（popup 打开时用于填充源语言下拉）
@@ -312,14 +453,38 @@
     if (state.activeTrack && state.activeTrack.url === track.url && state.cues.length) {
       return; // 已经在用这条轨道且已加载
     }
+    switchTrack(track);
+  }
+
+  function switchTrack(track) {
+    if (!track || !track.url) return;
+    invalidateRuntimeRequests();
+    state.timelineEpoch++;
+    state.semanticPending = false;
+    clearSemanticFallbackTimer();
     state.activeTrack = track;
+    state.cues = [];
+    state.sourceTimeline = null;
+    state.timelineSnapshot = null;
+    state.clips = [];
+    state.cueMap = [];
+    state.clipUnits = {};
+    state.renderUnits = [];
+    state.clipState = {};
+    state.clipBackoff = {};
+    state.clipInflight = {};
+    state.lastHitCueIdx = -1;
+    clearRenderer();
     loadTrack(track);
   }
 
   function resetForNewVideo() {
+    invalidateRuntimeRequests();
     state.timelineEpoch++;
     state.activeTrack = null;
     state.cues = [];
+    state.sourceTimeline = null;
+    state.timelineSnapshot = null;
     state.clips = [];
     state.cueMap = [];
     state.clipUnits = {};
@@ -389,16 +554,28 @@
    * 拉取 + 解析 + 切 clip
    * ===================================================== */
   async function loadTrack(track) {
+    var trackUrl = track && track.url;
+    function trackRequestCurrent(context) {
+      return isRuntimeRequestCurrent(context) && !!state.activeTrack && state.activeTrack.url === trackUrl;
+    }
     state.firstClipReady = false;
     state.waitPausedByUs = false;
     clearWaitTimer();
+    var requestContext = beginRuntimeRequest();
     try {
-      var resp = await fetch(track.url, { credentials: "omit" });
+      var resp = await fetch(track.url, {
+        credentials: "omit",
+        signal: requestContext.controller ? requestContext.controller.signal : undefined,
+      });
+      if (!trackRequestCurrent(requestContext)) return;
       if (!resp.ok) {
         console.warn("[dualsub] 字幕请求失败 HTTP", resp.status);
         return;
       }
       var text = await resp.text();
+      if (!trackRequestCurrent(requestContext)) return;
+      endRuntimeRequest(requestContext);
+      requestContext = null;
       var cues;
       // 优先按 json3 解析，失败再试 vtt
       var trimmed = text.trim();
@@ -410,14 +587,16 @@
       }
       cues = Core.cleanupCues(cues);
       // 先立即建立稳定 fallback 原文时间轴；技术 cue 不翻译。语义恢复是整轨模型工作，不能阻塞首字幕。
+      var sourceTimeline = Core.buildCanonicalTokenTimeline(cues);
       var fallbackCues = Core.resegmentCues(cues, { tailTrimMs: config.tailTrimMs, maxWords: 12, continuationMaxWords: 14 });
-      if (!installCueTimeline(fallbackCues, "fallback")) {
+      if (!installCueTimeline(fallbackCues, "fallback", { sourceTimeline: sourceTimeline })) {
         console.warn("[dualsub] 解析后无有效字幕");
         return;
       }
       // 完整验证成功后才原子切换到语义时间轴；失败保持已工作的 fallback。
       // 但语义恢复慢不能阻塞首屏中文字幕：短阈值后先翻 fallback，后续 semantic 准备好再升级。
       var loadEpoch = state.timelineEpoch;
+      state.semanticPending = true;
       clearSemanticFallbackTimer();
       state.semanticFallbackTimer = setTimeout(function () {
         state.semanticFallbackTimer = null;
@@ -428,22 +607,47 @@
           if (loadEpoch !== state.timelineEpoch) return;
           clearSemanticFallbackTimer();
           if (!semanticCues || !semanticCues.length) {
+            finishSemanticPending(loadEpoch);
             enableFallbackTranslation(loadEpoch);
             return;
           }
           var installed = await stageSemanticTimeline(Core.applyTailTrim(semanticCues, config.tailTrimMs), loadEpoch);
-          if (!installed) enableFallbackTranslation(loadEpoch);
+          if (installed) state.semanticPending = false;
+          else {
+            finishSemanticPending(loadEpoch);
+            enableFallbackTranslation(loadEpoch);
+          }
         }).catch(function (e) {
           // Semantic restoration is optional. If it fails, translate the already resegmented
           // fallback timeline instead of leaving the page permanently English-only.
+          // A stale epoch (track switch / config reload / new video / disable) or an aborted
+          // in-flight request is an EXPECTED cancellation, not a failure: skip it silently so
+          // config switches and teardown do not surface phantom "restore failed" warnings.
+          if (loadEpoch !== state.timelineEpoch) return;
           clearSemanticFallbackTimer();
-          console.warn("[dualsub] semantic restore failed; translating fallback timeline", e);
+          if (!(e && (e.name === "AbortError" || e.name === "DOMException"))) {
+            console.warn("[dualsub] semantic restore failed; translating fallback timeline", e);
+          }
+          finishSemanticPending(loadEpoch);
           enableFallbackTranslation(loadEpoch);
         });
       }, 0);
     } catch (e) {
+      if (requestContext && !isRuntimeRequestCurrent(requestContext)) return;
       console.warn("[dualsub] loadTrack 出错", e);
+    } finally {
+      endRuntimeRequest(requestContext);
     }
+  }
+
+  function finishSemanticPending(loadEpoch) {
+    if (loadEpoch !== state.timelineEpoch) return false;
+    state.semanticPending = false;
+    if (state.segmentationMode === "fallback-translation") {
+      state.lastPrefetchMs = -1e9;
+      prefetchAround(currentTimeMs(), true);
+    }
+    return true;
   }
 
   function enableFallbackTranslation(loadEpoch) {
@@ -463,9 +667,13 @@
   function sliceTimelineClips(cues) {
     var firstSec = Number(config.firstClipSeconds);
     if (!Number.isFinite(firstSec) || firstSec <= 0) firstSec = config.clipSeconds;
+    var configuredMaxCues = Math.floor(Number(config.maxCuesPerClip) || 0);
+    // 全轨 coverage 的硬协议上限是 8 source units；源 clip 在唯一切分入口就必须满足，
+    // planCoverageBatches 仍会对任何违反该不变量的单项 fail-closed。
+    var hardMaxCues = configuredMaxCues > 0 ? Math.min(configuredMaxCues, 8) : 8;
     return Core.sliceClipsByCue(cues, config.clipSeconds * 1000, {
       firstTargetMs: firstSec * 1000,
-      maxCuesPerClip: config.maxCuesPerClip || 0,
+      maxCuesPerClip: hardMaxCues,
       maxSourceChars: config.maxSourceCharsPerClip || 0,
     });
   }
@@ -480,22 +688,85 @@
     return clips.length - 1;
   }
 
+  async function readVerifiedClipCache(clip, segmentationMode, identity, generation) {
+    var key = clipCacheKey(clip, segmentationMode, identity);
+    var cached = await readCacheEntry(key);
+    if (generation !== state.requestGeneration || !config.enabled) throw runtimeAbortError();
+    if (!cached || !Array.isArray(cached.coverage)) return null;
+    try {
+      var expectedCoverage = Core.translationCoverageUnitsFromCues(clip.cues);
+      var verifiedCoverage = Core.parseTranslationCoverageResponse(JSON.stringify({ translations: cached.coverage }), expectedCoverage);
+      return { key: key, cues: clip.cues, lines: verifiedCoverage.map(function (entry) { return entry.translation; }), coverage: verifiedCoverage, repaired: false, fromCache: true };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async function loadOrTranslateClip(clip, segmentationMode, priority) {
+    var identity = translationIdentitySnapshot();
+    var generation = state.requestGeneration;
+    var key = clipCacheKey(clip, segmentationMode, identity);
+    if (state.translationInflight[key]) return state.translationInflight[key];
+
+    var task = (async function () {
+      var context = beginRuntimeRequest();
+      var pendingUsage = [];
+      try {
+        // Intent 先进入优先级 gate，再做异步 storage lookup。否则高优先级 seek 会在
+        // cache callback 尚未返回时被稍后到达的低优先级全轨任务抢先占槽。
+        var payload = await ensureGate().run(async function () {
+          if (!isRuntimeRequestCurrent(context)) throw runtimeAbortError();
+          var cachedResult = await readVerifiedClipCache(clip, segmentationMode, identity, generation);
+          if (cachedResult) return { cached: cachedResult };
+          if (!identity.apiBaseUrl || !identity.apiModel) throw new Error("translation configuration missing");
+          var result = await Core.translateClipWithBoundaryRepair({
+            cues: clip.cues,
+            apiBaseUrl: identity.apiBaseUrl,
+            apiKey: identity.apiKey,
+            apiModel: identity.apiModel,
+            targetLang: identity.targetLang,
+            systemPrompt: identity.systemPrompt,
+            reasoningEffort: identity.reasoningEffort,
+            maxLineChars: identity.maxLineChars,
+            segmentationMode: segmentationMode,
+            timeoutMs: 20000,
+            fetchImpl: function (u, o) { return fetch(u, o); },
+            onUsage: function (usage) { pendingUsage.push(usage); },
+            signal: context.controller ? context.controller.signal : undefined,
+          });
+          return { translated: result };
+        }, priority == null ? 20 : priority);
+        if (payload.cached) return payload.cached;
+        if (!isRuntimeRequestCurrent(context) || generation !== state.requestGeneration) throw runtimeAbortError();
+        var result = payload.translated;
+        var out = {
+          key: key,
+          cues: result && result.repaired ? result.cues : clip.cues,
+          lines: result && result.lines ? result.lines : [],
+          coverage: result && result.coverage ? result.coverage : [],
+          repaired: !!(result && result.repaired),
+          fromCache: false,
+        };
+        if (out.lines.length) await writeCache(key, { lines: out.lines, coverage: out.coverage }, generation);
+        if (!isRuntimeRequestCurrent(context) || generation !== state.requestGeneration) throw runtimeAbortError();
+        commitPendingUsage(context, pendingUsage);
+        return out;
+      } finally {
+        endRuntimeRequest(context);
+      }
+    })();
+
+    state.translationInflight[key] = task;
+    try {
+      return await task;
+    } finally {
+      if (state.translationInflight[key] === task) delete state.translationInflight[key];
+    }
+  }
+
   function translatePreparedClip(clip) {
-    return ensureGate().run(function () {
-      return Core.translateClipWithBoundaryRepair({
-        cues: clip.cues,
-        apiBaseUrl: config.apiBaseUrl,
-        apiKey: config.apiKey,
-        apiModel: config.apiModel,
-        targetLang: config.targetLang,
-        systemPrompt: config.systemPrompt || "",
-        reasoningEffort: config.reasoningEffort,
-        maxLineChars: config.maxLineChars,
-        segmentationMode: "semantic",
-        timeoutMs: 20000,
-        fetchImpl: function (u, o) { return fetch(u, o); },
-        onUsage: recordApiUsage,
-      });
+    return loadOrTranslateClip(clip, "semantic", 100).then(function (result) {
+      return { cues: result.cues, lines: result.lines, repaired: result.repaired };
     });
   }
 
@@ -534,7 +805,27 @@
     // Prepare the complete candidate before changing epoch, mode, or any live timeline state.
     // In particular, model-derived seed construction may throw. A failure must leave the working
     // fallback timeline intact so the caller can enable fallback translation safely.
-    var nextClips = prepared && prepared.clips ? prepared.clips : sliceTimelineClips(cues);
+    var nextTimeline = prepared && prepared.sourceTimeline
+      ? prepared.sourceTimeline
+      : (state.sourceTimeline || Core.buildCanonicalTokenTimeline(cues));
+    var nextSourceUnits;
+    var nextSnapshot;
+    var canonicalCues;
+    try {
+      nextSourceUnits = Core.buildCueTokenSpanUnits(nextTimeline, cues);
+      nextSnapshot = Core.createTimelineSnapshot({
+        revision: state.timelineSnapshot ? state.timelineSnapshot.revision + 1 : 0,
+        videoId: state.videoId,
+        trackCode: state.activeTrack && (state.activeTrack.code || state.activeTrack.languageCode) || "",
+        timeline: nextTimeline,
+        units: nextSourceUnits,
+      });
+      canonicalCues = Core.cuesFromTimelineSnapshot(nextSnapshot);
+    } catch (snapshotError) {
+      console.warn("[dualsub] reject invalid timeline snapshot", snapshotError && snapshotError.message);
+      return false;
+    }
+    var nextClips = sliceTimelineClips(canonicalCues);
     var nextCueMap = Core.cueClipIndexMap(nextClips);
     var nextClipUnits = {};
     var nextClipState = {};
@@ -554,12 +845,15 @@
       }
     }
 
+    invalidateRuntimeRequests();
     state.timelineEpoch++;
     clearSemanticFallbackTimer();
     // fallback 已经给用户可播放首屏；后台语义切换绝不再次暂停视频等翻译。
     if (mode === "semantic") state.firstClipReady = true;
     state.segmentationMode = mode;
-    state.cues = cues;
+    state.sourceTimeline = nextSnapshot.timeline;
+    state.timelineSnapshot = nextSnapshot;
+    state.cues = canonicalCues;
     state.clips = nextClips;
     state.cueMap = nextCueMap;
     state.clipUnits = nextClipUnits;
@@ -664,7 +958,8 @@
     var remainMsInCurrent = endMs - ms;
 
     // 滑动窗口下标列表（含当前段）。每段整段一起翻。
-    var plan = Core.planPrefetch(idx, state.clips.length, undefined, {
+    var pendingFallback = state.semanticPending && state.segmentationMode === "fallback-translation";
+    var plan = pendingFallback ? [idx] : Core.planPrefetch(idx, state.clips.length, undefined, {
       remainMsInCurrent: remainMsInCurrent,
     });
     // 当前 clip 必须排队首：先抢信号量/网关，避免与预取段并行抢跑拖慢首包。
@@ -672,14 +967,17 @@
     // force（刚加载/seek）时：先只踢当前段，下一 macrotask 再铺后续预取，
     // 让首包请求更早离开浏览器、更少与同批预取抢模型算力。
     if (force && plan.length > 1) {
-      translateClip(plan[0]);
+      translateClip(plan[0], 100);
       var rest = plan.slice(1);
+      var scheduledEpoch = state.timelineEpoch;
+      var scheduledGeneration = state.requestGeneration;
       setTimeout(function () {
-        for (var j = 0; j < rest.length; j++) translateClip(rest[j]);
+        if (scheduledEpoch !== state.timelineEpoch || scheduledGeneration !== state.requestGeneration) return;
+        for (var j = 0; j < rest.length; j++) translateClip(rest[j], j === 0 && remainMsInCurrent < 15000 ? 60 : 10);
       }, 0);
     } else {
       for (var i = 0; i < plan.length; i++) {
-        translateClip(plan[i]);
+        translateClip(plan[i], plan[i] === idx ? 100 : (plan[i] === idx + 1 && remainMsInCurrent < 15000 ? 60 : 10));
       }
     }
   }
@@ -691,107 +989,74 @@
     return state.clipBackoff[idx];
   }
 
-  async function translateClip(idx) {
+  function adoptRepairedClipTimeline(idx, repairedCues) {
+    var oldClip = state.clips[idx];
+    if (!oldClip || !state.timelineSnapshot) throw new Error("cannot resegment missing timeline clip");
+    var nextSnapshot = Core.resegmentTimelineSnapshot(
+      state.timelineSnapshot,
+      oldClip.startIndex,
+      oldClip.startIndex + oldClip.cues.length,
+      repairedCues
+    );
+    var nextCues = Core.cuesFromTimelineSnapshot(nextSnapshot);
+    var nextClips = sliceTimelineClips(nextCues);
+    var nextIdx = clipIdxAtIn(nextClips, oldClip.startMs);
+    if (nextIdx < 0) throw new Error("resegmented clip not found");
+    invalidateRuntimeRequests();
+    state.timelineEpoch++;
+    state.timelineSnapshot = nextSnapshot;
+    state.sourceTimeline = nextSnapshot.timeline;
+    state.cues = nextCues;
+    state.clips = nextClips;
+    state.cueMap = Core.cueClipIndexMap(nextClips);
+    state.clipUnits = {};
+    state.clipState = {};
+    state.clipBackoff = {};
+    state.clipInflight = {};
+    state.lastHitCueIdx = -1;
+    return { idx: nextIdx, clip: nextClips[nextIdx] };
+  }
+
+  async function translateClip(idx, priority) {
     var timelineEpoch = state.timelineEpoch;
     var segmentationModeAtStart = state.segmentationMode;
+    var requestGeneration = state.requestGeneration;
     var clip = state.clips[idx];
-    if (!clip) return;
-    if (state.clipState[idx] === "done") return;
-    if (state.clipState[idx] === "failed") return; // 达 maxFails 的终态，不再自动重试
-    // 重入互斥：同一 clip 不并发跑两个 translateClip。clipInflight 是唯一的互斥源；
-    // 不再用 clipState==="pending" 当门禁——否则一旦某次跑动抛在 applyClipLines
-    // （pending 已置但 done/error 未写）就永久卡 pending，retryTick 只重试 error 永远救不回来
-    // → UI 永久「翻译中…」(症状1根因)。改由下方 finally 兜底把残留 pending 降级为 error 可重试。
-    if (state.clipInflight[idx]) return;
+    if (!clip || state.clipState[idx] === "done" || state.clipState[idx] === "failed" || state.clipInflight[idx]) return;
 
-    // 没配置 API：不翻，只显示原文（非瞬态错误，不进重试调度）
-    if (!config.apiBaseUrl || !config.apiModel) {
-      state.clipState[idx] = "error";
-      return;
-    }
-    // 失败退避：未到下次允许时间就跳过（由后台调度器到点再来）
     var backoff = getBackoff(idx);
     if (!backoff.shouldTry()) return;
-
     state.clipInflight[idx] = true;
     try {
-      // 先查持久缓存：命中直接用，零 API 调用。缓存存的是模型吐的自然中文行(lines)，
-      // 命中后重跑 buildClipUnits 按当前 clip 时间窗配时间轴（时间轴不入缓存，避免跨会话漂移）。
-      var key = clipCacheKey(clip);
-      var cached = await readCache();
-      if (timelineEpoch !== state.timelineEpoch || segmentationModeAtStart !== state.segmentationMode) return;
-      if (cached[key] && Array.isArray(cached[key].lines)) {
-        if (Array.isArray(cached[key].cues) && cached[key].cues.length === cached[key].lines.length) {
-          clip.cues = cached[key].cues;
-        }
-        state.clipUnits[idx] = Core.buildClipUnits(
-          cached[key].lines,
-          clip.startMs,
-          clip.endMs,
-          clip.cues
-        );
-        state.clipState[idx] = "done";
-        if (idx === 0) maybeResumeAfterFirstTranslation(0);
-        backoff.reset();
-        rebuildRenderTimeline();
-        requestRender();
-        return;
-      }
-
       state.clipState[idx] = "pending";
       if (idx === 0) maybePauseForFirstTranslation(0);
-
-      // 主路径：所有字幕 clip 都经 translateClipWithBoundaryRepair；除 testConnection 的单行探针外绝不直调 translateClipLines。
-      // wrapper 在 API 前守住模式词数上限，并对模型拒绝执行有界合并或锁边重译；buildClipUnits 只负责按时间轴安装。
-      var translationResult;
-      try {
-        translationResult = await ensureGate().run(function () {
-          return Core.translateClipWithBoundaryRepair({
-            cues: clip.cues,
-            apiBaseUrl: config.apiBaseUrl,
-            apiKey: config.apiKey,
-            apiModel: config.apiModel,
-            targetLang: config.targetLang,
-            systemPrompt: config.systemPrompt || "",
-            reasoningEffort: config.reasoningEffort,
-            maxLineChars: config.maxLineChars,
-            segmentationMode: state.segmentationMode,
-            timeoutMs: 20000,
-            fetchImpl: function (u, o) {
-              return fetch(u, o);
-            },
-            onUsage: recordApiUsage,
-          });
-        });
-      } catch (e) {
-        // 翻译调用失败（网络/超时/HTTP）→ 回报 gate 降并发 + 退避，交后台调度器重试。
-        ensureGate().reportError(Core.errorKind(e));
-        console.warn("[dualsub] clip", idx, "翻译调用失败：", e && e.message, "→ 退避重试");
+      var result = await loadOrTranslateClip(clip, segmentationModeAtStart, priority);
+      if (requestGeneration !== state.requestGeneration || timelineEpoch !== state.timelineEpoch || segmentationModeAtStart !== state.segmentationMode) return;
+      if (result.repaired) {
+        var adopted = adoptRepairedClipTimeline(idx, result.cues);
+        idx = adopted.idx;
+        clip = adopted.clip;
+        requestGeneration = state.requestGeneration;
+        timelineEpoch = state.timelineEpoch;
+        segmentationModeAtStart = state.segmentationMode;
+      }
+      applyClipLines(idx, clip, result.key, result.lines, { skipCacheWrite: true });
+    } catch (e) {
+      var stale = requestGeneration !== state.requestGeneration || timelineEpoch !== state.timelineEpoch || segmentationModeAtStart !== state.segmentationMode;
+      var aborted = e && (e.name === "AbortError" || /aborted|superseded/i.test(String(e.message || "")));
+      if (stale || aborted) return;
+      if (/configuration missing/i.test(String(e && e.message || ""))) {
         state.clipState[idx] = "error";
-        backoff.fail();
-        ensureRetryScheduler();
         return;
       }
-
-      if (timelineEpoch !== state.timelineEpoch || segmentationModeAtStart !== state.segmentationMode) return;
-      if (translationResult && translationResult.repaired) {
-        // 缓存仍写入本次请求的输入 key；下次以同一原始 cue 查询即可命中，
-        // value 内携带回修后的 cues，命中后原子恢复同批时间轴。
-        clip.cues = translationResult.cues;
-      }
-      applyClipLines(idx, clip, key, translationResult ? translationResult.lines : []);
-    } catch (e) {
-      if (timelineEpoch !== state.timelineEpoch || segmentationModeAtStart !== state.segmentationMode) return;
-      // applyClipLines / readCache / rebuildRenderTimeline 等意外抛出：绝不让 clip 卡死。
-      // 降级为 error + 退避，交后台调度器重试（达 maxFails 才 failed），不再永久 pending。
-      console.warn("[dualsub] clip", idx, "translateClip 意外异常 → 降级 error 重试：", e && e.message);
+      ensureGate().reportError(Core.errorKind(e));
+      console.warn("[dualsub] clip", idx, "翻译失败：", e && e.message, "→ 退避重试");
       state.clipState[idx] = "error";
-      getBackoff(idx).fail();
+      backoff.fail();
       ensureRetryScheduler();
     } finally {
-      if (timelineEpoch !== state.timelineEpoch || segmentationModeAtStart !== state.segmentationMode) return;
+      if (requestGeneration !== state.requestGeneration || timelineEpoch !== state.timelineEpoch || segmentationModeAtStart !== state.segmentationMode) return;
       state.clipInflight[idx] = false;
-      // 兜底：跑完后仍残留 pending（任何路径漏写终态）→ 当作可重试 error，杜绝永久「翻译中…」。
       if (state.clipState[idx] === "pending") {
         state.clipState[idx] = "error";
         getBackoff(idx).fail();
@@ -807,16 +1072,19 @@
    *    渲染层此时对该 clip 回退显原文（rebuildRenderTimeline 用 cue 铺空译文单元）。
    * 不再有「部分接受 / 缺口逐行补翻」—— 模型一步到位直接分行，代码只配时间轴。
    */
-  function applyClipLines(idx, clip, key, lines) {
+  function applyClipLines(idx, clip, key, lines, opts) {
+    opts = opts || {};
     var backoff = getBackoff(idx);
     if (lines && lines.length) {
       state.clipUnits[idx] = Core.buildClipUnits(lines, clip.startMs, clip.endMs, clip.cues);
       state.clipState[idx] = "done";
       if (idx === 0) maybeResumeAfterFirstTranslation(0);
       backoff.reset();
-      writeCache(key, { lines: lines, cues: clip.cues });
-      rebuildRenderTimeline();
-      requestRender();
+      if (!opts.skipCacheWrite) writeCache(key, { lines: lines, cues: clip.cues });
+      if (!opts.deferRender) {
+        rebuildRenderTimeline();
+        requestRender();
+      }
     } else {
       // 模型空响应：无译文 → 退避重试（不写缓存，避免把空结果固化）。
       console.warn("[dualsub] clip", idx, "模型空响应（无字幕行）→ 退避重试");
@@ -827,6 +1095,157 @@
       requestRender();
       ensureRetryScheduler();
     }
+  }
+
+  function usageSnapshot() {
+    return Object.assign({}, state.apiUsage);
+  }
+
+  function usageDelta(start) {
+    var now = state.apiUsage;
+    return {
+      promptTokens: now.promptTokens - start.promptTokens,
+      completionTokens: now.completionTokens - start.completionTokens,
+      totalTokens: now.totalTokens - start.totalTokens,
+      reasoningTokens: now.reasoningTokens - start.reasoningTokens,
+      requests: now.requests - start.requests,
+    };
+  }
+
+  function fullSrtStatus() {
+    var job = state.srtJob;
+    if (!job) return { status: "idle", totalUnits: state.cues.length, completedUnits: 0 };
+    return {
+      id: job.id,
+      status: job.status,
+      totalUnits: job.totalUnits,
+      completedUnits: job.completedUnits,
+      completedBatches: job.completedBatches,
+      totalBatches: job.totalBatches,
+      error: job.error || "",
+      usage: usageDelta(job.usageStart),
+    };
+  }
+
+  async function translateFullSrtBatch(batch, job, identity, mode) {
+    var cues = [];
+    batch.forEach(function (item) { cues = cues.concat(item.clip.cues || []); });
+    var context = beginRuntimeRequest();
+    job.activeContext = context;
+    var pendingUsage = [];
+    try {
+      var result = await ensureGate().run(function () {
+        if (!isRuntimeRequestCurrent(context)) throw runtimeAbortError();
+        return Core.translateClipWithBoundaryRepair({
+          cues: cues,
+          apiBaseUrl: identity.apiBaseUrl,
+          apiKey: identity.apiKey,
+          apiModel: identity.apiModel,
+          targetLang: identity.targetLang,
+          systemPrompt: identity.systemPrompt,
+          reasoningEffort: identity.reasoningEffort,
+          maxLineChars: identity.maxLineChars,
+          segmentationMode: mode,
+          timeoutMs: 20000,
+          fetchImpl: function (u, o) { return fetch(u, o); },
+          onUsage: function (usage) { pendingUsage.push(usage); },
+          signal: context.controller ? context.controller.signal : undefined,
+        });
+      }, 1);
+      if (!isRuntimeRequestCurrent(context) || job.generation !== state.requestGeneration) throw runtimeAbortError();
+      var offset = 0;
+      var commits = [];
+      for (var i = 0; i < batch.length; i++) {
+        var item = batch[i];
+        var count = item.clip.cues.length;
+        var lines = result.lines.slice(offset, offset + count);
+        var coverage = result.coverage.slice(offset, offset + count);
+        offset += count;
+        if (lines.length !== count || coverage.length !== count) throw new Error("full SRT batch coverage mismatch");
+        var key = clipCacheKey(item.clip, mode, identity);
+        var accepted = await writeCache(key, { lines: lines, coverage: coverage }, job.generation, function () {
+          return !job.cancelRequested && isRuntimeRequestCurrent(context) && job.generation === state.requestGeneration;
+        });
+        if (!accepted || job.cancelRequested || !isRuntimeRequestCurrent(context) || job.generation !== state.requestGeneration) throw runtimeAbortError();
+        commits.push({ item: item, key: key, lines: lines, count: count });
+      }
+      if (!isRuntimeRequestCurrent(context) || job.generation !== state.requestGeneration) throw runtimeAbortError();
+      for (var ci = 0; ci < commits.length; ci++) {
+        var commit = commits[ci];
+        applyClipLines(commit.item.idx, commit.item.clip, commit.key, commit.lines, { skipCacheWrite: true, deferRender: true });
+        job.completedUnits += commit.count;
+      }
+      commitPendingUsage(context, pendingUsage);
+      job.completedBatches++;
+      rebuildRenderTimeline();
+      requestRender();
+    } finally {
+      if (job.activeContext === context) job.activeContext = null;
+      endRuntimeRequest(context);
+    }
+  }
+
+  async function runFullSrtPreparation(job) {
+    var identity = translationIdentitySnapshot();
+    var mode = state.segmentationMode;
+    try {
+      var missing = [];
+      for (var idx = 0; idx < state.clips.length; idx++) {
+        if (job.cancelRequested || job.generation !== state.requestGeneration) throw runtimeAbortError();
+        var clip = state.clips[idx];
+        if (state.clipState[idx] === "done" && state.clipUnits[idx]) {
+          job.completedUnits += clip.cues.length;
+          continue;
+        }
+        var cached = await readVerifiedClipCache(clip, mode, identity, job.generation);
+        if (cached) {
+          applyClipLines(idx, clip, cached.key, cached.lines, { skipCacheWrite: true, deferRender: true });
+          job.completedUnits += clip.cues.length;
+        } else {
+          missing.push({ idx: idx, clip: clip, cues: clip.cues });
+        }
+      }
+      rebuildRenderTimeline();
+      requestRender();
+      var batches = Core.planCoverageBatches(missing, 8);
+      job.totalBatches = batches.length;
+      for (var bi = 0; bi < batches.length; bi++) {
+        if (job.cancelRequested) {
+          job.status = "cancelled";
+          return;
+        }
+        if (job.generation !== state.requestGeneration || !config.enabled) throw runtimeAbortError();
+        await translateFullSrtBatch(batches[bi], job, identity, mode);
+      }
+      job.status = "completed";
+    } catch (e) {
+      if (job.cancelRequested || (e && e.name === "AbortError")) {
+        job.status = "cancelled";
+      } else {
+        job.status = "failed";
+        job.error = String(e && e.message || e);
+      }
+    }
+  }
+
+  function startFullSrtPreparation() {
+    if (state.srtJob && (state.srtJob.status === "running" || state.srtJob.status === "cancelling")) return state.srtJob;
+    var job = {
+      id: "srt-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
+      status: "running",
+      generation: state.requestGeneration,
+      cancelRequested: false,
+      totalUnits: state.cues.length,
+      completedUnits: 0,
+      completedBatches: 0,
+      totalBatches: 0,
+      usageStart: usageSnapshot(),
+      error: "",
+      activeContext: null,
+    };
+    state.srtJob = job;
+    runFullSrtPreparation(job);
+    return job;
   }
 
   /* =====================================================
@@ -878,38 +1297,47 @@
    * 每个单元：{ start, end, originalText, translation, clipIdx }。
    */
   function rebuildRenderTimeline() {
-    var units = [];
+    if (!state.timelineSnapshot) {
+      state.renderUnits = [];
+      state.lastHitCueIdx = -1;
+      updateNativeCaptionVisibility();
+      return;
+    }
+    var translations = Object.assign({}, state.timelineSnapshot.translations || {});
     for (var ci = 0; ci < state.clips.length; ci++) {
-      var clipUnits = state.clipUnits[ci];
-      if (clipUnits && clipUnits.length) {
-        for (var s = 0; s < clipUnits.length; s++) {
-          var u = clipUnits[s];
-          units.push({
-            start: u.startMs,
-            end: u.endMs,
-            originalText: u.originalText,
-            translation: u.translation != null && u.translation !== "" ? u.translation : null,
-            clipIdx: ci,
-          });
-        }
-        continue;
-      }
-      // 原文兜底：clip 的每条 cue 一个单元，原文用 cue.content，译文留空（未翻/翻译中/失败）。
       var clip = state.clips[ci];
-      for (var k = 0; k < clip.cues.length; k++) {
-        var cue = clip.cues[k];
-        units.push({
-          start: cue.start,
-          end: cue.end,
-          originalText: cue.content,
-          translation: null,
-          clipIdx: ci,
-        });
+      var clipUnits = state.clipUnits[ci];
+      if (!clip || !clipUnits || clipUnits.length !== clip.cues.length) continue;
+      for (var local = 0; local < clipUnits.length; local++) {
+        var globalIndex = clip.startIndex + local;
+        var sourceUnit = state.timelineSnapshot.units[globalIndex];
+        if (!sourceUnit) continue;
+        translations[sourceUnit.id] = String(clipUnits[local].translation == null ? "" : clipUnits[local].translation);
       }
     }
-    state.renderUnits = units;
+    state.timelineSnapshot = Core.createTimelineSnapshot({
+      revision: state.timelineSnapshot.revision + 1,
+      videoId: state.timelineSnapshot.videoId,
+      trackCode: state.timelineSnapshot.trackCode,
+      timeline: state.timelineSnapshot.timeline,
+      units: state.timelineSnapshot.units,
+      translations: translations,
+    });
+    state.renderUnits = state.timelineSnapshot.renderUnits.map(function (unit, index) {
+      var map = state.cueMap[index];
+      return {
+        unitId: unit.unitId,
+        sourceFingerprint: unit.sourceFingerprint,
+        tokenStart: unit.tokenStart,
+        tokenEnd: unit.tokenEnd,
+        start: unit.startMs,
+        end: unit.endMs,
+        originalText: unit.originalText,
+        translation: unit.translation || null,
+        clipIdx: map ? map.clipIdx : -1,
+      };
+    });
     updateNativeCaptionVisibility();
-    // 时间轴重建后旧的命中下标失效（单元数/边界变了）
     state.lastHitCueIdx = -1;
   }
 
@@ -1316,6 +1744,12 @@
       if (state.lastHitCueIdx !== -1 || lastRenderedKey !== "") {
         state.lastHitCueIdx = -1;
         setRendererText("", "", false);
+        if (state.renderer) {
+          delete state.renderer.dataset.unitId;
+          delete state.renderer.dataset.tokenStart;
+          delete state.renderer.dataset.tokenEnd;
+          delete state.renderer.dataset.sourceFingerprint;
+        }
         lastRenderedKey = "";
       }
       return;
@@ -1344,6 +1778,10 @@
     var key = unitIdx + ":" + (trans || "") + ":" + stTag;
     if (key === lastRenderedKey) return;
     lastRenderedKey = key;
+    state.renderer.dataset.unitId = unit.unitId || "";
+    state.renderer.dataset.tokenStart = String(unit.tokenStart);
+    state.renderer.dataset.tokenEnd = String(unit.tokenEnd);
+    state.renderer.dataset.sourceFingerprint = unit.sourceFingerprint || "";
     setRendererText(unit.originalText, trans, pending, failed);
   }
 
@@ -1447,13 +1885,20 @@
     }
 
     if (msg.type === "set-config") {
+      if (msg.config && msg.config.targetLang != null && !Core.normalizeTargetLang(msg.config.targetLang)) {
+        sendResponse({ ok: false, error: "当前版本仅支持简体中文译文（zh-Hans）" });
+        return true;
+      }
       var prevSource = config.sourceLang;
       var prevEnabled = config.enabled;
       var prevModel = config.apiModel;
       var prevTarget = config.targetLang;
       var prevBase = config.apiBaseUrl;
       var prevKey = config.apiKey;
-      config = Object.assign({}, config, msg.config || {});
+      var prevPrompt = config.systemPrompt;
+      var prevReasoning = config.reasoningEffort;
+      var prevMaxLineChars = config.maxLineChars;
+      config = Core.migrateConfig(Object.assign({}, config, msg.config || {}));
       saveConfig();
       // 样式即时生效
       applyStyleVars();
@@ -1462,15 +1907,35 @@
         config.apiBaseUrl !== prevBase ||
         config.apiKey !== prevKey ||
         config.apiModel !== prevModel ||
-        config.targetLang !== prevTarget;
+        config.targetLang !== prevTarget ||
+        config.systemPrompt !== prevPrompt ||
+        config.reasoningEffort !== prevReasoning ||
+        config.maxLineChars !== prevMaxLineChars;
+      var translationIdentityChanged =
+        config.apiBaseUrl !== prevBase ||
+        config.apiModel !== prevModel ||
+        config.targetLang !== prevTarget ||
+        config.systemPrompt !== prevPrompt ||
+        config.reasoningEffort !== prevReasoning ||
+        config.maxLineChars !== prevMaxLineChars;
       if (apiChanged) {
+        invalidateRuntimeRequests();
         state.clipBackoff = {};
         state.clipInflight = {};
         // model/语言变了，旧译文已不适用 → 丢内存缓存重翻（持久缓存按新 key 自然不命中）
-        if (config.apiModel !== prevModel || config.targetLang !== prevTarget) {
+        if (translationIdentityChanged) {
           state.clipUnits = {};
           state.renderUnits = [];
           state.clipState = {};
+          if (state.timelineSnapshot) {
+            state.timelineSnapshot = Core.createTimelineSnapshot({
+              revision: state.timelineSnapshot.revision + 1,
+              videoId: state.timelineSnapshot.videoId,
+              trackCode: state.timelineSnapshot.trackCode,
+              timeline: state.timelineSnapshot.timeline,
+              units: state.timelineSnapshot.units,
+            });
+          }
         } else {
           // 仅 base/key 变：把 error/failed 态清掉以便重试，已成功的保留
           for (var ci in state.clipState) {
@@ -1479,7 +1944,11 @@
         }
       }
       if (!config.enabled) {
-        // 禁用：彻底停掉所有循环 + 解绑监听 + 移除渲染器（空闲零开销）
+        // 禁用先失效代际并主动取消，再拆循环/DOM；任何迟到 continuation 都无法提交。
+        invalidateRuntimeRequests();
+        state.timelineEpoch++;
+        state.semanticPending = false;
+        clearSemanticFallbackTimer();
         teardownRuntime(true);
       } else {
         ensureRenderer();
@@ -1487,13 +1956,7 @@
         if (config.sourceLang !== prevSource || !prevEnabled) {
           var track = pickTrack(state.tracks, config.sourceLang);
           if (track) {
-            state.activeTrack = track;
-            state.clipUnits = {};
-            state.renderUnits = [];
-            state.clipState = {};
-            state.clipBackoff = {};
-            state.clipInflight = {};
-            loadTrack(track); // 内部会 bindVideo + 起循环 + 预取
+            switchTrack(track); // 单一 transition：先取消旧轨，再加载新轨
           } else {
             // 没轨道也要把循环按当前状态接起来
             bindVideo();
@@ -1512,13 +1975,44 @@
       return true;
     }
 
+    if (msg.type === "prepare-full-srt") {
+      if (msg.confirmed !== true) {
+        sendResponse({ ok: false, error: "需要明确确认全轨翻译费用" });
+        return true;
+      }
+      if (!config.enabled || !state.clips.length || !config.apiBaseUrl || !config.apiModel) {
+        sendResponse({ ok: false, error: "当前轨道或翻译配置尚未就绪" });
+        return true;
+      }
+      var startedJob = startFullSrtPreparation();
+      sendResponse(Object.assign({ ok: true }, fullSrtStatus(), { id: startedJob.id }));
+      return true;
+    }
+
+    if (msg.type === "cancel-full-srt") {
+      if (state.srtJob && state.srtJob.status === "running") {
+        state.srtJob.cancelRequested = true;
+        state.srtJob.status = "cancelling";
+        var activeSrtContext = state.srtJob.activeContext;
+        try { if (activeSrtContext && activeSrtContext.controller) activeSrtContext.controller.abort(); } catch (e) {}
+      }
+      sendResponse(Object.assign({ ok: true }, fullSrtStatus()));
+      return true;
+    }
+
+    if (msg.type === "full-srt-status") {
+      sendResponse(Object.assign({ ok: true }, fullSrtStatus()));
+      return true;
+    }
+
     if (msg.type === "export-srt") {
       // popup 请求导出当前视频双语 SRT：返回已翻译的渲染单元（clip 渲染单元优先、原文兜底）+ 元信息。
       // 时间轴重建一次确保最新；renderUnits 内部用 start/end，转成 startMs/endMs 供 Core.buildSrt。
       rebuildRenderTimeline();
-      var realUnits = state.renderUnits.filter(function (u) {
+      var exportSnapshot = state.timelineSnapshot;
+      var realUnits = exportSnapshot ? exportSnapshot.renderUnits.filter(function (u) {
         return u && String(u.originalText || "").trim() !== "";
-      });
+      }) : [];
       var allTranslated = realUnits.length > 0 && realUnits.every(function (u) {
         return String(u.translation || "").trim() !== "";
       });
@@ -1526,14 +2020,21 @@
         ok: allTranslated,
         videoId: state.videoId,
         targetLang: config.targetLang,
-        units: state.renderUnits.map(function (u) {
+        sourceFingerprint: exportSnapshot ? exportSnapshot.sourceFingerprint : "",
+        snapshotRevision: exportSnapshot ? exportSnapshot.revision : 0,
+        missingUnits: realUnits.filter(function (u) { return !String(u.translation || "").trim(); }).length,
+        preparation: fullSrtStatus(),
+        units: exportSnapshot ? exportSnapshot.renderUnits.map(function (u) {
           return {
-            startMs: u.start,
-            endMs: u.end,
+            unitId: u.unitId,
+            tokenStart: u.tokenStart,
+            tokenEnd: u.tokenEnd,
+            startMs: u.startMs,
+            endMs: u.endMs,
             originalText: u.originalText,
             translation: u.translation,
           };
-        }),
+        }) : [],
       });
       return true;
     }

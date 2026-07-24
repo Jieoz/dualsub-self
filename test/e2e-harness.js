@@ -1,10 +1,10 @@
 /*
  * test/e2e-harness.js — 真·E2E 调试 harness（node 直接跑，零外部依赖除 fetch）
  * =============================================================================
- * v0.5.1 架构：模型按编号把每个源 cue 翻成一条中文，译文/原文/时间轴 1:1。
+ * v0.6.0 架构：模型按 unitId/token span 返回完整 coverage，译文/原文/时间轴 1:1。
  *   本 harness 跑完整主链路：cleanupCues → resegmentCues → sliceClipsByCue
- *     → translateClipLines(编号解析与安全换行)
- *     → buildClipUnits(沿用对应 cue 原文与时间轴) → buildSrt
+ *     → translateClipLines(结构化 coverage 验证)
+ *     → buildClipUnits(沿用 immutable cue 原文与时间轴) → buildSrt
  *   产出 SRT + 并排 HTML（原文 | 译文 | 时间轴）供肉眼核对断句/丢字，并打点延迟统计。
  *
  * 两种模型后端：
@@ -91,20 +91,25 @@ function loadOriginalCues(limit) {
   }));
 }
 
-/* ---------------- mock 模型：按源 cue 编号 1:1 返回中文 ---------------- */
+/* ---------------- mock 模型：按 token-span coverage 1:1 返回中文 ---------------- */
 function structuralMockZh(index) {
   return "完整译文" + String(index + 1) + "。";
 }
 
-function makeMockFetch(clipLinesResolver, stats, opts) {
+function makeMockFetch(stats, opts) {
   opts = opts || {};
   const REASON_MS = opts.reasonMs != null ? opts.reasonMs : 20;
   const PER_CHAR_MS = opts.perCharMs != null ? opts.perCharMs : 1;
   return function mockFetch(url, fetchOpts) {
     const body = JSON.parse(fetchOpts.body);
     const user = (body.messages[1] && body.messages[1].content) || "";
-    const lines = clipLinesResolver(user);
-    const content = lines.map((line, i) => `${i + 1}. ${line}`).join("\n");
+    const payload = JSON.parse(user);
+    const content = JSON.stringify({ translations: payload.units.map((unit, index) => ({
+      unitId: unit.unitId,
+      coverFrom: unit.coverFrom,
+      coverTo: unit.coverTo,
+      translation: structuralMockZh(index),
+    })) });
     const t0 = Date.now();
     const thinkMs = REASON_MS + content.length * PER_CHAR_MS;
     return new Promise((resolve) => setTimeout(() => {
@@ -148,18 +153,6 @@ async function run() {
   const stats = { requestMs: [], retries429: 0, clipFallbacks: 0, emptyClips: 0,
                   firstUnitMs: null, totalMs: 0, clipMs: [] };
 
-  // mock 只验证当前 semantic unit 的结构契约；不复用版本不匹配的旧 ref_zh。
-  const clipByFirstContent = new Map();
-  let mockUnitIndex = 0;
-  for (const clip of clips) {
-    const key = Core.collapseWhitespace(clip.cues[0] ? clip.cues[0].content : "");
-    clipByFirstContent.set(key, clip.cues.map(() => structuralMockZh(mockUnitIndex++)));
-  }
-  const clipLinesResolver = (userContent) => {
-    const first = userContent.split("\n").map((l) => l.match(/^\s*\d+\.\s+(.*)$/)).find(Boolean);
-    const key = first ? Core.collapseWhitespace(first[1]) : "";
-    return clipByFirstContent.get(key) || ["暂无译文"];
-  };
 
   let fetchImpl, mode;
   if (a.real) {
@@ -174,8 +167,8 @@ async function run() {
   } else {
     a.apiKey = "mock-key";
     a.base = "http://mock.local/v1";
-    fetchImpl = makeMockFetch(clipLinesResolver, stats, {});
-    mode = "MOCK (offline structural 1:1; no legacy translation remapping)";
+    fetchImpl = makeMockFetch(stats, {});
+    mode = "MOCK (offline token-span coverage 1:1)";
   }
 
   console.log("\n=== dualsub E2E harness (v" + EXT_VERSION + ") ===");

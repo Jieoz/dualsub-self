@@ -118,7 +118,9 @@
         <option value="auto">自动（优先自动字幕 ASR）</option>
       </select>
       <label for="targetLang">译文语言</label>
-      <input type="text" id="targetLang" placeholder="zh-Hans" />
+      <select id="targetLang">
+        <option value="zh-Hans">简体中文（zh-Hans）</option>
+      </select>
       <div class="inline" style="margin-top:8px">
         <input type="checkbox" id="skipChineseSource" />
         <label for="skipChineseSource">跳过中文源字幕（只对非中文视频翻译）</label>
@@ -213,7 +215,7 @@
         <button id="importBtn" class="secondary">导入配置</button>
       </div>
       <input type="file" id="importFile" accept="application/json,.json" style="display:none" />
-      <div class="hint">导出文件含 API Key 等敏感信息，请妥善保管、勿分享。导入后点"保存设置"生效。</div>
+      <div class="hint">导出文件默认不含 API Key，可安全用于普通配置备份。导入后点"保存设置"生效。</div>
     </fieldset>
 
     <fieldset>
@@ -224,9 +226,10 @@
           <option value="bilingual_trans_top">双语（译文在上）</option>
           <option value="only_translated">仅译文</option>
         </select>
-        <button id="exportSrtBtn" class="secondary">导出双语 SRT</button>
+        <button id="exportSrtBtn" class="secondary">准备并导出 SRT</button>
       </div>
-      <div class="hint">导出当前视频已翻译并缓存的字幕为 .srt。请先在 YouTube 播放页等待翻译出现再导出。</div>
+      <button id="cancelSrtBtn" class="secondary" style="display:none">取消全轨翻译</button>
+      <div class="hint">若全轨尚未翻完，会先明确确认费用，并显示进度；可随时取消后续批次。不会静默请求整轨。</div>
     </fieldset>
 
     <button id="saveBtn">保存设置</button>
