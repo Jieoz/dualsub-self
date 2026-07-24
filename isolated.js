@@ -327,6 +327,9 @@
         maxWords: 12,
         attempts: 2,
         timeoutMs: 20000,
+        // 整轨语义恢复走同一个全局并发闸门，但用最低优先级(0)：首屏 fallback(100)/预取(20)/
+        // 导出(1)全部抢先，semantic 恢复只用富余容量，绝不 flood 端点拖慢首屏中文首包。
+        runRequest: function (fn) { return ensureGate().run(fn, 0); },
         fetchImpl: function (u, o) { return fetch(u, o); },
         onUsage: function (usage) { pendingUsage.push(usage); },
         signal: semanticRequest.controller ? semanticRequest.controller.signal : undefined,
@@ -595,6 +598,8 @@
       }
       // 完整验证成功后才原子切换到语义时间轴；失败保持已工作的 fallback。
       // 但语义恢复慢不能阻塞首屏中文字幕：短阈值后先翻 fallback，后续 semantic 准备好再升级。
+      // 关键：整轨 semantic 恢复的模型请求走同一个全局并发闸门(ensureGate)但用最低优先级，
+      // 这样首屏 fallback(优先级 100)永远抢先，semantic 恢复只用富余容量，绝不 flood 端点拖慢首包。
       var loadEpoch = state.timelineEpoch;
       state.semanticPending = true;
       clearSemanticFallbackTimer();
@@ -695,7 +700,7 @@
     if (!cached || !Array.isArray(cached.coverage)) return null;
     try {
       var expectedCoverage = Core.translationCoverageUnitsFromCues(clip.cues);
-      var verifiedCoverage = Core.parseTranslationCoverageResponse(JSON.stringify({ translations: cached.coverage }), expectedCoverage);
+      var verifiedCoverage = Core.parseTranslationCoverageResponse(JSON.stringify({ translations: cached.coverage }), expectedCoverage, { lenient: true });
       return { key: key, cues: clip.cues, lines: verifiedCoverage.map(function (entry) { return entry.translation; }), coverage: verifiedCoverage, repaired: false, fromCache: true };
     } catch (_) {
       return null;
@@ -730,6 +735,7 @@
             maxLineChars: identity.maxLineChars,
             segmentationMode: segmentationMode,
             timeoutMs: 20000,
+            lenient: true, // 运行时：单句坏译文只回退那一句英文，不连坐整个 clip（导出 SRT 仍严格）
             fetchImpl: function (u, o) { return fetch(u, o); },
             onUsage: function (usage) { pendingUsage.push(usage); },
             signal: context.controller ? context.controller.signal : undefined,
@@ -839,7 +845,8 @@
           seedLines,
           seedClip.startMs,
           seedClip.endMs,
-          seedClip.cues
+          seedClip.cues,
+          { lenient: true }
         );
         nextClipState[seedIdx] = "done";
       }
@@ -1075,8 +1082,13 @@
   function applyClipLines(idx, clip, key, lines, opts) {
     opts = opts || {};
     var backoff = getBackoff(idx);
-    if (lines && lines.length) {
-      state.clipUnits[idx] = Core.buildClipUnits(lines, clip.startMs, clip.endMs, clip.cues);
+    // lenient 运行时：lines 里坏句为空串（该句回退英文）。只要还有至少一句有译文就算 clip 部分成功，
+    // 落地渲染（坏句显英文、好句显中文），不再因单句连坐整组回退重试。全空才当作模型空响应退避重试。
+    var hasAnyTranslation = !!(lines && lines.length && lines.some(function (line) {
+      return line != null && String(line).trim() !== "";
+    }));
+    if (hasAnyTranslation) {
+      state.clipUnits[idx] = Core.buildClipUnits(lines, clip.startMs, clip.endMs, clip.cues, { lenient: true });
       state.clipState[idx] = "done";
       if (idx === 0) maybeResumeAfterFirstTranslation(0);
       backoff.reset();

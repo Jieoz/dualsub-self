@@ -682,6 +682,52 @@ test("parseTranslationCoverageResponse 对缺口、重复、错 span、未知 ID
   ]) assert.throws(() => Core.parseTranslationCoverageResponse(JSON.stringify(payload), units), /translation coverage/i);
 });
 
+test("parseTranslationCoverageResponse lenient 运行时只把坏内容单元置空，保留同 clip 其余合规译文", () => {
+  const units = [
+    { unitId: "u0", tokenStart: 0, tokenEnd: 2 },
+    { unitId: "u1", tokenStart: 2, tokenEnd: 4 },
+    { unitId: "u2", tokenStart: 4, tokenEnd: 6 },
+  ];
+  // u1 空译文、u2 英文（非中文单元）——lenient 下这两条回退英文（置空），u0 正常保留。
+  const raw = JSON.stringify({ translations: [
+    { unitId: "u0", coverFrom: 0, coverTo: 2, translation: "第一条译文" },
+    { unitId: "u1", coverFrom: 2, coverTo: 4, translation: "   " },
+    { unitId: "u2", coverFrom: 4, coverTo: 6, translation: "still English here" },
+  ] });
+  const lenient = Core.parseTranslationCoverageResponse(raw, units, { lenient: true });
+  assert.deepStrictEqual(lenient.map(x => x.unitId), ["u0", "u1", "u2"]);
+  assert.strictEqual(lenient[0].translation, "第一条译文", "合规单元必须保留中文译文");
+  assert.strictEqual(lenient[1].translation, "", "空译文单元回退英文=置空");
+  assert.strictEqual(lenient[2].translation, "", "非中文单元回退英文=置空");
+  // 严格模式（导出）同一 payload 仍必须整体 fail-closed。
+  assert.throws(() => Core.parseTranslationCoverageResponse(raw, units), /translation coverage/i);
+});
+
+test("parseTranslationCoverageResponse lenient 仍对结构性违规 fail-closed（协议漂移不放行）", () => {
+  const units = [{ unitId: "u0", tokenStart: 0, tokenEnd: 2 }, { unitId: "u1", tokenStart: 2, tokenEnd: 4 }];
+  const entry = (id, from, to, translation="完整译文") => ({ unitId:id, coverFrom:from, coverTo:to, translation });
+  // 数量不足、重复、错 span、未知 ID、额外字段——这些是协议漂移，lenient 也必须 throw。
+  for (const payload of [
+    { translations:[entry("u0",0,2)] },
+    { translations:[entry("u0",0,2),entry("u0",0,2)] },
+    { translations:[entry("u0",0,3),entry("u1",2,4)] },
+    { translations:[entry("u0",0,2),entry("other",2,4)] },
+    { translations:[Object.assign(entry("u0",0,2),{source:"forged"}),entry("u1",2,4)] },
+  ]) assert.throws(() => Core.parseTranslationCoverageResponse(JSON.stringify(payload), units, { lenient: true }), /translation coverage/i);
+});
+
+test("buildClipUnits lenient 允许空译文单元（回退英文），严格模式仍对空单元 fail-closed", () => {
+  const cues = [{start:0,end:500,content:"first unit"},{start:500,end:1000,content:"second unit"}];
+  // 严格（导出）：空行是硬错误。
+  assert.throws(()=>Core.buildClipUnits(["译文",""],0,1000,cues),/empty materialized unit/i);
+  // lenient（运行时）：空行=该句显英文，其余显中文，不 throw。
+  const units = Core.buildClipUnits(["译文",""],0,1000,cues,{ lenient: true });
+  assert.strictEqual(units.length, 2);
+  assert.strictEqual(units[0].translation, "译文");
+  assert.strictEqual(units[1].translation, "", "空译文单元保留 originalText，渲染层回退英文");
+  assert.strictEqual(units[1].originalText, "second unit");
+});
+
 test("buildClipUnits 对 coverage 行数不匹配 fail-closed，不再合成时间轴或重映射原文", () => {
   const cues=[{start:0,end:500,content:"first unit"},{start:500,end:1000,content:"second unit"}];
   assert.throws(()=>Core.buildClipUnits(["只有一条译文"],0,1000,cues),/coverage alignment/i);
@@ -831,6 +877,88 @@ test("buildCueTokenSpanUnits 将滚动 cue 重叠压成无重叠 canonical spans
   const canonical = Core.cuesFromTimelineSnapshot(snapshot);
   assert.deepStrictEqual(canonical.map(c => c.content), ["go into a", "cold kettle"]);
   assert.deepStrictEqual(canonical.flatMap(c => c.tokens.map(t => t.text)), ["go", "into", "a", "cold", "kettle"]);
+});
+
+test("真实 loadTrack 链路：滚动 ASR 经 resegment 后仍能对齐 canonical（回归 v0.6.0 整轨拒绝）", () => {
+  // 真机故障：json3 词级时间轴 → canonical 按时间重叠去重；resegmentCues 输出的
+  // 显示 cue 没有 tokens、正文含标点、且句末边界处保留了 canonical 已删除的重复词。
+  // 旧 buildCueTokenSpanUnits 从这些 cue 重建平行 token 流并要求逐 token 全等，必然
+  // throw "cue tokens do not match canonical timeline" → installCueTimeline 整轨拒绝
+  // → 英文字幕一条都装不进去。此测试锁死这条真实链路必须成功对齐。
+  const json = { events: [
+    { tStartMs: 0,    dDurationMs: 2000, segs: [
+      {utf8:"So",tOffsetMs:0},{utf8:" you",tOffsetMs:300},{utf8:" want",tOffsetMs:600},
+      {utf8:" to",tOffsetMs:900},{utf8:" boil",tOffsetMs:1200},{utf8:" water.",tOffsetMs:1500}] },
+    // 滚动重叠：重复 "boil water" 再继续（时间与上一条重叠 → canonical 去重）
+    { tStartMs: 1200, dDurationMs: 2400, segs: [
+      {utf8:"boil",tOffsetMs:0},{utf8:" water",tOffsetMs:300},{utf8:" on",tOffsetMs:800},
+      {utf8:" the",tOffsetMs:1100},{utf8:" stove",tOffsetMs:1500},{utf8:" top,",tOffsetMs:1900}] },
+    { tStartMs: 3600, dDurationMs: 2000, segs: [
+      {utf8:"and",tOffsetMs:0},{utf8:" one",tOffsetMs:300},{utf8:" of",tOffsetMs:600},
+      {utf8:" those",tOffsetMs:900},{utf8:" other",tOffsetMs:1300}] },
+    { tStartMs: 5600, dDurationMs: 2600, segs: [
+      {utf8:"things",tOffsetMs:0},{utf8:" you",tOffsetMs:400},{utf8:" need",tOffsetMs:800},
+      {utf8:" is",tOffsetMs:1200},{utf8:" much",tOffsetMs:1600},{utf8:" water.",tOffsetMs:2000}] },
+  ] };
+  const cues = Core.cleanupCues(Core.parseJson3(json));
+  const timeline = Core.buildCanonicalTokenTimeline(cues);
+  // canonical 已把重复的 "boil water" 去掉一次
+  assert.strictEqual(timeline.tokens.map(t => t.text).join(" "),
+    "So you want to boil water on the stove top and one of those other things you need is much water");
+  const fallbackCues = Core.resegmentCues(cues, { tailTrimMs: 120, maxWords: 12, continuationMaxWords: 14 });
+  // resegment 的显示 cue 无 tokens、含标点、且第二段仍带重复的 "boil water"
+  assert.ok(fallbackCues.some(c => !Array.isArray(c.tokens)));
+  // 关键断言：不再 throw，且切出的 spans 覆盖整条 canonical timeline 恰好一次
+  const units = Core.buildCueTokenSpanUnits(timeline, fallbackCues);
+  assert.ok(units.length >= 1);
+  assert.strictEqual(units[0].tokenStart, 0);
+  assert.strictEqual(units[units.length - 1].tokenEnd, timeline.tokens.length);
+  const snapshot = Core.createTimelineSnapshot({ timeline, units });
+  assert.strictEqual(snapshot.status, "provisional");
+});
+
+test("mapDisplayCuesToBoundaries：真正的正文漂移仍 fail-closed 抛错", () => {
+  // 对齐必须只容忍"重复词"（canonical 或 display 任一端去重造成的落差），
+  // 不能吞掉模型/解析制造的假词，否则 fail-closed 语义被削弱。
+  const timeline = Core.buildCanonicalTokenTimeline([
+    { start: 0, end: 1500, content: "alpha beta gamma", tokens: [
+      { text: "alpha", start: 0, end: 500 }, { text: "beta", start: 500, end: 1000 }, { text: "gamma", start: 1000, end: 1500 },
+    ] },
+  ]);
+  assert.throws(
+    () => Core.buildCueTokenSpanUnits(timeline, [{ start: 0, end: 1500, content: "alpha delta gamma" }]),
+    /does not align to canonical timeline/,
+  );
+});
+
+test("双向去重对齐：canonical 保留、display 删除的 gap 重复词仍能对齐（回归真机整轨拒绝）", () => {
+  // 真机故障模式：滚动 ASR 相邻事件间有 gap，重复词跨（"on the stove"）两次出现
+  // 时间不重叠 → canonical 按时间重叠去重时"保留"重复；resegment 按文本 stripOverlap
+  // "删除"重复 → display 比 canonical 短。旧对齐只处理 display 多的方向，遇此 throw
+  // "display cue does not align to canonical timeline" → installCueTimeline 整轨拒绝。
+  function ev(tStart, dur, words) {
+    const per = dur / words.length;
+    return { tStartMs: tStart, dDurationMs: dur, segs: words.map((w, i) => ({ utf8: (i ? " " : "") + w, tOffsetMs: Math.round(per * i) })) };
+  }
+  const json = { events: [
+    ev(0,    2000, ["boil", "water", "on", "the", "stove"]),
+    ev(2600, 2400, ["on", "the", "stove", "top", "and", "cook"]), // gap：无时间重叠
+  ] };
+  const cues = Core.cleanupCues(Core.parseJson3(json));
+  const timeline = Core.buildCanonicalTokenTimeline(cues);
+  // canonical 保留了重复的 "on the stove"
+  assert.strictEqual(timeline.tokens.map(t => t.text).join(" "),
+    "boil water on the stove on the stove top and cook");
+  const fallbackCues = Core.resegmentCues(cues, { tailTrimMs: 120, maxWords: 12, continuationMaxWords: 14 });
+  // resegment 把重复删掉了，display 比 canonical 短
+  const displayWordCount = fallbackCues.reduce((n, c) => n + (String(c.content).match(/[A-Za-z0-9]+/g) || []).length, 0);
+  assert.ok(displayWordCount < timeline.tokens.length, "display 应短于 canonical");
+  const units = Core.buildCueTokenSpanUnits(timeline, fallbackCues);
+  assert.ok(units.length >= 1);
+  assert.strictEqual(units[0].tokenStart, 0);
+  assert.strictEqual(units[units.length - 1].tokenEnd, timeline.tokens.length);
+  const snapshot = Core.createTimelineSnapshot({ timeline, units });
+  assert.strictEqual(snapshot.status, "provisional");
 });
 
 test("withTimelineTranslations 原子生成新 snapshot，不修改旧 snapshot", () => {
@@ -2161,6 +2289,45 @@ async function main() {
     assert.match(src, /restoreAndPackTokens\(\{[\s\S]*?systemPrompt:\s*restorationPrompt[\s\S]*?\}\);/);
   });
 
+  test("整轨语义恢复走全局并发闸门且用最低优先级，绝不与首屏 fallback 抢占模型端点（防卡顿回归）", () => {
+    // 回归卡顿根因：整轨 semantic 恢复的 N 个 chunk 模型请求旧版绕过 ensureGate 直连 chatCompletion，
+    // 与首屏 fallback 抢同一端点 → 首包被挤到队尾 → 429 退避 → 首个中文要等整轨恢复跑完（可达 1 分钟）。
+    // 根治：core.restoreTokenBoundaries 暴露 runRequest hook；isolated 传 ensureGate().run(fn, 0)
+    // 让 semantic 恢复只用富余容量，首屏 fallback(100)/预取(20)/导出(1) 全部抢先。
+    const iso = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
+    const core = fs.readFileSync(path.join(ROOT, "core.js"), "utf8");
+    // core 必须支持可选 runRequest 包装器，且默认无闸门直接执行（不破坏纯 core 单测/导出路径）。
+    assert.match(core, /typeof opts\.runRequest === "function" \? await opts\.runRequest\(doChat\) : await doChat\(\)/,
+      "core.restoreTokenBoundaries 必须支持可选 runRequest 闸门包装器");
+    // isolated 的整轨语义恢复必须把 runRequest 接到全局闸门且优先级为 0（最低）。
+    const restore = iso.match(/restoreAndPackTokens\(\{[\s\S]*?\}\);/);
+    assert.ok(restore, "定位到整轨语义恢复的 restoreAndPackTokens 调用");
+    assert.match(restore[0], /runRequest:\s*function \(fn\) \{ return ensureGate\(\)\.run\(fn, 0\); \}/,
+      "整轨语义恢复必须走 ensureGate 且优先级 0，否则会 flood 端点拖慢首屏");
+    // 首屏 fallback 翻译仍是原来的 700ms 短阈值兜底（不得被误删/误改）。
+    assert.match(iso, /state\.semanticFallbackTimer = setTimeout\(function \(\) \{[\s\S]{0,120}?enableFallbackTranslation\(loadEpoch\);\s*\}, 700\);/,
+      "首屏 fallback 700ms 兜底定时器必须保留");
+  });
+
+  test("运行时翻译逐 cue 容错：单句坏译文只回退那一句英文，不连坐整组；导出仍严格", () => {
+    // 回归丢句根因：旧版 clip 级 all-or-nothing，clip 内任一 cue 触发校验失败即 throw 整组作废回退英文。
+    // 修复后：运行时 translate 路径传 lenient:true（单句坏译文置空=显英文，其余显中文），导出 SRT 路径不传 lenient（严格）。
+    const src = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
+    // 运行时 loadOrTranslateClip 的 boundary-repair 调用必须显式 lenient:true。
+    assert.match(src, /translateClipWithBoundaryRepair\(\{[\s\S]{0,500}?lenient:\s*true/,
+      "运行时 clip 翻译必须 lenient（单句容错）");
+    // 缓存复验也走 lenient，避免历史缓存里单句坏译文连坐整组失效。
+    assert.match(src, /parseTranslationCoverageResponse\([\s\S]{0,120}?\{\s*lenient:\s*true\s*\}\)/,
+      "缓存复验必须 lenient");
+    // applyClipLines 只要有任意一句译文就落地（部分成功），不再要求整组齐全。
+    assert.match(src, /hasAnyTranslation[\s\S]{0,300}?buildClipUnits\([\s\S]{0,120}?\{\s*lenient:\s*true\s*\}\)/,
+      "applyClipLines 部分成功即落地，用 lenient buildClipUnits");
+    // 导出批次翻译（translateFullSrtBatch）不得传 lenient——导出保持严格 fail-closed。
+    const exportBatch = src.match(/async function translateFullSrtBatch[\s\S]*?ensureGate\(\)\.run\([\s\S]*?\}, 1\);/);
+    assert.ok(exportBatch, "定位到 translateFullSrtBatch");
+    assert.ok(!/lenient/.test(exportBatch[0]), "导出批次翻译必须严格，不得 lenient（成品绝不半英文半中文）");
+  });
+
   test("popup 独立显示会话 Token，不覆盖连接诊断 status", () => {
     const html = fs.readFileSync(path.join(ROOT, "popup.html"), "utf8");
     const js = fs.readFileSync(path.join(ROOT, "popup.js"), "utf8");
@@ -2701,7 +2868,7 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     const raw = fs.readFileSync(path.join(ROOT, "manifest.json"), "utf8");
     const m = JSON.parse(raw);
     assert.strictEqual(m.manifest_version, 3);
-    assert.strictEqual(m.version, "0.6.0", "token timeline、coverage 与全轨 SRT 契约必须随 v0.6.0 发布");
+    assert.match(m.version, /^\d+\.\d+\.\d+$/, "manifest 版本必须是 semver（发版时同步 bump，不再硬编码单一版本）");
     assert.ok(Array.isArray(m.content_scripts) && m.content_scripts.length === 2);
     const worlds = m.content_scripts.map((c) => c.world).sort();
     assert.deepStrictEqual(worlds, ["ISOLATED", "MAIN"]);

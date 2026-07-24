@@ -21,7 +21,11 @@
 
 ## 安装（加载已解压的扩展程序）
 
-当前版本：**v0.6.0**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.6.0) 下载 Chrome MV3 安装包。
+当前版本：**v0.6.2**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.6.2) 下载 Chrome MV3 安装包。
+
+v0.6.2 的主要变化：
+- **修复首屏中文字幕卡顿（可达 1 分钟）**：整轨语义恢复的模型请求此前绕过全局并发闸门直连模型端点，与首屏 fallback 翻译抢占同一 API，导致首个中文被挤到 429 退避队尾。现在整轨恢复统一走 `ensureGate()` 且用最低优先级（0），首屏 fallback（100）/预取（20）/导出（1）全部抢先，语义恢复只用富余容量，绝不拖慢首屏。慢/失败的语义恢复不再让中文字幕空等。
+- **修复成组丢句**：运行时翻译此前是 clip 级 all-or-nothing——clip 内任一 cue 译文不合规就整组作废回退英文。现在运行时 coverage 校验支持逐 cue 容错（`lenient` 模式）：单句坏译文只回退那一句英文，同 clip 其余照显中文；结构性协议漂移仍整包 fail-closed。**导出 SRT 路径保持严格 fail-closed，成品绝不半英文半中文。**
 
 v0.6.0 的主要变化：
 - 英文、顺序和词级时间统一来自不可变 canonical token timeline；模型只能返回 token 边界 ID，不能回显或改写英文。

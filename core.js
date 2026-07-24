@@ -243,21 +243,87 @@
     return { version: "token-v1", sourceFingerprint: fingerprint, tokens: tokens };
   }
 
-  function buildCueTokenSpanUnits(timeline, cues) {
-    var accumulated = [];
-    var boundaries = [];
-    (cues || []).forEach(function (cue) {
-      var before = accumulated.length;
-      appendTimelineTokens(accumulated, timelineTokensForCue(cue));
-      if (accumulated.length > before) boundaries.push(accumulated.length - 1);
-    });
+  /**
+   * 把显示分段（resegment / semantic 产生的 cue）映射为 canonical timeline 上的
+   * token 边界。canonical token 流是唯一权威来源：正文、顺序、时间都取自它，显示
+   * cue 只贡献"切在哪里"。
+   *
+   * 关键背景：canonical 与 resegment 从同一源各自独立去重，且对"重复词跨"的处理
+   * 方向相反——
+   *   · canonical（appendTimelineTokens）按"词级时间重叠"去重：两次出现时间不重叠
+   *     时保留重复词（如 gap 分隔的滚动 ASR "on the stove … on the stove"）。
+   *   · resegmentCues（stripOverlap）按"文本"去重且封顶 8 词：会删掉 canonical 保留
+   *     的那份重复。
+   * 因此显示词流既可能比 canonical 多一份重复（canonical 删、display 留），也可能
+   * 比 canonical 少一份（canonical 留、display 删）。旧实现只处理前一个方向，真机上
+   * 遇到后一个方向就 throw，整轨字幕加载失败。这里做双向去重容忍的单调对齐：
+   *   1. 词相等 → 匹配，游标 +1，消费该显示词；
+   *   2. 显示词是 canonical 已删的重复（等于最近已消费 token）→ 跳过该显示词，游标不动；
+   *   3. canonical 游标处 token 是 display 已删的重复（等于最近已消费 token）→ 游标 +1，
+   *      不消费显示词（把该重复 token 归入当前区间）；
+   *   4. 都不成立 → 真正的正文漂移，fail-closed 抛错（不削弱 fail-closed 语义）。
+   * 只有"重复词"允许被跳过；引入 canonical 里不存在的新词或丢失非重复词一律抛错。
+   * 边界只影响换行位置，token 正文与时间仍由 validateTokenSpanCoverage 对 canonical
+   * 复核，故此处对重复接缝的容忍不会污染正文或时轴。
+   */
+  var TOKEN_ALIGN_DUP_WINDOW = 32;
+  function isRecentDuplicateToken(tokens, cursor, wk) {
+    for (var back = 1; back <= TOKEN_ALIGN_DUP_WINDOW && cursor - back >= 0; back++) {
+      if (wordKey(tokens[cursor - back].text) === wk) return true;
+    }
+    return false;
+  }
+  function mapDisplayCuesToBoundaries(timeline, cues) {
     var tokens = timeline && Array.isArray(timeline.tokens) ? timeline.tokens : [];
-    if (accumulated.length !== tokens.length) throw new Error("cue tokens do not match canonical timeline");
-    for (var i = 0; i < tokens.length; i++) {
-      if (collapseWhitespace(accumulated[i].text) !== tokens[i].text) {
-        throw new Error("cue token provenance mismatch at " + i);
+    var cursor = 0;
+    var boundaries = [];
+
+    // 消费掉 canonical 游标处、display 已删除的重复 token（display 端去重造成的落差）。
+    // 只在这些 token 是"最近已消费 token 的重复"时前进，避免吞掉真正的新内容。
+    function drainCanonicalDuplicates(nextDisplayKey) {
+      while (cursor < tokens.length) {
+        var ck = wordKey(tokens[cursor].text);
+        if (nextDisplayKey != null && ck === nextDisplayKey) break; // 让它去和显示词正常匹配
+        if (!isRecentDuplicateToken(tokens, cursor, ck)) break;      // 不是重复 → 停，交给正常流程/报错
+        cursor++;
       }
     }
+
+    (cues || []).forEach(function (cue) {
+      var words = restoredWords(cue && cue.content || "");
+      var consumed = 0;
+      for (var wi = 0; wi < words.length; wi++) {
+        var wk = wordKey(words[wi]);
+        if (!wk) continue;
+        // 方向 3：先跳过 canonical 保留、display 删除的重复 token（除非它正好等于本显示词）。
+        drainCanonicalDuplicates(wk);
+        // 方向 1：正常匹配。
+        if (cursor < tokens.length && wordKey(tokens[cursor].text) === wk) {
+          cursor++;
+          consumed++;
+          continue;
+        }
+        // 方向 2：显示词是 canonical 已删除的重复 → 跳过该显示词，游标不动。
+        if (isRecentDuplicateToken(tokens, cursor, wk)) continue;
+        // 方向 4：真正的漂移。
+        throw new Error("display cue does not align to canonical timeline");
+      }
+      if (consumed > 0) boundaries.push(cursor - 1);
+    });
+
+    // 收尾：末段之后 canonical 可能仍留有 display 已删的重复 token，并入最后一段。
+    drainCanonicalDuplicates(null);
+    if (cursor !== tokens.length) {
+      throw new Error("display cues do not cover canonical timeline");
+    }
+    if (boundaries.length && boundaries[boundaries.length - 1] !== tokens.length - 1) {
+      boundaries[boundaries.length - 1] = tokens.length - 1;
+    }
+    return boundaries;
+  }
+
+  function buildCueTokenSpanUnits(timeline, cues) {
+    var boundaries = mapDisplayCuesToBoundaries(timeline, cues);
     return buildTokenSpanUnits(timeline, boundaries);
   }
 
@@ -1273,7 +1339,8 @@
   }
 
   /** Materialize already-verified 1:1 translations on immutable source cue timing. */
-  function buildClipUnits(lines, startMs, endMs, cues) {
+  function buildClipUnits(lines, startMs, endMs, cues, opts) {
+    opts = opts || {};
     var list = cues || [];
     var rawLines = lines || [];
     if (rawLines.length !== list.length) throw new Error("translation coverage alignment mismatch");
@@ -1284,7 +1351,9 @@
         throw new Error("translation coverage cue timing invalid");
       }
       var translation = String(rawLines[index] == null ? "" : rawLines[index]);
-      if (!translation.trim()) throw new Error("translation coverage empty materialized unit");
+      // 运行时 lenient：空译文表示该句回退显示英文原文（parseTranslationCoverageResponse 已把坏句置空）。
+      // 导出（lenient=false）时空译文仍是硬错误，成品绝不出现无译文单元。
+      if (!translation.trim() && !opts.lenient) throw new Error("translation coverage empty materialized unit");
       return {
         unitId: cue.unitId || "",
         sourceFingerprint: cue.sourceFingerprint || "",
@@ -1408,7 +1477,10 @@
       var attempts = opts.attempts != null ? Math.max(1, Number(opts.attempts)) : 2;
       for (var attempt = 0; attempt < attempts; attempt++) {
         try {
-          var response = await chatCompletion({
+          // runRequest（可选）让调用方把这次模型请求纳入其全局并发闸门并指定优先级，
+          // 使整轨语义恢复只用富余容量、绝不与首屏翻译抢占端点。默认直接执行（无闸门）。
+          var doChat = function () {
+            return chatCompletion({
             apiBaseUrl: opts.apiBaseUrl,
             apiKey: opts.apiKey,
             apiModel: opts.apiModel,
@@ -1420,7 +1492,9 @@
             fetchImpl: opts.fetchImpl,
             onUsage: opts.onUsage,
             signal: opts.signal,
-          });
+            });
+          };
+          var response = typeof opts.runRequest === "function" ? await opts.runRequest(doChat) : await doChat();
           cuts = parseBoundaryCutsResponse(response, ids);
           break;
         } catch (error) {
@@ -1690,10 +1764,22 @@
       if (!Number.isInteger(item.coverFrom) || !Number.isInteger(item.coverTo) || item.coverFrom !== source.tokenStart || item.coverTo !== source.tokenEnd) {
         throw new Error("translation coverage span mismatch");
       }
+      // 结构性违规（JSON 形状 / 字段 / unitId / span / 数量 / 缺口重叠）永远 fail-closed——它们是协议漂移。
+      // 但单个单元的“内容”问题（空译文 / 中文单元不合规）在 lenient（运行时）模式下只把该条译文置空
+      // （= 该句回退显示英文原文），保留同 clip 其余合规译文，避免一句坏译文连坐整组 clip 全丢。
+      // opts.lenient=false（默认，导出 SRT 用）时仍严格 throw，成品绝不半英文半中文。
       var translation = sanitizeSubtitleLine(String(item.translation == null ? "" : item.translation));
-      if (!translation.trim()) throw new Error("translation coverage empty translation");
-      var verdict = validateChineseDisplayUnit(translation);
-      if (!verdict.ok) throw new Error("translation coverage invalid Chinese unit: " + verdict.reason);
+      var contentError = "";
+      if (!translation.trim()) {
+        contentError = "translation coverage empty translation";
+      } else {
+        var verdict = validateChineseDisplayUnit(translation);
+        if (!verdict.ok) contentError = "translation coverage invalid Chinese unit: " + verdict.reason;
+      }
+      if (contentError) {
+        if (!opts.lenient) throw new Error(contentError);
+        translation = ""; // 运行时：该单元回退英文，不连坐整个 clip
+      }
       translatedById[unitId] = {
         unitId: unitId,
         coverFrom: source.tokenStart,
@@ -1737,7 +1823,7 @@
       onUsage: opts.onUsage,
       signal: opts.signal,
     });
-    var coverage = parseTranslationCoverageResponse(content, units, { maxLineChars: opts.maxLineChars });
+    var coverage = parseTranslationCoverageResponse(content, units, { maxLineChars: opts.maxLineChars, lenient: !!opts.lenient });
     var lines = coverage.map(function (entry) { return entry.translation; });
     Object.defineProperty(lines, "coverage", { value: coverage, enumerable: false });
     return lines;
@@ -1752,7 +1838,7 @@
       var sourceWords = unitWordCount(cues[i]);
       if (sourceWords > maxSourceWords) throw new Error("oversized source unit before translation: " + sourceWords + " words (cap " + maxSourceWords + ")");
     }
-    var lines = await translateClipLines(Object.assign({}, opts, { cues: cues }));
+    var lines = await translateClipLines(Object.assign({}, opts, { cues: cues, lenient: !!opts.lenient }));
     if (lines.length !== cues.length || !Array.isArray(lines.coverage) || lines.coverage.length !== cues.length) {
       throw new Error("translation coverage alignment mismatch");
     }
