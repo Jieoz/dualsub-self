@@ -2494,7 +2494,12 @@ async function main() {
     assert.strictEqual((src.match(/preferredMaxWords:\s*10/g) || []).length, 2, "缓存身份和真实请求必须使用同一 10 词目标");
     assert.strictEqual((src.match(/maxWords:\s*12/g) || []).length, 3, "semantic 缓存/请求与 fallback 目标必须统一使用 12 词");
     assert.ok(!/preferredMaxWords:\s*14/.test(src) && !/maxWords:\s*16/.test(src), "运行时不得残留旧 14/16 行长目标");
-    assert.match(src, /function translatePreparedClip[\s\S]*?loadOrTranslateClip\(clip, "semantic",\s*100\)/, "semantic 预热必须显式标记 semantic mode");
+    // 旧断言要求存在 translatePreparedClip（整轨恢复的 seed 预热）。整轨恢复已被
+    // 区间恢复取代（整轨要 9.5 分钟，期间翻译永远追不上播放），seed 预热随之删除：
+    // 区间换入走 Core.resegmentTimelineSnapshot，按 token 跨度保留已有译文，
+    // 不再需要"先翻一个 seed clip 才敢装载"。这里改为断言区间换入的关键性质。
+    assert.match(src, /stageSemanticInterval[\s\S]*?Core\.resegmentTimelineSnapshot\(/, "语义区间必须走 resegmentTimelineSnapshot 就地换入（保留已有译文）");
+    assert.ok(!/installCueTimeline\([^)]*"semantic"/.test(src), "不得再用整轨 installCueTimeline 装载 semantic（会清空全部已翻 clip）");
     assert.match(src, /function translateClip[\s\S]*?loadOrTranslateClip\(clip, segmentationModeAtStart, priority\)/, "运行翻译必须传入真实 segmentation mode");
     assert.strictEqual((src.match(/Core\.translateClipLines\s*\(/g) || []).length, 1, "除 testConnection 单行探针外不得绕过 repair/source-cap 门禁直调 translateClipLines");
     assert.match(src, /function testConnection[\s\S]*?Core\.translateClipLines\s*\(\{[\s\S]*?cues:\s*\[\{ content:\s*"hello world"/, "唯一直调必须受限于 testConnection 的单行连接探针");
@@ -2921,7 +2926,7 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     const src = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
     const load = src.slice(src.indexOf("async function loadTrack"), src.indexOf("/* =====================================================\n   * 翻译编排"));
     assert.ok(load.indexOf('installCueTimeline(fallbackCues, "fallback", { sourceTimeline: sourceTimeline })') >= 0, "应先安装 fallback 首屏时间轴");
-    assert.ok(load.indexOf('installCueTimeline(fallbackCues, "fallback", { sourceTimeline: sourceTimeline })') < load.indexOf("restoreSemanticCuesIfAvailable(cues)"), "语义恢复必须后台启动，不得 await 阻塞首屏");
+    assert.ok(load.indexOf('installCueTimeline(fallbackCues, "fallback", { sourceTimeline: sourceTimeline })') < load.indexOf("restoreSemanticIntervalIfAvailable(state.timelineSnapshot, cues, currentTimeMs())"), "语义恢复必须后台启动，不得 await 阻塞首屏");
     assert.ok(/timelineEpoch !== state\.timelineEpoch/.test(src), "旧分段异步请求不得写入新时间轴");
     assert.ok(/state\.timelineSnapshot = Core\.createTimelineSnapshot/.test(src), "renderer 提交必须生成不可变 TimelineSnapshot revision");
     assert.ok(/var exportSnapshot = state\.timelineSnapshot/.test(src), "SRT 导出必须读取 renderer 同一 snapshot");
@@ -2938,7 +2943,10 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     assert.ok(/fitSubtitleRows\(\)/.test(setTextBody), "每次写入新字幕后必须重新做像素宽度适配");
     assert.ok(!/-webkit-line-clamp:2/.test(src) && !/white-space:pre-wrap/.test(src), "渲染器不得允许字幕折成多行");
     assert.ok(/function clipCacheKey\(clip, segmentationMode/.test(src), "不同分段模式不得复用同一 clip 缓存");
-    assert.ok(/function loadOrTranslateClip[\s\S]*Core\.translateClipWithBoundaryRepair/.test(src) && /function translatePreparedClip[\s\S]*loadOrTranslateClip\(clip, "semantic",\s*100\)/.test(src), "semantic 原子接管的预热翻译也必须走统一边界回修入口，不能绕过新契约");
+    // translatePreparedClip（整轨 seed 预热）已随整轨恢复删除。真需求保留：
+    // 所有 clip 翻译必须走统一的边界回修入口，不得绕过契约。
+    assert.ok(/function loadOrTranslateClip[\s\S]*Core\.translateClipWithBoundaryRepair/.test(src), "clip 翻译必须走统一边界回修入口，不能绕过新契约");
+    assert.ok(!/translatePreparedClip/.test(src), "整轨 seed 预热已删除，不得留下悬空引用");
     assert.ok(/cached\.coverage/.test(src) && /writeCache\(key, \{ lines: out\.lines, coverage: out\.coverage \}, generation\)/.test(src), "coverage ledger 必须随 per-entry 译文缓存，并受 generation 写门禁保护");
     assert.ok(!/if \(translationResult && translationResult\.repaired\)[\s\S]{0,160}key = clipCacheKey\(clip\)/.test(src), "回修结果必须写在本次输入 key 下；若改写为输出 key，下一次仍以原 cue 查询将永远无法命中");
     const cacheKeyBody = src.slice(src.indexOf("function clipCacheKey"), src.indexOf("function semanticUnitsFromTrack"));
@@ -2947,26 +2955,50 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     const prefetch = src.slice(src.indexOf("function prefetchAround"), src.indexOf("function getBackoff"));
     assert.ok(/state\.segmentationMode === "fallback"/.test(prefetch), "语义恢复尚未结束时 fallback 只显原文，不应抢跑重复翻译");
     assert.ok(/function enableFallbackTranslation\(loadEpoch\)/.test(src), "语义恢复失败后必须有显式 fallback 翻译降级入口");
-    assert.ok(/!semanticCues[\s\S]{0,160}enableFallbackTranslation\(loadEpoch\)/.test(load), "语义恢复不适用或失败时必须启动 fallback 翻译");
-    assert.ok(/stageSemanticTimeline[\s\S]{0,360}else \{[\s\S]*finishSemanticPending\(loadEpoch\)[\s\S]*enableFallbackTranslation\(loadEpoch\)/.test(load), "semantic 当前段预热失败时必须启动 fallback 翻译");
+    assert.ok(/!result \|\| !result\.cues[\s\S]{0,200}enableFallbackTranslation\(loadEpoch\)/.test(load), "语义恢复不适用或失败时必须启动 fallback 翻译");
+    // 区间换入版：无论换入成功与否都必须让 fallback 翻译跑起来 —— 语义恢复只提升
+    // 断句质量，绝不是"有译文"的前提条件（旧实现里换入成功就不启动 fallback，
+    // 于是恢复期间只有当前段有译文）。
+    assert.ok(/stageSemanticInterval\(result, loadEpoch\)[\s\S]{0,400}finishSemanticPending\(loadEpoch\)[\s\S]{0,300}enableFallbackTranslation\(/.test(load), "区间换入后必须无条件启动 fallback 翻译");
     const render = src.slice(src.indexOf("function onRenderTick"), src.indexOf("function setRendererText"));
     assert.ok(/state\.segmentationMode !== "fallback" \? Core\.clipDisplayFlags/.test(render), "启用翻译降级后的 fallback 必须显示中文或翻译状态");
   });
 
   test("isolated.js 只在可靠 JSON3 token 时序下启用语义恢复，失败完整回退", () => {
     const src = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
-    assert.ok(/Core\.hasNativeTokenTiming\(cues, 0\.8\)/.test(src), "应有 80% 原生 token timing 门槛");
+    assert.ok(/Core\.hasNativeTokenTiming\(rawCues, 0\.8\)/.test(src), "应有 80% 原生 token timing 门槛（须看带原生 tokens 的原始轨）");
     assert.ok(/Core\.restoreAndPackTokens\b/.test(src), "加载路径应调用生产语义恢复器");
     assert.ok(/var fallbackCues = Core\.resegmentCues\(cues, \{ tailTrimMs: config\.tailTrimMs, maxWords: 12, continuationMaxWords: 14 \}\)/.test(src), "不满足契约时应完整回退 ASR 重组");
     assert.ok(/installCueTimeline\(fallbackCues, "fallback", \{ sourceTimeline: sourceTimeline \}\)/.test(src), "fallback 必须先安装可播放时间轴");
-    assert.ok(/stageSemanticTimeline\(Core\.applyTailTrim\(semanticCues, config\.tailTrimMs\), loadEpoch\)/.test(src), "启用路径应先预热当前 semantic clip");
-    assert.ok(/for \(var attempt = 0; attempt < 3; attempt\+\+\)/.test(src), "semantic 预热应有界重验播放头");
-    assert.ok(/var installIdx = clipIdxAtIn\(clips, currentTimeMs\(\)\)/.test(src), "翻译 await 后必须重验当前 clip");
-    assert.ok(/return installCueTimeline\(installedCues, "semantic", \{ clips: clips, seeds: seeds \}\)/.test(src), "只有当前段已有 seed 且回修 cue 已汇总的 semantic 候选才能原子接管屏幕");
-    const install = src.slice(src.indexOf("function installCueTimeline"), src.indexOf("/* =====================================================\n   * 翻译编排"));
-    assert.ok(install.indexOf("nextClipUnits[seedIdx]") < install.indexOf("state.timelineEpoch++"), "semantic seed 必须在 epoch/mode 切换前事务化构建；异常时保留工作中的 fallback");
-    assert.ok(install.indexOf("nextClipUnits[seedIdx]") < install.indexOf("state.segmentationMode = mode"), "semantic seed 构建失败不得留下半安装 semantic mode");
-    assert.ok(install.indexOf("state.clipUnits = nextClipUnits") < install.indexOf("rebuildRenderTimeline();"), "semantic seeds 必须在首帧重建前原子写入，禁止闪回翻译中");
+    // 整轨恢复 + seed 预热已被区间恢复取代：区间换入自身保留已有译文，无需预热 seed。
+    assert.ok(/stageSemanticInterval\(result, loadEpoch\)/.test(src), "启用路径必须走区间换入");
+    assert.ok(/Core\.planSemanticInterval\(/.test(src), "区间选择必须走 core 的单一权威实现");
+    assert.ok(/planSemanticInterval:\s*planSemanticInterval/.test(fs.readFileSync(path.join(ROOT, "core.js"), "utf8")), "planSemanticInterval 必须在 core 导出表里");
+    // 旧的三条断言锁定整轨 seed 预热的实现细节（attempt 循环 / installIdx 重验 /
+    // seeds 事务化）。整轨恢复已删除，等价的安全保障现在由区间换入提供：
+    //   1) 候选快照必须在改动任何 live state 之前构建完（resegmentTimelineSnapshot 会
+    //      对词流做覆盖数+逐词比对，不通过直接抛错）；
+    //   2) 抛错时必须保留当前可用时间轴（catch 里只 warn 并 return false）。
+    const stage = src.slice(src.indexOf("async function stageSemanticInterval"), src.indexOf("// 仅在完整 cue 集合准备好时切换"));
+    assert.ok(stage.length > 200, "未找到 stageSemanticInterval 实现");
+    assert.ok(
+      stage.indexOf("Core.resegmentTimelineSnapshot(") < stage.indexOf("state.timelineEpoch++"),
+      "候选快照必须在 epoch/mode 切换前构建完；校验失败不得留下半安装状态"
+    );
+    assert.ok(
+      /catch \(e\)[\s\S]*?return false;/.test(stage),
+      "词流契约不通过时必须保留当前可用时间轴（fail-closed）"
+    );
+    // 等价保障（区间换入版）：保留下来的已翻 clip 必须在首帧重建前写入 state，
+    // 否则换入瞬间会把已有译文闪回成"翻译中…"。
+    // 先断言机制存在，再断言顺序。只写顺序断言会假绿：把 preservedUnits 删掉后
+    // indexOf 返回 -1，而 -1 仍然"小于"任何下标，断言照样通过（实测踩过）。
+    const preservedAt = stage.indexOf("state.clipUnits = preservedUnits");
+    const rebuildAt = stage.indexOf("rebuildRenderTimeline();");
+    assert.ok(preservedAt >= 0, "区间换入必须保留已翻译 clip（不得整轨清空 clipUnits）");
+    assert.ok(rebuildAt >= 0, "区间换入必须重建渲染时间轴");
+    assert.ok(preservedAt < rebuildAt, "已保留的译文必须在首帧重建前原子写入，禁止闪回翻译中");
+    assert.ok(/clipCueFingerprint\(oldClip\) !== clipCueFingerprint\(nextClips\[ci\]\)/.test(stage), "只有源文本未变的 clip 才能复用译文，避免旧断句译文错配到新断句");
     assert.ok(/if \(ms < clips\[i\]\.startMs\) return i/.test(src), "播放头在 gap 时应预热下一段而不是末段");
     assert.ok(/installCueTimeline\(fallbackCues, "fallback", \{ sourceTimeline: sourceTimeline \}\)/.test(src), "回退路径应安装可诊断 fallback 模式");
   });
@@ -3666,6 +3698,177 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     const allText = rendered.map((u) => u.originalText).join(" ");
     const diacritics = (allText.match(/[ąćęłńóśźżĄĆĘŁŃÓŚŹŻ]/g) || []).length;
     assert.ok(diacritics > 100, `波兰语变音字母只剩 ${diacritics} 个，说明仍被吞掉`);
+  });
+
+  test("语义恢复必须跟着播放位置滑动，token 消耗正比于实际观看时长", () => {
+    // 旧实现整轨一次性恢复：37 分钟轨 = 6257 token / 35 个模型块 / 约 9.5 分钟，
+    // 且无论用户看多久都要先付满 35 块。这条门禁锁住"按需恢复"这个性质：
+    // 只看开头一小段时，恢复量必须远小于整轨。
+    const raw = JSON.parse(fs.readFileSync(path.join(__dirname, "fixtures/youtube-json3-rolling-raw.json"), "utf8"));
+    const cues = Core.cleanupCues(Core.parseJson3(raw));
+    // 区间必须定义在 snapshot units 空间上：原始轨 197 条 cue 经 fallback 重组变 150 个
+    // 单元，两套下标混用会让 resegmentTimelineSnapshot 取到错误 token 跨度
+    // （实测 browser-replay 报 replacement token coverage mismatch）。
+    const timeline = Core.buildCanonicalTokenTimeline(cues);
+    const fallbackCues = Core.resegmentCues(cues, { tailTrimMs: 0, maxWords: 12, continuationMaxWords: 14 });
+    const snapshot = Core.createTimelineSnapshot({
+      revision: 0, videoId: "gate", trackCode: "en",
+      timeline: timeline,
+      units: Core.buildCueTokenSpanUnits(timeline, fallbackCues),
+      translations: {},
+    });
+    const wholeTrackTokens = timeline.tokens.length;
+    assert.ok(wholeTrackTokens > 0, "fixture 没有可恢复 token");
+
+    const first = Core.planSemanticInterval(snapshot, 0);
+    assert.ok(first, "必须能为播放位置 0 选出恢复区间");
+    assert.ok(first.startIndex === 0, "首个区间必须从轨首开始");
+    assert.ok(first.endIndex > first.startIndex, "区间必须非空");
+    // 区间必须按整条 cue 对齐 —— 半条 cue 过不了 resegmentTimelineSnapshot 的词流校验。
+    assert.ok(Number.isInteger(first.startIndex) && Number.isInteger(first.endIndex), "区间边界必须是 cue 下标");
+
+    // 关键性质：单次恢复量必须显著小于整轨（否则等于没改）。
+    assert.ok(
+      first.tokens.length < wholeTrackTokens,
+      `单次恢复 ${first.tokens.length} token，与整轨 ${wholeTrackTokens} 相同 —— 仍是整轨恢复`
+    );
+
+    // 区间要跟着播放位置走：从后面的位置出发，必须选到后面的单元。
+    const units = snapshot.units;
+    const lastStart = Number(units[units.length - 1].startMs);
+    if (lastStart > 0) {
+      const later = Core.planSemanticInterval(snapshot, lastStart);
+      assert.ok(later, "轨尾附近也应能选出区间");
+      assert.ok(later.startIndex > first.startIndex, "区间必须随播放位置前移");
+    }
+    // 播放位置超过轨尾 → 无可恢复区间（推进器据此停止，不再无谓请求）。
+    assert.strictEqual(Core.planSemanticInterval(snapshot, Number(units[units.length - 1].endMs) + 1), null, "轨尾之后必须返回 null");
+
+    // 区间推进必须连续覆盖，不得跳过中间片段（跳过 = 那段永远停留在 fallback 断句）。
+    // 换入后单元数会变（真实轨实测 36 个 fallback 单元 → 46 个 semantic 单元），
+    // 所以"下一个区间的起点"必须按换入后的快照重新计算，不能沿用旧下标。
+    let cursor = 0;
+    let guard = 0;
+    let snap = snapshot;
+    while (guard++ < 50) {
+      const iv = Core.planSemanticInterval(snap, cursor);
+      if (!iv) break;
+      assert.strictEqual(
+        iv.startIndex,
+        snap.units.findIndex((u) => Number(u.endMs) > cursor),
+        "区间起点必须正好接在已恢复位置之后，不得跳过单元"
+      );
+      const last = snap.units[iv.endIndex - 1];
+      const nextCursor = Number(last.endMs);
+      assert.ok(nextCursor > cursor, "区间推进必须前进，否则会无限循环");
+      cursor = nextCursor;
+    }
+    assert.ok(guard < 50, "区间推进未能在合理步数内覆盖整轨");
+
+    // 区间必须能真的换入：这条直接调用生产替换器，覆盖校验不通过就会抛错。
+    // 用「原样替换」验证下标空间一致性 —— 这正是 mismatch 缺陷的最小复现。
+    const sameCues = [];
+    for (let i = first.startIndex; i < first.endIndex; i++) {
+      sameCues.push({ start: snapshot.units[i].startMs, end: snapshot.units[i].endMs, content: snapshot.units[i].originalText });
+    }
+    const replaced = Core.resegmentTimelineSnapshot(snapshot, first.startIndex, first.endIndex, sameCues);
+    assert.ok(replaced && replaced.units.length === snapshot.units.length, "原样区间替换必须通过词流覆盖校验");
+  });
+
+  test("预取调度不得被旁路：prefetchAround 只能经 planTranslationWindow 决定翻哪些段", () => {
+    // 为什么需要这条：上一条门禁测的是 planTranslationWindow 这个纯函数，
+    // 但缺陷本体是**调用点**上的降级分支（semanticPending 时直接只翻当前段）。
+    // 实测把该分支重新注入调用点时，纯函数门禁照样全绿 —— 判据被绕过了看不见。
+    // 所以必须同时锁住"调用点没有旁路"。
+    const src = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
+    const body = src.slice(src.indexOf("function prefetchAround"), src.indexOf("function maybeAdvanceSemanticInterval"));
+    assert.ok(body.length > 200, "未找到 prefetchAround 实现");
+    assert.ok(/Core\.planTranslationWindow\(/.test(body), "prefetchAround 必须经 planTranslationWindow 决定预取窗口");
+
+    // 判据之前不得出现任何 translateClip —— 那就是绕过窗口直接开翻。
+    const decideAt = body.indexOf("Core.planTranslationWindow(");
+    const earlyTranslate = body.slice(0, decideAt).indexOf("translateClip(");
+    assert.strictEqual(earlyTranslate, -1, "预取判据之前不得直接 translateClip（绕过调度窗口）");
+
+    // 也不得靠 semanticPending 降级预取：这正是"翻译永远跟不上播放"的根因。
+    // 只看可执行代码 —— 注释里解释这段历史是应该的，不能因此判红。
+    const code = body.split("\n").filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line)).join("\n");
+    assert.ok(!/semanticPending/.test(code), "prefetchAround 不得依据 semanticPending 降级预取窗口");
+  });
+
+  test("翻译必须始终领先播放：整轨模拟播放，译文边界不得被播放追上", () => {
+    // 用户报障原话：「我看着翻译文字永远也跟不上字幕」。
+    //
+    // 实测根因不是速度不够：单 clip 翻译 9.5s 中位，一个 clip 覆盖约 14s 播放，
+    // 并发 4 的吞吐 = 5.74 倍播放速度，绰绰有余。真正的原因是调度降级 ——
+    // 整轨语义恢复期间（semanticPending），预取计划被砍成 [idx]（只翻当前正在播的段）。
+    // 而整轨恢复在 37 分钟轨上要 9.5 分钟（35 块 × 16.4s，最低优先级只吃富余并发）。
+    // 这 9 分钟里翻译退化成"播到哪才翻哪"，必然永远追着播放跑。
+    //
+    // 这条门禁把"调度能否维持领先"变成可测断言：离散事件模拟整轨播放，
+    // 用真实 fixture 的 clip 时间轴 + 实测翻译延迟，断言译文边界始终领先播放位置。
+    // 它不测网关速度（那个已单独实测），只测调度设计。
+    const raw = JSON.parse(fs.readFileSync(path.join(__dirname, "fixtures/youtube-json3-rolling-raw.json"), "utf8"));
+    const cues = Core.cleanupCues(Core.parseJson3(raw));
+    const timeline = Core.buildCanonicalTokenTimeline(cues);
+    const display = Core.resegmentCues(cues, { maxWords: 12, continuationMaxWords: 14 });
+    const units = Core.buildCueTokenSpanUnits(timeline, display);
+    const snap = Core.createTimelineSnapshot({ timeline, units, cues });
+    const R = snap.renderUnits.filter((u) => String(u.originalText || "").trim());
+    assert.ok(R.length >= 8, `fixture 单元太少（${R.length}），模拟没有意义`);
+
+    const clips = Core.sliceClipsByCue(
+      R.map((u) => ({ start: u.startMs, end: u.endMs, content: u.originalText })),
+      Core.DEFAULT_CONFIG.clipSeconds * 1000,
+      { maxCues: 8 }
+    ).map((c) => {
+      const cs = c.cues || c;
+      return { start: cs[0].start, end: cs[cs.length - 1].end };
+    });
+    assert.ok(clips.length >= 3, `clip 太少（${clips.length}）`);
+
+    const LAT = 9500;   // 单 clip 翻译耗时（真实模型实测中位）
+    const CONC = 4;     // 生产全局并发上限
+    const TICK = 1500;  // 预取轮询周期
+    const st = {};
+    const finish = [];
+    let inflight = 0;
+    let uncovered = 0;
+    let samples = 0;
+    const endMs = clips[clips.length - 1].end;
+
+    for (let now = 0; now <= endMs; now += TICK) {
+      for (let i = finish.length - 1; i >= 0; i--) {
+        if (finish[i].at <= now) { st[finish[i].idx] = "done"; inflight--; finish.splice(i, 1); }
+      }
+      let idx = clips.findIndex((c) => now >= c.start && now < c.end);
+      if (idx === -1) idx = clips.findIndex((c) => c.start > now);
+      if (idx === -1) idx = clips.length - 1;
+
+      // 走产品的权威调度判据
+      const plan = Core.planTranslationWindow({
+        currentIdx: idx,
+        clipCount: clips.length,
+        remainMsInCurrent: clips[idx].end - now,
+      }).plan;
+      for (const j of plan) {
+        if (st[j] || inflight >= CONC) continue;
+        st[j] = "inflight"; inflight++; finish.push({ idx: j, at: now + LAT });
+      }
+
+      // 首个 clip 必然要等一次翻译（约 LAT），这段不计入落后统计
+      if (now < LAT * 1.5) continue;
+      samples++;
+      if (st[idx] !== "done") uncovered++;
+    }
+
+    assert.ok(samples > 0, "模拟没有产生采样点");
+    const missRate = uncovered / samples;
+    // 首屏之后，播放中的字幕应当基本总是已有译文。
+    assert.ok(
+      missRate <= 0.05,
+      `翻译跟不上播放：${uncovered}/${samples} 个采样点（${(missRate * 100).toFixed(1)}%）当前字幕还没译文`
+    );
   });
 
   test("真实停顿必须保留：源轨里说话人停下来的地方，字幕之间也要有空隙", () => {

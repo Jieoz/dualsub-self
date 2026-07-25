@@ -83,7 +83,14 @@
     clipInflight: {}, // clipIndex -> bool：translateClip 进行中（重入互斥，防同 clip 并发）
     retryTimer: null, // 后台失败重试调度器 id（第2层；只在有 error clip 时活跃）
     semanticFallbackTimer: null, // 语义恢复过慢时先翻 fallback，避免 1–2 分钟只有英文
-    semanticPending: false, // semantic 未决时 fallback 只翻当前播放段，禁止投机预取浪费请求
+    // semantic 区间恢复是否在途。仅用于诊断/避免重复发起同一区间，
+    // **不再**用来降级预取窗口（那条降级曾让翻译永远跟不上播放）。
+    semanticPending: false,
+    // 语义断句已恢复到哪个播放位置（ms）。播放接近它时再恢复下一区间。
+    semanticDoneUntilMs: 0,
+    // 原始轨 cue（带原生词级 tokens）。区间推进时要据此复查 token 时序可靠性；
+    // state.cues 是重组后的单元，已不带原生 tokens，不能用于该判断。
+    rawTrackCues: [],
     renderer: null, // 叠加层 DOM
     videoEl: null,
     fontObserver: null, // ResizeObserver：观察播放器高度变化，同比缩放字号（全屏放大）
@@ -297,10 +304,29 @@
     return Core.sameRestoredWords(sourceWords, cachedText) ? cleaned : null;
   }
 
-  async function restoreSemanticCuesIfAvailable(cues) {
+  /**
+   * 恢复「播放位置附近」这一段的语义断句。
+   *
+   * 为什么不整轨一次性恢复：整轨在 37 分钟轨上实测 6261 token / 35 块 / 单块 16.4s
+   * ≈ 9.5 分钟，且刻意用最低优先级只吃富余并发。旧实现在这 9.5 分钟里把预取窗口
+   * 降级成「只翻当前段」，于是翻译永远追着播放跑（整轨模拟覆盖率 0%）。
+   * 而且无论用户看多久，都要为全部 35 块付 token。
+   *
+   * 改为跟着播放位置滑动后：单次只 2-3 块（实测首个区间 294 token / 2 块 / 覆盖 90s），
+   * token 消耗正比于实际观看时长（看 5 分钟 = 8 块，而非 35 块），
+   * 每一段仍是 semantic 断句 —— 质量不降，只是按需产生。
+   *
+   * 缓存键用区间自身的 token 指纹（makeSemanticCacheKey 已含 semanticTokenFingerprint），
+   * 因此天然是区间粒度：跳着看、看一半退出下次接着看，都能各自复用。
+   */
+  async function restoreSemanticIntervalIfAvailable(snapshot, rawCues, positionMs) {
     if (!config.apiBaseUrl || !config.apiKey || !config.apiModel) return null;
-    if (!Core.hasNativeTokenTiming(cues, 0.8)) return null;
-    var tokens = Core.collectSemanticTokens(cues);
+    // token 时序可靠性看原始轨（fallback 重组后的单元不带原生 tokens）。
+    if (!Core.hasNativeTokenTiming(rawCues, 0.8)) return null;
+    // 区间下标必须来自 snapshot.units —— 与 resegmentTimelineSnapshot 同一空间。
+    var interval = Core.planSemanticInterval(snapshot, positionMs);
+    if (!interval) return null;
+    var tokens = interval.tokens;
     if (!tokens.length) return null;
     var restorationPrompt = Core.DEFAULT_RESTORATION_PROMPT;
     var cacheKey = Core.makeSemanticCacheKey({
@@ -318,7 +344,7 @@
     var semanticGeneration = state.requestGeneration;
     var cached = cachedSemanticCues(await readSemanticCacheEntry(cacheKey), tokens);
     if (semanticGeneration !== state.requestGeneration || !config.enabled) return null;
-    if (cached) return cached;
+    if (cached) return { cues: cached, startIndex: interval.startIndex, endIndex: interval.endIndex };
     try {
       var semanticRequest = beginRuntimeRequest();
       var pendingUsage = [];
@@ -352,7 +378,7 @@
       if (cleaned && cleaned.length) await writeSemanticCache(cacheKey, cleaned, semanticRequest.generation);
       if (!isRuntimeRequestCurrent(semanticRequest)) return null;
       commitPendingUsage(semanticRequest, pendingUsage);
-      return cleaned;
+      return cleaned ? { cues: cleaned, startIndex: interval.startIndex, endIndex: interval.endIndex } : null;
     } catch (e) {
       console.warn("[dualsub] 语义恢复未通过词流契约，回退 ASR 重组：", e && e.message);
       return null;
@@ -645,6 +671,7 @@
         return;
       }
       // 先立即建立稳定 fallback 原文时间轴；技术 cue 不翻译。语义恢复是整轨模型工作，不能阻塞首字幕。
+      state.rawTrackCues = cues;
       var sourceTimeline = Core.buildCanonicalTokenTimeline(cues);
       var fallbackCues = Core.resegmentCues(cues, { tailTrimMs: config.tailTrimMs, maxWords: 12, continuationMaxWords: 14 });
       if (!installCueTimeline(fallbackCues, "fallback", { sourceTimeline: sourceTimeline })) {
@@ -664,20 +691,21 @@
         enableFallbackTranslation(loadEpoch);
       }, 700);
       setTimeout(function () {
-        restoreSemanticCuesIfAvailable(cues).then(async function (semanticCues) {
+        // 只恢复播放位置附近这一段。后续区间由 maybeAdvanceSemanticInterval 跟着播放推进，
+        // 因此 semanticPending 是短暂的（单区间 2-3 块），不再长期压制预取窗口。
+        restoreSemanticIntervalIfAvailable(state.timelineSnapshot, cues, currentTimeMs()).then(async function (result) {
           if (loadEpoch !== state.timelineEpoch) return;
           clearSemanticFallbackTimer();
-          if (!semanticCues || !semanticCues.length) {
+          if (!result || !result.cues || !result.cues.length) {
             finishSemanticPending(loadEpoch);
             enableFallbackTranslation(loadEpoch);
             return;
           }
-          var installed = await stageSemanticTimeline(Core.applyTailTrim(semanticCues, config.tailTrimMs), loadEpoch);
-          if (installed) state.semanticPending = false;
-          else {
-            finishSemanticPending(loadEpoch);
-            enableFallbackTranslation(loadEpoch);
-          }
+          var installed = await stageSemanticInterval(result, loadEpoch);
+          finishSemanticPending(loadEpoch);
+          // 无论区间恢复成功与否，都要让 fallback 翻译跑起来：
+          // 语义恢复只提升断句质量，绝不是「有译文」的前提条件。
+          enableFallbackTranslation(installed ? state.timelineEpoch : loadEpoch);
         }).catch(function (e) {
           // Semantic restoration is optional. If it fails, translate the already resegmented
           // fallback timeline instead of leaving the page permanently English-only.
@@ -848,38 +876,81 @@
     }
   }
 
-  function translatePreparedClip(clip) {
-    return loadOrTranslateClip(clip, "semantic", 100).then(function (result) {
-      return { cues: result.cues, lines: result.lines, repaired: result.repaired };
-    });
-  }
-
   // Keep the working fallback visible while translating the semantic clip at the current playhead.
-  // Revalidate after every await: playback or a seek may move to another clip while the request is queued.
-  // Only install when the clip on screen has a ready translation, so semantic takeover cannot regress to
-  // "翻译中…" or blank Chinese. Three attempts bound extra work under adversarial repeated seeks.
-  async function stageSemanticTimeline(cues, loadEpoch) {
-    if (!cues || !cues.length || loadEpoch !== state.timelineEpoch) return false;
-    var clips = sliceTimelineClips(cues);
-    if (!clips.length) return false;
-    var seeds = {};
-    for (var attempt = 0; attempt < 3; attempt++) {
-      var currentIdx = clipIdxAtIn(clips, currentTimeMs());
-      if (currentIdx < 0) return false;
-      if (!seeds[currentIdx]) {
-        var translated = await translatePreparedClip(clips[currentIdx]);
-        if (loadEpoch !== state.timelineEpoch || !translated || !translated.lines || !translated.lines.length) return false;
-        if (translated.repaired) clips[currentIdx].cues = translated.cues;
-        seeds[currentIdx] = translated.lines;
+  /**
+   * 把已恢复的一个区间就地换入当前时间轴。
+   *
+   * 与旧的整轨 stageSemanticTimeline 的关键差别：旧实现走 installCueTimeline，
+   * 它会把 clipUnits / clipState 全部清空、只留一个 seed clip —— 已经翻好的
+   * 其他 clip 全部作废重翻。这里改用 Core.resegmentTimelineSnapshot：
+   * 它按 token 跨度保留 translations（未被替换的单元跨度不变 → 译文原样保留），
+   * 只有真正被重新断句的那一段需要重翻。
+   *
+   * 词流契约由 resegmentTimelineSnapshot 强制校验（覆盖数/文本逐词比对），
+   * 恢复结果若与源词流不一致会直接抛错，不会污染时间轴 —— fail-closed。
+   */
+  async function stageSemanticInterval(result, loadEpoch) {
+    if (loadEpoch !== state.timelineEpoch) return false;
+    if (!state.timelineSnapshot || !result || !result.cues || !result.cues.length) return false;
+    var trimmed = Core.applyTailTrim(result.cues, config.tailTrimMs);
+    if (!trimmed || !trimmed.length) return false;
+    try {
+      var nextSnapshot = Core.resegmentTimelineSnapshot(
+        state.timelineSnapshot,
+        result.startIndex,
+        result.endIndex,
+        trimmed
+      );
+      var nextCues = Core.cuesFromTimelineSnapshot(nextSnapshot);
+      var nextClips = sliceTimelineClips(nextCues);
+      if (!nextClips.length) return false;
+
+      // 被替换区间覆盖的 clip 需要重翻；其余 clip 的已翻结果按 cue 指纹继续复用。
+      var preservedUnits = {};
+      var preservedState = {};
+      for (var ci = 0; ci < nextClips.length; ci++) {
+        var oldIdx = clipIdxAtIn(state.clips, nextClips[ci].startMs);
+        if (oldIdx < 0) continue;
+        if (state.clipState[oldIdx] !== "done") continue;
+        var oldClip = state.clips[oldIdx];
+        var oldUnits = state.clipUnits[oldIdx];
+        if (!oldClip || !oldUnits) continue;
+        // 只在这个 clip 的源文本完全未变时复用，避免把旧断句的译文错配到新断句上。
+        if (clipCueFingerprint(oldClip) !== clipCueFingerprint(nextClips[ci])) continue;
+        preservedUnits[ci] = oldUnits;
+        preservedState[ci] = "done";
       }
-      var installIdx = clipIdxAtIn(clips, currentTimeMs());
-      if (installIdx === currentIdx && seeds[installIdx]) {
-        var installedCues = [];
-        for (var ci = 0; ci < clips.length; ci++) installedCues = installedCues.concat(clips[ci].cues || []);
-        return installCueTimeline(installedCues, "semantic", { clips: clips, seeds: seeds });
-      }
+
+      invalidateRuntimeRequests();
+      state.timelineEpoch++;
+      state.segmentationMode = "semantic";
+      state.firstClipReady = true;
+      state.timelineSnapshot = nextSnapshot;
+      state.sourceTimeline = nextSnapshot.timeline;
+      state.cues = nextCues;
+      state.clips = nextClips;
+      state.cueMap = Core.cueClipIndexMap(nextClips);
+      state.clipUnits = preservedUnits;
+      state.clipState = preservedState;
+      state.clipBackoff = {};
+      state.clipInflight = {};
+      state.lastHitCueIdx = -1;
+      // 已恢复到哪个播放位置：取被替换区间末尾单元的结束时刻。
+      // 区间之后还有单元 → 记录边界；已到轨尾 → Infinity（推进器据此停止）。
+      var doneUnits = nextSnapshot.units || [];
+      var lastReplaced = trimmed.length ? result.startIndex + trimmed.length - 1 : result.startIndex;
+      state.semanticDoneUntilMs = lastReplaced + 1 < doneUnits.length
+        ? Number(doneUnits[lastReplaced].endMs) || 0
+        : Infinity;
+      rebuildRenderTimeline();
+      state.lastPrefetchMs = -1e9;
+      prefetchAround(currentTimeMs(), true);
+      return true;
+    } catch (e) {
+      // 词流契约不通过 = 恢复结果不可信，保持当前可用时间轴。
+      console.warn("[dualsub] 语义区间换入失败，保留当前时间轴：", e && e.message);
+      return false;
     }
-    return false;
   }
 
   // 仅在完整 cue 集合准备好时切换。递增 epoch 使旧分段的翻译请求自然失效。
@@ -1043,12 +1114,15 @@
     var remainMsInCurrent = endMs - ms;
 
     // 滑动窗口下标列表（含当前段）。每段整段一起翻。
-    var pendingFallback = state.semanticPending && state.segmentationMode === "fallback-translation";
-    var plan = pendingFallback ? [idx] : Core.planPrefetch(idx, state.clips.length, undefined, {
+    // 调度判据收敛到 Core.planTranslationWindow（单一权威 + 可被门禁覆盖）。
+    // 此处原先有一条降级：semanticPending 期间只翻当前段 [idx]。那条降级是
+    // 「翻译永远跟不上播放」的根因 —— 整轨语义恢复要 9.5 分钟，期间等于边播边翻。
+    // 语义恢复已改为跟着播放位置滑动，不再长期 pending，因此不再降级窗口。
+    var plan = Core.planTranslationWindow({
+      currentIdx: idx,
+      clipCount: state.clips.length,
       remainMsInCurrent: remainMsInCurrent,
-    });
-    // 当前 clip 必须排队首：先抢信号量/网关，避免与预取段并行抢跑拖慢首包。
-    plan = Core.prioritizePrefetch(plan, idx);
+    }).plan;
     // force（刚加载/seek）时：先只踢当前段，下一 macrotask 再铺后续预取，
     // 让首包请求更早离开浏览器、更少与同批预取抢模型算力。
     if (force && plan.length > 1) {
@@ -1065,6 +1139,55 @@
         translateClip(plan[i], plan[i] === idx ? 100 : (plan[i] === idx + 1 && remainMsInCurrent < 15000 ? 60 : 10));
       }
     }
+    // 语义断句跟着播放推进：接近已恢复区间的末尾时恢复下一段。
+    maybeAdvanceSemanticInterval(ms);
+  }
+
+  /**
+   * 播放接近「已恢复到的位置」时，恢复下一个区间。
+   *
+   * 这是"整轨一次性恢复"被替换掉之后的推进器：整轨恢复要 9.5 分钟且必须先付
+   * 全部 35 块的 token；改为跟着播放滑动后，token 消耗正比于实际观看时长
+   * （看 5 分钟 = 8 块），而每一段仍是 semantic 断句，质量不降。
+   *
+   * 提前量取一个预取窗口（SEMANTIC_INTERVAL_MS 的一半）：早于播放到达就开始恢复，
+   * 使换入发生在字幕上屏之前，用户看不到断句变化。
+   */
+  function maybeAdvanceSemanticInterval(ms) {
+    if (state.semanticPending) return;                       // 已有区间在途
+    // 只在这条轨确实在用语义断句时才推进。
+    // "fallback" = 首屏恢复还没结束；"fallback-translation" = 恢复已失败并降级，
+    // 此时再推进只会把同一个失败重复一遍（刷日志 + 白烧 token）。
+    if (state.segmentationMode !== "semantic") return;
+    if (!state.cues.length || !state.timelineSnapshot) return;
+    var doneUntil = Number(state.semanticDoneUntilMs);
+    if (!Number.isFinite(doneUntil)) return;                  // Infinity = 已恢复到轨尾
+    if (ms + Core.SEMANTIC_INTERVAL_MS / 2 < doneUntil) return;
+
+    var loadEpoch = state.timelineEpoch;
+    state.semanticPending = true;
+    restoreSemanticIntervalIfAvailable(state.timelineSnapshot, state.rawTrackCues, Math.max(ms, doneUntil)).then(async function (result) {
+      if (loadEpoch !== state.timelineEpoch) { state.semanticPending = false; return; }
+      if (!result || !result.cues || !result.cues.length) {
+        // 没有可恢复区间（轨尾）或恢复不可用：停止推进，保留当前断句。
+        state.semanticDoneUntilMs = Infinity;
+        state.semanticPending = false;
+        return;
+      }
+      var ok = await stageSemanticInterval(result, loadEpoch);
+      // 换入失败（词流契约不通过）说明这条轨的恢复结果不可信 —— 停止推进。
+      // 否则每个预取周期都会重试，把同一个错误刷满日志、白烧 token。
+      if (!ok && loadEpoch === state.timelineEpoch) state.semanticDoneUntilMs = Infinity;
+      state.semanticPending = false;
+    }).catch(function (e) {
+      state.semanticPending = false;
+      if (loadEpoch !== state.timelineEpoch) return;
+      // 同上：恢复本身抛错也不再反复重试，避免刷日志和重复烧 token。
+      state.semanticDoneUntilMs = Infinity;
+      if (!(e && (e.name === "AbortError" || e.name === "DOMException"))) {
+        console.warn("[dualsub] 语义区间推进失败，保留当前断句：", e && e.message);
+      }
+    });
   }
 
   function getBackoff(idx) {
