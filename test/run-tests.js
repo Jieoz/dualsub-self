@@ -3152,6 +3152,61 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
       "句中切开的译文被清空(sourceText 未传到校验侧): " + JSON.stringify(out[0]));
   });
 
+  // ── 过短显示单元必须补足可读时长(只借真实静音) ────────────────────
+  // 回归防护。renderUnits 时间原本完全照抄 token 跨度,没有任何可读下限:
+  // 实测真机轨 449 单元中 63 个短于 1200ms,最短 113ms("I")。长句在句中切开后
+  // 的后半截尤其容易只分到极短跨度 → 一闪而过几乎看不见(用户报告 52-57s 长句)。
+  //
+  // 补偿必须落在 renderUnits(呈现层):units 是 canonical provenance,
+  // validateTokenSpanCoverage 要求其时间与 token 跨度逐一相等(source timing
+  // mismatch),在那一层补会直接违约 —— 曾这样改过,7 个既有测试立刻变红。
+  //
+  // 同时锁死不得换来别的毛病:不与下一条重叠、不改 startMs、不动 token 跨度。
+  test("过短渲染单元补足时长且不与下一条重叠", () => {
+    const tl = {
+      sourceFingerprint: "fp-pad",
+      tokens: [
+        { id: 0, text: "this", startMs: 0, endMs: 1500 },
+        { id: 1, text: "just", startMs: 1500, endMs: 3000 },
+        // 长句后半截:仅 200ms
+        { id: 2, text: "isnt", startMs: 3000, endMs: 3100 },
+        { id: 3, text: "true", startMs: 3100, endMs: 3200 },
+        // 后接 2s 静音
+        { id: 4, text: "next", startMs: 5200, endMs: 6400 },
+      ],
+    };
+    const units = Core.buildTokenSpanUnits(tl, [1, 3]);
+    // units 层必须仍严格等于 token 跨度(否则 coverage 契约被破坏)
+    assert.strictEqual(units[1].endMs, 3200, "units 层时间被改动: " + units[1].endMs);
+
+    const snap = Core.createTimelineSnapshot({ timeline: tl, units: units });
+    const ru = snap.renderUnits;
+    assert.strictEqual(ru.length, 3, "渲染单元数不对: " + ru.length);
+
+    const short = ru[1];
+    assert.ok(short.endMs - short.startMs >= 1200,
+      "过短渲染单元未补足时长: " + (short.endMs - short.startMs) + "ms");
+    assert.strictEqual(short.startMs, 3000, "startMs 被改动了: " + short.startMs);
+    assert.strictEqual(short.tokenEnd - short.tokenStart, 2, "token 跨度被动过");
+
+    for (let i = 0; i + 1 < ru.length; i++) {
+      assert.ok(ru[i].endMs <= ru[i + 1].startMs,
+        `渲染单元 ${i} 与下一条重叠: ${ru[i].endMs} > ${ru[i + 1].startMs}`);
+    }
+
+    // 静音不足时只能借多少算多少,仍不许重叠
+    const tightTl = {
+      sourceFingerprint: "fp-tight",
+      tokens: [
+        { id: 0, text: "a", startMs: 0, endMs: 100 },
+        { id: 1, text: "b", startMs: 150, endMs: 1600 },
+      ],
+    };
+    const tightSnap = Core.createTimelineSnapshot({ timeline: tightTl, units: Core.buildTokenSpanUnits(tightTl, [0]) });
+    assert.ok(tightSnap.renderUnits[0].endMs <= tightSnap.renderUnits[1].startMs,
+      "静音不足时仍重叠: " + tightSnap.renderUnits[0].endMs + " > " + tightSnap.renderUnits[1].startMs);
+  });
+
   console.log("\n========================================");
   console.log("  通过: " + passed + "  失败: " + failed);
   console.log("========================================");
