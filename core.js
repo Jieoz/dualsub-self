@@ -503,6 +503,68 @@
     return list;
   }
 
+  // 一个词最多能占多久的"说话时间"。超出这个量的部分不是在说话，是静音。
+  //
+  // 为什么需要它：YouTube 的 json3 里每个 seg 只有 tOffsetMs（词的**开始**时刻），
+  // 没有任何词级时长字段。于是 parseJson3 只能把词的 end 填成下一个词的 start，
+  // 相邻词之间必然零间隔 —— 说话人真实的停顿被吞进了前一个词的显示时长里。
+  // 实测真实 ASR 轨：4070 个 token 中 3483 个零距，渲染层 436/439 个相邻单元
+  // 空隙为 0ms，字幕整段连成一片没有任何呼吸感。
+  //
+  // 但停顿信息其实在数据里：同一 event 内相邻词的 offset 间隔中位 241ms，
+  // 而有 500 处 ≥500ms、114 处 ≥1000ms —— 那些就是真实的停顿。
+  // 按"每词最多占 MAX_SPEECH_MS_PER_WORD"回推，多余的时间让回去即为停顿。
+  // 取值依据（真实 ASR 轨实测，不是拍的）：源 token 相邻间隔 = 真实说话速度，
+  // 中位 241ms/词、p75 400ms、p90 640ms。而渲染单元的时长却是中位 498ms/词 ——
+  // 高出真实语速的那部分就是被吞掉的静音。取 p75 的 400ms 作为"说话"上界：
+  // 比它更慢的部分按静音让回去，同时不会把正常语速的单元削短。
+  var MAX_SPEECH_MS_PER_WORD = 400;
+  // 让出的空隙小于这个值就不值得让（避免制造大量肉眼看不见的 1 帧空档）
+  var MIN_MEANINGFUL_GAP_MS = 120;
+
+  /**
+   * 把单元尾部那段"其实没人在说话"的时间让回去，形成真实停顿。
+   *
+   * 只动 endMs，且只在【本单元自己的时长明显超过说完它所需的时间】时才动；
+   * startMs 一个都不许改（出现时刻是唯一必须精确贴合音轨的量，改动会整轨累积
+   * 漂移 —— v0.7.3 就是这么错的）。也绝不动 canonical token 跨度。
+   *
+   * 与 padShortUnitsIntoSilence 的关系：本函数削到的目标绝不低于可读下限
+   * （minVisibleMsForUnit），而后者只处理时长不足下限的单元，两者作用域不相交，
+   * 因此调用顺序颠倒对真实轨结果无影响（实测两种顺序均 185/186、无过短单元）。
+   * 仍按"先补时长、后让停顿"排列，因为这个次序的语义更直白：先保证看得清，
+   * 再把多出来的静音让回去。
+   */
+  function restoreSpeechPauses(units) {
+    var list = Array.isArray(units) ? units : [];
+    for (var i = 0; i < list.length; i++) {
+      var u = list[i];
+      if (!u) continue;
+      var next = list[i + 1];
+      if (!next) continue; // 末条后面没有内容，留着不影响观感
+      var gap = next.startMs - u.endMs;
+      if (gap >= MIN_MEANINGFUL_GAP_MS) continue; // 本来就有停顿
+      var words = restoredWords(u.originalText).length;
+      if (!words) continue;
+      // 停顿发生在【末词说完之后】，不是均摊在整个单元上。所以判据必须落在末词上：
+      // 单元里最后一个词的开口时刻 + 一个词的说话时长 = 这句话真正说完的时刻，
+      // 之后的时间都是静音。按整单元均摊会漏掉一半真实停顿（实测 ASR 轨只能
+      // 保住 49%）—— 因为长单元整体时长常常并不宽裕，但末词后面照样有静音。
+      var lastWordStartMs = Number(u.lastTokenStartMs);
+      var spokenUntil = Number.isFinite(lastWordStartMs)
+        ? lastWordStartMs + MAX_SPEECH_MS_PER_WORD
+        : u.startMs + words * MAX_SPEECH_MS_PER_WORD;
+      // 不得短于可读下限，也不得早于 startMs
+      var floor = minVisibleMsForUnit(u.originalText);
+      var target = Math.max(spokenUntil, u.startMs + floor);
+      if (target >= u.endMs) continue;
+      // 让出的空隙太小就不折腾
+      if (u.endMs - target < MIN_MEANINGFUL_GAP_MS) continue;
+      u.endMs = target;
+    }
+    return list;
+  }
+
   function buildTokenSpanUnits(timeline, boundaries) {
     var tokens = timeline && Array.isArray(timeline.tokens) ? timeline.tokens : [];
     if (!tokens.length) return [];
@@ -588,9 +650,13 @@
     if (!coverage.ok) throw new Error("timeline coverage invalid: " + coverage.error);
     var translations = opts.translations || {};
     var translationMap = {};
+    var timelineTokens = Array.isArray(timeline.tokens) ? timeline.tokens : [];
     var renderUnits = units.map(function (unit) {
       var translation = String(translations[unit.id] == null ? "" : translations[unit.id]);
       translationMap[unit.id] = translation;
+      // 末词开口时刻：restoreSpeechPauses 判断"话说完了没"的依据。
+      // 只读不改 canonical token 时间。
+      var lastTok = timelineTokens[unit.tokenEnd - 1];
       return {
         unitId: unit.id,
         sourceFingerprint: unit.sourceFingerprint,
@@ -600,6 +666,7 @@
         translation: translation,
         startMs: unit.startMs,
         endMs: unit.endMs,
+        lastTokenStartMs: lastTok ? lastTok.startMs : null,
       };
     });
     // 可读时长补偿只作用于呈现层:units 必须与 token 跨度严格一致
@@ -607,6 +674,8 @@
     // 拿去画的那份。只延 endMs、只吃真实静音、不动 startMs、不动 token 跨度。
     clampOverlappingRenderUnits(renderUnits);
     padShortUnitsIntoSilence(renderUnits);
+    // 把末词说完之后的静音让回去，形成真实停顿（只动 endMs，不动 startMs）。
+    restoreSpeechPauses(renderUnits);
     var snapshot = {
       version: "timeline-snapshot-v1",
       revision: Math.max(0, toInt(opts.revision, 0)),
