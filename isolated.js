@@ -152,13 +152,10 @@
     return error;
   }
 
-  // 预取节拍(ms)。1s 一次,与渲染解耦。
-  // 渲染不再用固定节拍轮询:改由 requestVideoFrameCallback(有则用)/
-  // requestAnimationFrame 驱动,见 startRenderLoop。原先 250ms setInterval
-  // 会让每条字幕平均晚 127ms、最坏晚 248ms 才出现(实测 449 单元中 17.8%
-  // 晚于 200ms),且时长不足一个 tick 的短单元会被整条跳过(实测 5 条 <250ms)。
+  // 保底渲染节拍(ms)。与帧回调并存 —— 帧回调给精度,它给活性
+  // (rVFC 只在合成新帧时触发,无媒体源/缓冲/暂停时不产帧)。见 startRenderLoop。
   var PREFETCH_INTERVAL_MS = 1000;
-  var RENDER_FALLBACK_INTERVAL_MS = 250; // 仅当两个回调 API 都不可用时的兜底节拍
+  var RENDER_FALLBACK_INTERVAL_MS = 250;
   var SEEK_SETTLE_MS = 350; // seek 停稳多少 ms 后才翻目标 clip
   var RETRY_INTERVAL_MS = 3000; // 失败 clip 后台重试调度节拍（第2层）
 
@@ -1631,18 +1628,26 @@
   /**
    * 启动渲染循环(幂等)。仅在启用 + 有字幕时跑。
    *
-   * 用视频帧回调而非固定节拍轮询:字幕出现时刻必须跟随视频时间,
-   * 而不是跟随一个与视频无关的 250ms 定时器。requestVideoFrameCallback
-   * 在每帧合成前触发(与画面同步,精度 ~1 帧);不可用时退回 rAF(~16ms);
-   * 两者都没有才用 setInterval 兜底。
-   * 低配机(如 Chromebook)上这两个回调本身会随浏览器降帧一起降频,
-   * 反而比固定 250ms 轮询更省 —— 且页面隐藏时浏览器自动暂停回调。
+   * 双驱动,缺一不可:
+   *  1) 帧回调(requestVideoFrameCallback,无则 rAF)—— 提供精度。字幕出现时刻
+   *     必须跟随视频时间,而非一个与视频无关的定时器。原先仅 250ms setInterval
+   *     使每条字幕平均晚 127ms、最坏晚 248ms(449 单元中 17.8% 晚于 200ms),
+   *     且时长不足一个 tick 的短单元被整条跳过(实测 5 条 <250ms)。
+   *  2) 定时器保底 —— 提供活性。rVFC **只在真正合成新视频帧时**触发:无媒体源、
+   *     缓冲、暂停、隐藏标签页都不产帧,单靠它会完全停摆(CI headless replay
+   *     即因此漏掉两个语义单元没画出来)。保底节拍确保任何情况下都在推进。
+   *
+   * 两者都调用同一个 onRenderTick,后者按 lastRenderedKey 去重,重复调用无副作用。
+   * 低配机上帧回调随浏览器降帧自动降频,页面隐藏时浏览器暂停回调,占用不高于原方案。
    */
   function startRenderLoop() {
     if (state.renderTimer != null || state.renderFrameHandle != null) return;
     if (!config.enabled || !state.cues.length) return;
-    var v = state.videoEl;
 
+    // 保底节拍:始终存在,与帧回调并存(onRenderTick 幂等,不会重复画)
+    state.renderTimer = setInterval(onRenderTick, RENDER_FALLBACK_INTERVAL_MS);
+
+    var v = state.videoEl;
     if (v && typeof v.requestVideoFrameCallback === "function") {
       state.renderDriver = "vfc";
       var stepVfc = function () {
@@ -1670,8 +1675,7 @@
       return;
     }
 
-    state.renderDriver = "interval";
-    state.renderTimer = setInterval(onRenderTick, RENDER_FALLBACK_INTERVAL_MS);
+    state.renderDriver = "interval"; // 只有保底节拍
   }
   function stopRenderLoop() {
     var driver = state.renderDriver;
