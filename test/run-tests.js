@@ -459,14 +459,18 @@ test("partitionReadableTokenUnit 确定性识别完整并列分句与 trailing a
   }
 });
 
-test("normalizeOversizeSentenceMarks 覆盖模型 4/21/9 坏切并恢复 14/11/9", () => {
+test("normalizeOversizeSentenceMarks 只重切超长屏并保留模型自然边界", () => {
+  // 设计:信任模型给出的边界(marks[3] 处的 4 词首屏),只对真正超 hard 的中段 21 词
+  // 屏做细分,不因局部超长而全局重排抹平模型边界。这是完整轨不再退化成均匀硬切的关键。
   const source = "let me reiterate that the cheapest electric kettle I could get my hands on is significantly faster at boiling water than this stove top kettle despite being limited by our 120 volt electrical system";
   const tokens = source.split(" ").map((text, i) => ({ text, start: i * 100, end: (i + 1) * 100 }));
   const marks = tokens.map(() => ""); marks[3] = "|"; marks[24] = "|"; marks[33] = ".";
   const normalized = Core.normalizeOversizeSentenceMarks(tokens, marks, { preferredWords: 14, hardWords: 16, minWords: 6 });
   const units = Core.packRestoredTokens(tokens, normalized, { maxWords: 16 });
-  assert.deepStrictEqual(units.map((u) => u.content.split(/\s+/).length), [14, 11, 9]);
-  assert.strictEqual(units.map((u) => u.content).join(" "), source);
+  // 模型的 4 词首屏被保留;超长的 21 词中段被切成 ≤16 词的子屏;尾屏保留。
+  assert.deepStrictEqual(units.map((u) => u.content.split(/\s+/).length), [4, 14, 7, 9]);
+  assert.ok(units.every((u) => u.content.split(/\s+/).length <= 16), "重切后不得留超 hard 屏");
+  assert.strictEqual(units.map((u) => u.content).join(" "), source, "必须逐词保真");
 });
 
 asyncTest("restoreAndPackTokens 真实水壶长句拆成四个舒适短屏且保留词与时间", async () => {

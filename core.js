@@ -568,6 +568,13 @@
     return marks;
   }
 
+  // 语义恢复分块的单一权威参数。整轨恢复按块送模型:块越大重叠开销越低。
+  // 实测(gpt-5.5,180s 真实轨):c120/o30 需 10 次调用 13494 token;c200/o20 只需
+  // 7 次调用 10145 token(省 25%)、快 31%,且句中硬切比例还略降(45%→42%)——
+  // 200 词上下文对边界判断已足够,而 30/120 的 25% 重叠是纯重复发送开销。
+  var SEMANTIC_CHUNK_WORDS = 200;
+  var SEMANTIC_OVERLAP_WORDS = 20;
+
   function chunkTokenRanges(tokens, size, overlap) {
     var n = (tokens || []).length;
     var limit = Math.max(1, Math.floor(Number(size) || 120));
@@ -1464,7 +1471,7 @@
       if (seenIds[token.tokenId]) throw new Error("duplicate boundary token ID: " + token.tokenId);
       seenIds[token.tokenId] = true;
     });
-    var ranges = chunkTokenRanges(tokens, opts.chunkWords || 120, opts.overlapWords || 30);
+    var ranges = chunkTokenRanges(tokens, opts.chunkWords || SEMANTIC_CHUNK_WORDS, opts.overlapWords || SEMANTIC_OVERLAP_WORDS);
     var marks = new Array(tokens.length).fill("");
     var prompt = opts.systemPrompt || DEFAULT_RESTORATION_PROMPT;
     for (var ri = 0; ri < ranges.length; ri++) {
@@ -1568,36 +1575,45 @@
   // flow 判据强制把过长单元切到硬上限内。连续字幕本就靠介词/连词/从句引导承接,
   // 一个 13-14 词从句找不到 strict 安全点不该让整轨作废——但绝不在破坏词法硬绑定
   // (number+unit、比较结构、数字)处下刀。只在已验证的原始 token 词边界放 |,不改正文。
-  function forceFlowPartition(words, hard, preferred) {
-    var n = (words || []).length;
-    var out = new Array(n).fill("");
-    if (n <= hard) return out;
-    // 先按需要的段数均匀定位理想切点,避免贪心切出「... water」这种孤字尾屏。
-    var segments = Math.ceil(n / Math.max(1, Math.min(hard, preferred || hard)));
-    var ideal = Math.ceil(n / segments);
-    var runStart = 0;
-    for (var seg = 1; seg < segments; seg++) {
-      var aim = runStart + ideal;
-      if (aim >= n) break;
-      // 在理想切点附近找不破坏硬绑定(number+unit/比较结构/数字)的词边界,
-      // 优先靠近 aim;硬上限前必须落刀,绝不产生超过 hard 的屏。
-      var chosen = -1;
-      var maxCut = runStart + hard; // 该屏最远只能到 hard 词
-      for (var off = 0; off <= hard; off++) {
-        var cands = off === 0 ? [aim] : [aim - off, aim + off];
-        for (var c = 0; c < cands.length; c++) {
-          var i = cands[c];
-          if (i < runStart + 1 || i >= n || i > maxCut) continue;
-          var verdict = classifySemanticBoundary(words.slice(runStart, i + 1).join(" "), words.slice(i + 1).join(" "));
-          if (!FLOW_INTEGRITY_REASONS[verdict.reason]) { chosen = i; break; }
-        }
-        if (chosen >= 0) break;
+  // token 空间保底切分:切点只能落在 token 之间(| 放在某 token 之后),屏长按该屏
+  // 内各 token 的词数之和度量。返回数组长度 == token 数,与全系统 marks 契约一致。
+  // 入参:tokWordCounts[i] = 第 i 个 token 的词数;tokTexts[i] = 该 token 文本。
+  function forceFlowPartition(tokWordCounts, tokTexts, hard, preferred) {
+    var T = (tokWordCounts || []).length;
+    var out = new Array(T).fill("");
+    var total = 0;
+    for (var a = 0; a < T; a++) total += tokWordCounts[a];
+    if (total <= hard) return out;
+    var target = Math.max(1, Math.min(hard, preferred || hard));
+    // 累计词数,用于把「理想词位置」映射到 token 边界。
+    var cum = new Array(T + 1).fill(0);
+    for (var b = 0; b < T; b++) cum[b + 1] = cum[b] + tokWordCounts[b];
+    var joinText = function (s, e) { // tokens[s..e) 的文本(词级)拼接
+      var parts = [];
+      for (var t = s; t < e; t++) parts.push(String(tokTexts[t] || ""));
+      return parts.join(" ");
+    };
+    var runStartTok = 0;
+    while (cum[T] - cum[runStartTok] > hard) {
+      var baseWords = cum[runStartTok];
+      var aimWords = baseWords + target;
+      // 该屏最远只能到 hard 词:找满足「起点到该 token 末尾词数 <= hard」的最大 token 边界。
+      var maxTok = runStartTok;
+      while (maxTok < T && cum[maxTok + 1] - baseWords <= hard) maxTok++;
+      if (maxTok <= runStartTok) maxTok = runStartTok + 1; // 单 token 已超 hard,只能整块留
+      // 在 [runStartTok+1, maxTok] 里挑不破坏硬绑定、且离 aimWords 最近的 token 边界。
+      var chosen = -1, bestDist = Infinity;
+      for (var cut = runStartTok + 1; cut <= maxTok && cut < T; cut++) {
+        var verdict = classifySemanticBoundary(joinText(runStartTok, cut), joinText(cut, T));
+        if (FLOW_INTEGRITY_REASONS[verdict.reason]) continue; // 破坏词法硬绑定,跳过
+        var dist = Math.abs(cum[cut] - aimWords);
+        if (dist < bestDist) { bestDist = dist; chosen = cut; }
       }
-      // 实在找不到安全边界(整段都是硬绑定),退到硬上限-1 处强切,守住不超长。
-      if (chosen < 0) chosen = Math.min(maxCut - 1, n - 2);
-      if (chosen <= runStart || chosen >= n - 1) break;
-      out[chosen] = "|";
-      runStart = chosen + 1;
+      // 整段都是硬绑定找不到安全边界:退到 maxTok(守住不超 hard),但至少切一个 token。
+      if (chosen < 0) chosen = Math.min(maxTok, T - 1);
+      if (chosen <= runStartTok || chosen >= T) break;
+      out[chosen - 1] = "|"; // | 放在第 (chosen-1) 个 token 之后
+      runStartTok = chosen;
     }
     return out;
   }
@@ -1607,68 +1623,89 @@
    * 可验证的连续字幕边界：长主语→限定谓语、完整主句→despite being 让步附加语。
    * 动态规划有界于 O(n * hardWords)，无额外模型调用；找不到全程安全路径就返回 null。
    */
+  // 在 token 空间做确定性显示分区。切点只落在 token 之间;屏长按屏内各 token 的词数
+  // 之和度量(一个 ASR token 可能含多词,如 ".And"、"boily pory")。marks 与返回值都
+  // 按 token 索引(长度 == token 数),与 packRestoredTokens 的 marks.length===token 数
+  // 契约一致——绝不能用词级长度返回,否则多词 token 会让写回越界撑长整条 marks。
   function partitionReadableTokenUnit(tokens, marks, opts) {
     opts = opts || {};
-    var words = tokenWords(tokens || []);
-    var n = words.length;
+    var toks = tokens || [];
+    var T = toks.length;
     var preferred = Math.max(1, Math.floor(Number(opts.preferredWords) || 14));
     var hard = Math.max(preferred, Math.floor(Number(opts.hardWords) || 16));
     var min = Math.max(1, Math.min(hard, Math.floor(Number(opts.minWords) || 6)));
-    if (!n || n <= hard) return (marks || []).slice();
+    // 每个 token 的词数(权重)与文本;累计词数 cum 用于按词度量屏长。
+    var wc = new Array(T);
+    var txt = new Array(T);
+    var totalWords = 0;
+    for (var ti = 0; ti < T; ti++) {
+      var tw = restoredWords(toks[ti] && toks[ti].text || "");
+      wc[ti] = tw.length;
+      txt[ti] = tw.join(" ");
+      totalWords += tw.length;
+    }
+    if (!T || totalWords <= hard) return (marks || []).slice();
     var sourceMarks = (marks || []).slice();
-    while (sourceMarks.length < n) sourceMarks.push("");
+    while (sourceMarks.length < T) sourceMarks.push("");
+    var cum = new Array(T + 1).fill(0);
+    for (var ci = 0; ci < T; ci++) cum[ci + 1] = cum[ci] + wc[ci];
+    var joinTok = function (s, e) { // tokens[s..e) 的词级文本
+      var parts = [];
+      for (var t = s; t < e; t++) parts.push(txt[t]);
+      return parts.join(" ");
+    };
+    // 候选切点 = token 边界 c(| 放在第 c-1 个 token 后,屏为 tokens[start..c))。
     var candidates = {};
-    for (var i = 0; i < n - 1; i++) {
-      if (sourceMarks[i] === "|") candidates[i + 1] = 0;
-      var left = words.slice(0, i + 1).join(" ");
-      var right = words.slice(i + 1).join(" ");
-      var rightFirst = words[i + 1] || "";
+    for (var i = 1; i < T; i++) {
+      if (sourceMarks[i - 1] === "|") candidates[i] = 0;
+      var left = joinTok(0, i);
+      var right = joinTok(i, T);
+      var leftWordCount = cum[i];
       var reportingMatch = left.match(REPORTING_CLAUSE_PREFIX_RE);
-      // 行长优先时，允许把完整 reporting 引导语（Let me point out that / I think that）
-      // 单独作为渐进屏。后续长主语仍必须落在 completedReportingSubjectBoundary，
-      // 因而这里只新增 5/10/8 这类可读路径，不泛化放过名词短语或关系从句硬切。
-      var progressiveReportingIntro = i + 1 >= min && reportingMatch &&
+      var progressiveReportingIntro = leftWordCount >= min && reportingMatch &&
         normalizeBoundaryText(left).toLowerCase() === normalizeBoundaryText(reportingMatch[0]).toLowerCase();
-      var longSubjectPredicate = i + 1 >= min && completedReportingSubjectBoundary(left, right);
-      var trailingAdjunct = i + 1 >= min && /^(?:despite\s+being|although|though|even\s+(?:during|after|before)|during|after|before)\b/i.test(right) &&
+      var longSubjectPredicate = leftWordCount >= min && completedReportingSubjectBoundary(left, right);
+      var trailingAdjunct = leftWordCount >= min && /^(?:despite\s+being|although|though|even\s+(?:during|after|before)|during|after|before)\b/i.test(right) &&
         hasComparisonPredicateText(left);
-      var coordinatedClause = i + 1 >= min && isCoordinatedIndependentBoundary(left, right);
+      var coordinatedClause = leftWordCount >= min && isCoordinatedIndependentBoundary(left, right);
       if (progressiveReportingIntro || longSubjectPredicate || trailingAdjunct || coordinatedClause) {
         var penalty = longSubjectPredicate ? 1 : (progressiveReportingIntro || coordinatedClause ? 2 : 3);
-        if (candidates[i + 1] == null || penalty < candidates[i + 1]) candidates[i + 1] = penalty;
+        if (candidates[i] == null || penalty < candidates[i]) candidates[i] = penalty;
       }
     }
-    var dp = new Array(n + 1).fill(null);
+    // DP over token 边界;屏长以词数(cum[end]-cum[start])度量,超 hard 词的段禁止。
+    var dp = new Array(T + 1).fill(null);
     dp[0] = { score: 0, prev: -1 };
-    for (var end = 1; end <= n; end++) {
-      if (end !== n && candidates[end] == null) continue;
-      for (var start = Math.max(0, end - hard); start < end; start++) {
+    for (var end = 1; end <= T; end++) {
+      if (end !== T && candidates[end] == null) continue;
+      for (var start = 0; start < end; start++) {
         if (!dp[start]) continue;
-        var len = end - start;
-        if (len < min && end !== n) continue;
-        var shortNaturalTail = end === n && len >= 3 &&
-          /^despite\s+being\s+\w+/i.test(words.slice(start, end).join(" "));
-        if (end === n && len < min && start !== 0 && !shortNaturalTail) continue;
-        var boundaryPenalty = end === n ? 0 : candidates[end];
-        var score = dp[start].score + Math.pow(len - preferred, 2) + boundaryPenalty;
+        var wlen = cum[end] - cum[start];
+        if (wlen > hard) continue; // 屏词数不得超硬上限
+        if (wlen < min && end !== T) continue;
+        var shortNaturalTail = end === T && wlen >= 3 &&
+          /^despite\s+being\s+\w+/i.test(joinTok(start, end));
+        if (end === T && wlen < min && start !== 0 && !shortNaturalTail) continue;
+        var boundaryPenalty = end === T ? 0 : candidates[end];
+        var score = dp[start].score + Math.pow(wlen - preferred, 2) + boundaryPenalty;
         if (!dp[end] || score < dp[end].score) dp[end] = { score: score, prev: start };
       }
     }
     var cuts = [];
-    var dpOk = !!dp[n];
+    var dpOk = !!dp[T];
     if (dpOk) {
-      for (var at = n; at > 0;) {
+      for (var at = T; at > 0;) {
         var prev = dp[at].prev;
         if (prev < 0) { dpOk = false; break; }
-        if (at < n) cuts.push(at);
+        if (at < T) cuts.push(at);
         at = prev;
       }
     }
-    // strict DP 找不到全程「书面完整句」路径时,不再返回 null 让整轨作废;
-    // 改用连续语流保底切分把过长单元切到硬上限内(保留原句末 . 边界)。
+    // strict DP 找不到全程「书面完整句」路径时,不返回 null 让整轨作废;改用 token 空间
+    // 保底切分切到硬上限内(保留原句末 . 边界)。返回长度恒为 T。
     if (!dpOk) {
-      var forced = forceFlowPartition(words, hard, preferred);
-      for (var si = 0; si < n; si++) if (sourceMarks[si] === ".") forced[si] = ".";
+      var forced = forceFlowPartition(wc, txt, hard, preferred);
+      for (var si = 0; si < T; si++) if (sourceMarks[si] === ".") forced[si] = ".";
       return forced;
     }
     var out = sourceMarks.map(function (m) { return m === "." ? "." : ""; });
@@ -1676,26 +1713,36 @@
     return out;
   }
 
+  // 只重切「真正超长的单个屏」,绝不因局部一处超长而重排整轨。修复单位是屏
+  // (相邻两个已确认边界 |/. 之间的 token 段),不是「句子」——模型只产出 |、从不
+  // 产出句末 .,若按 . 分句会把整轨当成一个巨句,任一处漏切就触发整段 forceFlow
+  // 均匀硬切,抹平模型给出的全部自然边界(这正是完整轨退化成 95% 均匀 10 词屏的根因)。
+  // 每个屏的长度按其 token 的词数之和度量;仅超 hard 词的屏才交给 partitionReadableTokenUnit
+  // 细分,其余屏的模型边界原样保留。
   function normalizeOversizeSentenceMarks(tokens, marks, opts) {
     opts = opts || {};
     var out = (marks || []).slice();
     var hard = Math.max(1, Math.floor(Number(opts.hardWords) || 16));
-    var sentenceStart = 0;
+    var wordsOf = function (t) { return restoredWords(t && t.text || "").length; };
+    var segStart = 0;
     for (var i = 0; i <= out.length; i++) {
-      if (i < out.length && out[i] !== ".") continue;
-      var sentenceEnd = i < out.length ? i + 1 : out.length;
-      if (sentenceEnd <= sentenceStart) { sentenceStart = sentenceEnd; continue; }
-      var run = 0, oversize = false;
-      for (var j = sentenceStart; j < sentenceEnd; j++) {
-        run++;
-        if (out[j] === "|" || out[j] === ".") { if (run > hard) oversize = true; run = 0; }
+      var isBoundary = i === out.length || out[i] === "|" || out[i] === ".";
+      if (!isBoundary) continue;
+      var segEnd = i < out.length ? i + 1 : out.length; // 含边界 token
+      if (segEnd <= segStart) { segStart = segEnd; continue; }
+      var segWords = 0;
+      for (var j = segStart; j < segEnd; j++) segWords += wordsOf(tokens[j]);
+      if (segWords > hard) {
+        // 只把这个超长屏交给 partition 细分;它在 token 空间工作,返回长度 == 段 token 数。
+        var outerBoundary = out[segEnd - 1]; // 段末已确认边界(|/.),partition 会清掉,需恢复
+        var local = partitionReadableTokenUnit(tokens.slice(segStart, segEnd), out.slice(segStart, segEnd), opts);
+        if (local) {
+          for (var k = 0; k < local.length; k++) out[segStart + k] = local[k];
+          // partition 不在末位设边界,恢复本段与下一段之间的原始边界,避免两段被 pack 合并。
+          if (outerBoundary === "|" || outerBoundary === ".") out[segEnd - 1] = outerBoundary;
+        }
       }
-      if (run > hard) oversize = true;
-      if (oversize) {
-        var local = partitionReadableTokenUnit(tokens.slice(sentenceStart, sentenceEnd), out.slice(sentenceStart, sentenceEnd), opts);
-        if (local) for (var k = 0; k < local.length; k++) out[sentenceStart + k] = local[k];
-      }
-      sentenceStart = sentenceEnd;
+      segStart = segEnd;
     }
     return out;
   }
@@ -1740,19 +1787,17 @@
         preferredMaxWords: preferredMaxWords,
         maxWords: maxWords,
       }));
-      var marked = filterUnsafeRescueMarks(tokenWords(rescue.tokens), rescue.marks);
-      var safe = true;
-      for (var mi = 0, run = 0; mi < marked.length; mi++) {
-        run++;
-        if (marked[mi] === "." || marked[mi] === "|") run = 0;
-        if (run > maxWords) { safe = false; break; }
-      }
-      if (!safe) {
-        marked = partitionReadableTokenUnit(restored.tokens.slice(begin, end), marked, {
-          preferredWords: Math.min(preferredMaxWords, 10), hardWords: Math.min(maxWords, 12), minWords: 4,
-        });
-      }
-      if (!marked) continue; // 宁可保持完整句，也不接受未校验/仍过长的局部模型输出。
+      // 单一权威切分:把 rescue 模型给出的 | 直接交给 partitionReadableTokenUnit。
+      // 它内部已是唯一判定器——保留可读的模型 |、DP 重排到目标词长,找不到全程
+      // 「书面完整句」路径就走 flow 保底切分,绝不产出超过 maxWords 的屏。不再先跑
+      // 一遍 strict filter 再看情况补切:那是多余中间层,还会误删候选让 DP 更难成路。
+      // 单一权威切分:把 rescue 模型给出的 | 直接交给 partitionReadableTokenUnit。
+      // 它在 token 空间工作(marks 按 token 索引,与 packRestoredTokens 契约一致),
+      // 返回长度恒等于输入 token 数,写回不会越界。
+      var marked = partitionReadableTokenUnit(rescue.tokens, rescue.marks, {
+        preferredWords: Math.min(preferredMaxWords, 10), hardWords: Math.min(maxWords, 12), minWords: 4,
+      });
+      if (!marked) continue; // 理论上 partitionReadableTokenUnit 对真实文本不返回 null;保守兜底。
       for (var m = 0; m < marked.length; m++) restored.marks[begin + m] = marked[m];
       // 局部 rescue 只能细分当前单元，不能删除它与后一单元之间已确认的外边界。
       if (outerBoundary === "." || outerBoundary === "|") restored.marks[end - 1] = outerBoundary;
@@ -2506,8 +2551,8 @@
       hashCacheIdentity(String(parts.apiBaseUrl || "").replace(/\/+$/, "")),
       semanticTokenFingerprint(parts.tokens || []),
       hashCacheIdentity(parts.systemPrompt || DEFAULT_RESTORATION_PROMPT),
-      Number(parts.chunkWords) || 120,
-      Number(parts.overlapWords) || 30,
+      Number(parts.chunkWords) || SEMANTIC_CHUNK_WORDS,
+      Number(parts.overlapWords) || SEMANTIC_OVERLAP_WORDS,
       Number(parts.preferredMaxWords) || 14,
       Number(parts.maxWords) || 16,
     ].join("|");
@@ -2927,6 +2972,8 @@
     sameRestoredWords: sameRestoredWords,
     restoredBoundaryMarks: restoredBoundaryMarks,
     chunkTokenRanges: chunkTokenRanges,
+    SEMANTIC_CHUNK_WORDS: SEMANTIC_CHUNK_WORDS,
+    SEMANTIC_OVERLAP_WORDS: SEMANTIC_OVERLAP_WORDS,
     packRestoredTokens: packRestoredTokens,
     repairNaturalUnitBoundaries: repairNaturalUnitBoundaries,
     filterUnsafeRescueMarks: filterUnsafeRescueMarks,
