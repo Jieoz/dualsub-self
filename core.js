@@ -140,7 +140,7 @@
         start: group[0].start,
         end: Math.max(group[group.length - 1].end, group[0].start),
         duration: Math.max(0, group[group.length - 1].end - group[0].start),
-        content: collapseWhitespace(group.map(function (token) { return token.text; }).join(" ")),
+        content: collapseWhitespace(joinRestoredWords(group.map(function (token) { return token.text; }))),
         tokens: group,
       });
       first = last + 1;
@@ -302,7 +302,14 @@
         nativeTiming: token.nativeTiming,
       };
     });
-    return { version: "token-v1", sourceFingerprint: fingerprint, tokens: tokens };
+    return {
+      version: "token-v1",
+      sourceFingerprint: fingerprint,
+      tokens: tokens,
+      // 重发前缀的回看窗口在这里定稿：它是源轨属性，必须在还看得见源 cue 时算好，
+      // 不能留给对齐阶段从 display cue 反推（见 computeDupWindow 注释）。
+      dupWindow: computeDupWindow(cues),
+    };
   }
 
   /**
@@ -335,9 +342,16 @@
    * 抛 "display cue does not align to canonical timeline" → 整轨字幕失效。
    * 实测 seg40/ov35、seg60/ov50、seg80/ov70 均因此失败,而 seg40/ov20 正常。
    *
-   * 正确口径:回看范围 = 最长一条 display cue 的词数(重发前缀不可能超过它)。
+   * 正确口径:回看范围 = 最长一条【源】cue 的词数(重发前缀不可能超过它)。
    * 这样窗口随数据自适应,既不会因常量偏小而漏判,也不会无界放大到把
    * 正文里合法的同词复现误判成重复(真实英文语料同词相邻距离中位 84)。
+   *
+   * 注意口径是【源 cue】而不是 display cue。重发前缀长度是源轨的物理属性,
+   * 与显示侧怎么切分无关。曾用 display cue 词数,于是显示侧一旦切得更细
+   * (人工字幕轨长句硬拆后单元从 40 词降到 12 词),窗口跟着缩到 12,再也看不见
+   * 35 词的重发前缀 → 整轨抛 display cue does not align to canonical timeline。
+   * 因此窗口由 buildCanonicalTokenTimeline 在解析源 cue 时算好挂在 timeline 上,
+   * 对齐阶段直接用,不再从 display 反推。
    */
   function computeDupWindow(cues) {
     var maxWords = 0;
@@ -358,7 +372,11 @@
     var tokens = timeline && Array.isArray(timeline.tokens) ? timeline.tokens : [];
     var cursor = 0;
     var boundaries = [];
-    var dupWindow = computeDupWindow(cues);
+    // 窗口优先取 timeline 上定稿的源轨口径；旧调用方传入的 timeline 没有这个字段时
+    // 退回按 display 推导（行为与历史一致），保证向后兼容。
+    var dupWindow = timeline && Number(timeline.dupWindow) > 0
+      ? Number(timeline.dupWindow)
+      : computeDupWindow(cues);
 
     // 消费掉 canonical 游标处、display 已删除的重复 token（display 端去重造成的落差）。
     // 只在这些 token 是"最近已消费 token 的重复"时前进，避免吞掉真正的新内容。
@@ -509,7 +527,7 @@
         tokenEnd: last + 1,
         startMs: span[0].startMs,
         endMs: Math.max(span[span.length - 1].endMs, span[0].startMs),
-        originalText: collapseWhitespace(span.map(function (token) { return token.text; }).join(" ")),
+        originalText: collapseWhitespace(joinRestoredWords(span.map(function (token) { return token.text; }))),
       };
       first = last + 1;
       return unit;
@@ -541,7 +559,7 @@
         return invalidCoverage(unit.tokenStart < cursor ? "token overlap" : "token gap", cursor);
       }
       var span = tokens.slice(unit.tokenStart, unit.tokenEnd);
-      var original = collapseWhitespace(span.map(function (token) { return token.text; }).join(" "));
+      var original = collapseWhitespace(joinRestoredWords(span.map(function (token) { return token.text; })));
       if (collapseWhitespace(unit.originalText || "") !== original) return invalidCoverage("source text mismatch", cursor);
       if (Number(unit.startMs) !== Number(span[0].startMs) || Number(unit.endMs) !== Math.max(Number(span[span.length - 1].endMs), Number(span[0].startMs))) {
         return invalidCoverage("source timing mismatch", cursor);
@@ -707,7 +725,41 @@
   //   - 数字内分隔符:1,800、334,720、8.8、120.5(千分位逗号与小数点)
   // 真实字幕轨(4067 token)实测含 20 个这类数字 token,是上一轮完整轨才暴露的
   // 词/token 粒度错位的源头之一。
-  var RESTORE_WORD_RE = /[0-9]+(?:[.,][0-9]+)+|[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*/g;
+  //
+  // 字母类必须是 Unicode 而非 ASCII。曾用 [A-Za-z0-9]，于是任何带变音符号的拉丁
+  // 语言都在变音字母处断开：波兰语 "najsłodszych" 被切成 "najs"+"odszych"，且 ł
+  // 本身作为分隔符被丢掉 —— 词数被高估（切分器按"词数 ≤12"限长，数的是碎片不是
+  // 单词，屏上出现 20+ 真实单词的超长行），同时原文肉眼可见地缺字母。
+  // \p{L} 覆盖全部 Unicode 字母，\p{M} 覆盖组合用变音记号（NFD 分解形式），
+  // \p{N} 覆盖各语言数字。
+  //
+  // 连写文字（scriptio continua：汉字、假名、泰语、老挝语、高棉语、缅甸语）不靠
+  // 空格分词，整句会被算成【一个】词 —— 于是所有以"词数"为单位的长度上限、时间
+  // 分配、切分判据统统失效：实测 92 字日文长句、125 字泰文长句都是 1 词 1 段，
+  // 原样铺满屏幕且永不被拆。语言中立的解法是让这些文字【一字一词】，而不是给它们
+  // 另开分支：下游 maxWords、token 跨度时间、去重对齐全按原样生效，无需任何
+  // "如果是中日泰就特殊处理"的判断。汉字/假名一字约合两个拉丁字符宽，一字一词也
+  // 让"词数"重新近似屏幕宽度。韩文与越南语用空格分词，故不在此列。
+  // 用 Script_Extensions（scx）而不是 Script：ー(U+30FC 长音符)、・(中点) 这类字符的
+  // Script 是 Common，\p{Script=Katakana} 匹配不到，只有 scx 才认它们属于假名书写。
+  // 当前实现里这些字符即便漏掉也会被标点尾巴 [^\p{L}\p{M}\p{N}\s]* 顺带吸收，
+  // 但那是巧合而非设计；scx 让"哪些字符属于连写文字"这件事直接说对，
+  // 不依赖另一条规则替它兜底。
+  var UNSPACED_SET = "\\p{scx=Han}\\p{scx=Hiragana}\\p{scx=Katakana}" +
+    "\\p{scx=Thai}\\p{scx=Lao}\\p{scx=Khmer}\\p{scx=Myanmar}";
+  var UNSPACED_SCRIPT_SOURCE = "[" + UNSPACED_SET + "]\\p{M}*";
+  // 空格分词语言的字母类必须【排除】连写文字，否则 \p{L} 也匹配汉字/假名，
+  // 拉丁分支会贪婪地把后面的连写文字一起吞掉："NASAが温度マップ" 成为一个 token，
+  // 而显示侧按一字一词算 —— 两条词流错位，混排轨直接对齐失败（实测）。
+  // 用否定预查而不是 v 标志的集合减法：v 标志要 Chrome 112+，而目标环境含很低配的
+  // 老设备，u 标志的兼容面更宽。
+  var SPACED_LETTER = "(?:(?![" + UNSPACED_SET + "])[\\p{L}\\p{M}\\p{N}])";
+  var RESTORE_WORD_RE = new RegExp(
+    "[0-9]+(?:[.,][0-9]+)+" +
+    "|" + UNSPACED_SCRIPT_SOURCE +
+    "|" + SPACED_LETTER + "+(?:['’-]" + SPACED_LETTER + "+)*",
+    "gu"
+  );
 
   // 全系统唯一的"什么算一个词"权威定义。此前有三份互相矛盾的词正则:
   // parseJson3 与 restoredBoundaryMarks 各写了一份【不含连字符】的版本,
@@ -719,11 +771,80 @@
   // 因此:任何需要"把文本切成词"的地方都必须使用 newWordRe()/restoredWords(),
   // 不得再各自手写正则。
   function newWordRe() {
-    return new RegExp(RESTORE_WORD_RE.source, "g");
+    // flags 必须从权威正则继承，不能硬写 "g"。RESTORE_WORD_RE 用了 \p{L} 等
+    // Unicode 属性转义，它们只在带 u 标志时成立；丢掉 u 之后 \p 退化成字面量
+    // "p"，整个字符类变成 [p{LMN}] —— parseJson3 把 "purpose-built" 切成
+    // ["p","p","p"]（实测），词流全线崩坏。
+    return new RegExp(RESTORE_WORD_RE.source, RESTORE_WORD_RE.flags);
   }
+
+  // 单次翻译请求超时。全系统唯一定义，isolated.js 也从 Core 取此值，
+  // 不再各处硬写 20000（曾有 4 处各写一遍）。
+  //
+  // 为什么是 90s：实测同一网关同一模型（gpt-5.4-mini）翻 4 行波兰语，端到端
+  // 10.0s–32.4s 不等（含边界修复的二次请求）。原先写死 20s 时，慢的那一批请求
+  // 被自己的超时掐断，重试也常常再次超时，整个 clip 全成 [未翻译] —— 用户看到的
+  // 大面积未翻译有一半来自这里，与语言无关。上限仍需存在，否则卡死的请求会永远
+  // 占住重试队列。
+  var TRANSLATE_TIMEOUT_MS = 90000;
 
   function restoredWords(text) {
     return String(text || "").match(RESTORE_WORD_RE) || [];
+  }
+
+  // 全系统唯一的"把词拼回文本"权威实现，与 RESTORE_WORD_RE 是一对；凡是把词数组
+  // 还原成显示文本的地方都必须走它，不得再各自 join(" ")。
+  //
+  // 连写文字一字一词（见 RESTORE_WORD_RE 注释），若无脑用空格拼回，45 字中文会变成
+  // "米 玛 斯 是 …" 89 字 —— 原文被硬生生撑开一倍，屏上全是散字。规则很简单：
+  // 相邻两个词只要有一侧属于连写文字，就直接相接不加空格；两侧都是空格分词语言
+  // （英/波/俄/越…）才加空格。这样中英混排 "NASAが温度" 也能正确还原。
+  var UNSPACED_EDGE_RE = new RegExp("^" + UNSPACED_SCRIPT_SOURCE + "$", "u");
+  // 判断一个词内部是否含连写文字（用于决定要不要再切一层）
+  var UNSPACED_CHAR_RE = new RegExp(UNSPACED_SCRIPT_SOURCE, "u");
+  // 把含连写文字的词切成"一字一片"，同时让紧跟其后的标点/闭合引号留在该字上，
+  // 使句末判定仍能在正确的片上看到句号。非连写字符（拉丁字母、数字）按连续块保留，
+  // 这样 "NASAが温度" 会切成 ["NASA","が","温","度"] 而不是逐个字母散开。
+  // 拉丁分支同样必须用 SPACED_LETTER（排除连写文字），否则 \p{L} 会让 "NASA" 把
+  // 后面的 "が温度マップ…" 一起吞进同一片，整段又变成不可再切的巨词（实测 42 词）。
+  var UNSPACED_PIECE_RE = new RegExp(
+    UNSPACED_SCRIPT_SOURCE + "[^\\p{L}\\p{M}\\p{N}\\s]*" +
+    "|" + SPACED_LETTER + "+(?:['’-]" + SPACED_LETTER + "+)*[^\\p{L}\\p{M}\\p{N}\\s]*" +
+    "|[^\\p{L}\\p{M}\\p{N}\\s]+",
+    "gu"
+  );
+  // 切分成"显示用词"：空格分词语言按空白切（词上保留原标点，句末判定要用），
+  // 连写文字再按字细切一层，标点跟随所属的字。
+  // 与 restoredWords() 的区别只在于保留标点，词的边界口径完全一致 —— 这样
+  // 「显示侧算几个词」与「canonical 侧几个 token」不会错位。
+  function splitDisplayWords(text) {
+    var out = [];
+    var rawWords = collapseWhitespace(text).split(" ").filter(Boolean);
+    for (var i = 0; i < rawWords.length; i++) {
+      var raw = rawWords[i];
+      if (!UNSPACED_CHAR_RE.test(raw)) { out.push(raw); continue; }
+      var pieces = raw.match(UNSPACED_PIECE_RE);
+      if (pieces && pieces.length > 1) {
+        for (var p = 0; p < pieces.length; p++) out.push(pieces[p]);
+      } else {
+        out.push(raw);
+      }
+    }
+    return out;
+  }
+
+  function joinRestoredWords(words) {
+    var list = Array.isArray(words) ? words : [];
+    var out = "";
+    for (var i = 0; i < list.length; i++) {
+      var word = String(list[i] == null ? "" : list[i]);
+      if (!word) continue;
+      if (!out) { out = word; continue; }
+      var prevChar = out.slice(-1);
+      var glue = UNSPACED_EDGE_RE.test(prevChar) || UNSPACED_EDGE_RE.test(word.slice(0, 1));
+      out += glue ? word : " " + word;
+    }
+    return out;
   }
 
   function sameRestoredWords(source, restored) {
@@ -940,13 +1061,13 @@
       }
       if (capitalAnd > 0 && Array.isArray(current.tokens) && current.tokens.length === currentWords.length) {
         var left = Object.assign({}, current, {
-          content: currentWords.slice(0, capitalAnd).join(" "),
+          content: joinRestoredWords(currentWords.slice(0, capitalAnd)),
           tokens: current.tokens.slice(0, capitalAnd),
           end: toInt(current.tokens[capitalAnd - 1].end, current.end),
         });
         left.duration = Math.max(0, left.end - toInt(left.start, 0));
         var right = Object.assign({}, current, {
-          content: currentWords.slice(capitalAnd).join(" "),
+          content: joinRestoredWords(currentWords.slice(capitalAnd)),
           tokens: current.tokens.slice(capitalAnd),
           start: toInt(current.tokens[capitalAnd].start, left.end),
         });
@@ -1073,11 +1194,20 @@
   // 句末标点（中英文）：命中则认为一句自然结束，适合断句
   var SENTENCE_END_RE = /[.!?。！？…]+["'”’)\]]*$/;
 
-  // 把一个词规整为比较用 token：转小写、去首尾标点
+  // 对齐用的词键：转小写、去掉词首尾的标点，保留内部的撇号/连字符。
+  //
+  // 字符类必须是 Unicode。曾用 [^0-9a-z一-鿿]，它只认 ASCII 字母、数字和 CJK，
+  // 于是任何带变音符号或非拉丁字母的词都被当成"标点包裹"而遭削首去尾：
+  //   "Łódź" -> "d"、"żółty" -> "ty"、"świat" -> "wiat"
+  //   "ąćę" / "Привет" / 全角数字 -> ""（整词清空）
+  // 键一旦被削，同一个词在 canonical 与 display 两侧算出不同的键，对齐直接抛
+  // "display cue does not align to canonical timeline" —— 整轨字幕失效
+  // （实测视频 scWj1BMRHUA 的波兰语轨即因此整轨拒绝，屏上全是 [未翻译]）。
+  // \p{L} 字母 + \p{M} 组合记号 + \p{N} 数字，覆盖全部书写系统。
   function wordKey(w) {
     return String(w || "")
       .toLowerCase()
-      .replace(/^[^0-9a-z一-鿿]+|[^0-9a-z一-鿿]+$/g, "");
+      .replace(/^[^\p{L}\p{M}\p{N}]+|[^\p{L}\p{M}\p{N}]+$/gu, "");
   }
 
   /**
@@ -1194,24 +1324,99 @@
       return /^(?:on|in|at|with|for|from|by|to|of|under|over|through|into|during|after|before|without)\b/.test(text);
     }
 
+    // maxWords 此前只作为"跨 cue 合并"的判据，单条源 cue 自身超限时无人拆它。
+    // ASR 轨每条只有几个词，掩盖了这个缺口；人工字幕轨一条就是一整句长文本
+    // （实测 scWj1BMRHUA 有 16 词单条），于是原样透传到屏上 —— 既超出舒适阅读
+    // 宽度，又超过翻译层的词数上限被 fail-closed 拒成 [未翻译]。
+    //
+    // 拆分口径必须是 canonical 的 RESTORE_WORD_RE token，不是空白分词：
+    // 一个空白词可能含多个 token（Onesecond[.designly.com]、1,800）或零个
+    // token（纯标点）。按空白均摊会让显示侧与 canonical 侧的 token 下标错位，
+    // 整轨抛 "display cue does not align to canonical timeline"（首版实测 15 红）。
+    // 因此这里以「累计 token 数」决定切点，空白词本身保持完整不切开。
+    function splitWordsToCap(words, cap) {
+      if (cap <= 0) return [words];
+      var totalTokens = 0;
+      var counts = [];
+      for (var i = 0; i < words.length; i++) {
+        var n = restoredWords(words[i]).length;
+        counts.push(n);
+        totalTokens += n;
+      }
+      if (totalTokens <= cap) return [words];
+      // 均摊成尽量等长的若干块，避免 12 + 1 这种孤儿尾巴
+      var parts = Math.ceil(totalTokens / cap);
+      var target = Math.ceil(totalTokens / parts);
+      var chunks = [];
+      var curChunk = [];
+      var curTokens = 0;
+      for (var j = 0; j < words.length; j++) {
+        // 达到目标块长就收口，或者再加这个词会越过 cap 时必须收口；不切开单个空白词。
+        // 用【或】而不是与：一词一 token 的连写文字里 counts[j] 恒为 1，与关系下
+        // "已达 target"和"再加就超 cap"这两件事很难同时成立，收口被推迟到贴着 cap
+        // 才发生，块长分布明显偏斜（实测中文长句 好11词/坏12词）。或关系让块长稳定
+        // 落在 target 附近，屏宽更均匀。
+        var wouldExceedCap = curTokens + counts[j] > cap;
+        if (curChunk.length && (curTokens >= target || wouldExceedCap)) {
+          chunks.push(curChunk);
+          curChunk = [];
+          curTokens = 0;
+        }
+        curChunk.push(words[j]);
+        curTokens += counts[j];
+      }
+      if (curChunk.length) chunks.push(curChunk);
+      return chunks;
+    }
+
     function flush() {
       if (!cur) return;
-      var content = collapseWhitespace(cur.words.join(" "));
-      if (content) {
-        var endMs = cur.end;
-        if (tailTrimMs > 0 && cur.end - cur.start > tailTrimMs * 2) {
-          var trimmed = cur.end - tailTrimMs;
-          if (trimmed - cur.start < TAIL_TRIM_MIN_VISIBLE_MS) trimmed = cur.start + TAIL_TRIM_MIN_VISIBLE_MS;
+      // 超长硬拆的上限分两档，因为这里有两个互相拉扯的约束：
+      //  - 未合并的单元就是原样一条源 cue（人工字幕轨的整句长文本落在这里），
+      //    按 maxWords 拆，得到舒适阅读宽度；
+      //  - 合并出来的单元是 grammarMerge / orphanPrepMerge 有意越过 maxWords 的产物
+      //    （语法未完成的句子续接、孤立限定词并入）。在 maxWords 处拆会把刚合好的
+      //    语义单元重新切碎，实测打红 7 条续接门禁；但完全不拆也不行 ——
+      //    translateClipWithBoundaryRepair 对超限单元直接抛 oversized source unit，
+      //    整 clip 变 [未翻译]。所以按「合并逻辑自己允许的最大宽度」兜底拆，
+      //    上限口径复用 mergeHardCap（与 orphanCap / continuationCap 同源，
+      //    不在这里另算一套，否则两处漂移就是下一个 bug）。
+      var chunks = splitWordsToCap(cur.words, cur.merged ? (cur.mergeHardCap || maxWords) : maxWords);
+      var span = Math.max(0, cur.end - cur.start);
+      var weights = chunks.map(function (ws) {
+        return Math.max(1, collapseWhitespace(joinRestoredWords(ws)).length);
+      });
+      var weightTotal = weights.reduce(function (a, b) { return a + b; }, 0);
+      var acc = 0;
+      for (var ci = 0; ci < chunks.length; ci++) {
+        var content = collapseWhitespace(joinRestoredWords(chunks[ci]));
+        var pieceStart = cur.start + Math.round(span * acc / weightTotal);
+        acc += weights[ci];
+        var pieceEnd = cur.start + Math.round(span * acc / weightTotal);
+        if (!content) continue;
+        var endMs = pieceEnd;
+        // 尾部留白只作用于最后一块：中间块的 end 就是下一块的 start，
+        // 在这里裁剪会凭空制造缝隙并让时间不再连续。
+        if (ci === chunks.length - 1 && tailTrimMs > 0 && pieceEnd - pieceStart > tailTrimMs * 2) {
+          var trimmed = pieceEnd - tailTrimMs;
+          if (trimmed - pieceStart < TAIL_TRIM_MIN_VISIBLE_MS) trimmed = pieceStart + TAIL_TRIM_MIN_VISIBLE_MS;
           if (trimmed < endMs) endMs = trimmed;
         }
-        out.push({ start: cur.start, end: endMs, duration: Math.max(0, endMs - cur.start), content: content });
+        out.push({ start: pieceStart, end: endMs, duration: Math.max(0, endMs - pieceStart), content: content });
       }
       cur = null;
     }
 
     for (var idx = 0; idx < list.length; idx++) {
       var c = list[idx];
-      var words = collapseWhitespace(c.content).split(" ").filter(Boolean);
+      // 空白切分对连写文字（中日泰…）无效：整句没有空格，只得到【一个】巨词，
+      // splitWordsToCap 无处可切，45 词的中文长句原样铺满屏幕（实测 92 字日文 /
+      // 125 字泰文 / 45 字中文全都 1 段）。
+      // 但这里【不能】直接用 restoredWords()：它会剥掉标点，而下游的句末判定
+      // (SENTENCE_END_RE)、小写续接、引号处理都依赖词上带着原标点，剥了会打红 15 条。
+      // 正确做法是保留空白切分的结果（含标点），仅对"内部还含连写文字"的巨词按
+      // 权威口径再切一层，切点落在字与字之间，标点自然留在所属的字上。
+      var words = splitDisplayWords(c.content);
       if (!words.length) continue;
 
       if (!cur) {
@@ -1249,6 +1454,13 @@
         if (canMerge && (normalMerge || grammarMerge || orphanPrepMerge)) {
           for (var w = 0; w < added.length; w++) cur.words.push(added[w]);
           cur.end = Math.max(cur.end, c.end);
+          cur.merged = true;
+          // 记下"本次合并被允许到多宽"。flush 的超长兜底拆分复用这个值，
+          // 而不是另算一套上限 —— 上限只有一个来源，两处各算必然漂移。
+          var allowedCap = normalMerge ? maxWords : 0;
+          if (orphanPrepMerge && orphanCap > allowedCap) allowedCap = orphanCap;
+          if (grammarMerge && effectiveContinuationCap > allowedCap) allowedCap = effectiveContinuationCap;
+          if (!(cur.mergeHardCap > allowedCap)) cur.mergeHardCap = allowedCap;
         } else {
           flush();
           cur = { start: c.start, end: c.end, words: words.slice(), fragmentChain: startsSyntacticFragmentChain(words) };
@@ -1519,13 +1731,26 @@
   function sanitizeSubtitleLine(line) {
     var s = String(line == null ? "" : line);
     if (!s) return "";
-    // 保留：CJK 统一表意、扩展A常见区粗略、数字、空白、中文/通用标点。
+    // 白名单只能用来剔除"不该出现在字幕里的字符"，不能用来剔除文字本身。
+    //
+    // 曾经的白名单是 [^一-鿿㐀-䶿0-9\s，。！？…]，即"只留汉字/数字/标点"，于是译文里
+    // 一切拉丁字母都被删掉 —— 而中文字幕里本来就该保留人名、品牌、术语的原文：
+    //   "嗨 Vsauce 我是 Michael"  ->  "嗨，，我是"        （实测 3/3 复现）
+    //   "米玛斯(Mimas)是最可爱的" ->  "是最可爱的之一"
+    // 这不是模型没译好，是产品把已译好的内容删了。用户看到的"翻译不完整"里
+    // 有一部分就是这么来的，而且与源语言无关（英、波、日文轨都中招）。
+    //
+    // 改为只删真正不该显示的东西：控制字符、以及不属于任何书写系统的私有区/
+    // 装饰符号。字母、数字、标记、常见标点全部保留。
+    s = s.replace(/[\p{Cc}\p{Cf}\p{Co}\p{Cs}\p{Cn}]/gu, "");
     // 产品显示契约：中文字幕不显示中文句号“。”；问号、感叹号等语义标点保留。
-    s = s.replace(/[^一-鿿㐀-䶿0-9\s，。！？、：；“”‘’（）()\-–—…·℃°%\/.，]/gu, "");
     s = s.replace(/。/gu, "");
     s = collapseWhitespace(s).trim();
-    // 去掉拉丁串后可能留下「个 瓶子」：仅压 CJK 之间的空格，数字两侧空格保留（「功率是 8.8 千瓦」）。
-    s = s.replace(/([一-鿿])\s+([一-鿿])/gu, "$1$2");
+    // 仅压 CJK 之间的多余空格（模型有时会在汉字间加空格）；
+    // 拉丁词与数字两侧的空格必须保留，否则 "功率是 8.8 千瓦"、"我是 Michael" 会粘连。
+    // 用前视而非捕获右侧汉字：捕获会把右侧汉字消耗掉，相邻的多处空格只压掉第一处
+    //（"这 是 一句话" → "这是 一句话"，实测）。
+    s = s.replace(/([\p{scx=Han}\p{scx=Hiragana}\p{scx=Katakana}])\s+(?=[\p{scx=Han}\p{scx=Hiragana}\p{scx=Katakana}])/gu, "$1");
     return s;
   }
 
@@ -1563,6 +1788,33 @@
       continues = !/[.!?。！？…]["'”’)\]]?$/.test(src);
     } else {
       continues = false; // 无上下文:保持原有严格行为
+    }
+
+    // 「模型压根没翻译、原样回吐源文」必须在这里显式判定。
+    //
+    // 此前没有这条判据：它是靠 sanitizeSubtitleLine 删光所有拉丁字母、
+    // 让译文变成空串再落进 empty 分支实现的 —— 用副作用当判定。代价是
+    // 人名/品牌/术语的原文（Vsauce、Michael、Mimas、SodaStream）也一起被删，
+    // 已译好的内容被产品自己抹掉。
+    //
+    // 正确判据是「整条里中日文字够不够」，而不是「有没有出现拉丁字母」：
+    // 合法中文字幕里夹几个专有名词很正常，但一整句都是源语言就是没译。
+    // 判据与源语言无关（英、波、俄、日…都适用）。
+    //
+    // 计量单位必须是「词」而不是「字符」：一个拉丁单词是一个语义单位，
+    // 按字符数算会让 "嗨 Vsauce 我是 Michael" 的汉字占比只有 3/16=0.19，
+    // 把完全正确的译文误杀（实测）。按词计则是 3 个汉字词 : 2 个外文词。
+    var cjkChars = (s.match(/[\p{scx=Han}\p{scx=Hiragana}\p{scx=Katakana}]/gu) || []).length;
+    if (!cjkChars) return { ok: false, reason: "no-chinese" };
+    // 外文词：连续的非 CJK 字母序列（数字不算——"8.8 千瓦"里的数字属于译文）
+    var foreignWords = (s.match(
+      /(?:(?![\p{scx=Han}\p{scx=Hiragana}\p{scx=Katakana}])[\p{L}\p{M}])+(?:['’-](?:(?![\p{scx=Han}\p{scx=Hiragana}\p{scx=Katakana}])[\p{L}\p{M}])+)*/gu
+    ) || []).length;
+    // 汉字/假名一字即一个语义单位，与外文词等量齐观。
+    // 外文词多于中文单位时，说明这条基本没译（阈值放宽到 1.0 倍，
+    // 宁可漏判也不误杀 —— 漏判只是显示一条质量差的译文，误杀是整句回退英文）。
+    if (foreignWords > cjkChars) {
+      return { ok: false, reason: "mostly-untranslated" };
     }
 
     if (!continues) {
@@ -2217,7 +2469,7 @@
     };
     var re = opts.reasoningEffort;
     if (re && re !== "default" && re !== "none") body.reasoning_effort = String(re);
-    var timeoutMs = typeof opts.timeoutMs === "number" ? opts.timeoutMs : 20000;
+    var timeoutMs = typeof opts.timeoutMs === "number" ? opts.timeoutMs : TRANSLATE_TIMEOUT_MS;
     var fetchOpts = {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: "Bearer " + (opts.apiKey || "") },
@@ -3287,6 +3539,8 @@
     hasNativeTokenTiming: hasNativeTokenTiming,
     collectSemanticTokens: collectSemanticTokens,
     restoredWords: restoredWords,
+    TRANSLATE_TIMEOUT_MS: TRANSLATE_TIMEOUT_MS,
+    joinRestoredWords: joinRestoredWords,
     sameRestoredWords: sameRestoredWords,
     restoredBoundaryMarks: restoredBoundaryMarks,
     chunkTokenRanges: chunkTokenRanges,

@@ -336,7 +336,7 @@
         preferredMaxWords: 10,
         maxWords: 12,
         attempts: 2,
-        timeoutMs: 20000,
+        timeoutMs: Core.TRANSLATE_TIMEOUT_MS,
         // 整轨语义恢复走同一个全局并发闸门，但用最低优先级(0)：首屏 fallback(100)/预取(20)/
         // 导出(1)全部抢先，semantic 恢复只用富余容量，绝不 flood 端点拖慢首屏中文首包。
         runRequest: function (fn) { return ensureGate().run(fn, 0); },
@@ -524,12 +524,22 @@
 
   /**
    * 选轨道：
-   *  - sourceLang === "auto"：优先非中文 ASR → 任意非中文轨 → 再退回第一条 ASR/第一条。
+   *  - sourceLang === "auto"：优先非中文 ASR → 优先英文 → 任意非中文轨 → 第一条 ASR/第一条。
    *  - 否则按 languageCode / code 精确或前缀匹配。
    *  - skipChineseSource 时：若最终选中轨是中文，返回 null（调用方跳过本视频）。
+   *
+   * auto 下必须显式优先英文，不能拿"第一条非中文轨"当默认。
+   * captionTracks 的顺序由 YouTube 决定且不保证语言：实测视频 scWj1BMRHUA
+   * 有 7 条人工轨（en/el/id/pl/pt/ru/es-419）且全部 kind=null（无 ASR），
+   * 于是 nonZhAny 命中的是列表里恰好排在前面的那条 —— 用户实际拿到波兰语轨，
+   * 屏上是波兰语原文配错乱译文。轨序不可依赖，必须按语言判定。
    */
   function isAsrTrack(t) {
     return t && (/-asr$/.test(t.code) || t.kind === "asr");
+  }
+  function isEnglishTrack(t) {
+    var lang = String((t && (t.languageCode || t.code)) || "").toLowerCase();
+    return /^en(\b|[-_.]|$)/.test(lang);
   }
   function isChineseTrack(t) {
     return !!(t && Core.shouldSkipChineseSource(t, {
@@ -543,9 +553,12 @@
     var picked = null;
     if (!sourceLang || sourceLang === "auto") {
       var nonZhAsr = list.find(function (t) { return isAsrTrack(t) && !isChineseTrack(t); });
+      // 英文优先于"列表里第一条非中文轨"：轨序由 YouTube 决定，多语言人工字幕
+      // 视频上第一条可能是任意语言（实测 scWj1BMRHUA 命中波兰语）。
+      var enTrack = list.find(function (t) { return isEnglishTrack(t) && !isChineseTrack(t); });
       var nonZhAny = list.find(function (t) { return !isChineseTrack(t); });
       var anyAsr = list.find(isAsrTrack);
-      picked = nonZhAsr || nonZhAny || anyAsr || list[0];
+      picked = nonZhAsr || enTrack || nonZhAny || anyAsr || list[0];
     } else {
       var exact = list.find(function (t) {
         return t.code === sourceLang || t.languageCode === sourceLang;
@@ -799,7 +812,7 @@
             reasoningEffort: identity.reasoningEffort,
             maxLineChars: identity.maxLineChars,
             segmentationMode: segmentationMode,
-            timeoutMs: 20000,
+            timeoutMs: Core.TRANSLATE_TIMEOUT_MS,
             lenient: true, // 运行时：单句坏译文只回退那一句英文，不连坐整个 clip（导出 SRT 仍严格）
             fetchImpl: function (u, o) { return fetch(u, o); },
             onUsage: function (usage) { pendingUsage.push(usage); },
@@ -1223,7 +1236,7 @@
           reasoningEffort: identity.reasoningEffort,
           maxLineChars: identity.maxLineChars,
           segmentationMode: mode,
-          timeoutMs: 20000,
+          timeoutMs: Core.TRANSLATE_TIMEOUT_MS,
           fetchImpl: function (u, o) { return fetch(u, o); },
           onUsage: function (usage) { pendingUsage.push(usage); },
           signal: context.controller ? context.controller.signal : undefined,
