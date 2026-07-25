@@ -218,9 +218,6 @@
   // 源 cue 时间失真的判定阈值。低于此值即认为该 cue 自报的时长不可能是真实语速
   // (200ms/词 ≈ 300 wpm 已是极快语速的地板)。
   var IMPLAUSIBLE_MS_PER_WORD = 200;
-  // 滚动窗口去重叠时每个词至少保留的时长：嵌套窗口顺延后不能塌成 0ms。
-  // 取值只需保证单元非零可见，实际可读时长由呈现层 padShortUnitsIntoSilence 负责。
-  var MIN_TOKEN_MS = 40;
 
   /**
    * 修复源轨自报时间失真的 cue —— 这是「字幕后半段几乎看不见」的**根**。
@@ -281,27 +278,16 @@
         nativeTiming: token.nativeTiming === true,
       };
     });
-    // 唯一权威时间源在这里收敛为严格不重叠的单调词流。
-    // 滚动窗口 ASR 轨（json3 自动字幕）相邻 cue 大幅重叠，appendTimelineTokens 去掉了
-    // 重复词，但保留下来的词仍带各自窗口的原生时间：前一个词的 endMs 可以远超后一个词的
-    // startMs，甚至整条窗口被完全嵌套。渲染单元的 startMs/endMs 直接取自 token 跨度，
-    // 这里不收敛，重叠就会出现在屏幕上（实测同一时刻 3 条字幕同时显示）。
+    // canonical token 流保留各词的原生时间，一个都不改。
     //
-    // 收敛方式是按词序前推，不是把前一个词的 endMs 压到后一个词的 startMs：
-    // 后者在嵌套窗口上会把整条单元压成 0ms（字幕一闪而过甚至不显示）。
-    // 前推只在重叠区内让时间顺延，原生时间追上后自然重新对齐音轨。
-    // 必须在 fingerprint 之前收敛：fingerprint 要对最终时间敏感，缓存才不会串。
-    var flowMs = -1;
-    for (var c = 0; c < canonical.length; c++) {
-      var token = canonical[c];
-      var startMs = Math.max(token.startMs, flowMs);
-      // 嵌套窗口里整条窗口都落在前一条内部，只做 max() 会把它压成 0ms（字幕根本不显示）。
-      // 给每个词留最小可见时长，重叠区内顺延；原生时间追上后自然重新贴合音轨。
-      var endMs = Math.max(token.endMs, startMs + MIN_TOKEN_MS);
-      token.startMs = startMs;
-      token.endMs = endMs;
-      flowMs = endMs;
-    }
+    // 这里曾经按词序"前推"收敛重叠（startMs = max(自身, 上一个词的 endMs)）。那是错的：
+    // 前推让时间凭空增加且永不归还，于是整轨累积漂移 —— 实测中位晚 1960ms、末段晚 2.2s，
+    // 52 个单元被挤到 400ms 以下，用户实测"完全对不上原始音频"。按词数重新锚定同样在累积
+    // （1441→2080ms）。结论：startMs 是唯一必须精确贴合音轨的量，任何改动都会漂移。
+    //
+    // 重叠改由渲染层的 clampOverlappingRenderUnits 只截 endMs 处理，漂移严格为 0。
+    // canonical 这一层还有 validateTokenSpanCoverage 的 fail-closed 契约：单元时间必须与
+    // token 跨度严格相等，在这里动时间会直接违约。
     var identity = canonical.map(function (token) {
       return [token.text, token.startMs, token.endMs, token.nativeTiming ? 1 : 0].join("\x1f");
     }).join("\x1e");
@@ -453,6 +439,34 @@
    *  - 不改 startMs —— 出现时刻必须仍然精确对齐语音,这是上一版刚修好的;
    *  - 借不够就借多少算多少(能改善就改善),不硬凑,不挪动别人的时间。
    */
+  /**
+   * 消除相邻显示单元的重叠 —— 只截 endMs，绝不动 startMs。
+   *
+   * 滚动窗口 ASR 轨（YouTube 自动字幕）相邻 cue 大幅重叠，同一句话在连续几条窗口里
+   * 反复出现。cleanupCues 只压 cue 外层时间，而渲染单元的时间取自 token 跨度，
+   * 于是重叠原封不动到达屏幕：实测真实轨 439 个单元里 233 个（53%）与下一条重叠，
+   * 同一时刻最多 3 条字幕叠在一起。
+   *
+   * 为什么只能截 endMs：
+   * startMs 是唯一必须精确贴合音轨的量。任何"把后续单元往后推"的做法都会让时间
+   * 凭空增加且不归还，整轨累积漂移 —— 实测前推方案中位晚 1960ms、末尾晚 10s，
+   * 按词重新锚定也仍然累积（1441→2080ms）。截 endMs 则漂移严格为 0。
+   *
+   * 代价是重叠区内单元变短，但"何时出现"对同步感的影响远大于"显示多久"，
+   * 且随后的 padShortUnitsIntoSilence 会把过短的单元补进真实静音。
+   */
+  function clampOverlappingRenderUnits(units) {
+    var list = Array.isArray(units) ? units : [];
+    for (var i = 0; i < list.length - 1; i++) {
+      var cur = list[i];
+      var next = list[i + 1];
+      if (!cur || !next) continue;
+      if (cur.endMs > next.startMs) {
+        cur.endMs = Math.max(cur.startMs, next.startMs);
+      }
+    }
+  }
+
   function padShortUnitsIntoSilence(units, minVisibleMs) {
     var list = Array.isArray(units) ? units : [];
     for (var i = 0; i < list.length; i++) {
@@ -573,6 +587,7 @@
     // 可读时长补偿只作用于呈现层:units 必须与 token 跨度严格一致
     // (validateTokenSpanCoverage 的 fail-closed 契约),renderUnits 才是真正
     // 拿去画的那份。只延 endMs、只吃真实静音、不动 startMs、不动 token 跨度。
+    clampOverlappingRenderUnits(renderUnits);
     padShortUnitsIntoSilence(renderUnits);
     var snapshot = {
       version: "timeline-snapshot-v1",
