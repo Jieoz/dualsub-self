@@ -1677,11 +1677,21 @@ test("诊断统计必须能定位读不完的单元", () => {
 });
 
 
-test("滚动窗口 ASR 轨（json3 原生词级时间）去重叠必须同时收敛 token 时间，否则重叠回到渲染层", () => {
-  // 回归来源：真实 YouTube 自动字幕轨是滚动窗口形状——相邻 cue 大幅重叠，
-  // 同一句话在连续几条里反复出现。旧 cleanupCues 只把 cue 外层 end 压到下一条 start，
-  // 但下游 buildCueTokenSpanUnits 取的是 **token 跨度**，token 时间没被压，
-  // 于是重叠原封不动回到渲染层，实测 3 条字幕同时上屏。
+test("滚动窗口 ASR 轨（json3 原生词级时间）去重叠：渲染层零重叠且起始时间零漂移", () => {
+  // 回归来源（两次，方向相反，必须同时钉住）：
+  //
+  // 1) 重叠：真实 YouTube 自动字幕轨是滚动窗口形状——相邻 cue 大幅重叠，同一句话在连续
+  //    几条里反复出现。cleanupCues 只把 cue 外层 end 压到下一条 start，但下游
+  //    buildCueTokenSpanUnits 取的是 **token 跨度**，token 时间没被压，于是重叠原封不动
+  //    回到渲染层，实测 3 条字幕同时上屏。
+  //
+  // 2) 漂移（v0.7.3 引入的回归）：为消重叠而在 canonical 层"按词序前推"
+  //    （startMs = max(自身, 上一个词的 endMs)）会让时间凭空增加且永不归还，整轨累积漂移
+  //    —— 实测中位晚 1961ms、最差晚 10s、53 个单元被挤到 400ms 以下，用户实测
+  //    "完全对不上原始音频"。
+  //
+  // 因此正确契约是：**startMs 一个都不许动**（唯一必须精确贴合音轨的量），
+  // 重叠只靠在渲染层截 endMs 消除。这条门禁同时断言两个方向，缺一不可。
   function mk(start, end, words) {
     const step = (end - start) / words.length;
     return {
@@ -1705,30 +1715,48 @@ test("滚动窗口 ASR 轨（json3 原生词级时间）去重叠必须同时收
   const rawOverlaps = cues.filter((c, i) => cues[i + 1] && c.end > cues[i + 1].start).length;
   assert.equal(rawOverlaps, 2, "样本必须真的带重叠，否则这条门禁测不到东西");
 
+  // 源轨里每个词的**全部**原生起始时间。滚动窗口轨上同一个词会在多条窗口里重复出现
+  // （样本里 "youre" 就出现两次：660 和 3189），所以基准是一个集合而非单值——
+  // 断言"必须等于第一个出现的时间"会把正常的第二次出现误判成漂移。
+  const nativeStart = new Map();
+  cues.forEach((c) => c.tokens.forEach((t) => {
+    if (!nativeStart.has(t.text)) nativeStart.set(t.text, new Set());
+    nativeStart.get(t.text).add(t.start);
+  }));
+
   const clean = Core.cleanupCues(cues);
   // cleanupCues 只压 cue 外层，token 原生时间必须保留：
   // 它是 appendTimelineTokens 判定滚动重复词的唯一依据，抹平会导致重复词被渲染两次。
   const timeline = Core.buildCanonicalTokenTimeline(clean);
-  // canonical token 流是唯一权威时间源，必须严格单调不重叠
-  for (let i = 0; i < timeline.tokens.length - 1; i++) {
-    const cur = timeline.tokens[i];
-    const next = timeline.tokens[i + 1];
+
+  // 方向 2：canonical token 的起始时间必须是源轨里真实存在过的原生值（零漂移）。
+  // 前推/重锚会算出源轨里根本不存在的时间，这里立刻抓到。
+  // 注意这里**不能**断言 canonical token 互不重叠——滚动窗口轨上 token 时间的重叠是真实
+  // 数据形态，压平它就等于改 startMs，那正是 v0.7.3 的回归。
+  timeline.tokens.forEach((tok) => {
+    const set = nativeStart.get(tok.text);
+    if (!set) return;
     assert.ok(
-      cur.endMs <= next.startMs,
-      `canonical token#${i} 与下一个重叠：[${cur.startMs}-${cur.endMs}] vs [${next.startMs}-${next.endMs}]`
+      set.has(tok.startMs),
+      `token "${tok.text}" 起始时间被改动：got=${tok.startMs}，源原生值只有 ${[...set].join("/")}（startMs 必须保持原生值，否则整轨累积漂移）`
     );
-    assert.ok(cur.startMs <= next.startMs, `canonical token#${i} 时间非单调`);
-  }
+  });
+
   const units = Core.buildCueTokenSpanUnits(timeline, clean);
   const snapshot = Core.createTimelineSnapshot({
     revision: 0, videoId: "rolling", trackCode: "en", timeline: timeline, units: units,
   });
   const rendered = snapshot.renderUnits.filter((u) => String(u.originalText || "").trim());
+
+  // 方向 1：渲染层必须零重叠
   const overlaps = rendered.filter((u, i) => rendered[i + 1] && u.endMs > rendered[i + 1].startMs);
   assert.equal(
     overlaps.length, 0,
     "渲染层仍有重叠（字幕会同时上屏）：" + overlaps.map((u) => `[${u.startMs}-${u.endMs}]`).join(" ")
   );
+  // 截 endMs 不许把单元压成不可见
+  const zero = rendered.filter((u) => u.endMs <= u.startMs);
+  assert.equal(zero.length, 0, `出现 0ms 单元（字幕不显示）：${zero.length} 个`);
   // 压时间不能丢词：原文必须逐词守恒，否则 coverage 会 fail-closed
   const got = rendered.map((u) => u.originalText).join(" ").split(/\s+/).length;
   const want = cues.reduce((a, c) => a + c.content.split(/\s+/).length, 0);
@@ -3346,6 +3374,76 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     const tightSnap = Core.createTimelineSnapshot({ timeline: tightTl, units: Core.buildTokenSpanUnits(tightTl, [0]) });
     assert.ok(tightSnap.renderUnits[0].endMs <= tightSnap.renderUnits[1].startMs,
       "静音不足时仍重叠: " + tightSnap.renderUnits[0].endMs + " > " + tightSnap.renderUnits[1].startMs);
+  });
+
+  test("真实滚动窗口 ASR 轨（yt-dlp 抓取的线上 json3）：零漂移 + 零重叠 + 零丢词", () => {
+    // 为什么必须有这条：前面所有滚动窗口断言用的都是 4 条 cue 的手造样本。
+    // 真实线上轨是 8 分钟 393 条 cue、几乎每条都与下一条重叠（99% 重叠率）的形状，
+    // 三个版本连续修错就是因为验证数据里根本没有这个形状——手造样本的规模掩盖了
+    // 累积漂移（漂移要走过几百条才显形）。这份 fixture 是 yt-dlp 直接抓的原始
+    // json3，未经任何整理，解析走产品自己的 parseJson3。
+    const raw = JSON.parse(
+      fs.readFileSync(path.join(ROOT, "test/fixtures/youtube-json3-rolling-raw.json"), "utf8")
+    );
+    const cues = Core.parseJson3(raw);
+    // parseJson3 会合并滚动窗口的重发前缀，所以解析后条数远少于原始 events（393 -> ~197），
+    // 这是产品的正常行为，不是丢内容。规模断言按解析后的实际量级设定。
+    assert.ok(cues.length > 150, `fixture 规模不足：${cues.length} 条`);
+    const srcOverlap = cues.filter((c, i) => cues[i + 1] && c.end > cues[i + 1].start).length;
+    assert.ok(
+      srcOverlap > cues.length * 0.5,
+      `fixture 必须是真实滚动窗口形状（高重叠），当前只有 ${srcOverlap}/${cues.length} 重叠`
+    );
+
+    // 基准：源轨每个词的原生起始时间
+    const nativeStart = new Map();
+    cues.forEach((c) => (c.tokens || []).forEach((t) => {
+      const k = t.text + "@" + t.start;
+      if (!nativeStart.has(t.text)) nativeStart.set(t.text, new Set());
+      nativeStart.get(t.text).add(t.start);
+      void k;
+    }));
+
+    const clean = Core.cleanupCues(cues);
+    const timeline = Core.buildCanonicalTokenTimeline(clean);
+
+    // 零漂移：每个 canonical token 的 startMs 必须是它在源轨里出现过的某个原生时间。
+    // 前推/重锚会产生源轨里不存在的时间值，这里立刻抓到。
+    let drifted = 0;
+    let sample = "";
+    timeline.tokens.forEach((tok) => {
+      const set = nativeStart.get(tok.text);
+      if (!set) return;
+      if (!set.has(tok.startMs)) {
+        drifted++;
+        if (!sample) {
+          sample = `"${tok.text}" got=${tok.startMs} 源可选=${[...set].slice(0, 3).join("/")}`;
+        }
+      }
+    });
+    assert.equal(drifted, 0, `${drifted} 个 token 起始时间不是源原生值（整轨会累积漂移）：${sample}`);
+
+    const display = Core.resegmentCues(clean, { maxWords: 12, continuationMaxWords: 14 });
+    const units = Core.buildCueTokenSpanUnits(timeline, display);
+    const snapshot = Core.createTimelineSnapshot({
+      revision: 0, videoId: "real-rolling", trackCode: "en", timeline: timeline, units: units,
+    });
+    const rendered = snapshot.renderUnits.filter((u) => String(u.originalText || "").trim());
+
+    const overlaps = rendered.filter((u, i) => rendered[i + 1] && u.endMs > rendered[i + 1].startMs);
+    assert.equal(overlaps.length, 0, `真实轨渲染层仍有 ${overlaps.length} 处重叠`);
+
+    const zero = rendered.filter((u) => u.endMs <= u.startMs);
+    assert.equal(zero.length, 0, `真实轨出现 ${zero.length} 个 0ms 单元`);
+
+    // 单元起始时间也必须落在源原生时间上（渲染层截 endMs 不许动 startMs）
+    const allNative = new Set();
+    cues.forEach((c) => (c.tokens || []).forEach((t) => allNative.add(t.start)));
+    const offGrid = rendered.filter((u) => !allNative.has(u.startMs));
+    assert.equal(
+      offGrid.length, 0,
+      `${offGrid.length} 个渲染单元的起始时间不在源原生时间上，例：${offGrid.slice(0, 2).map((u) => u.startMs).join(",")}`
+    );
   });
 
   console.log("\n========================================");

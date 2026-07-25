@@ -21,9 +21,17 @@
 
 ## 安装（加载已解压的扩展程序）
 
-当前版本：**v0.7.3**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.7.3) 下载 Chrome MV3 安装包。
+当前版本：**v0.7.4**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.7.4) 下载 Chrome MV3 安装包。
+
+v0.7.4 的主要变化（修复 v0.7.3 引入的整轨时间漂移 —— 字幕整体比音频晚约 2 秒）：
+- **v0.7.3 是一次回归，v0.7.4 覆盖它**：v0.7.3 为消除重叠在 canonical 层"按词序前推"（`startMs = max(自身, 上一个词的 endMs)`）。前推让时间凭空增加且**永不归还**，于是整轨累积漂移。用同一视频前后两次实测导出逐条比对：**434 条字幕起始时间变晚，中位 +1961ms，最差 +10010ms**，且漂移随播放推进越来越大（前段 +1.6s → 末段 +2.2s）；同时 **53 个单元被挤到 400ms 以下**（最短仅 240ms，一闪而过）。实际体验就是「完全对不上原始音频」。
+- **正确契约：`startMs` 一个都不许动。** 出现时刻是唯一必须精确贴合音轨的量，任何改动都会累积。「按词数重新锚定」同样不行（实测仍在累积：1441ms → 2080ms）。重叠改为只在渲染层把上一条的 `endMs` 截到下一条的 `startMs`，漂移严格为 **0**；重叠区内单元变短，由既有的 `padShortUnitsIntoSilence` 补进真实静音。
+- 收敛位置从 `buildCanonicalTokenTimeline` 移到渲染层 `clampOverlappingRenderUnits`。canonical 层不能动时间：它与 token 跨度之间有 `validateTokenSpanCoverage` 的 fail-closed 契约；且 token 时间的重叠是 `appendTimelineTokens` 判定滚动重复词的**唯一依据**，抹平会让同一句话被渲染两次。
+- 真实轨验证（4070 token / 439 单元）：起始时间**零漂移**（4070 个 token 无一被改动）、重叠 **233 → 0**、0ms 单元 0 个、词数守恒、最短单元 **240ms → 1199ms**。
+- **新增真实数据门禁**：`test/fixtures/youtube-json3-rolling-raw.json` 是 yt-dlp 直接抓取的线上原始 json3（未经任何整理，解析走产品自己的 `parseJson3`）。此前三个版本连续修错的根本原因是验证数据里没有这个形状 —— 手造的 4 条 cue 样本规模太小，累积漂移要走过几百条才显形。门禁同时断言两个方向（零重叠 + 零漂移），退回 v0.7.3 前推实现时精确变红（真实轨抓出 1385 个 token 漂移）。
 
 v0.7.3 的主要变化（修复滚动窗口 ASR 轨的字幕重叠 —— 这是「长句显示混乱」的真实根因）：
+> ⚠️ v0.7.3 虽然消除了重叠，但引入了整轨约 2 秒的时间漂移，已由 v0.7.4 修复。请直接使用 v0.7.4。
 - **半数字幕互相重叠、最多 3 条同时上屏**：YouTube 自动字幕是滚动窗口轨，相邻 cue 大幅重叠，同一句话在连续几条里反复出现。`cleanupCues` 只把 cue 外层 `end` 压到下一条 `start`，但真正拿去渲染的是 **token 跨度**，token 原生时间没被收敛，重叠原封不动回到渲染层。实测真实轨 439 个单元里 **233 个（53%）与下一条重叠**，重叠中位 2479ms、最长 10010ms，同一时刻最多 3 条字幕叠在一起。
 - 修复落在 `buildCanonicalTokenTimeline`：canonical token 流是唯一权威时间源，在生成 fingerprint 之前收敛为严格单调不重叠。收敛用**按词序前推**而不是把前一条的 `end` 压到后一条的 `start` —— 后者在嵌套窗口上会把整条单元压成 0ms（字幕根本不显示）。
 - 真实轨验证：重叠 **233 → 0**，同时在屏 **3 → 1** 条，0ms 单元 0 个，词数守恒。
