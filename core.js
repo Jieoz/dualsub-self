@@ -532,10 +532,14 @@
 
   // 语义恢复协议：模型只可在源词之间加入 .?!|，绝不拥有正文所有权。
   // 逐词归一化后必须完全相等，否则整个 chunk 无效并由调用方重试/回退。
-  // 连字符复合词(purpose-built / old-fashioned / plug-in)在屏上显示为一个词,
-  // 词数计量必须当一个:否则「切分/DP 按 token 数=1」与「最终校验按正则=2」口径不一,
-  // 一个显示 12 词的合格屏会被算成 13 词而误触发 oversize 抛错,拖垮整轨 semantic。
-  var RESTORE_WORD_RE = /[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*/g;
+  // 词数计量必须与「屏上所见」一致 —— 屏上显示为一个词的就算一个词,否则
+  // 「切分/DP 按 token 数」与「最终校验按正则」口径不一,一个显示 12 词的合格屏
+  // 会被算成 13 词而误触发 oversize 抛错,拖垮整轨 semantic。因此下列都算一个词:
+  //   - 连字符/撇号复合词:purpose-built、old-fashioned、plug-in、don't
+  //   - 数字内分隔符:1,800、334,720、8.8、120.5(千分位逗号与小数点)
+  // 真实字幕轨(4067 token)实测含 20 个这类数字 token,是上一轮完整轨才暴露的
+  // 词/token 粒度错位的源头之一。
+  var RESTORE_WORD_RE = /[0-9]+(?:[.,][0-9]+)+|[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*/g;
 
   function restoredWords(text) {
     return String(text || "").match(RESTORE_WORD_RE) || [];
