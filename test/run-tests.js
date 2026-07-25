@@ -3668,6 +3668,49 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     assert.ok(diacritics > 100, `波兰语变音字母只剩 ${diacritics} 个，说明仍被吞掉`);
   });
 
+  test("真实停顿必须保留：源轨里说话人停下来的地方，字幕之间也要有空隙", () => {
+    // 用户报障原话：「字幕没有停顿是不是你没发现？」—— 他是对的。
+    // 此前渲染层 436/439 个相邻单元空隙为 0ms，字幕整段连成一片。
+    //
+    // 根因：YouTube json3 的每个 seg 只有 tOffsetMs（词的**开始**时刻），没有任何
+    // 词级时长字段，于是 parseJson3 只能把词的 end 填成下一个词的 start ——
+    // 说话人的停顿被吞进了前一个词的显示时长里。
+    // 但停顿信息确实在数据里：同一 event 内相邻词间隔中位 241ms，而有 500 处
+    // ≥500ms。修复在渲染层按"末词说完即止"把静音让回去（只动 endMs）。
+    const raw = JSON.parse(fs.readFileSync(path.join(__dirname, "fixtures/youtube-json3-rolling-raw.json"), "utf8"));
+    const cues = Core.cleanupCues(Core.parseJson3(raw));
+    const timeline = Core.buildCanonicalTokenTimeline(cues);
+    const display = Core.resegmentCues(cues, { maxWords: 12, continuationMaxWords: 14 });
+    const units = Core.buildCueTokenSpanUnits(timeline, display);
+    const snap = Core.createTimelineSnapshot({ timeline, units, cues });
+    const R = snap.renderUnits;
+    const T = timeline.tokens;
+
+    let srcPause = 0, kept = 0;
+    for (let i = 0; i < R.length - 1; i++) {
+      const lastTok = T[units[i].tokenEnd - 1];
+      const nextTok = T[units[i + 1].tokenStart];
+      if (!lastTok || !nextTok) continue;
+      // 源数据里"末词开口 → 下一词开口"跨度很大 = 说话人真的停了
+      if (nextTok.startMs - lastTok.startMs < 800) continue;
+      srcPause++;
+      if (R[i + 1].startMs - R[i].endMs >= 120) kept++;
+    }
+    // 下限按 fixture 自身真实规模定（实测 63 处）。定得比实际高会让整条门禁
+    // 卡在这一行上，保住率断言永远跑不到 —— 那样它就成了永远变红的死门禁。
+    assert.ok(srcPause >= 50, `真实轨应含大量停顿，实测仅 ${srcPause} 处（fixture 形状不对）`);
+    const rate = kept / srcPause;
+    assert.ok(rate >= 0.9, `真实停顿只保住 ${kept}/${srcPause}（${Math.round(rate * 100)}%），字幕会连成一片`);
+
+    // 让出停顿绝不能破坏既有的三条硬契约
+    for (let i = 0; i < R.length; i++) {
+      assert.strictEqual(R[i].startMs, units[i].startMs, "startMs 被改动 —— 出现时刻必须精确贴合音轨");
+      assert.ok(R[i].endMs > R[i].startMs, "单元时长非正");
+      assert.ok(R[i].endMs - R[i].startMs >= 400, `单元被削到 ${R[i].endMs - R[i].startMs}ms，短于可读下限`);
+      if (i + 1 < R.length) assert.ok(R[i + 1].startMs >= R[i].endMs, "让出停顿后仍存在重叠");
+    }
+  });
+
   console.log("\n========================================");
   console.log("  通过: " + passed + "  失败: " + failed);
   console.log("========================================");
