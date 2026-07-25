@@ -3013,12 +3013,53 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
 
 
 
-  test("sanitizeSubtitleLine：去掉非中文目标杂质（拉丁串/异常脚本）但保留数字与常用标点", () => {
+  test("sanitizeSubtitleLine：只剔除不可显示字符，绝不删除专有名词原文", () => {
+    // 此前这里断言的是"删掉一切拉丁串"（SodaStream/hello 被抹成空）。那个行为的
+    // 本意是拦住"模型没翻译、原样回吐英文"，但机制错了：它连合法的人名/品牌/术语
+    // 一起删，把已经译好的内容抹掉（"嗨 Vsauce 我是 Michael" → "嗨，，我是"）。
+    // 「有没有真的翻译」现在由 validateChineseDisplayUnit 显式判定（见下一条门禁），
+    // sanitize 只负责剔除控制字符等不可显示内容。
     assert.strictEqual(typeof Core.sanitizeSubtitleLine, "function");
-    assert.strictEqual(Core.sanitizeSubtitleLine("这里少得多ഒരു"), "这里少得多");
-    assert.strictEqual(Core.sanitizeSubtitleLine("把水烧开对，这是个 SodaStream 瓶子"), "把水烧开对，这是个瓶子");
     assert.strictEqual(Core.sanitizeSubtitleLine("功率是 8.8 千瓦"), "功率是 8.8 千瓦");
-    assert.strictEqual(Core.sanitizeSubtitleLine("  hello  "), "");
+    // 专有名词必须活着
+    assert.strictEqual(Core.sanitizeSubtitleLine("把水烧开对，这是个 SodaStream 瓶子"), "把水烧开对，这是个 SodaStream 瓶子");
+    assert.strictEqual(Core.sanitizeSubtitleLine("嗨 Vsauce 我是 Michael"), "嗨 Vsauce 我是 Michael");
+    // 控制字符/零宽字符要去掉
+    assert.strictEqual(Core.sanitizeSubtitleLine("这里少\u200b得多"), "这里少得多");
+    // 中文显示契约：句号不显示
+    assert.strictEqual(Core.sanitizeSubtitleLine("这是一句话。"), "这是一句话");
+    // 汉字之间的多余空格压掉，拉丁词两侧空格保留
+    assert.strictEqual(Core.sanitizeSubtitleLine("这 是 一句话"), "这是一句话");
+  });
+
+  test("翻译超时必须容得下真实网关延迟，且全系统只有一处定义", () => {
+    // 实测同网关同模型（gpt-5.4-mini）翻 4 行波兰语端到端 10.0s–32.4s。
+    // 原先写死 20s：慢的请求被自己掐断，重试再超时，整个 clip 全成 [未翻译]。
+    // 这与源语言无关，是"大面积未翻译"的第二个独立根因。
+    assert.ok(Core.TRANSLATE_TIMEOUT_MS >= 60000, `翻译超时 ${Core.TRANSLATE_TIMEOUT_MS}ms 低于实测延迟上限，慢请求会被误判为失败`);
+    // 上限仍须存在，否则卡死的请求会永久占住重试队列
+    assert.ok(Core.TRANSLATE_TIMEOUT_MS <= 180000, "翻译超时过大，卡死请求会占住重试队列");
+    // 不得再各处硬写 20000
+    const isolatedSrc = fs.readFileSync(path.join(__dirname, "../isolated.js"), "utf8");
+    assert.equal(
+      /timeoutMs:\s*\d+/.test(isolatedSrc), false,
+      "isolated.js 又出现硬编码 timeoutMs，必须统一取 Core.TRANSLATE_TIMEOUT_MS"
+    );
+  });
+
+  test("validateChineseDisplayUnit：显式判定「模型没翻译」而不是靠删拉丁字母", () => {
+    const judge = (t) => Core.validateChineseDisplayUnit(t, { continues: false });
+    // 合法：夹专有名词、缩写、单位的中文译文必须通过
+    assert.strictEqual(judge("嗨 Vsauce 我是 Michael").ok, true, "专有名词密集的正确译文被误杀");
+    assert.strictEqual(judge("这是个 SodaStream 瓶子").ok, true, "品牌名导致误杀");
+    assert.strictEqual(judge("NASA 绘制了温度图").ok, true, "缩写导致误杀");
+    assert.strictEqual(judge("功率是 8.8 千瓦").ok, true, "数字导致误杀");
+    assert.strictEqual(judge("在 Google 和 Amazon 的数据中心里存储着数百万台服务器").ok, true, "多专名长句被误杀");
+    // 没翻译：整条源语言原样回吐必须拒绝（与源语言无关）
+    assert.strictEqual(judge("still English here").reason, "no-chinese", "纯英文未被拦住");
+    assert.strictEqual(judge("Mimas jest jednym z najsłodszych księżyców").reason, "no-chinese", "纯波兰语未被拦住");
+    assert.strictEqual(judge("Mimas jest jednym z 的").reason, "mostly-untranslated", "几乎没译未被拦住");
+    assert.strictEqual(judge("Mimas is one of Saturns cutest 卫星").reason, "mostly-untranslated", "半英半中未被拦住");
   });
 
 
@@ -3503,6 +3544,128 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
       offGrid.length, 0,
       `${offGrid.length} 个渲染单元的起始时间不在源原生时间上，例：${offGrid.slice(0, 2).map((u) => u.startMs).join(",")}`
     );
+  });
+
+  // ==========================================================================
+  // 语言无关性门禁
+  //
+  // 缘由：整套时间轴/切分/对齐此前隐含"源语言是英文"的假设，散落多处 ASCII-only
+  // 字符类（[A-Za-z0-9] 分词、[^0-9a-z一-鿿] 词键、按空白数词）。后果是真实用户
+  // 视频 scWj1BMRHUA（波兰语人工字幕轨）整轨失效：变音字母被吞成空格、词数被高估
+  // 导致超长行、词键被削致对齐抛错、138 单元里 127 条 [未翻译]。
+  // 这些都是"英文轨永远测不出"的缺陷，因此必须有跨书写系统的常驻门禁。
+  // ==========================================================================
+  const MULTILANG_SAMPLES = {
+    英语: "Mimas is one of Saturn's cutest moons but its enormous crater makes it look like the Death Star honestly",
+    波兰语: "Mimas jest jednym z najsłodszych księżyców Saturna ale jego ogromny krater powoduje że wygląda jak Gwiazda Śmierci",
+    俄语: "Мимас один из самых милых спутников Сатурна но его огромный кратер делает его похожим на Звезду Смерти",
+    希腊语: "Ο Μίμας είναι ένας από τους πιο χαριτωμένους δορυφόρους του Κρόνου αλλά ο τεράστιος κρατήρας του",
+    阿拉伯语: "ميماس هو أحد أجمل أقمار زحل لكن فوهته الضخمة تجعله يشبه نجمة الموت تماما جدا",
+    希伯来语: "מימאס הוא אחד הירחים החמודים של שבתאי אבל המכתש הענק שלו גורם לו להיראות",
+    印地语: "मीमास शनि के सबसे प्यारे चंद्रमाओं में से एक है लेकिन इसका विशाल क्रेटर",
+    土耳其语: "Mimas Satürnün en şirin uydularından biri ama dev krateri onu Ölüm Yıldızına benzetiyor gerçekten",
+    越南语: "Mimas là một trong những mặt trăng đáng yêu nhất của Sao Thổ nhưng miệng núi lửa khổng lồ",
+    韩语: "미마스는 토성의 가장 귀여운 위성 중 하나이지만 거대한 분화구 때문에 데스스타처럼 보입니다",
+    日语: "ミマスは土星の最もかわいい衛星の一つですが巨大なクレーターのせいで死の星のように見えますそしてNASAが温度マップを作ったとき最も暖かい領域がパックマンのように見えることを発見しました",
+    中文: "米玛斯是土星最可爱的卫星之一但它巨大的陨石坑让它看起来像死星而当美国航空航天局绘制温度图时最温暖的区域看起来像吃豆人",
+    泰语: "ไมมัสเป็นหนึ่งในดวงจันทร์ที่น่ารักที่สุดของดาวเสาร์แต่หลุมอุกกาบาตขนาดใหญ่ทำให้ดูเหมือนดาวมรณะและเมื่อนาซาสร้างแผนที่อุณหภูมิ",
+    中英混排: "NASAが温度マップを作ったとき Pac-Man のように見えた really",
+  };
+  const MULTILANG_CAP = 14;
+
+  Object.keys(MULTILANG_SAMPLES).forEach((lang) => {
+    test(`语言无关：${lang} 轨走完整链路（对齐/不丢词/不超宽/原文逐字保真）`, () => {
+      const text = MULTILANG_SAMPLES[lang];
+      const cues = Core.cleanupCues([{ start: 0, end: 9000, content: text }]);
+      const timeline = Core.buildCanonicalTokenTimeline(cues);
+      const display = Core.resegmentCues(cues, { maxWords: 12, continuationMaxWords: MULTILANG_CAP });
+
+      // 对齐不得抛错（词键被削 / 词流错位都会在这里炸）
+      const units = Core.buildCueTokenSpanUnits(timeline, display);
+      const snap = Core.createTimelineSnapshot({ timeline, units, cues });
+      const rendered = snap.renderUnits.filter((u) => String(u.originalText || "").trim());
+
+      // 不丢词
+      const covered = units.reduce((n, u) => n + (u.tokenEnd - u.tokenStart), 0);
+      assert.equal(covered, timeline.tokens.length, `${lang}: token 覆盖 ${covered}/${timeline.tokens.length}，丢词`);
+
+      // 不超过翻译层词数上限（超了必被 fail-closed 拒成 [未翻译]）
+      const widths = rendered.map((u) => Core.restoredWords(u.originalText).length);
+      const over = widths.filter((n) => n > MULTILANG_CAP);
+      assert.equal(over.length, 0, `${lang}: ${over.length} 个单元超过 ${MULTILANG_CAP} 词上限（最宽 ${Math.max(...widths)} 词）→ 会变 [未翻译]`);
+
+      // 零重叠
+      let overlap = 0;
+      for (let i = 0; i + 1 < rendered.length; i++) if (rendered[i].endMs > rendered[i + 1].startMs) overlap++;
+      assert.equal(overlap, 0, `${lang}: ${overlap} 处相邻单元重叠`);
+
+      // 原文逐字保真：不得丢字母（变音符号/非拉丁字）也不得插入空格撑开
+      const rebuilt = rendered.map((u) => u.originalText).join("").replace(/\s+/g, "");
+      assert.equal(rebuilt, text.replace(/\s+/g, ""), `${lang}: 原文被改动（丢字母或被空格撑开）`);
+    });
+  });
+
+  test("语言无关：连写文字（中日泰）必须一字一词，否则长度上限对它们全部失效", () => {
+    // 这是"通用方案"的承重点：不给中日泰另开分支，而是让它们的分词粒度与
+    // 空格分词语言可比，于是 maxWords / token 跨度时间 / 去重对齐全部原样生效。
+    assert.equal(Core.restoredWords("米玛斯是土星").length, 6, "中文未按字分词");
+    assert.equal(Core.restoredWords("ミマスは").length, 4, "日文假名未按字分词");
+    // 长音符 ー(U+30FC)、中点 ・ 的 Script 是 Common，需 scx 才归入假名
+    assert.deepEqual(Core.restoredWords("クレーター"), ["ク", "レ", "ー", "タ", "ー"], "长音符未按字切分");
+    // 拉丁与连写文字相邻时不得互相吞并
+    assert.deepEqual(Core.restoredWords("NASAが温度"), ["NASA", "が", "温", "度"], "拉丁块吞掉了连写文字");
+    // 空格分词语言必须保持原有粒度（连字符/撇号/千分位仍算一个词）
+    assert.deepEqual(
+      Core.restoredWords("purpose-built don't 1,800"),
+      ["purpose-built", "don't", "1,800"],
+      "空格分词语言的词粒度被破坏"
+    );
+    // 韩文用空格分词，不应被按字切开
+    assert.equal(Core.restoredWords("미마스는 토성의").length, 2, "韩文被误当连写文字");
+  });
+
+  test("语言无关：把词拼回文本时连写文字之间不得插入空格", () => {
+    // 一字一词之后，若无脑 join(" ")，45 字中文会变成 89 字的散字，屏上全是空隙。
+    assert.equal(Core.joinRestoredWords(["米", "玛", "斯"]), "米玛斯");
+    assert.equal(Core.joinRestoredWords(["Hello", "world"]), "Hello world");
+    // 混排：连写侧不加空格
+    assert.equal(Core.joinRestoredWords(["NASA", "が", "温", "度"]), "NASAが温度");
+  });
+
+  test("真实波兰语人工字幕轨（yt-dlp 抓取，0% 词级时间）：整轨可用且原文保真", () => {
+    // 用户实际报障的视频 scWj1BMRHUA。它与既有 ASR fixture 是两种不同形状：
+    //   - 人工字幕：一条 cue 就是一整句长文本，且【完全没有】tOffsetMs 词级时间
+    //   - ASR 轨：每条只有几个词，100% 带原生词级时间
+    // 既有门禁全按 ASR 轨写，因此这一整类缺陷此前无法被发现。
+    const raw = JSON.parse(fs.readFileSync(path.join(__dirname, "fixtures/youtube-manual-polish-raw.json"), "utf8"));
+    const cues = Core.cleanupCues(Core.parseJson3(raw));
+    assert.ok(cues.length > 100, `波兰语轨只解析出 ${cues.length} 条 cue`);
+
+    // 这条轨确实没有词级时间——保证 fixture 的形状不被后人换掉
+    assert.equal(Core.hasNativeTokenTiming(cues), false, "波兰语人工轨不应有原生词级时间（fixture 形状变了）");
+
+    const timeline = Core.buildCanonicalTokenTimeline(cues);
+    const display = Core.resegmentCues(cues, { maxWords: 12, continuationMaxWords: 14 });
+    const units = Core.buildCueTokenSpanUnits(timeline, display);
+    const snap = Core.createTimelineSnapshot({ timeline, units, cues });
+    const rendered = snap.renderUnits.filter((u) => String(u.originalText || "").trim());
+
+    const covered = units.reduce((n, u) => n + (u.tokenEnd - u.tokenStart), 0);
+    assert.equal(covered, timeline.tokens.length, `丢词：覆盖 ${covered}/${timeline.tokens.length}`);
+
+    const widths = rendered.map((u) => Core.restoredWords(u.originalText).length);
+    const over = widths.filter((n) => n > 14);
+    assert.equal(over.length, 0, `${over.length} 个单元超 14 词上限（最宽 ${Math.max(...widths)}）→ 会变 [未翻译]`);
+
+    let overlap = 0;
+    for (let i = 0; i + 1 < rendered.length; i++) if (rendered[i].endMs > rendered[i + 1].startMs) overlap++;
+    assert.equal(overlap, 0, `${overlap} 处相邻单元重叠`);
+
+    // 变音符号必须活着。原缺陷把 ł/ą/ę/ś/ż 全替换成空格，
+    // "najsłodszych księżyców" 变成 "najs odszych ksi yc w"。
+    const allText = rendered.map((u) => u.originalText).join(" ");
+    const diacritics = (allText.match(/[ąćęłńóśźżĄĆĘŁŃÓŚŹŻ]/g) || []).length;
+    assert.ok(diacritics > 100, `波兰语变音字母只剩 ${diacritics} 个，说明仍被吞掉`);
   });
 
   console.log("\n========================================");

@@ -1,0 +1,1033 @@
+{
+  "wireMagic": "pb3",
+  "pens": [ {
+  
+  } ],
+  "wsWinStyles": [ {
+  
+  } ],
+  "wpWinPositions": [ {
+  
+  } ],
+  "events": [ {
+    "tStartMs": 190,
+    "dDurationMs": 3140,
+    "segs": [ {
+      "utf8": "Hej, Vsauce. Tutaj Michael."
+    } ]
+  }, {
+    "tStartMs": 3330,
+    "dDurationMs": 4210,
+    "segs": [ {
+      "utf8": "Mimas jest jednym z najsłodszych księżyców Saturna."
+    } ]
+  }, {
+    "tStartMs": 7549,
+    "dDurationMs": 3101,
+    "segs": [ {
+      "utf8": "Jego cała powierzchnia jest wielkości Hiszpanii,"
+    } ]
+  }, {
+    "tStartMs": 10650,
+    "dDurationMs": 4149,
+    "segs": [ {
+      "utf8": "ale jego ogromny krater powoduje, że wygląda jak"
+    } ]
+  }, {
+    "tStartMs": 14799,
+    "dDurationMs": 3820,
+    "segs": [ {
+      "utf8": "Gwiazda Śmierci. A gdy NASA stworzyła mapę cieplną"
+    } ]
+  }, {
+    "tStartMs": 18619,
+    "dDurationMs": 4250,
+    "segs": [ {
+      "utf8": "Mimasa, odkryli, że najcieplejsze regiony - pokazane na żółto"
+    } ]
+  }, {
+    "tStartMs": 22869,
+    "dDurationMs": 3410,
+    "segs": [ {
+      "utf8": "przypominają Pac-Mana jedzącego krater"
+    } ]
+  }, {
+    "tStartMs": 26279,
+    "dDurationMs": 3240,
+    "segs": [ {
+      "utf8": "jak kropkę. Uczyłem się o Mimasie podczas"
+    } ]
+  }, {
+    "tStartMs": 29519,
+    "dDurationMs": 3421,
+    "segs": [ {
+      "utf8": "surfowania światowej sieci jak prawdziwy internauta."
+    } ]
+  }, {
+    "tStartMs": 34180,
+    "dDurationMs": 1780,
+    "segs": [ {
+      "utf8": "Ale Sieć"
+    } ]
+  }, {
+    "tStartMs": 35969,
+    "dDurationMs": 3930,
+    "segs": [ {
+      "utf8": "oraz Internet, to różne rzeczy. Sieć WWW\n[World Wide Web]"
+    } ]
+  }, {
+    "tStartMs": 39899,
+    "dDurationMs": 4101,
+    "segs": [ {
+      "utf8": "i Internet mają podobne nazwy,"
+    } ]
+  }, {
+    "tStartMs": 44000,
+    "dDurationMs": 3879,
+    "segs": [ {
+      "utf8": "ale łapią co innego. I jak zobaczymy"
+    } ]
+  }, {
+    "tStartMs": 47879,
+    "dDurationMs": 3391,
+    "segs": [ {
+      "utf8": "surfowanie WWW jest radykalne,"
+    } ]
+  }, {
+    "tStartMs": 51270,
+    "dDurationMs": 3420,
+    "segs": [ {
+      "utf8": "ale także à propos. Metaforycznie mówiąc,"
+    } ]
+  }, {
+    "tStartMs": 54690,
+    "dDurationMs": 3820,
+    "segs": [ {
+      "utf8": "sieć jest całkiem mokra."
+    } ]
+  }, {
+    "tStartMs": 58510,
+    "dDurationMs": 3369,
+    "segs": [ {
+      "utf8": "Zanim istniała sieć oraz zanim istniał internet,"
+    } ]
+  }, {
+    "tStartMs": 61879,
+    "dDurationMs": 3210,
+    "segs": [ {
+      "utf8": "istniały komputery, ale były duże"
+    } ]
+  }, {
+    "tStartMs": 65089,
+    "dDurationMs": 3171,
+    "segs": [ {
+      "utf8": "i samotne. Nie mogły właściwie rozmawiać ze sobą."
+    } ]
+  }, {
+    "tStartMs": 68260,
+    "dDurationMs": 3840,
+    "segs": [ {
+      "utf8": "Znaczy - racja - można było podłączyć podobne sprzęty, które mówiły podobnymi"
+    } ]
+  }, {
+    "tStartMs": 72100,
+    "dDurationMs": 1780,
+    "segs": [ {
+      "utf8": "protokołami, ale wtedy to była"
+    } ]
+  }, {
+    "tStartMs": 73880,
+    "dDurationMs": 4559,
+    "segs": [ {
+      "utf8": "sieć [network]. Aby połączyć osobne globalnie maszyny"
+    } ]
+  }, {
+    "tStartMs": 78439,
+    "dDurationMs": 3631,
+    "segs": [ {
+      "utf8": "potrzebaby sieci tych sieci."
+    } ]
+  }, {
+    "tStartMs": 82070,
+    "dDurationMs": 4390,
+    "segs": [ {
+      "utf8": "I w latach 60. grupa wspaniałych umysłów współpracowała"
+    } ]
+  }, {
+    "tStartMs": 86460,
+    "dDurationMs": 5140,
+    "segs": [ {
+      "utf8": "nad taką rzeczą. W tamtych czasach, koncerny telefonowe nie były zainteresowane"
+    } ]
+  }, {
+    "tStartMs": 91600,
+    "dDurationMs": 3839,
+    "segs": [ {
+      "utf8": "i ponieważ żadna instytucja nie mogłaby utrzymać całej odpowiedzialności"
+    } ]
+  }, {
+    "tStartMs": 95439,
+    "dDurationMs": 3601,
+    "segs": [ {
+      "utf8": "i siły obliczeniowej potrzebnej dla dedykowanych liń...\nNo cóż,"
+    } ]
+  }, {
+    "tStartMs": 99040,
+    "dDurationMs": 3490,
+    "segs": [ {
+      "utf8": "bardziej innowacyjne i wydajne metody zostały użyte."
+    } ]
+  }, {
+    "tStartMs": 102530,
+    "dDurationMs": 4210,
+    "segs": [ {
+      "utf8": "System obejmujący wiele narodów jest międzynarodowy."
+    } ]
+  }, {
+    "tStartMs": 106740,
+    "dDurationMs": 3040,
+    "segs": [ {
+      "utf8": "Więc system obejmujący wiele sieci"
+    } ]
+  }, {
+    "tStartMs": 109790,
+    "dDurationMs": 5189,
+    "segs": [ {
+      "utf8": "jest międzysiecią. W 1974,"
+    } ]
+  }, {
+    "tStartMs": 114979,
+    "dDurationMs": 3021,
+    "segs": [ {
+      "utf8": "w tym dokumencie, słowo internetwork"
+    } ]
+  }, {
+    "tStartMs": 118000,
+    "dDurationMs": 3869,
+    "segs": [ {
+      "utf8": "zostało oficjalnie skrócone do tego, co używamy dziś -\nInternet"
+    } ]
+  }, {
+    "tStartMs": 121869,
+    "dDurationMs": 3581,
+    "segs": [ {
+      "utf8": "29 października 1969,"
+    } ]
+  }, {
+    "tStartMs": 125450,
+    "dDurationMs": 3130,
+    "segs": [ {
+      "utf8": "dokładnie 100 dni po tym, jak po raz pierwszy"
+    } ]
+  }, {
+    "tStartMs": 128580,
+    "dDurationMs": 3150,
+    "segs": [ {
+      "utf8": "wylądowaliśmy na dalekiej skale w przestrzeni kosmicznej,"
+    } ]
+  }, {
+    "tStartMs": 131730,
+    "dDurationMs": 3009,
+    "segs": [ {
+      "utf8": "pierwszy raz wylądowaliśmy literę"
+    } ]
+  }, {
+    "tStartMs": 134739,
+    "dDurationMs": 5491,
+    "segs": [ {
+      "utf8": "na odległym ekranie w przestrzeni internetu.\nLeonard Kleinrock i drużyna w UCLA"
+    } ]
+  }, {
+    "tStartMs": 140230,
+    "dDurationMs": 1700,
+    "segs": [ {
+      "utf8": "zdecydowali się wysłać słowo"
+    } ]
+  }, {
+    "tStartMs": 141930,
+    "dDurationMs": 3529,
+    "segs": [ {
+      "utf8": "\"login\" do innego modelu komputera w Stanford."
+    } ]
+  }, {
+    "tStartMs": 145459,
+    "dDurationMs": 4320,
+    "segs": [ {
+      "utf8": "Przesłali \"L\" i dotarło. Przesłali \"O\""
+    } ]
+  }, {
+    "tStartMs": 149780,
+    "dDurationMs": 3820,
+    "segs": [ {
+      "utf8": "i dotarło. I wtedy system się zepsuł."
+    } ]
+  }, {
+    "tStartMs": 153610,
+    "dDurationMs": 3790,
+    "segs": [ {
+      "utf8": "Ale wciąż, pierwsza wiadomość przesłana przez internet"
+    } ]
+  }, {
+    "tStartMs": 157400,
+    "dDurationMs": 3720,
+    "segs": [ {
+      "utf8": "była wielką rzeczą. Na liście technologicznych osiągnięć"
+    } ]
+  }, {
+    "tStartMs": 161120,
+    "dDurationMs": 4180,
+    "segs": [ {
+      "utf8": "stanęła całkiem wysoko, nawet jeśli to było tylko"
+    } ]
+  }, {
+    "tStartMs": 165300,
+    "dDurationMs": 3100,
+    "segs": [ {
+      "utf8": "lo... [ang.: nisko]\nTeraz do przyszłości"
+    } ]
+  }, {
+    "tStartMs": 168400,
+    "dDurationMs": 4710,
+    "segs": [ {
+      "utf8": "o dwie dekady. CERN pracuje nad wieloma różnymi projektami z różnymi ludźmi"
+    } ]
+  }, {
+    "tStartMs": 173110,
+    "dDurationMs": 1000,
+    "segs": [ {
+      "utf8": "i technologiami."
+    } ]
+  }, {
+    "tStartMs": 174110,
+    "dDurationMs": 3000,
+    "segs": [ {
+      "utf8": "Aby się dowiedzieć kto lub co robi co..."
+    } ]
+  }, {
+    "tStartMs": 177110,
+    "dDurationMs": 5269,
+    "segs": [ {
+      "utf8": "Możesz po prostu sprawdzić to w internecie. Ale sposób w jaki informacja była układana w internecie"
+    } ]
+  }, {
+    "tStartMs": 182379,
+    "dDurationMs": 3750,
+    "segs": [ {
+      "utf8": "była nielogiczna. Bazując na hierarchiach,"
+    } ]
+  }, {
+    "tStartMs": 186129,
+    "dDurationMs": 4030,
+    "segs": [ {
+      "utf8": "liniowo, było to kiepskie. I to przeszkadzało człowiekowi"
+    } ]
+  }, {
+    "tStartMs": 190159,
+    "dDurationMs": 4201,
+    "segs": [ {
+      "utf8": "imieniem Tim Berners-Lee. Właściwie, mogłeś podążać za drzewem długi czas"
+    } ]
+  }, {
+    "tStartMs": 194360,
+    "dDurationMs": 3140,
+    "segs": [ {
+      "utf8": "tylko po to, żeby znaleźć osobę lub technologię związaną z jakimś innym projektem"
+    } ]
+  }, {
+    "tStartMs": 197500,
+    "dDurationMs": 4140,
+    "segs": [ {
+      "utf8": "i po informacje o tym, musisz iść spowrotem na początek i zacząć od nowa."
+    } ]
+  }, {
+    "tStartMs": 201640,
+    "dDurationMs": 3480,
+    "segs": [ {
+      "utf8": "Więc w marcu 1989 Tim Berners-Lee"
+    } ]
+  }, {
+    "tStartMs": 205129,
+    "dDurationMs": 4431,
+    "segs": [ {
+      "utf8": "napisał wartościowy tekst zwyczajnie nazwany \"Zarządzanie informacjami:"
+    } ]
+  }, {
+    "tStartMs": 209560,
+    "dDurationMs": 4280,
+    "segs": [ {
+      "utf8": "Propozycja\". Argumentował, że notatki z linkami,"
+    } ]
+  }, {
+    "tStartMs": 213840,
+    "dDurationMs": 3200,
+    "segs": [ {
+      "utf8": "jak odnośniki między nimi są użyteczniejsze niż"
+    } ]
+  }, {
+    "tStartMs": 217040,
+    "dDurationMs": 3339,
+    "segs": [ {
+      "utf8": "stały system hierarchii. Zamiast drzew,"
+    } ]
+  }, {
+    "tStartMs": 220379,
+    "dDurationMs": 3511,
+    "segs": [ {
+      "utf8": "Berners-Lee zaproponował sieć [web]."
+    } ]
+  }, {
+    "tStartMs": 224740,
+    "dDurationMs": 5160,
+    "segs": [ {
+      "utf8": "Sieciowane systemy, które łączyły dokumenty w nieliniowy sposób już istniały."
+    } ]
+  }, {
+    "tStartMs": 229900,
+    "dDurationMs": 3759,
+    "segs": [ {
+      "utf8": "Nazywały się hipertekstem. Ale Tim Berners-Lee"
+    } ]
+  }, {
+    "tStartMs": 233659,
+    "dDurationMs": 4080,
+    "segs": [ {
+      "utf8": "zoficjalizował małżeństwo hipertekstowych sieci i internetu,"
+    } ]
+  }, {
+    "tStartMs": 237739,
+    "dDurationMs": 5411,
+    "segs": [ {
+      "utf8": "aby stworzyć sieć, która była światowa. Było to szerokie, połączone, logiczne"
+    } ]
+  }, {
+    "tStartMs": 243150,
+    "dDurationMs": 3710,
+    "segs": [ {
+      "utf8": "i użyteczne partnerstwo potrzebne do stworzenia internetu, najszybciej przyjętej"
+    } ]
+  }, {
+    "tStartMs": 246860,
+    "dDurationMs": 3099,
+    "segs": [ {
+      "utf8": "formy komunikacji w historii naszego gatunku."
+    } ]
+  }, {
+    "tStartMs": 249959,
+    "dDurationMs": 3161,
+    "segs": [ {
+      "utf8": "Internet łączy uczestników,"
+    } ]
+  }, {
+    "tStartMs": 253120,
+    "dDurationMs": 3899,
+    "segs": [ {
+      "utf8": "sieć łączy informacje. Dokładniej,"
+    } ]
+  }, {
+    "tStartMs": 257019,
+    "dDurationMs": 4231,
+    "segs": [ {
+      "utf8": "hipertekstowe dokumenty dostępne przez internet."
+    } ]
+  }, {
+    "tStartMs": 261250,
+    "dDurationMs": 4790,
+    "segs": [ {
+      "utf8": "Możesz zobaczyć komputer, którym Tim Berners-Lee stworzył światową sieć"
+    } ]
+  }, {
+    "tStartMs": 266040,
+    "dDurationMs": 3820,
+    "segs": [ {
+      "utf8": "w Londyńskim Muzeum Nauki. 25 lat temu,"
+    } ]
+  }, {
+    "tStartMs": 269870,
+    "dDurationMs": 4870,
+    "segs": [ {
+      "utf8": "gdyby odłączyć ten komputer, możnaby dosłownie wyłączyć"
+    } ]
+  }, {
+    "tStartMs": 274740,
+    "dDurationMs": 3540,
+    "segs": [ {
+      "utf8": "całą sieć. Pierwsza strona sieciowa"
+    } ]
+  }, {
+    "tStartMs": 278280,
+    "dDurationMs": 5530,
+    "segs": [ {
+      "utf8": "to \"info.cern.ch\". Dzisiaj dostarcza ona symulator, który pozwala"
+    } ]
+  }, {
+    "tStartMs": 283810,
+    "dDurationMs": 1199,
+    "segs": [ {
+      "utf8": "zobaczyć sieć"
+    } ]
+  }, {
+    "tStartMs": 285009,
+    "dDurationMs": 3151,
+    "segs": [ {
+      "utf8": "jak wyglądała na początku. Przeszliśmy"
+    } ]
+  }, {
+    "tStartMs": 288160,
+    "dDurationMs": 4650,
+    "segs": [ {
+      "utf8": "długą drogę od tego. Jeśli chcesz dostać mindblowa,"
+    } ]
+  }, {
+    "tStartMs": 292810,
+    "dDurationMs": 3579,
+    "segs": [ {
+      "utf8": "odwiedź \"Onesecond.designly.com\" w sieci. Możesz zobaczyć jak dużo"
+    } ]
+  }, {
+    "tStartMs": 296389,
+    "dDurationMs": 3891,
+    "segs": [ {
+      "utf8": "Facebookowych like'ów, tweetów i nawet e-maili jest przesyłanych każdej sekundy"
+    } ]
+  }, {
+    "tStartMs": 300280,
+    "dDurationMs": 4770,
+    "segs": [ {
+      "utf8": "oraz jak dużo zostało wysłanych od kiedy otworzyłeś stronę."
+    } ]
+  }, {
+    "tStartMs": 305050,
+    "dDurationMs": 3690,
+    "segs": [ {
+      "utf8": "Isaac Asimov raz powiedział, że Ziemia powinna nazywać się"
+    } ]
+  }, {
+    "tStartMs": 308740,
+    "dDurationMs": 3390,
+    "segs": [ {
+      "utf8": "oceanem, ponieważ ocean jest jej największą"
+    } ]
+  }, {
+    "tStartMs": 312130,
+    "dDurationMs": 3379,
+    "segs": [ {
+      "utf8": "cechą. Nasze oceany są szerokie,"
+    } ]
+  }, {
+    "tStartMs": 315509,
+    "dDurationMs": 4671,
+    "segs": [ {
+      "utf8": "i niebezpieczne, i głębokie, i zagadkowe. Więc nie jest to zagadką, że gdy ludzie potrzebowali"
+    } ]
+  }, {
+    "tStartMs": 320180,
+    "dDurationMs": 2230,
+    "segs": [ {
+      "utf8": "metafory do opisania internetu"
+    } ]
+  }, {
+    "tStartMs": 322410,
+    "dDurationMs": 3680,
+    "segs": [ {
+      "utf8": "i na wygląd nieskończonej i często niezbadanej"
+    } ]
+  }, {
+    "tStartMs": 326090,
+    "dDurationMs": 4109,
+    "segs": [ {
+      "utf8": "sieci hipertekstu jaki dostarczał, kierowali się morzem."
+    } ]
+  }, {
+    "tStartMs": 330199,
+    "dDurationMs": 3111,
+    "segs": [ {
+      "utf8": "Surfujemy po sieci, nawigując"
+    } ]
+  }, {
+    "tStartMs": 333310,
+    "dDurationMs": 3790,
+    "segs": [ {
+      "utf8": "strumienie danych. Są tam piraci i powodzie i połowy [phishing]."
+    } ]
+  }, {
+    "tStartMs": 337100,
+    "dDurationMs": 3720,
+    "segs": [ {
+      "utf8": "Nawet blogi i vlogi pochodzą"
+    } ]
+  }, {
+    "tStartMs": 340820,
+    "dDurationMs": 4740,
+    "segs": [ {
+      "utf8": "od logów - zapisów początkowo trzymanych przez kapitanów na morzu."
+    } ]
+  }, {
+    "tStartMs": 345560,
+    "dDurationMs": 3640,
+    "segs": [ {
+      "utf8": "Jak ciekła woda, sieć jest fenomenalnym rozpuszczalnikiem."
+    } ]
+  }, {
+    "tStartMs": 349210,
+    "dDurationMs": 3880,
+    "segs": [ {
+      "utf8": "Sprawia, że materiał jest szeroko dostępny."
+    } ]
+  }, {
+    "tStartMs": 353090,
+    "dDurationMs": 3590,
+    "segs": [ {
+      "utf8": "Szacuje się, że każda strona sieciowa jest średnio"
+    } ]
+  }, {
+    "tStartMs": 356680,
+    "dDurationMs": 3230,
+    "segs": [ {
+      "utf8": "19 kliknięć od każdej"
+    } ]
+  }, {
+    "tStartMs": 359910,
+    "dDurationMs": 3060,
+    "segs": [ {
+      "utf8": "innej strony. Jak nasze oceany,"
+    } ]
+  }, {
+    "tStartMs": 362970,
+    "dDurationMs": 3400,
+    "segs": [ {
+      "utf8": "sieć jest po prostu jednym globalnym"
+    } ]
+  }, {
+    "tStartMs": 366370,
+    "dDurationMs": 3370,
+    "segs": [ {
+      "utf8": "morzem. I jak nasze oceany, sieć"
+    } ]
+  }, {
+    "tStartMs": 369740,
+    "dDurationMs": 4130,
+    "segs": [ {
+      "utf8": "jest ekosystemem, którego potrzebujemy i musimy ostrożnie ochraniać."
+    } ]
+  }, {
+    "tStartMs": 373870,
+    "dDurationMs": 4299,
+    "segs": [ {
+      "utf8": "Jest giętki i płynący, i jak odkrywamy"
+    } ]
+  }, {
+    "tStartMs": 378169,
+    "dDurationMs": 4911,
+    "segs": [ {
+      "utf8": "sieć, jak ciekła woda, jest czymś, w czym możesz zobaczyć siebie."
+    } ]
+  }, {
+    "tStartMs": 383080,
+    "dDurationMs": 3739,
+    "segs": [ {
+      "utf8": "W latach 90. Douglas Rushkoff wymyślił termin"
+    } ]
+  }, {
+    "tStartMs": 386819,
+    "dDurationMs": 4231,
+    "segs": [ {
+      "utf8": "\"ekrano-latkowie\", aby opisać pokolenie, które pierwszy raz wyrastało"
+    } ]
+  }, {
+    "tStartMs": 391050,
+    "dDurationMs": 1519,
+    "segs": [ {
+      "utf8": "na myśli, że obrazy"
+    } ]
+  }, {
+    "tStartMs": 392569,
+    "dDurationMs": 3641,
+    "segs": [ {
+      "utf8": "na ekranie nie są czymś, na co można jedynie patrzeć,"
+    } ]
+  }, {
+    "tStartMs": 396210,
+    "dDurationMs": 3670,
+    "segs": [ {
+      "utf8": "ale zamiast tego, czymś co można manipulować."
+    } ]
+  }, {
+    "tStartMs": 399880,
+    "dDurationMs": 3090,
+    "segs": [ {
+      "utf8": "Cóż, dziś jest to jeszcze bardziej ekstremalne."
+    } ]
+  }, {
+    "tStartMs": 402970,
+    "dDurationMs": 3419,
+    "segs": [ {
+      "utf8": "Narzędzia i łączność dostarczana przez Sieć pozwala nam myśleć"
+    } ]
+  }, {
+    "tStartMs": 406389,
+    "dDurationMs": 3011,
+    "segs": [ {
+      "utf8": "o obrazach na ekranach nie tylko o rzeczach do manipulowania,"
+    } ]
+  }, {
+    "tStartMs": 409400,
+    "dDurationMs": 4690,
+    "segs": [ {
+      "utf8": "ale jako rzeczom, na które możemy nakładać naszą tożsamość."
+    } ]
+  }, {
+    "tStartMs": 414090,
+    "dDurationMs": 4130,
+    "segs": [ {
+      "utf8": "Nie każdy kto to robi jest profesjonalnym powieściopisarzem"
+    } ]
+  }, {
+    "tStartMs": 418220,
+    "dDurationMs": 3870,
+    "segs": [ {
+      "utf8": "lub uznanym poetą lub razem."
+    } ]
+  }, {
+    "tStartMs": 422090,
+    "dDurationMs": 6270,
+    "segs": [ {
+      "utf8": "Ale, poza materiałem, hiperlinkowane sieci ludzkich ekspresji są niewiarygodnie bogatymy środowiskami"
+    } ]
+  }, {
+    "tStartMs": 428360,
+    "dDurationMs": 4400,
+    "segs": [ {
+      "utf8": "i ćwiczą one nasz mózg, bardziej niż książki?"
+    } ]
+  }, {
+    "tStartMs": 433820,
+    "dDurationMs": 2020,
+    "segs": [ {
+      "utf8": "No, wyłącznie dla argumentu,"
+    } ]
+  }, {
+    "tStartMs": 435849,
+    "dDurationMs": 3741,
+    "segs": [ {
+      "utf8": "czytajmy z \"Wszystko co złe jest dla ciebie dobre\","
+    } ]
+  }, {
+    "tStartMs": 439590,
+    "dDurationMs": 3100,
+    "segs": [ {
+      "utf8": "książki Stevena Johnsona. W tej książce"
+    } ]
+  }, {
+    "tStartMs": 442690,
+    "dDurationMs": 3319,
+    "segs": [ {
+      "utf8": "wyobraża sobie świat, w którym książki zostały wynalezione"
+    } ]
+  }, {
+    "tStartMs": 446009,
+    "dDurationMs": 3470,
+    "segs": [ {
+      "utf8": "po grach wideo i WWW."
+    } ]
+  }, {
+    "tStartMs": 449479,
+    "dDurationMs": 3361,
+    "segs": [ {
+      "utf8": "Wszędzie dzieci zaczynają czytać te nowe, modne"
+    } ]
+  }, {
+    "tStartMs": 452840,
+    "dDurationMs": 4460,
+    "segs": [ {
+      "utf8": "książki, więc nauczyciele i rodzice są zaniepokojeni. Wyobraża sobie,"
+    } ]
+  }, {
+    "tStartMs": 457300,
+    "dDurationMs": 3230,
+    "segs": [ {
+      "utf8": "że mogą mówić coś w tym stylu:"
+    } ]
+  }, {
+    "tStartMs": 460530,
+    "dDurationMs": 3180,
+    "segs": [ {
+      "utf8": "\"Byćmoże najniebezpieczniejszą właściwością tych książek"
+    } ]
+  }, {
+    "tStartMs": 463710,
+    "dDurationMs": 3450,
+    "segs": [ {
+      "utf8": "jest fakt, że podążają one stałą, liniową ścieżką."
+    } ]
+  }, {
+    "tStartMs": 467160,
+    "dDurationMs": 3520,
+    "segs": [ {
+      "utf8": "Nie możesz kontrolować ich narracji w żaden sposób. Zwyczajnie siadasz"
+    } ]
+  }, {
+    "tStartMs": 470680,
+    "dDurationMs": 3220,
+    "segs": [ {
+      "utf8": "i ta opowieść jest tobie dyktowana."
+    } ]
+  }, {
+    "tStartMs": 473900,
+    "dDurationMs": 4329,
+    "segs": [ {
+      "utf8": "Dla tych z nas, dorastających na interaktywnych narracjach, ta właściwość może wydawać się"
+    } ]
+  }, {
+    "tStartMs": 478229,
+    "dDurationMs": 3190,
+    "segs": [ {
+      "utf8": "zaskakująca. Dlaczego ktoś chciałby rozpocząć przygodę"
+    } ]
+  }, {
+    "tStartMs": 481419,
+    "dDurationMs": 3111,
+    "segs": [ {
+      "utf8": "w całości poukładaną przez inną osobę?"
+    } ]
+  }, {
+    "tStartMs": 484530,
+    "dDurationMs": 3389,
+    "segs": [ {
+      "utf8": "Ale dzisiejsze pokolenie rozpoczyna takie przygody"
+    } ]
+  }, {
+    "tStartMs": 487919,
+    "dDurationMs": 3491,
+    "segs": [ {
+      "utf8": "miliony razy dziennie. Czytanie nie jest"
+    } ]
+  }, {
+    "tStartMs": 491410,
+    "dDurationMs": 3900,
+    "segs": [ {
+      "utf8": "procesem z aktywnym uczestnictwem, tylko uległym."
+    } ]
+  }, {
+    "tStartMs": 495310,
+    "dDurationMs": 3079,
+    "segs": [ {
+      "utf8": "Czytelnicy książek młodszych pokoleń uczą się"
+    } ]
+  }, {
+    "tStartMs": 498389,
+    "dDurationMs": 4221,
+    "segs": [ {
+      "utf8": "podążać za wątkiem zamiast go prowadzić.\""
+    } ]
+  }, {
+    "tStartMs": 502610,
+    "dDurationMs": 3149,
+    "segs": [ {
+      "utf8": "Interesujące. Ale możesz myśleć, no weź,"
+    } ]
+  }, {
+    "tStartMs": 505759,
+    "dDurationMs": 3321,
+    "segs": [ {
+      "utf8": "Michael, nie możesz odsuwać materiału na bok tak prosto."
+    } ]
+  }, {
+    "tStartMs": 509080,
+    "dDurationMs": 3560,
+    "segs": [ {
+      "utf8": "Co na temat wszystkich głupich i powierzchownych rzeczy, które sieć upowszechnia?"
+    } ]
+  }, {
+    "tStartMs": 512640,
+    "dDurationMs": 4459,
+    "segs": [ {
+      "utf8": "Znaczy, racja, dużo z tego jest kompletnie bezużyteczne. W końcu, jesteśmy ludźmi,"
+    } ]
+  }, {
+    "tStartMs": 517100,
+    "dDurationMs": 4919,
+    "segs": [ {
+      "utf8": "powinniśmy wartościować powód. Może."
+    } ]
+  }, {
+    "tStartMs": 522019,
+    "dDurationMs": 4260,
+    "segs": [ {
+      "utf8": "Ale czy to  powoduje, że jesteśmy wyjątkowi? Unamuno powiedział:"
+    } ]
+  }, {
+    "tStartMs": 526279,
+    "dDurationMs": 3211,
+    "segs": [ {
+      "utf8": "\"częściej widziałem kota uzasadniającego"
+    } ]
+  }, {
+    "tStartMs": 529490,
+    "dDurationMs": 3260,
+    "segs": [ {
+      "utf8": "niż śmiejącego lub płaczącego. Byćmoże on płacze lub śmieje się"
+    } ]
+  }, {
+    "tStartMs": 532750,
+    "dDurationMs": 4899,
+    "segs": [ {
+      "utf8": "wewnętrznie. Lecz wtedy byćmoże, także wewnętrznie, krab rozwiązuje równania"
+    } ]
+  }, {
+    "tStartMs": 537649,
+    "dDurationMs": 5761,
+    "segs": [ {
+      "utf8": "drugiego stopnia.\" Co jeśli tanie śmieszki, soczyste poematy, plotki,"
+    } ]
+  }, {
+    "tStartMs": 543410,
+    "dDurationMs": 2619,
+    "segs": [ {
+      "utf8": "skomlenie, dramaty i selfie tak naprawdę są"
+    } ]
+  }, {
+    "tStartMs": 546029,
+    "dDurationMs": 4761,
+    "segs": [ {
+      "utf8": "najbardziej ludzką rzeczą, którą sieć pozwoliła nam robić?"
+    } ]
+  }, {
+    "tStartMs": 550790,
+    "dDurationMs": 3970,
+    "segs": [ {
+      "utf8": "To głębokie. Ale nie tak głębokie jak Głęboka Sieć,"
+    } ]
+  }, {
+    "tStartMs": 554760,
+    "dDurationMs": 3460,
+    "segs": [ {
+      "utf8": "ukryta sieć. Część sieci niewidoczna"
+    } ]
+  }, {
+    "tStartMs": 558220,
+    "dDurationMs": 5160,
+    "segs": [ {
+      "utf8": "dla silników wyszukiwania. Teraz, większość z tego, to nieszkodliwe dane"
+    } ]
+  }, {
+    "tStartMs": 563380,
+    "dDurationMs": 1840,
+    "segs": [ {
+      "utf8": "ukryte za paywall lub hasłami"
+    } ]
+  }, {
+    "tStartMs": 565220,
+    "dDurationMs": 3760,
+    "segs": [ {
+      "utf8": "lub dynamicznie tworzonymi stronami sieciowymi. Ale nawet nie zindeksowaliśmy"
+    } ]
+  }, {
+    "tStartMs": 568980,
+    "dDurationMs": 4020,
+    "segs": [ {
+      "utf8": "tego. I nie jest to 1% sieci,"
+    } ]
+  }, {
+    "tStartMs": 573000,
+    "dDurationMs": 3350,
+    "segs": [ {
+      "utf8": "nie 10%. To 80%"
+    } ]
+  }, {
+    "tStartMs": 576350,
+    "dDurationMs": 3109,
+    "segs": [ {
+      "utf8": "całej sieci WWW."
+    } ]
+  }, {
+    "tStartMs": 579459,
+    "dDurationMs": 3250,
+    "segs": [ {
+      "utf8": "Sieć to głęboki ocean"
+    } ]
+  }, {
+    "tStartMs": 582709,
+    "dDurationMs": 4231,
+    "segs": [ {
+      "utf8": "w którym ciągle robimy fale. Na przykład, popatrz na użycie emoji"
+    } ]
+  }, {
+    "tStartMs": 586940,
+    "dDurationMs": 5000,
+    "segs": [ {
+      "utf8": "na Twitterze w czasie rzeczywistym i powiedz kilka słów pocieszenia"
+    } ]
+  }, {
+    "tStartMs": 591940,
+    "dDurationMs": 4579,
+    "segs": [ {
+      "utf8": "dla najmniej popularnego emoji. My także ciągle eksplorujemy sieć."
+    } ]
+  }, {
+    "tStartMs": 596519,
+    "dDurationMs": 4171,
+    "segs": [ {
+      "utf8": "To kompletnie nowa granica. Każdego dnia"
+    } ]
+  }, {
+    "tStartMs": 600690,
+    "dDurationMs": 3709,
+    "segs": [ {
+      "utf8": "Google otrzymuje 500 milionów zapytań,"
+    } ]
+  }, {
+    "tStartMs": 604399,
+    "dDurationMs": 4271,
+    "segs": [ {
+      "utf8": "które nigdy wcześniej nie zostały wyszukane."
+    } ]
+  }, {
+    "tStartMs": 608670,
+    "dDurationMs": 3609,
+    "segs": [ {
+      "utf8": "Gdzie zaprowadzi nas ta eksploracja?"
+    } ]
+  }, {
+    "tStartMs": 612279,
+    "dDurationMs": 5341,
+    "segs": [ {
+      "utf8": "Kto wie? Ale wróćmy do naszej metafory, dokładnie te same stroje, które stworzyliśmy do eksploracji"
+    } ]
+  }, {
+    "tStartMs": 617620,
+    "dDurationMs": 1980,
+    "segs": [ {
+      "utf8": "głębin oceanu"
+    } ]
+  }, {
+    "tStartMs": 619600,
+    "dDurationMs": 3310,
+    "segs": [ {
+      "utf8": "zainspirowały i stworzyły stroje, które później użyliśmy,"
+    } ]
+  }, {
+    "tStartMs": 622910,
+    "dDurationMs": 4299,
+    "segs": [ {
+      "utf8": "by opuścić Ziemię. Więc eksploruj dalej,"
+    } ]
+  }, {
+    "tStartMs": 627209,
+    "dDurationMs": 1280,
+    "segs": [ {
+      "utf8": "surfuj dalej."
+    } ]
+  }, {
+    "tStartMs": 628540,
+    "dDurationMs": 1000,
+    "segs": [ {
+      "utf8": "I jak zawsze,"
+    } ]
+  }, {
+    "tStartMs": 629540,
+    "dDurationMs": 1660,
+    "segs": [ {
+      "utf8": "dzieki za oglądanie."
+    } ]
+  } ]
+}
