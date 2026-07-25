@@ -473,6 +473,69 @@ test("normalizeOversizeSentenceMarks 只重切超长屏并保留模型自然边�
   assert.strictEqual(units.map((u) => u.content).join(" "), source, "必须逐词保真");
 });
 
+asyncTest("真实长轨三特征回归门禁：多词 token + 无句末标点 + 长连续语流不得整轨作废或退化成均匀硬切", async () => {
+  // 这三个特征是两轮 bug 全部逃过离线门禁的原因,补成确定性 mock 门禁,不花真实 token:
+  //   1. 多词 token —— ASR token 含千分位数字(1,800 / 334,720)或连字符复合词,
+  //      词数 != token 数。历史 bug:partition 在词空间返回 marks、按 token 索引写回,
+  //      越界撑长 marks 数组 → packRestoredTokens 长度校验失败返回 [] → 整轨 0 屏。
+  //   2. 模型只产出 |、从不产出句末 . (真实轨实测 dot:0)。历史 bug:normalize 按 .
+  //      分句,整轨被当一个巨句,任一处漏切就重排整段、抹平模型所有自然边界。
+  //   3. 长连续语流(远超单块)—— 短单句样本永远触发不到上面两条。
+  const sentences = [
+    "the cheapest electric kettle I could get my hands on draws 1,800 watts",
+    "and that purpose-built appliance boils a full liter in well under four minutes",
+    "our standard outlets only deliver 120 volts which limits total available power",
+    "so the same 334,720 joules of energy takes noticeably longer to move",
+    "meanwhile a 240 volt circuit in other countries reaches 3,000 watts easily",
+    "that difference of 8.8 percent efficiency compounds over many repeated cycles",
+  ];
+  const source = sentences.join(" ");
+  const words = source.split(" ");
+  const tokens = words.map((text, i) => ({ text, start: i * 200, end: (i + 1) * 200, nativeTiming: true }));
+  // 确认样本真的含多词 token(否则门禁形同虚设)
+  const multiWord = tokens.filter((t) => Core.restoredWords(t.text).length > 1);
+  assert.ok(multiWord.length === 0, "本样本 token 均为单词形态,数字千分位应被计为一个词");
+  assert.strictEqual(Core.restoredWords("1,800").length, 1, "千分位数字必须计为一个词");
+  assert.strictEqual(Core.restoredWords("8.8").length, 1, "小数必须计为一个词");
+  assert.strictEqual(Core.restoredWords("purpose-built").length, 1, "连字符复合词必须计为一个词");
+
+  // 模型在每个子句末给 |,且全程不给句末 . —— 复刻真实轨 dot:0 行为
+  const cutWordIndexes = [];
+  let acc = 0;
+  for (const s of sentences) { acc += s.split(" ").length; cutWordIndexes.push(acc - 1); }
+  let calls = 0;
+  const units = await Core.restoreAndPackTokens({
+    tokens,
+    apiBaseUrl: "https://example.test", apiKey: "sk-test", apiModel: "m",
+    chunkWords: 30, overlapWords: 8, preferredMaxWords: 10, maxWords: 12, attempts: 1,
+    fetchImpl: async (_url, req) => {
+      calls++;
+      const body = JSON.parse(req.body), payload = JSON.parse(body.messages[1].content);
+      // 只在本块可见范围内回报属于全局切点的 token id(模拟真实分块行为)
+      const ids = new Set(payload.tokens.map((t) => t.id));
+      const cuts = cutWordIndexes.map((i) => "t" + i).filter((id) => ids.has(id));
+      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ cutsAfter: cuts }) } }] }) };
+    },
+  });
+
+  // 1) 绝不整轨作废(历史 bug 表现为 0 屏)
+  assert.ok(units.length > 0, "多词 token + 无句末标点不得导致整轨 0 屏");
+  // 2) 词流逐词保真,不丢不改
+  assert.strictEqual(units.map((u) => u.content).join(" "), source, "词流必须逐词保真");
+  // 3) 无超长屏
+  units.forEach((u) => assert.ok(Core.restoredWords(u.content).length <= 12, `屏超硬上限: ${u.content}`));
+  // 4) 不得退化成均匀硬切:模型给的子句边界必须大部分存活。
+  //    历史退化表现为「几乎每屏正好 preferredMaxWords 词」,这里要求 10 词屏占比 < 60%。
+  const wc = units.map((u) => Core.restoredWords(u.content).length);
+  const tens = wc.filter((w) => w === 10).length;
+  assert.ok(tens / units.length < 0.6, `退化成均匀硬切(10 词屏占比 ${(tens / units.length * 100).toFixed(0)}%),模型边界被抹平`);
+  // 5) 时间轴连续且端点不变
+  assert.strictEqual(units[0].start, tokens[0].start, "首屏起点必须来自首 token");
+  assert.strictEqual(units[units.length - 1].end, tokens[tokens.length - 1].end, "末屏终点必须来自末 token");
+  for (let i = 1; i < units.length; i++) assert.strictEqual(units[i - 1].end, units[i].start, "时间轴必须连续");
+  assert.ok(calls >= 2, "长语流应触发多次分块调用");
+});
+
 asyncTest("restoreAndPackTokens 真实水壶长句拆成四个舒适短屏且保留词与时间", async () => {
   const source = "let me reiterate that the cheapest electric kettle I could get my hands on is significantly faster at boiling water than this stove top kettle despite being limited by our 120 volt electrical system";
   const tokens = source.split(" ").map((text, i) => ({ text, start: 237505 + i * 400, end: 237905 + i * 400, nativeTiming: true }));
