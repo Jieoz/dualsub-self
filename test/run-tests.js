@@ -3194,6 +3194,29 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
         `渲染单元 ${i} 与下一条重叠: ${ru[i].endMs} > ${ru[i + 1].startMs}`);
     }
 
+    // 可读下限必须**随词数增长**,不能是定值。
+    // 实测 ASR 会给出 "13 词 / 1000ms"(77ms/词 ≈ 650 wpm)这类失真 cue:
+    // 定值下限(曾用 1200ms)会认为它够长而完全不管,长句照旧一闪而过。
+    const longTl = {
+      sourceFingerprint: "fp-long",
+      tokens: [],
+    };
+    // 13 词挤在 1000ms 内,后面留 1000ms 静音(真机 #16 的形状)
+    const words = "I think it is fair to say that they are a lot less".split(" ");
+    words.forEach((w, i) => {
+      longTl.tokens.push({ id: i, text: w, startMs: 40322 + i * 77, endMs: 40322 + (i + 1) * 77 });
+    });
+    longTl.tokens.push({ id: words.length, text: "next", startMs: 42324, endMs: 43182 });
+    const longUnits = Core.buildTokenSpanUnits(longTl, [words.length - 1]);
+    const longSnap = Core.createTimelineSnapshot({ timeline: longTl, units: longUnits });
+    const longRu = longSnap.renderUnits[0];
+    const longDur = longRu.endMs - longRu.startMs;
+    const perWord = longDur / words.length;
+    assert.ok(perWord >= 150,
+      `长单元每词时长仍过短(下限没随词数增长): ${Math.round(perWord)}ms/词, 总 ${longDur}ms`);
+    assert.ok(longRu.endMs <= longSnap.renderUnits[1].startMs,
+      "长单元补偿后与下一条重叠");
+
     // 静音不足时只能借多少算多少,仍不许重叠
     const tightTl = {
       sourceFingerprint: "fp-tight",
