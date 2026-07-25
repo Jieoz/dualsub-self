@@ -350,9 +350,23 @@
     return buildTokenSpanUnits(timeline, boundaries);
   }
 
-  // 一条字幕至少要可读这么久。短句(尤其被长句从中间切开后的后半截)的
-  // token 跨度可能只有 100-300ms,照抄就是一闪而过、几乎看不见。
-  var MIN_VISIBLE_MS = 1200;
+  // 一条字幕至少要可读这么久 —— 下限必须**随词数增长**,不能是个定值。
+  //
+  // 定值(曾用 1200ms)的问题:1 词和 13 词拿到同样的预算。实测真机轨里
+  // ASR 自己就会给出 "13 词 / 1000ms"(77ms/词 ≈ 650 wpm,没人这么说话)
+  // 这类明显失真的 cue —— 定值下限认为它「够长」,于是完全不管,长句照旧
+  // 一闪而过。真机轨共 9 条原始 cue 的每词时长低于 150ms。
+  //
+  // 参考量:该轨正常语速中位约 350ms/词、p10 约 255ms/词。取 200ms/词
+  // 作为「勉强读得完」的地板(约 300 wpm),明显偏快才补,不动正常语速的行。
+  var MIN_VISIBLE_MS = 1200; // 单条字幕的绝对下限(极短单元用)
+  var MIN_MS_PER_WORD = 200; // 每词可读时长地板(长单元用)
+
+  // 一个显示单元的目标可读时长。取「绝对下限」与「按词数折算」的较大者。
+  function minVisibleMsForUnit(text) {
+    var words = restoredWords(String(text == null ? "" : text)).length;
+    return Math.max(MIN_VISIBLE_MS, words * MIN_MS_PER_WORD);
+  }
 
   /**
    * 给过短的显示单元补足可读时长 —— 只向后延进**真正的静音**里。
@@ -368,10 +382,11 @@
    */
   function padShortUnitsIntoSilence(units, minVisibleMs) {
     var list = Array.isArray(units) ? units : [];
-    var floor = minVisibleMs != null ? minVisibleMs : MIN_VISIBLE_MS;
     for (var i = 0; i < list.length; i++) {
       var u = list[i];
       if (!u) continue;
+      // 下限按该单元自己的词数算(显式传入则一律用传入值,便于测试)
+      var floor = minVisibleMs != null ? minVisibleMs : minVisibleMsForUnit(u.originalText);
       var dur = u.endMs - u.startMs;
       if (dur >= floor) continue;
       var next = list[i + 1];
