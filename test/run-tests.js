@@ -1565,6 +1565,29 @@ test("makeCacheKey 同输入稳定、异输入不同", () => {
   assert.notStrictEqual(a, c, "目标语言不同 key 不同 → 不误命中");
 });
 
+test("真实轨重新解析后语义缓存 key 不变（第二次观看必须秒出）", () => {
+  // 首屏 6-7 秒是网关单次往返的固定开销（实测：clip 切小反而更慢，1 段 7771ms vs 4 段 3798ms；
+  // reasoning_effort 已是最快合法档位，none 反而 16771ms）。既然首包压不下去，
+  // "第二次看同一视频秒出" 就是唯一的体验杠杆，而它完全取决于缓存 key 在重新解析后是否稳定。
+  // 一旦 fingerprint 掺进不稳定输入（Date.now / 遍历顺序 / 浮点误差），缓存永远 miss，
+  // 用户每次都要重等 6 秒，而所有功能测试仍会全绿 —— 没有这条门禁就没人会发现。
+  const raw = JSON.parse(fs.readFileSync(path.join(__dirname, "fixtures", "youtube-json3-rolling-raw.json"), "utf8"));
+  const idOf = (tokens) => Core.makeSemanticCacheKey({
+    videoId: "_yMMTVVJI4c", trackCode: "en", apiBaseUrl: "http://gw/v1", apiModel: "m",
+    tokens, systemPrompt: Core.DEFAULT_RESTORATION_PROMPT,
+    chunkWords: Core.SEMANTIC_CHUNK_WORDS, overlapWords: Core.SEMANTIC_OVERLAP_WORDS,
+    preferredMaxWords: 10, maxWords: 12,
+  });
+  // 完整走两遍生产链路（parse -> cleanup -> collect），模拟下次打开页面
+  const pass = () => Core.collectSemanticTokens(Core.cleanupCues(Core.parseJson3(JSON.parse(JSON.stringify(raw)))));
+  const t1 = pass();
+  const t2 = pass();
+  assert.ok(t1.length > 0, "真实轨必须产出词流");
+  assert.strictEqual(idOf(t2), idOf(t1), "重新解析同一轨 key 必须一致，否则缓存永远 miss、每次都重等首包");
+  // 反向：词流真变了必须换 key，不能为了稳定而对内容不敏感
+  assert.notStrictEqual(idOf(t1.slice(0, -1)), idOf(t1), "词流改变必须换 key，不得串用旧译文");
+});
+
 test("makeCacheKey v0.6 隔离旧协议缓存与 fallback/semantic 分段", () => {
   const fallback = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", segmentationMode: "fallback", clipStartMs: 0 });
   const semantic = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", segmentationMode: "semantic", clipStartMs: 0 });
