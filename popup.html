@@ -291,6 +291,10 @@
           </div>
           <button id="cancelSrtBtn" class="secondary" style="display:none">取消全轨翻译</button>
           <div class="hint">若全轨尚未翻完，会先明确确认费用并显示进度，可随时取消后续批次；不会静默请求整轨。</div>
+          <div class="row" style="margin-top:8px">
+            <button id="exportProgressSrtBtn" class="secondary">导出当前进度（诊断用）</button>
+          </div>
+          <div class="hint">按<strong>当前已翻译的内容</strong>原样导出，<strong>不发起任何翻译请求、不产生费用</strong>。未翻译的单元会保留原文并标记 <code>[未翻译]</code>，还会在文件头写入时长统计，便于反馈显示问题。这是诊断快照，不是成品字幕。</div>
         </div>
       </details>
 

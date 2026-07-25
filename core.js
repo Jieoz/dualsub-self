@@ -3151,6 +3151,82 @@
     }
     return blocks.length ? blocks.join("\n\n") + "\n" : "";
   }
+
+  /**
+   * 诊断快照 SRT:按**当前**已翻译内容原样导出,不做 fail-closed 拦截。
+   *
+   * 与 buildSrt 的区别和分工:
+   *   buildSrt(requireTranslations:true) = 成品导出,任何缺译文都拒绝出文件
+   *                                        (绝不产出半英文半中文成品)。
+   *   buildProgressSrt                   = 诊断用,故意允许半成品,但会把
+   *                                        未翻译单元显式标记出来,并在文件头
+   *                                        附上每单元时长/每词时长统计,
+   *                                        方便直接看出「长句一闪而过」这类问题。
+   * 两者共用同一个 buildSrt 渲染核心,不另写一套时间格式化逻辑。
+   */
+  function buildProgressSrt(renderUnits, opts) {
+    opts = opts || {};
+    var list = (renderUnits || []).filter(function (u) {
+      return u && (String(u.originalText || "").trim() || String(u.translation || "").trim());
+    });
+    var marked = list.map(function (u) {
+      var trans = String(u.translation || "").trim();
+      return {
+        startMs: u.startMs != null ? u.startMs : u.start,
+        endMs: u.endMs != null ? u.endMs : u.end,
+        originalText: u.originalText,
+        // 未翻译的显式标记,避免把半成品误当成品看
+        translation: trans || "[未翻译]",
+      };
+    });
+    var body = buildSrt(marked, { mode: opts.mode || "bilingual_orig_top" });
+    if (!body) return "";
+    var stats = progressSrtStats(list);
+    var header = [
+      "0",
+      "00:00:00,000 --> 00:00:00,000",
+      "[DualSub 诊断快照] " + (opts.videoId || "unknown") +
+        " | 单元 " + stats.total + " | 已译 " + stats.translated + " | 未译 " + stats.untranslated,
+      "每词时长 中位 " + stats.medianMsPerWord + "ms / p10 " + stats.p10MsPerWord + "ms" +
+        " | <150ms/词 的单元 " + stats.tooFast + " 个" + (stats.worst ? " | 最差 " + stats.worst.msPerWord + "ms/词: " + stats.worst.text : ""),
+    ].join("\n");
+    return header + "\n\n" + body;
+  }
+
+  /** 诊断统计:单元时长与每词时长分布,用来定位「读不完」的单元 */
+  function progressSrtStats(units) {
+    var perWord = [];
+    var tooFast = 0;
+    var worst = null;
+    var translated = 0;
+    (units || []).forEach(function (u) {
+      var text = String(u.originalText || "").trim();
+      if (String(u.translation || "").trim()) translated++;
+      if (!text) return;
+      var startMs = u.startMs != null ? u.startMs : u.start;
+      var endMs = u.endMs != null ? u.endMs : u.end;
+      var words = text.split(/\s+/).filter(Boolean).length;
+      if (!words || !(endMs > startMs)) return;
+      var ratio = Math.round((endMs - startMs) / words);
+      perWord.push(ratio);
+      if (ratio < 150) tooFast++;
+      if (!worst || ratio < worst.msPerWord) worst = { msPerWord: ratio, text: text };
+    });
+    perWord.sort(function (a, b) { return a - b; });
+    function at(p) {
+      if (!perWord.length) return 0;
+      return perWord[Math.min(perWord.length - 1, Math.floor(perWord.length * p))];
+    }
+    return {
+      total: (units || []).length,
+      translated: translated,
+      untranslated: (units || []).length - translated,
+      medianMsPerWord: at(0.5),
+      p10MsPerWord: at(0.1),
+      tooFast: tooFast,
+      worst: worst,
+    };
+  }
   var EXPORTS = {
     parseJson3: parseJson3,
     parseVtt: parseVtt,
@@ -3226,6 +3302,8 @@
     importConfig: importConfig,
     formatSrtTime: formatSrtTime,
     buildSrt: buildSrt,
+    buildProgressSrt: buildProgressSrt,
+    progressSrtStats: progressSrtStats,
   };
 
   return EXPORTS;

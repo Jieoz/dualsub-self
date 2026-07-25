@@ -1648,6 +1648,35 @@ asyncTest("chatCompletion 在 headers 后 body stall 期间仍可被外部 abort
   assert.strictEqual(usageCalls, 0, "stale/aborted body 不得提交 usage");
 });
 
+test("诊断快照 SRT 导出当前进度:允许半成品但必须显式标记,且不污染成品导出契约", () => {
+  const units = [
+    { startMs: 0, endMs: 2000, originalText: "first line here", translation: "第一行" },
+    { startMs: 2000, endMs: 4000, originalText: "second line untranslated", translation: "" },
+    { startMs: 4000, endMs: 6000, originalText: "third line here", translation: "第三行" },
+  ];
+  const srt = Core.buildProgressSrt(units, { mode: "bilingual_orig_top", videoId: "vid123" });
+  assert.ok(srt, "诊断导出不得因为存在未翻译单元而返回空");
+  assert.match(srt, /\[DualSub 诊断快照\] vid123/, "缺少诊断文件头");
+  assert.match(srt, /单元 3 \| 已译 2 \| 未译 1/, "文件头统计不对");
+  assert.match(srt, /\[未翻译\]/, "未翻译单元必须显式标记,不能静默留空冒充成品");
+  assert.ok(srt.includes("second line untranslated"), "未翻译单元必须保留原文");
+  // 成品导出契约不受影响:同样的输入仍必须 fail-closed
+  assert.equal(Core.buildSrt(units, { mode: "bilingual_orig_top", requireTranslations: true }), "",
+    "诊断导出不得放宽成品导出的 fail-closed 契约");
+});
+
+test("诊断统计必须能定位读不完的单元", () => {
+  const stats = Core.progressSrtStats([
+    // 13 词 / 1000ms = 77ms/词,正是用户反馈的失真形状
+    { startMs: 0, endMs: 1000, originalText: "a b c d e f g h i j k l m", translation: "x" },
+    { startMs: 2000, endMs: 5000, originalText: "normal pace line", translation: "y" },
+  ]);
+  assert.equal(stats.tooFast, 1, "未识别出每词时长过短的单元");
+  assert.equal(stats.worst.msPerWord, 77, `最差每词时长应为 77ms,实际 ${stats.worst.msPerWord}`);
+  assert.equal(stats.translated, 2);
+});
+
+
 test("isolated 生命周期：disable 与同视频换轨必须先失效旧 generation", () => {
   const src = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
   assert.match(src, /if \(!config\.enabled\) \{[\s\S]{0,260}?invalidateRuntimeRequests\(\)[\s\S]{0,260}?teardownRuntime\(true\)/, "disable 必须先 abort/失效再拆 UI");

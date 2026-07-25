@@ -444,6 +444,48 @@
         cancelBtn.style.display = "none";
       }
     });
+
+    // 诊断导出:只读当前进度,绝不触发任何翻译请求(与上面的成品导出严格分开)。
+    // 成品导出 fail-closed 是刻意设计(不产半英文半中文成品),所以不能改它来
+    // 满足「看看现在翻成什么样」的需求 —— 那会破坏成品契约。这里单独一条路径。
+    $("exportProgressSrtBtn").addEventListener("click", async function () {
+      if (currentTabId == null) {
+        setStatus("请在 YouTube 播放页导出（字幕数据来自内容脚本）", "err");
+        return;
+      }
+      var mode = $("srtMode") ? $("srtMode").value : "bilingual_orig_top";
+      var btn = $("exportProgressSrtBtn");
+      btn.disabled = true;
+      try {
+        var resp = await sendToTab(currentTabId, { type: "export-srt" });
+        if (!resp) throw new Error("无响应：请在 YouTube 标签页打开并刷新后重试");
+        if (!resp.units || !resp.units.length) throw new Error("当前还没有任何字幕单元（轨道未加载？）");
+        if (!Core || !Core.buildProgressSrt) throw new Error("core.js 未加载");
+        var srt = Core.buildProgressSrt(resp.units, { mode: mode, videoId: resp.videoId });
+        if (!srt) throw new Error("当前没有可导出的内容");
+        var blob = new Blob([srt], { type: "text/plain;charset=utf-8" });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement("a");
+        a.href = url;
+        a.download = makeSrtFilename((resp.videoId || "unknown") + "-progress", resp.targetLang);
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+        var stats = Core.progressSrtStats ? Core.progressSrtStats(resp.units) : null;
+        setStatus(
+          "已导出当前进度 ✓（" + a.download + "）\n" +
+          (stats ? ("已译 " + stats.translated + "/" + stats.total +
+            "，<150ms/词 的单元 " + stats.tooFast + " 个\n") : "") +
+          "未发起任何翻译请求",
+          "ok"
+        );
+      } catch (e) {
+        setStatus("导出失败：" + (e && e.message ? e.message : e), "err");
+      } finally {
+        btn.disabled = false;
+      }
+    });
   });
 
   /** 生成 ASCII 安全文件名：dualsub-<videoId>-<lang>.srt（非法字符替换为 _） */
