@@ -50,7 +50,10 @@
           : eventEnd;
         // ASR 自带的标点不是词流的一部分。丢掉它后，恢复器才可以安全地
         // 重建句末而不把错误的 event 标点带入新显示单元。
-        const words = String(seg.utf8).match(/[A-Za-z0-9]+(?:['’][A-Za-z]+)?/g) || [];
+        // 词的切分口径必须与全系统唯一权威 RESTORE_WORD_RE 一致(见其定义处注释)。
+        // 曾在此手写 /[A-Za-z0-9]+(?:['’][A-Za-z]+)?/g —— 不含连字符,导致
+        // "purpose-built" 在此被切成 2 个 token 而显示侧算 1 个词,两条词流永久错位。
+        const words = String(seg.utf8).match(newWordRe()) || [];
         for (let j = 0; j < words.length; j++) {
           const partStart = tokenStart + Math.round((tokenEnd - tokenStart) * j / words.length);
           const partEnd = tokenStart + Math.round((tokenEnd - tokenStart) * (j + 1) / words.length);
@@ -266,9 +269,28 @@
    * 边界只影响换行位置，token 正文与时间仍由 validateTokenSpanCoverage 对 canonical
    * 复核，故此处对重复接缝的容忍不会污染正文或时轴。
    */
-  var TOKEN_ALIGN_DUP_WINDOW = 32;
-  function isRecentDuplicateToken(tokens, cursor, wk) {
-    for (var back = 1; back <= TOKEN_ALIGN_DUP_WINDOW && cursor - back >= 0; back++) {
+  /**
+   * 重复接缝的回看范围不能是魔法常量。曾固定为 32,而 YouTube 滚动 ASR 的重发
+   * 前缀长度由【单条 cue 的词数】决定:当一条 cue 长 40 词、重发前缀 35 词时,
+   * 同一个词的上一次出现距离可达 36 > 32,回看窗口看不见它 → 判不出是重复 →
+   * 抛 "display cue does not align to canonical timeline" → 整轨字幕失效。
+   * 实测 seg40/ov35、seg60/ov50、seg80/ov70 均因此失败,而 seg40/ov20 正常。
+   *
+   * 正确口径:回看范围 = 最长一条 display cue 的词数(重发前缀不可能超过它)。
+   * 这样窗口随数据自适应,既不会因常量偏小而漏判,也不会无界放大到把
+   * 正文里合法的同词复现误判成重复(真实英文语料同词相邻距离中位 84)。
+   */
+  function computeDupWindow(cues) {
+    var maxWords = 0;
+    (cues || []).forEach(function (cue) {
+      var n = restoredWords(cue && cue.content).length;
+      if (n > maxWords) maxWords = n;
+    });
+    return maxWords;
+  }
+  function isRecentDuplicateToken(tokens, cursor, wk, dupWindow) {
+    var limit = dupWindow > 0 ? dupWindow : 0;
+    for (var back = 1; back <= limit && cursor - back >= 0; back++) {
       if (wordKey(tokens[cursor - back].text) === wk) return true;
     }
     return false;
@@ -277,6 +299,7 @@
     var tokens = timeline && Array.isArray(timeline.tokens) ? timeline.tokens : [];
     var cursor = 0;
     var boundaries = [];
+    var dupWindow = computeDupWindow(cues);
 
     // 消费掉 canonical 游标处、display 已删除的重复 token（display 端去重造成的落差）。
     // 只在这些 token 是"最近已消费 token 的重复"时前进，避免吞掉真正的新内容。
@@ -284,7 +307,7 @@
       while (cursor < tokens.length) {
         var ck = wordKey(tokens[cursor].text);
         if (nextDisplayKey != null && ck === nextDisplayKey) break; // 让它去和显示词正常匹配
-        if (!isRecentDuplicateToken(tokens, cursor, ck)) break;      // 不是重复 → 停，交给正常流程/报错
+        if (!isRecentDuplicateToken(tokens, cursor, ck, dupWindow)) break; // 不是重复 → 停，交给正常流程/报错
         cursor++;
       }
     }
@@ -304,7 +327,7 @@
           continue;
         }
         // 方向 2：显示词是 canonical 已删除的重复 → 跳过该显示词，游标不动。
-        if (isRecentDuplicateToken(tokens, cursor, wk)) continue;
+        if (isRecentDuplicateToken(tokens, cursor, wk, dupWindow)) continue;
         // 方向 4：真正的漂移。
         throw new Error("display cue does not align to canonical timeline");
       }
@@ -541,6 +564,19 @@
   // 词/token 粒度错位的源头之一。
   var RESTORE_WORD_RE = /[0-9]+(?:[.,][0-9]+)+|[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*/g;
 
+  // 全系统唯一的"什么算一个词"权威定义。此前有三份互相矛盾的词正则:
+  // parseJson3 与 restoredBoundaryMarks 各写了一份【不含连字符】的版本,
+  // 而这里的 RESTORE_WORD_RE 【含连字符】。于是 "purpose-built" 在
+  // canonical 侧被切成 2 个 token、在显示侧是 1 个词 —— 两条词流从该处起
+  // 永久错位,最终在对齐时抛 "display cue does not align to canonical timeline",
+  // 整轨字幕加载失败(连英文原文一起消失)。真机轨含 old-fashioned / plug-in /
+  // purpose-built 三个这类词,只要视频讲到就必崩。
+  // 因此:任何需要"把文本切成词"的地方都必须使用 newWordRe()/restoredWords(),
+  // 不得再各自手写正则。
+  function newWordRe() {
+    return new RegExp(RESTORE_WORD_RE.source, "g");
+  }
+
   function restoredWords(text) {
     return String(text || "").match(RESTORE_WORD_RE) || [];
   }
@@ -559,7 +595,9 @@
     var words = Array.isArray(sourceWords) ? sourceWords : restoredWords(sourceWords);
     if (!sameRestoredWords(words, restored)) return null;
     var matches = [];
-    var re = /[A-Za-z0-9]+(?:['’][A-Za-z]+)?/g;
+    // 同上:必须与 RESTORE_WORD_RE 同口径,否则连字符复合词会使
+    // matches.length 与 words.length 不等,恢复边界被整段丢弃。
+    var re = newWordRe();
     var match;
     while ((match = re.exec(String(restored || "")))) matches.push(match);
     if (matches.length !== words.length) return null;
