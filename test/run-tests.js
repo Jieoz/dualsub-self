@@ -1652,7 +1652,10 @@ test("isolated 生命周期：disable 与同视频换轨必须先失效旧 gener
   const src = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
   assert.match(src, /if \(!config\.enabled\) \{[\s\S]{0,260}?invalidateRuntimeRequests\(\)[\s\S]{0,260}?teardownRuntime\(true\)/, "disable 必须先 abort/失效再拆 UI");
   assert.match(src, /function switchTrack\(track\)[\s\S]{0,500}?invalidateRuntimeRequests\(\)[\s\S]{0,500}?state\.activeTrack = track[\s\S]{0,500}?loadTrack\(track\)/, "所有轨道切换必须走单一失效入口");
-  assert.match(src, /async function loadTrack\(track\)[\s\S]{0,700}?trackUrl[\s\S]{0,700}?state\.activeTrack\.url === trackUrl/, "轨道 body/install 前必须复验精确轨道身份");
+  assert.match(src, /async function loadTrack\(track, attempt\)[\s\S]{0,900}?trackUrl[\s\S]{0,900}?state\.activeTrack\.url === trackUrl/, "轨道 body/install 前必须复验精确轨道身份");
+  // 空轨/HTTP 失败/网络错误都必须走重试,不得像旧代码那样一次就永久放弃整条轨
+  assert.match(src, /if \(!cues\.length\) \{[\s\S]{0,200}?retryLater\("轨道为空"\)/, "空轨必须重试,不能直接 return(用户日志『解析后无有效字幕』的根因)");
+  assert.match(src, /function retryLater\(reason\)[\s\S]{0,300}?reportTrackFailure\(reason\)/, "重试用尽后必须向用户报告失败原因");
   assert.match(src, /function isRuntimeRequestCurrent\(context\)[\s\S]{0,220}?config\.enabled/, "所有异步副作用须同时受 enabled 门禁");
 });
 

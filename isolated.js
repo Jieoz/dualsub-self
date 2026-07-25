@@ -90,6 +90,8 @@
     // ---- 运行循环 / 生命周期（低配机占用优化）----
     renderTimer: null, // 仅无帧回调 API 时的兜底 setInterval id
     renderFrameHandle: null, // requestVideoFrameCallback / rAF 句柄
+    trackRetryTimer: null,   // 轨道加载重试定时器
+    trackFailure: null,      // 重试用尽后的失败原因,供 popup 显示
     renderDriver: null, // "vfc" | "raf" | "interval"，决定用哪个 cancel
     prefetchTimer: null, // 预取定时器 id（与渲染解耦、降频）
     seekTimer: null, // seek 防抖定时器 id
@@ -156,6 +158,11 @@
   // (rVFC 只在合成新帧时触发,无媒体源/缓冲/暂停时不产帧)。见 startRenderLoop。
   var PREFETCH_INTERVAL_MS = 1000;
   var RENDER_FALLBACK_INTERVAL_MS = 250;
+
+  // 字幕轨加载失败后的重试节奏。YouTube 在限流/降级时会返回 200 + 合法 JSON
+  // 但 events 为空,解析出 0 条 cue —— 这是**瞬态**故障,重试通常就拿到真轨。
+  // 递增间隔避免在真的持续故障时打死端点;用尽后才向用户报错。
+  var TRACK_RETRY_DELAYS_MS = [800, 2000, 5000];
   var SEEK_SETTLE_MS = 350; // seek 停稳多少 ms 后才翻目标 clip
   var RETRY_INTERVAL_MS = 3000; // 失败 clip 后台重试调度节拍（第2层）
 
@@ -468,6 +475,8 @@
     state.timelineEpoch++;
     state.semanticPending = false;
     clearSemanticFallbackTimer();
+    clearTrackRetryTimer();
+    state.trackFailure = null;
     state.activeTrack = track;
     state.cues = [];
     state.sourceTimeline = null;
@@ -500,6 +509,8 @@
     state.lastHitCueIdx = -1;
     state.lastPrefetchMs = -1e9;
     clearSemanticFallbackTimer();
+    clearTrackRetryTimer();
+    state.trackFailure = null;
     restoreNativeCaptions();
     clearRenderer();
   }
@@ -559,14 +570,35 @@
   /* =====================================================
    * 拉取 + 解析 + 切 clip
    * ===================================================== */
-  async function loadTrack(track) {
+  async function loadTrack(track, attempt) {
     var trackUrl = track && track.url;
+    attempt = attempt || 0;
     function trackRequestCurrent(context) {
       return isRuntimeRequestCurrent(context) && !!state.activeTrack && state.activeTrack.url === trackUrl;
+    }
+    // 轨道请求是**可重试**的:YouTube 在限流/降级时会返回 200 + 合法 JSON 但
+    // events 为空(或整个响应只有 pens/wsWinStyles),解析结果就是 0 条 cue。
+    // 之前这里 console.warn 后直接 return —— 一次抖动就让整条轨永久失效,
+    // 用户看到的就是「没有字幕」且无从判断原因,只能手动切换轨道。
+    function retryLater(reason) {
+      if (attempt >= TRACK_RETRY_DELAYS_MS.length) {
+        reportTrackFailure(reason);
+        return;
+      }
+      var delay = TRACK_RETRY_DELAYS_MS[attempt];
+      console.warn("[dualsub] 字幕轨加载失败(" + reason + "),第 " + (attempt + 1) + " 次重试将在 " + delay + "ms 后");
+      var epochAtSchedule = state.timelineEpoch;
+      state.trackRetryTimer = setTimeout(function () {
+        state.trackRetryTimer = null;
+        if (epochAtSchedule !== state.timelineEpoch) return;
+        if (!state.activeTrack || state.activeTrack.url !== trackUrl) return;
+        loadTrack(track, attempt + 1);
+      }, delay);
     }
     state.firstClipReady = false;
     state.waitPausedByUs = false;
     clearWaitTimer();
+    clearTrackRetryTimer();
     var requestContext = beginRuntimeRequest();
     try {
       var resp = await fetch(track.url, {
@@ -575,7 +607,9 @@
       });
       if (!trackRequestCurrent(requestContext)) return;
       if (!resp.ok) {
-        console.warn("[dualsub] 字幕请求失败 HTTP", resp.status);
+        endRuntimeRequest(requestContext);
+        requestContext = null;
+        retryLater("HTTP " + resp.status);
         return;
       }
       var text = await resp.text();
@@ -592,13 +626,19 @@
         cues = Core.parseVtt(text);
       }
       cues = Core.cleanupCues(cues);
+      if (!cues.length) {
+        // 200 + 合法 JSON 但没有任何字幕内容 —— 典型的限流/降级响应,重试通常能拿到真轨
+        retryLater("轨道为空");
+        return;
+      }
       // 先立即建立稳定 fallback 原文时间轴；技术 cue 不翻译。语义恢复是整轨模型工作，不能阻塞首字幕。
       var sourceTimeline = Core.buildCanonicalTokenTimeline(cues);
       var fallbackCues = Core.resegmentCues(cues, { tailTrimMs: config.tailTrimMs, maxWords: 12, continuationMaxWords: 14 });
       if (!installCueTimeline(fallbackCues, "fallback", { sourceTimeline: sourceTimeline })) {
-        console.warn("[dualsub] 解析后无有效字幕");
+        retryLater("解析后无有效字幕");
         return;
       }
+      state.trackFailure = null;
       // 完整验证成功后才原子切换到语义时间轴；失败保持已工作的 fallback。
       // 但语义恢复慢不能阻塞首屏中文字幕：短阈值后先翻 fallback，后续 semantic 准备好再升级。
       // 关键：整轨 semantic 恢复的模型请求走同一个全局并发闸门(ensureGate)但用最低优先级，
@@ -642,9 +682,31 @@
       }, 0);
     } catch (e) {
       if (requestContext && !isRuntimeRequestCurrent(requestContext)) return;
-      console.warn("[dualsub] loadTrack 出错", e);
+      endRuntimeRequest(requestContext);
+      requestContext = null;
+      // fetch 抛错(断网/超时/JSON 解析失败)同样可重试,不能一次就放弃整条轨
+      retryLater((e && e.name === "AbortError") ? "请求被中止" : ("网络或解析错误: " + (e && e.message || e)));
     } finally {
       endRuntimeRequest(requestContext);
+    }
+  }
+
+  /**
+   * 轨道彻底加载失败(重试全部用尽)。记录到 state 供 popup 显示 —— 之前只有
+   * 一行 console.warn,用户无从判断是扩展坏了还是网络问题。
+   */
+  function reportTrackFailure(reason) {
+    state.trackFailure = { reason: String(reason || "未知原因"), at: Date.now() };
+    console.warn("[dualsub] 字幕轨加载失败,重试已用尽:", state.trackFailure.reason);
+    try {
+      chrome.runtime.sendMessage({ type: "dualsub-track-failure", reason: state.trackFailure.reason });
+    } catch (ignored) { /* popup 未打开时无接收方,忽略 */ }
+  }
+
+  function clearTrackRetryTimer() {
+    if (state.trackRetryTimer) {
+      clearTimeout(state.trackRetryTimer);
+      state.trackRetryTimer = null;
     }
   }
 
@@ -1909,6 +1971,7 @@
     stopRenderLoop();
     stopPrefetchLoop();
     stopRetryScheduler();
+    clearTrackRetryTimer();
     if (state.seekTimer != null) {
       clearTimeout(state.seekTimer);
       state.seekTimer = null;
