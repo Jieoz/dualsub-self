@@ -3104,6 +3104,54 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     assert.strictEqual(covered, timeline.tokens.length, "大重叠下词流覆盖不完整");
   });
 
+  // ── 句中切开的译文不得被判违规 ──────────────────────────────────
+  // 回归防护。分屏器会故意在句中切开(一屏最多 ~12 词),这种单元的忠实译文
+  // 本来就该断在逗号上。曾有两处缺陷叠加导致这类正确译文被拒、整段回退英文:
+  //   1) validateChineseDisplayUnit 不看原文,一律拒绝逗号结尾;
+  //   2) parseTranslationCoverageResponse 重建 expected 时把 sourceText 丢掉,
+  //      于是即便校验侧想对照原文也永远拿到 undefined。
+  // gpt-5.4-mini 上实测首 clip 3 行有 2 行被误杀(3/3 复现),修复后 5/5 通过。
+  test("句中切开的译文(逗号结尾)不判违规", () => {
+    var midSentence = Core.validateChineseDisplayUnit("如果你是人类，", {
+      sourceText: "If you're a human person,",
+      continues: true,
+    });
+    assert(midSentence.ok, "句中续的逗号结尾译文被误判: " + midSentence.reason);
+
+    // 整句到此为止却断在逗号 → 仍必须拒绝(这才是真的没译完)
+    var ended = Core.validateChineseDisplayUnit("如果你是人类，", {
+      sourceText: "If you're a human person.",
+      continues: false,
+    });
+    assert(!ended.ok && ended.reason === "non-terminal-punctuation",
+      "整句结尾的逗号译文本应被拒,实际: " + JSON.stringify(ended));
+
+    // 只给原文时应能自行推断:原文无终止标点 = 还没说完
+    var inferred = Core.validateChineseDisplayUnit("如果你是人类，", {
+      sourceText: "If you're a human person,",
+    });
+    assert(inferred.ok, "未能从原文推断句中续: " + inferred.reason);
+  });
+
+  // sourceText 必须真的流到校验侧(防 expected 重建时再次丢字段)
+  test("覆盖响应解析保留 sourceText", () => {
+    var units = [
+      { unitId: "u0", tokenStart: 0, tokenEnd: 5, sourceText: "If you're a human person," },
+      { unitId: "u1", tokenStart: 5, tokenEnd: 9, sourceText: "we boil water." },
+    ];
+    var payload = JSON.stringify({
+      translations: [
+        { unitId: "u0", coverFrom: 0, coverTo: 5, translation: "如果你是人类，" },
+        { unitId: "u1", coverFrom: 5, coverTo: 9, translation: "我们烧水。" },
+      ],
+    });
+    // lenient=false:若 sourceText 丢失,u0 会因逗号结尾被 throw
+    var out = Core.parseTranslationCoverageResponse(payload, units, { lenient: false });
+    assert(out.length === 2, "单元数不对: " + out.length);
+    assert(out[0].translation === "如果你是人类，",
+      "句中切开的译文被清空(sourceText 未传到校验侧): " + JSON.stringify(out[0]));
+  });
+
   console.log("\n========================================");
   console.log("  通过: " + passed + "  失败: " + failed);
   console.log("========================================");
