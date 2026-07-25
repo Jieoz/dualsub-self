@@ -1122,6 +1122,17 @@
       currentIdx: idx,
       clipCount: state.clips.length,
       remainMsInCurrent: remainMsInCurrent,
+      // 翻译不得跑到语义恢复前面。
+      //
+      // 根因（用户轨 BhtgINeaJWg 实测）：预取窗口领先约 56s，而语义区间换入发生在
+      // 播放接近已恢复边界时。于是「先按 fallback 断句翻好 → 换入改断句 → 边界交叉 →
+      // 译文作废 → 重翻」。真机一次换入 28 条新单元里交叉切开 17 条，丢掉 56~68%
+      // 已翻词。同一段内容翻两遍，这才是「翻译永远跟不上字幕」。
+      //
+      // 语义恢复比播放快 3.5x，因此把预取截到已恢复边界内不会让翻译闲着 ——
+      // 只是不再把算力花在马上要作废的断句上。
+      semanticReadyUntilMs: state.segmentationMode === "semantic" ? state.semanticDoneUntilMs : null,
+      clipStartMs: state.clips.map(function (c) { return c ? c.startMs : NaN; }),
     }).plan;
     // force（刚加载/seek）时：先只踢当前段，下一 macrotask 再铺后续预取，
     // 让首包请求更早离开浏览器、更少与同批预取抢模型算力。
@@ -1162,7 +1173,15 @@
     if (!state.cues.length || !state.timelineSnapshot) return;
     var doneUntil = Number(state.semanticDoneUntilMs);
     if (!Number.isFinite(doneUntil)) return;                  // Infinity = 已恢复到轨尾
-    if (ms + Core.SEMANTIC_INTERVAL_MS / 2 < doneUntil) return;
+    // 推进时机必须**领先于预取窗口**，不是领先于播放位置。
+    //
+    // 旧条件是 ms + INTERVAL/2 < doneUntil 就跳过，即播放走到已恢复区间的后半段才恢复
+    // 下一段。但预取窗口领先播放约 56s —— 它会先撞上恢复边界被截断（clamped-to-semantic），
+    // 于是翻译闲着等恢复，反而变慢。恢复必须先把路铺到预取窗口之外。
+    //
+    // 取窗口深度 + 一个 clip 的余量：恢复比播放快 3.5x，铺在前面不会成为瓶颈。
+    var prefetchLeadMs = (Core.PREFETCH_AHEAD + 2) * config.clipSeconds * 1000;
+    if (ms + prefetchLeadMs < doneUntil) return;
 
     var loadEpoch = state.timelineEpoch;
     state.semanticPending = true;

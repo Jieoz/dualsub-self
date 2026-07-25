@@ -757,13 +757,50 @@
     boundaries = boundaries.concat(localEnds);
     for (var right = afterUnit; right < snapshot.units.length; right++) boundaries.push(snapshot.units[right].tokenEnd - 1);
     var nextUnits = buildTokenSpanUnits(snapshot.timeline, boundaries);
-    var oldBySpan = {};
+
+    // 译文继承必须按「词」判定，不能要求 token 跨度逐字节相等。
+    //
+    // 曾用 oldBySpan[tokenStart+":"+tokenEnd] 精确匹配，但语义恢复的目的**就是
+    // 改断句** —— 跨度一变就匹配不上，译文全丢。实测用户轨（BhtgINeaJWg）单次
+    // 区间换入丢掉 67.9% 的已翻词，那批单元退回 [未翻译] 后要重新排队再翻一遍，
+    // 翻译量凭空翻倍，表现就是「翻译永远追不上播放」。
+    //
+    // 现在的判据：新单元的 token 跨度若被某条旧译文**完全覆盖**，就继承它。
+    // 只有跨越了两条不同旧译文（合并了不同句子）才必须重翻 —— 那时旧译文确实
+    // 无法拼接。跨度完全相同是它的一个特例，行为不变。
+    var oldByToken = [];
     snapshot.units.forEach(function (unit) {
-      oldBySpan[unit.tokenStart + ":" + unit.tokenEnd] = snapshot.translations && snapshot.translations[unit.id] || "";
+      var text = snapshot.translations && snapshot.translations[unit.id] || "";
+      if (!text) return;
+      oldByToken.push({ start: unit.tokenStart, end: unit.tokenEnd, text: text });
     });
+    // 两种方向都要处理，否则等于没保留（实测断句变粗时新单元跨越 2 条旧单元，
+    // 只做「被包含」判断时命中率为 0，一个词都保不住）：
+    //   1. 新单元被某条旧译文完整覆盖 → 直接继承（断句变细，跨度相同是其特例）
+    //   2. 新单元由若干条**连续且完整**的旧译文拼成 → 按序拼接
+    // 只有边界与旧译文交叉切开（旧句被拦腰截断）时才判定为无法继承，必须重翻 ——
+    // 那时旧译文确实对不上新单元的内容。
+    function inheritedTranslation(unit) {
+      var pieces = [];
+      var cursor = unit.tokenStart;
+      for (var i = 0; i < oldByToken.length; i++) {
+        var old = oldByToken[i];
+        if (old.end <= unit.tokenStart || old.start >= unit.tokenEnd) continue;
+        // 情形 1：整个新单元落在一条旧译文里
+        if (unit.tokenStart >= old.start && unit.tokenEnd <= old.end) return old.text;
+        // 情形 2：要求逐段严丝合缝地接上，任何错位都放弃继承
+        if (old.start !== cursor || old.end > unit.tokenEnd) return "";
+        pieces.push(old.text);
+        cursor = old.end;
+      }
+      // 拼接用已有的语言无关连接器：中日韩等连写文字不插空格，拉丁语族插空格。
+      // 不新写一套判定 —— joinRestoredWords 是这件事的唯一权威实现。
+      if (pieces.length && cursor === unit.tokenEnd) return joinRestoredWords(pieces);
+      return "";
+    }
     var nextTranslations = {};
     nextUnits.forEach(function (unit) {
-      nextTranslations[unit.id] = oldBySpan[unit.tokenStart + ":" + unit.tokenEnd] || "";
+      nextTranslations[unit.id] = inheritedTranslation(unit);
     });
     return createTimelineSnapshot({
       revision: Number(snapshot.revision || 0) + 1,
@@ -2007,6 +2044,9 @@
   //
   // 单次恢复 3 块 ≈ 49s，覆盖 120s 播放 → 恢复速度约为播放速度的 2.4 倍，
   // 足以持续领先播放。
+  // 首个区间的跨度。取 36s ≈ 一个预取窗口（当前段 + 3 段 × 12s）：
+  // 刚好铺满开场预取需要的范围，实测恢复约 6s 完成，不让翻译干等。
+  var SEMANTIC_FIRST_INTERVAL_MS = 36000;
   var SEMANTIC_INTERVAL_MS = 120000;
 
   /**
@@ -2037,7 +2077,17 @@
     var pos = Number(positionMs);
     if (!Number.isFinite(pos)) pos = 0;
     var spanMs = Number(opts.intervalMs);
-    if (!Number.isFinite(spanMs) || spanMs <= 0) spanMs = SEMANTIC_INTERVAL_MS;
+    if (!Number.isFinite(spanMs) || spanMs <= 0) {
+      // 首个区间刻意更短。
+      //
+      // 翻译不得越过恢复边界（否则跨边界译文作废重翻），所以开场时预取会一直等
+      // 恢复铺路。若首个区间就取满 120s，实测要 31s 才恢复完，这段时间预取被卡在
+      // 当前段，真机覆盖率从 93.6% 掉到 83.4%（比不截断更差）。
+      //
+      // 首屏只需要够用的一小段：实测前 26s（47 token）恢复仅 5.7s，之后恢复以
+      // 3.5x 播放速度持续领先，再用满长度区间摊薄每块开销。
+      spanMs = pos <= 0 ? SEMANTIC_FIRST_INTERVAL_MS : SEMANTIC_INTERVAL_MS;
+    }
 
     // 起点：当前播放位置所在（或之后的第一个）单元。
     var startIndex = -1;
@@ -2913,6 +2963,32 @@
     if (!Number.isFinite(count) || count <= 0) return { plan: [], reason: "no-clips" };
     if (!Number.isFinite(idx) || idx < 0 || idx >= count) return { plan: [], reason: "idx-out-of-range" };
     var plan = planPrefetch(idx, count, opts.ahead, { remainMsInCurrent: opts.remainMsInCurrent });
+
+    // 翻译不得越过语义恢复边界。
+    //
+    // 语义恢复会重新切分句子边界，跨越边界的旧译文无法继承（真机实测 28 条新单元
+    // 里 17 条与旧边界交叉切开），只能作废重翻。所以「已恢复到哪里」就是「可以翻到
+    // 哪里」—— 越过去翻的那部分注定要扔掉，是纯浪费。
+    //
+    // 恢复速度是播放的 3.5x，截断不会让翻译闲置；当前段永远保留（首屏可用性底线，
+    // 哪怕它暂时还在 fallback 断句上，也必须先有中文）。
+    // clip 起始时间由调用方给出（clipStartMs[i]）—— 不能按 clipSeconds 均分推算：
+    // clipSeconds 是用户可配的，且首个 clip 刻意更短，均分算出的下标是错的。
+    var readyUntil = opts.semanticReadyUntilMs;
+    var clipStartMs = opts.clipStartMs;
+    if (readyUntil != null && Number.isFinite(Number(readyUntil)) && Array.isArray(clipStartMs)) {
+      var limit = Number(readyUntil);
+      var clamped = plan.filter(function (i) {
+        var s = Number(clipStartMs[i]);
+        return !Number.isFinite(s) || s < limit;
+      });
+      // 当前段无论如何都要翻 —— 没有中文比断句将来会变更糟。
+      if (!clamped.length) clamped = [Math.floor(idx)];
+      if (clamped.length !== plan.length) {
+        return { plan: prioritizePrefetch(clamped, Math.floor(idx)), reason: "clamped-to-semantic" };
+      }
+      plan = clamped;
+    }
     return { plan: prioritizePrefetch(plan, Math.floor(idx)), reason: "window" };
   }
 
@@ -3732,8 +3808,10 @@
     computeFontPx: computeFontPx,
     planPrefetch: planPrefetch,
     planTranslationWindow: planTranslationWindow,
+    PREFETCH_AHEAD: PREFETCH_AHEAD,
     planSemanticInterval: planSemanticInterval,
     SEMANTIC_INTERVAL_MS: SEMANTIC_INTERVAL_MS,
+    SEMANTIC_FIRST_INTERVAL_MS: SEMANTIC_FIRST_INTERVAL_MS,
     prioritizePrefetch: prioritizePrefetch,
     planCoverageBatches: planCoverageBatches,
     makeSemaphore: makeSemaphore,
