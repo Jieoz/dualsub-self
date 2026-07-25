@@ -3020,6 +3020,90 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     ]) assert.strictEqual(Core.validateTrackManifest({ ...base, files:[{ ...base.files[0], url }] }, { expectedVideoId:"videoA" }), null, url);
   });
 
+  // ── 连字符复合词:词切分口径必须全系统统一 ──────────────────────────
+  // 回归防护。曾有三份互相矛盾的词正则(parseJson3 与 restoredBoundaryMarks
+  // 各自手写不含连字符的版本,RESTORE_WORD_RE 含连字符),使 "purpose-built"
+  // 在 canonical 侧算 2 个 token、显示侧算 1 个词 → 两条词流从该处永久错位 →
+  // 对齐抛 "display cue does not align to canonical timeline" → 整轨字幕
+  // (含英文原文)全部消失。真机轨含 old-fashioned / plug-in / purpose-built。
+  // 此前 210 个测试全绿却漏掉,因为 fixture 无 tokens 字段,从未走词级时间路径。
+  test("连字符复合词在 parseJson3 中算一个 token", () => {
+    const cues = Core.parseJson3({
+      events: [{
+        tStartMs: 0, dDurationMs: 2000,
+        segs: [
+          { utf8: "these ", tOffsetMs: 0 },
+          { utf8: "purpose-built ", tOffsetMs: 500 },
+          { utf8: "old-fashioned ", tOffsetMs: 1000 },
+          { utf8: "plug-in ", tOffsetMs: 1500 },
+        ],
+      }],
+    });
+    assert.strictEqual(cues.length, 1);
+    const texts = cues[0].tokens.map((t) => t.text);
+    assert.deepStrictEqual(texts, ["these", "purpose-built", "old-fashioned", "plug-in"],
+      "连字符复合词被拆开了,词流会与显示侧永久错位");
+  });
+
+  test("含连字符复合词的整轨:canonical 与显示词流对齐不抛错", () => {
+    // 每个 event 10 词,含连字符词;走真实生产参数。
+    const words = ("If you are a human person one of those purpose-built things " +
+      "you will want to do with some regularity is boil water using an old-fashioned " +
+      "plug-in kettle because it heats much faster than any stove top method here").split(" ");
+    const events = [];
+    const PER = 250;
+    for (let i = 0; i < words.length; i += 10) {
+      const chunk = words.slice(i, i + 10);
+      events.push({
+        tStartMs: i * PER,
+        dDurationMs: chunk.length * PER,
+        segs: chunk.map((w, j) => ({ utf8: w + " ", tOffsetMs: j * PER })),
+      });
+    }
+    const cues = Core.cleanupCues(Core.parseJson3({ events }));
+    const timeline = Core.buildCanonicalTokenTimeline(cues);
+    const display = Core.resegmentCues(cues, { tailTrimMs: 120, maxWords: 12, continuationMaxWords: 14 });
+    // 修复前此处抛 "display cue does not align to canonical timeline"
+    const units = Core.buildCueTokenSpanUnits(timeline, display);
+    const covered = units.reduce((n, u) => n + (u.tokenEnd - u.tokenStart), 0);
+    assert.strictEqual(covered, timeline.tokens.length, "词流覆盖不完整,存在丢词");
+    assert.ok(units.length > 0, "未产出任何显示单元");
+  });
+
+  // ── 滚动 ASR 大重叠:重复回看范围必须随数据自适应 ────────────────────
+  // 回归防护。曾把回看范围写死为常量 32,而滚动 ASR 的重发前缀长度由单条 cue
+  // 的词数决定:cue 长 40 词、重发 35 词时同词上次出现距离达 36 > 32,
+  // 判不出是重复 → 抛 "display cue does not align to canonical timeline"
+  // → 整轨字幕(含英文原文)全部消失。现改为「最长 display cue 的词数」。
+  test("滚动 ASR 大重叠(重发前缀 > 32 词)仍能对齐且不丢词", () => {
+    const base = ("If you are a human person one of those things you will want to do " +
+      "with some regularity is boil water We do it for lots of reasons from cooking " +
+      "to cleaning and disinfecting to other things probably And one of the fastest " +
+      "ways to heat water across the planet is a purpose built electric kettle which " +
+      "many people in some countries use every single morning without thinking twice").split(" ");
+    const PER = 250;
+    // seg=40 / ov=35:重发前缀 35 词,同词回看距离可超过 32
+    const SEG = 40, OV = 35;
+    const events = [];
+    let pos = 0;
+    while (pos < base.length) {
+      const from = Math.max(0, pos - OV);
+      const to = Math.min(base.length, pos + SEG);
+      events.push({
+        tStartMs: from * PER,
+        dDurationMs: (to - from) * PER,
+        segs: base.slice(from, to).map((w, j) => ({ utf8: w + " ", tOffsetMs: (from + j) * PER - from * PER })),
+      });
+      pos = to;
+    }
+    const cues = Core.cleanupCues(Core.parseJson3({ events }));
+    const timeline = Core.buildCanonicalTokenTimeline(cues);
+    const display = Core.resegmentCues(cues, { tailTrimMs: 120, maxWords: 12, continuationMaxWords: 14 });
+    const units = Core.buildCueTokenSpanUnits(timeline, display);
+    const covered = units.reduce((n, u) => n + (u.tokenEnd - u.tokenStart), 0);
+    assert.strictEqual(covered, timeline.tokens.length, "大重叠下词流覆盖不完整");
+  });
+
   console.log("\n========================================");
   console.log("  通过: " + passed + "  失败: " + failed);
   console.log("========================================");
