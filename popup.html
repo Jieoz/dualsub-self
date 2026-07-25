@@ -7,40 +7,89 @@
     <style>
       :root {
         color-scheme: light dark;
+        --line: #ddd;
+        --muted: #888;
+        --accent: #1a73e8;
+        --bg: #fff;
+        --fg: #1a1a1a;
+        --panel: #fafafa;
       }
+      @media (prefers-color-scheme: dark) {
+        :root { --line: #3a3a3a; --muted: #9aa0a6; --bg: #1f1f1f; --fg: #eee; --panel: #262626; }
+      }
+      * { box-sizing: border-box; }
       body {
-        width: 340px;
+        /* 380px：Chrome popup 实际可用宽度上限附近，比 340px 多出的空间用于
+           两列排布，减少纵向堆叠（popup 最大高度只有 600px，纵向是稀缺资源）。 */
+        width: 380px;
         margin: 0;
-        padding: 12px 14px;
+        padding: 0;
         font-family: -apple-system, "Segoe UI", Roboto, "PingFang SC",
           "Microsoft YaHei", sans-serif;
         font-size: 13px;
-        background: #fff;
-        color: #1a1a1a;
+        background: var(--bg);
+        color: var(--fg);
       }
-      @media (prefers-color-scheme: dark) {
-        body { background: #1f1f1f; color: #eee; }
-        input, select, textarea { background: #2a2a2a; color: #eee; border-color: #444; }
-        fieldset { border-color: #3a3a3a; }
+      /* 三段式布局：顶栏 / 可滚动内容 / 底栏。
+         用显式 flex 滚动容器而不是 position:sticky —— Chrome popup 里
+         body 自身作为滚动容器时 sticky 行为不可靠，flex + overflow 是确定的。
+         max-height 594px 略低于 Chrome popup 的 600px 上限，避免外层再出现滚动条。 */
+      html, body { height: 100%; }
+      body {
+        display: flex;
+        flex-direction: column;
+        max-height: 594px;
+        overflow: hidden;
       }
-      h1 {
-        font-size: 15px;
-        margin: 0 0 8px;
+      /* 顶栏：标题 + 总开关常驻，不随内容滚动 */
+      .topbar {
+        flex: 0 0 auto;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 10px 14px;
+        background: var(--bg);
+        border-bottom: 1px solid var(--line);
       }
-      fieldset {
-        border: 1px solid #ddd;
+      .topbar h1 { font-size: 14px; margin: 0; flex: 1; white-space: nowrap; }
+      /* 开关样式的启用勾选（仍是原生 checkbox#enabled，逻辑不变） */
+      .switch { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+      .switch input { width: auto; margin: 0; }
+      /* 唯一滚动区 */
+      .content { flex: 1 1 auto; overflow-y: auto; padding: 10px 14px 8px; }
+      section {
+        border: 1px solid var(--line);
         border-radius: 6px;
-        margin: 0 0 10px;
-        padding: 8px 10px;
+        margin: 0 0 8px;
+        background: var(--panel);
+        overflow: hidden;
       }
-      legend {
+      section > h2 {
+        font-size: 12px;
         font-weight: 600;
-        padding: 0 4px;
+        margin: 0;
+        padding: 7px 10px;
+        background: transparent;
       }
-      label {
-        display: block;
-        margin: 6px 0 2px;
+      section > .body { padding: 0 10px 9px; }
+      /* 可折叠分区：罕用设置默认收起，节省纵向空间 */
+      details { border: 1px solid var(--line); border-radius: 6px; margin: 0 0 8px; background: var(--panel); }
+      details > summary {
+        font-size: 12px;
+        font-weight: 600;
+        padding: 7px 10px;
+        cursor: pointer;
+        list-style: none;
+        display: flex;
+        align-items: center;
+        gap: 6px;
       }
+      details > summary::-webkit-details-marker { display: none; }
+      details > summary::before { content: "▸"; color: var(--muted); font-size: 10px; }
+      details[open] > summary::before { content: "▾"; }
+      details > summary:hover { color: var(--accent); }
+      details > .body { padding: 0 10px 9px; }
+      label { display: block; margin: 6px 0 2px; font-size: 12px; }
       input[type="text"],
       input[type="password"],
       input[type="number"],
@@ -49,28 +98,30 @@
       select,
       textarea {
         width: 100%;
-        box-sizing: border-box;
         padding: 4px 6px;
         border: 1px solid #ccc;
         border-radius: 4px;
         font-size: 12px;
+        background: var(--bg);
+        color: var(--fg);
       }
+      @media (prefers-color-scheme: dark) {
+        input, select, textarea { border-color: #444; }
+      }
+      input[type="color"] { padding: 2px; height: 26px; cursor: pointer; }
       textarea { resize: vertical; min-height: 48px; }
-      .row {
-        display: flex;
-        gap: 8px;
-        align-items: center;
-      }
+      .row { display: flex; gap: 8px; align-items: center; }
       .row > * { flex: 1; }
-      .inline { display: flex; align-items: center; gap: 6px; margin: 6px 0; }
-      .inline input[type="checkbox"] { width: auto; flex: 0; }
+      .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 8px; }
+      .inline { display: flex; align-items: center; gap: 6px; margin: 5px 0; }
+      .inline input[type="checkbox"] { width: auto; flex: 0 0 auto; margin: 0; }
       .inline label { margin: 0; flex: 1; }
       button {
         width: 100%;
         padding: 7px;
         border: none;
         border-radius: 5px;
-        background: #1a73e8;
+        background: var(--accent);
         color: #fff;
         font-size: 13px;
         cursor: pointer;
@@ -78,162 +129,189 @@
       }
       button.secondary { background: #5f6368; }
       button:active { opacity: 0.85; }
-      #status {
-        margin-top: 8px;
-        font-size: 12px;
-        white-space: pre-wrap;
-        word-break: break-word;
+      /* 底栏：保存按钮吸底常驻，改任何设置都不必滚到页尾 */
+      .bottombar {
+        flex: 0 0 auto;
+        padding: 8px 14px 10px;
+        background: var(--bg);
+        border-top: 1px solid var(--line);
       }
+      .bottombar button { margin-top: 0; }
+      #status { margin-top: 6px; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+      #status:empty { margin-top: 0; }
       .ok { color: #137333; }
       .err { color: #c5221f; }
-      .hint { color: #888; font-size: 11px; margin-top: 2px; }
-      .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+      .hint { color: var(--muted); font-size: 11px; margin-top: 3px; line-height: 1.45; }
     </style>
   </head>
   <body>
-    <h1>MyDualsub · 双语字幕</h1>
-
-    <div class="inline">
-      <input type="checkbox" id="enabled" />
-      <label for="enabled">启用双语字幕</label>
+    <div class="topbar">
+      <h1>MyDualsub · 双语字幕</h1>
+      <div class="switch">
+        <input type="checkbox" id="enabled" />
+        <label for="enabled">启用</label>
+      </div>
     </div>
 
-    <fieldset>
-      <legend>翻译 API（OpenAI 兼容）</legend>
-      <label for="apiBaseUrl">API Base URL</label>
-      <input type="text" id="apiBaseUrl" placeholder="https://api.openai.com/v1" />
-      <label for="apiKey">API Key</label>
-      <input type="password" id="apiKey" placeholder="sk-..." />
-      <label for="apiModel">模型</label>
-      <input type="text" id="apiModel" placeholder="gpt-4o-mini" />
-      <div class="hint">密钥仅存本地 chrome.storage，只发往你填写的端点。</div>
-      <button id="testBtn" class="secondary">测试连接</button>
-      <div id="usageInfo" class="hint">本页尚无可统计的 API Token</div>
-    </fieldset>
+    <div class="content">
+      <!-- 翻译 API：每次换端点/模型都要碰，放首位 -->
+      <section>
+        <h2>翻译 API（OpenAI 兼容）</h2>
+        <div class="body">
+          <label for="apiBaseUrl">API Base URL</label>
+          <input type="text" id="apiBaseUrl" placeholder="https://api.openai.com/v1" />
+          <label for="apiKey">API Key</label>
+          <input type="password" id="apiKey" placeholder="sk-..." />
+          <label for="apiModel">模型</label>
+          <input type="text" id="apiModel" placeholder="gpt-4o-mini" />
+          <button id="testBtn" class="secondary">测试连接</button>
+          <div class="hint">密钥仅存本地 chrome.storage，只发往你填写的端点。</div>
+          <div id="usageInfo" class="hint">本页尚无可统计的 API Token</div>
+        </div>
+      </section>
 
-    <fieldset>
-      <legend>语言</legend>
-      <label for="sourceLang">源语言（当前视频字幕轨道）</label>
-      <select id="sourceLang">
-        <option value="auto">自动（优先自动字幕 ASR）</option>
-      </select>
-      <label for="targetLang">译文语言</label>
-      <select id="targetLang">
-        <option value="zh-Hans">简体中文（zh-Hans）</option>
-      </select>
-      <div class="inline" style="margin-top:8px">
-        <input type="checkbox" id="skipChineseSource" />
-        <label for="skipChineseSource">跳过中文源字幕（只对非中文视频翻译）</label>
-      </div>
-      <div class="hint">默认开启。源轨是 zh/粤语等时不请求翻译；手动把源语言选成中文轨时仍会翻译。</div>
-    </fieldset>
+      <!-- 字幕外观：常调项（字号、位置、颜色、上下顺序）集中在一屏内 -->
+      <section>
+        <h2>字幕外观</h2>
+        <div class="body">
+          <div class="grid2">
+            <div>
+              <label for="fontSize">字号 (px)</label>
+              <input type="number" id="fontSize" min="10" max="60" />
+            </div>
+            <div>
+              <label for="bottomOffset">底部间距 (px)</label>
+              <input type="number" id="bottomOffset" min="0" max="400" />
+            </div>
+            <div>
+              <label for="fontColor">原文颜色</label>
+              <input type="color" id="fontColor" />
+            </div>
+            <div>
+              <label for="transColor">译文颜色</label>
+              <input type="color" id="transColor" />
+            </div>
+          </div>
+          <div class="inline"><input type="checkbox" id="showOriginal" /><label for="showOriginal">显示原文行</label></div>
+          <div class="inline"><input type="checkbox" id="transOnTop" /><label for="transOnTop">译文在上（原文在下）</label></div>
+          <div class="hint">字号是常规窗口下的基准值，全屏/影院模式按播放器高度同比放大。</div>
+        </div>
+      </section>
 
-    <fieldset>
-      <legend>显示</legend>
-      <div class="grid2">
-        <div>
-          <label for="fontSize">字号 (px，全屏自动放大)</label>
-          <input type="number" id="fontSize" min="10" max="60" />
-        </div>
-        <div>
-          <label for="bottomOffset">底部间距 (px)</label>
-          <input type="number" id="bottomOffset" min="0" max="400" />
-        </div>
-        <div>
-          <label for="fontWeight">字重</label>
-          <select id="fontWeight">
-            <option value="400">常规 (400)</option>
-            <option value="500">中等 (500)</option>
-            <option value="600">半粗 (600)</option>
-            <option value="700">粗体 (700)</option>
-          </select>
-        </div>
-        <div>
-          <label for="fontFamily">字体（留空=默认）</label>
+      <!-- 高级样式：设一次基本不再动，默认折叠 -->
+      <details>
+        <summary>高级样式（字重、字体、描边、阴影）</summary>
+        <div class="body">
+          <div class="grid2">
+            <div>
+              <label for="fontWeight">字重</label>
+              <select id="fontWeight">
+                <option value="400">常规 (400)</option>
+                <option value="500">中等 (500)</option>
+                <option value="600">半粗 (600)</option>
+                <option value="700">粗体 (700)</option>
+              </select>
+            </div>
+            <div>
+              <label for="shadowStrength">阴影强度</label>
+              <select id="shadowStrength">
+                <option value="none">无</option>
+                <option value="weak">弱</option>
+                <option value="medium">中</option>
+                <option value="strong">强</option>
+              </select>
+            </div>
+            <div>
+              <label for="strokeWidth">描边粗细 <span id="strokeWidthVal" class="hint" style="display:inline">1.2 px</span></label>
+              <input type="range" id="strokeWidth" min="0" max="3" step="0.1" />
+            </div>
+            <div>
+              <label for="strokeColor">描边颜色</label>
+              <input type="color" id="strokeColor" />
+            </div>
+          </div>
+          <label for="fontFamily">字体（留空 = 默认）</label>
           <input type="text" id="fontFamily" placeholder="如 Noto Sans SC" />
+          <div class="inline"><input type="checkbox" id="background" /><label for="background">背景框</label></div>
+          <div class="hint">描边粗细 0 = 关闭描边；描边与阴影用于提升亮背景下的可读性。字体仅用本地/系统已安装字体，不远程加载。</div>
         </div>
-        <div>
-          <label for="fontColor">原文颜色</label>
-          <input type="color" id="fontColor" />
-        </div>
-        <div>
-          <label for="transColor">译文颜色</label>
-          <input type="color" id="transColor" />
-        </div>
-      </div>
-      <div class="hint">字号为常规窗口下的基准值，全屏/影院模式会按播放器高度同比放大。字体仅用本地/系统已安装字体，不远程加载。</div>
-      <div class="grid2">
-        <div>
-          <label for="strokeWidth">描边粗细 <span id="strokeWidthVal" class="hint" style="display:inline">1.2 px</span></label>
-          <input type="range" id="strokeWidth" min="0" max="3" step="0.1" />
-        </div>
-        <div>
-          <label for="strokeColor">描边颜色</label>
-          <input type="color" id="strokeColor" />
-        </div>
-        <div>
-          <label for="shadowStrength">阴影强度</label>
-          <select id="shadowStrength">
-            <option value="none">无</option>
-            <option value="weak">弱</option>
-            <option value="medium">中</option>
-            <option value="strong">强</option>
-          </select>
-        </div>
-      </div>
-      <div class="hint">描边粗细 0 = 关闭描边；阴影/描边均为提升亮背景下可读性。</div>
-      <div class="inline"><input type="checkbox" id="background" /><label for="background">背景框</label></div>
-      <div class="inline"><input type="checkbox" id="transOnTop" /><label for="transOnTop">译文在上（原文在下）</label></div>
-      <div class="inline"><input type="checkbox" id="showOriginal" /><label for="showOriginal">显示原文行</label></div>
-      <div class="inline"><input type="checkbox" id="showLoading" /><label for="showLoading">译文未到时显示"翻译中…"</label></div>
-      <div class="inline"><input type="checkbox" id="waitForFirstTranslation" /><label for="waitForFirstTranslation">首包未就绪时短暂暂停播放（就绪/超时后自动继续）</label></div>
-    </fieldset>
+      </details>
 
-    <fieldset>
-      <legend>字幕节奏</legend>
-      <div class="grid2">
-        <div>
+      <!-- 加载行为 + 节奏：偶尔调，默认折叠 -->
+      <details>
+        <summary>加载与节奏</summary>
+        <div class="body">
+          <div class="inline"><input type="checkbox" id="showLoading" /><label for="showLoading">译文未到时显示"翻译中…"</label></div>
+          <div class="inline"><input type="checkbox" id="waitForFirstTranslation" /><label for="waitForFirstTranslation">首包未就绪时短暂暂停播放</label></div>
           <label for="tailTrimMs">句间空隙 (ms)</label>
           <input type="number" id="tailTrimMs" min="0" max="500" />
+          <div class="hint">句间空隙为连续语流相邻句之间的视觉断点，0 = 关闭（消除字幕墙）。首包暂停在就绪或超时后自动继续播放。</div>
         </div>
-        <div>
-          <label for="maxCharsPerScreen">单屏最多字数（旧配置兼容）</label>
-          <input type="number" id="maxCharsPerScreen" min="0" max="200" />
+      </details>
+
+      <!-- 语言：译文语言当前仅简体中文，用一行说明代替两个单选项下拉 -->
+      <details>
+        <summary>源语言与译文语言</summary>
+        <div class="body">
+          <label for="sourceLang">源语言（当前视频字幕轨道）</label>
+          <select id="sourceLang">
+            <option value="auto">自动（优先自动字幕 ASR）</option>
+          </select>
+          <label for="targetLang">译文语言</label>
+          <select id="targetLang">
+            <option value="zh-Hans">简体中文（zh-Hans）</option>
+          </select>
+          <div class="inline"><input type="checkbox" id="skipChineseSource" /><label for="skipChineseSource">跳过中文源字幕</label></div>
+          <div class="hint">当前版本译文固定为简体中文。跳过中文源默认开启：源轨是中文/粤语时不请求翻译；手动把源语言指定为中文轨时仍会翻译。</div>
         </div>
-        <div>
-          <label for="maxDurPerScreen">单屏最长时长（旧配置兼容）</label>
-          <input type="number" id="maxDurPerScreen" min="0" max="20000" />
+      </details>
+
+      <!-- 导出字幕：用到时才展开 -->
+      <details>
+        <summary>导出字幕（SRT）</summary>
+        <div class="body">
+          <div class="row">
+            <select id="srtMode">
+              <option value="bilingual_orig_top">双语（原文在上）</option>
+              <option value="bilingual_trans_top">双语（译文在上）</option>
+              <option value="only_translated">仅译文</option>
+            </select>
+            <button id="exportSrtBtn" class="secondary">导出 SRT</button>
+          </div>
+          <button id="cancelSrtBtn" class="secondary" style="display:none">取消全轨翻译</button>
+          <div class="hint">若全轨尚未翻完，会先明确确认费用并显示进度，可随时取消后续批次；不会静默请求整轨。</div>
         </div>
-      </div>
-      <div class="hint">句间空隙：连续语流相邻句之间的视觉断点(0=关闭，消除字幕墙)。v0.5.1 起模型结合整段上下文按源 cue 编号 1:1 返回译文，代码不再跨 cue 重排；超长译文只在同一字幕单元内安全换行。单屏字数/时长仅保留为旧配置兼容项，当前不参与主路径。</div>
-    </fieldset>
+      </details>
 
-    <fieldset>
-      <legend>配置备份</legend>
-      <div class="row">
-        <button id="exportBtn" class="secondary">导出配置</button>
-        <button id="importBtn" class="secondary">导入配置</button>
-      </div>
-      <input type="file" id="importFile" accept="application/json,.json" style="display:none" />
-      <div class="hint">导出文件默认不含 API Key，可安全用于普通配置备份。导入后点"保存设置"生效。</div>
-    </fieldset>
+      <!-- 配置备份 + 旧兼容项：最少使用，放最后 -->
+      <details>
+        <summary>配置备份与兼容项</summary>
+        <div class="body">
+          <div class="row">
+            <button id="exportBtn" class="secondary">导出配置</button>
+            <button id="importBtn" class="secondary">导入配置</button>
+          </div>
+          <input type="file" id="importFile" accept="application/json,.json" style="display:none" />
+          <div class="hint">导出文件默认不含 API Key，可安全用于普通备份。导入后需点「保存设置」生效。</div>
+          <div class="grid2" style="margin-top:8px">
+            <div>
+              <label for="maxCharsPerScreen">单屏最多字数</label>
+              <input type="number" id="maxCharsPerScreen" min="0" max="200" />
+            </div>
+            <div>
+              <label for="maxDurPerScreen">单屏最长时长</label>
+              <input type="number" id="maxDurPerScreen" min="0" max="20000" />
+            </div>
+          </div>
+          <div class="hint">以上两项仅为旧配置兼容保留，当前主路径不使用：模型按源 cue 编号 1:1 返回译文，代码不跨 cue 重排。</div>
+        </div>
+      </details>
+    </div>
 
-    <fieldset>
-      <legend>导出字幕</legend>
-      <div class="row">
-        <select id="srtMode">
-          <option value="bilingual_orig_top">双语（原文在上）</option>
-          <option value="bilingual_trans_top">双语（译文在上）</option>
-          <option value="only_translated">仅译文</option>
-        </select>
-        <button id="exportSrtBtn" class="secondary">准备并导出 SRT</button>
-      </div>
-      <button id="cancelSrtBtn" class="secondary" style="display:none">取消全轨翻译</button>
-      <div class="hint">若全轨尚未翻完，会先明确确认费用，并显示进度；可随时取消后续批次。不会静默请求整轨。</div>
-    </fieldset>
-
-    <button id="saveBtn">保存设置</button>
-    <div id="status"></div>
+    <div class="bottombar">
+      <button id="saveBtn">保存设置</button>
+      <div id="status"></div>
+    </div>
 
     <script src="core.js"></script>
     <script src="popup.js"></script>
