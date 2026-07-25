@@ -3217,6 +3217,34 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     assert.ok(longRu.endMs <= longSnap.renderUnits[1].startMs,
       "长单元补偿后与下一条重叠");
 
+    // ★ 根因层:源 cue 自报时间失真时,必须在 canonical timeline 建立前修好。
+    // YouTube ASR 会给出 "13 词 / 1000ms"(77ms/词 ≈ 650 wpm)且后接大段静音。
+    // cue 的 [start,end] 是词级时间均摊的唯一依据 —— 不在这层修,它切出的
+    // 每一屏 startMs/endMs 全是错的,而错的 startMs 靠下游延长屏尾永远修不回来。
+    const distorted = [
+      { start: 40322, end: 41322, content: "I think it's fair to say that they are a lot less common." },
+      { start: 42324, end: 43182, content: "One" },
+    ];
+    const fixedTl = Core.buildCanonicalTokenTimeline(distorted);
+    const firstWordCount = 12; // "I think it's fair to say that they are a lot less common."
+    const lastOfFirst = fixedTl.tokens[firstWordCount - 1];
+    const spanMs = lastOfFirst.endMs - fixedTl.tokens[0].startMs;
+    const srcPerWord = spanMs / firstWordCount;
+    assert.ok(srcPerWord >= 150,
+      `失真源 cue 未在 canonical 层修复: ${Math.round(srcPerWord)}ms/词 (span ${spanMs}ms)`);
+    // 起点必须仍严格来自源轨(只延 end,不动 start)
+    assert.strictEqual(fixedTl.tokens[0].startMs, 40322,
+      "修复动了 startMs: " + fixedTl.tokens[0].startMs);
+    // 绝不越过下一条 cue 的 start
+    assert.ok(lastOfFirst.endMs <= 42324,
+      "修复越过了下一条 cue: " + lastOfFirst.endMs);
+
+    // 正常语速的 cue 不得被改动
+    const normal = [{ start: 1000, end: 4000, content: "this is a normal sentence" }];
+    const normalTl = Core.buildCanonicalTokenTimeline(normal);
+    assert.strictEqual(normalTl.tokens[normalTl.tokens.length - 1].endMs, 4000,
+      "正常语速 cue 被误改: " + normalTl.tokens[normalTl.tokens.length - 1].endMs);
+
     // 静音不足时只能借多少算多少,仍不许重叠
     const tightTl = {
       sourceFingerprint: "fp-tight",

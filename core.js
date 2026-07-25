@@ -215,9 +215,58 @@
     return native.length ? native : fallbackCueTokens(cue);
   }
 
+  // 源 cue 时间失真的判定阈值。低于此值即认为该 cue 自报的时长不可能是真实语速
+  // (200ms/词 ≈ 300 wpm 已是极快语速的地板)。
+  var IMPLAUSIBLE_MS_PER_WORD = 200;
+
+  /**
+   * 修复源轨自报时间失真的 cue —— 这是「字幕后半段几乎看不见」的**根**。
+   *
+   * YouTube ASR 会给出这种 cue:
+   *   [40322-41322] 1000ms / 13 词 = 77ms/词 ≈ 650 wpm(没人这么说话)
+   * 而它后面往往紧跟着大段静音(该例 1002ms)。真机轨共 9 条这样的 cue,
+   * 白白空着的静音合计 6919ms。
+   *
+   * 为什么必须在**这一层**修:cue 的 [start,end] 是 fallbackCueTokens 均匀
+   * 摊给每个词的唯一依据。cue 被压缩 → 它切出的每一屏 startMs/endMs **全都**
+   * 是错的。下游只延长屏尾(可读时长补偿)治不了这个:
+   *   - 错的 startMs 永远修不回来;
+   *   - 一条 cue 切成多屏时,浪费的静音在**最后一屏之后**,中间那些屏
+   *     紧邻下一屏、gap 为 0,根本无处可借。实测那条 95ms/词 的屏就是如此。
+   *
+   * 做法:把失真 cue 的 end 向后延伸进它后面的真实静音,延到「按 200ms/词
+   * 勉强读得完」为止,绝不越过下一条 cue 的 start。只动 end,不动 start,
+   * 所以出现时刻仍严格来自源轨。静音不够就延多少算多少。
+   */
+  function repairImplausibleCueTiming(cues) {
+    var list = Array.isArray(cues) ? cues : [];
+    var out = list.map(function (cue) { return cue; });
+    for (var i = 0; i < out.length; i++) {
+      var cue = out[i];
+      if (!cue) continue;
+      // 带原生词级时间的 cue 不碰:它的时间是真实测量值,不是均摊猜测
+      if (cue.tokens && cue.tokens.length) continue;
+      var words = restoredWords(cue.content || "").length;
+      if (!words) continue;
+      var start = Number(cue.start);
+      var end = Number(cue.end);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) continue;
+      if ((end - start) >= words * IMPLAUSIBLE_MS_PER_WORD) continue;
+
+      var next = out[i + 1];
+      var nextStart = next ? Number(next.start) : Infinity;
+      if (!Number.isFinite(nextStart)) nextStart = Infinity;
+      var want = start + words * IMPLAUSIBLE_MS_PER_WORD;
+      var repaired = Math.min(want, nextStart);
+      if (repaired <= end) continue;
+      out[i] = Object.assign({}, cue, { end: repaired });
+    }
+    return out;
+  }
+
   function buildCanonicalTokenTimeline(cues) {
     var raw = [];
-    (cues || []).forEach(function (cue) {
+    repairImplausibleCueTiming(cues).forEach(function (cue) {
       appendTimelineTokens(raw, timelineTokensForCue(cue));
     });
 
@@ -1058,6 +1107,9 @@
     }
 
     var list = [];
+    // 这里**不做**时间修复:resegment 只决定「切在哪里」,它的 cue 时间下游
+    // 会被丢弃(最终显示时间一律来自 canonical token)。在这里改时间只会
+    // 干扰长停顿/碎句黏合等分屏判定 —— 那是另一套已被测试锁定的行为。
     (cues || []).filter(function (c) { return c && c.content; }).forEach(function (c) {
       var pieces = splitCueAtSentenceEnds(c);
       for (var i = 0; i < pieces.length; i++) list.push(pieces[i]);
