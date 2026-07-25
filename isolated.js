@@ -88,7 +88,9 @@
     videoEl: null,
     fontObserver: null, // ResizeObserver：观察播放器高度变化，同比缩放字号（全屏放大）
     // ---- 运行循环 / 生命周期（低配机占用优化）----
-    renderTimer: null, // 单一节流渲染定时器 id
+    renderTimer: null, // 仅无帧回调 API 时的兜底 setInterval id
+    renderFrameHandle: null, // requestVideoFrameCallback / rAF 句柄
+    renderDriver: null, // "vfc" | "raf" | "interval"，决定用哪个 cancel
     prefetchTimer: null, // 预取定时器 id（与渲染解耦、降频）
     seekTimer: null, // seek 防抖定时器 id
     listeners: [], // 已绑定的监听器 [{target,type,fn}]，teardown 时统一解绑
@@ -150,9 +152,10 @@
     return error;
   }
 
-  // 渲染/预取节拍（ms）。渲染 250ms 人眼无感；预取 1s 一次（比渲染低频，但比旧 1.5s 更跟手），与渲染解耦。
-  var RENDER_INTERVAL_MS = 250;
+  // 保底渲染节拍(ms)。与帧回调并存 —— 帧回调给精度,它给活性
+  // (rVFC 只在合成新帧时触发,无媒体源/缓冲/暂停时不产帧)。见 startRenderLoop。
   var PREFETCH_INTERVAL_MS = 1000;
+  var RENDER_FALLBACK_INTERVAL_MS = 250;
   var SEEK_SETTLE_MS = 350; // seek 停稳多少 ms 后才翻目标 clip
   var RETRY_INTERVAL_MS = 3000; // 失败 clip 后台重试调度节拍（第2层）
 
@@ -1622,13 +1625,72 @@
     state.listeners = [];
   }
 
-  /** 启动渲染循环（幂等）。仅在启用 + 有字幕时跑 */
+  /**
+   * 启动渲染循环(幂等)。仅在启用 + 有字幕时跑。
+   *
+   * 双驱动,缺一不可:
+   *  1) 帧回调(requestVideoFrameCallback,无则 rAF)—— 提供精度。字幕出现时刻
+   *     必须跟随视频时间,而非一个与视频无关的定时器。原先仅 250ms setInterval
+   *     使每条字幕平均晚 127ms、最坏晚 248ms(449 单元中 17.8% 晚于 200ms),
+   *     且时长不足一个 tick 的短单元被整条跳过(实测 5 条 <250ms)。
+   *  2) 定时器保底 —— 提供活性。rVFC **只在真正合成新视频帧时**触发:无媒体源、
+   *     缓冲、暂停、隐藏标签页都不产帧,单靠它会完全停摆(CI headless replay
+   *     即因此漏掉两个语义单元没画出来)。保底节拍确保任何情况下都在推进。
+   *
+   * 两者都调用同一个 onRenderTick,后者按 lastRenderedKey 去重,重复调用无副作用。
+   * 低配机上帧回调随浏览器降帧自动降频,页面隐藏时浏览器暂停回调,占用不高于原方案。
+   */
   function startRenderLoop() {
-    if (state.renderTimer != null) return;
+    if (state.renderTimer != null || state.renderFrameHandle != null) return;
     if (!config.enabled || !state.cues.length) return;
-    state.renderTimer = setInterval(onRenderTick, RENDER_INTERVAL_MS);
+
+    // 保底节拍:始终存在,与帧回调并存(onRenderTick 幂等,不会重复画)
+    state.renderTimer = setInterval(onRenderTick, RENDER_FALLBACK_INTERVAL_MS);
+
+    var v = state.videoEl;
+    if (v && typeof v.requestVideoFrameCallback === "function") {
+      state.renderDriver = "vfc";
+      var stepVfc = function () {
+        state.renderFrameHandle = null;
+        if (state.renderDriver !== "vfc") return;
+        onRenderTick();
+        var vid = state.videoEl;
+        if (vid && typeof vid.requestVideoFrameCallback === "function") {
+          state.renderFrameHandle = vid.requestVideoFrameCallback(stepVfc);
+        }
+      };
+      state.renderFrameHandle = v.requestVideoFrameCallback(stepVfc);
+      return;
+    }
+
+    if (typeof requestAnimationFrame === "function") {
+      state.renderDriver = "raf";
+      var stepRaf = function () {
+        state.renderFrameHandle = null;
+        if (state.renderDriver !== "raf") return;
+        onRenderTick();
+        state.renderFrameHandle = requestAnimationFrame(stepRaf);
+      };
+      state.renderFrameHandle = requestAnimationFrame(stepRaf);
+      return;
+    }
+
+    state.renderDriver = "interval"; // 只有保底节拍
   }
   function stopRenderLoop() {
+    var driver = state.renderDriver;
+    var handle = state.renderFrameHandle;
+    state.renderDriver = null;
+    state.renderFrameHandle = null;
+    if (handle != null) {
+      try {
+        if (driver === "vfc" && state.videoEl && typeof state.videoEl.cancelVideoFrameCallback === "function") {
+          state.videoEl.cancelVideoFrameCallback(handle);
+        } else if (driver === "raf" && typeof cancelAnimationFrame === "function") {
+          cancelAnimationFrame(handle);
+        }
+      } catch (e) {}
+    }
     if (state.renderTimer != null) {
       clearInterval(state.renderTimer);
       state.renderTimer = null;

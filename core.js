@@ -1378,14 +1378,47 @@
     return s;
   }
 
-  function validateChineseDisplayUnit(text) {
+  /**
+   * 判断一条中文显示单元是否合规。
+   *
+   * opts.sourceText = 该单元原文;opts.continues = 该句是否在下一单元继续。
+   *
+   * 为什么必须知道「是否继续」:分屏器会**故意**在句中切开(一屏最多 ~12 词),
+   * 这种单元的忠实译文本来就该断在句中,尾部形态检查对它无意义。判据不是
+   * 「原文结尾是什么标点」(原文可能以单词结尾却仍未说完,如 "...want to do with"),
+   * 而是「这一屏是不是整句的结尾」—— 只有整句到此为止、译文却还断在逗号/连词上,
+   * 才说明真的没译完。
+   *
+   * 此前不看上下文一律拒绝逗号结尾,把 "If you're a human person," →
+   * "如果你是人类，" 这种完全正确的译文判违规;在 gpt-5.4-mini 上首 clip
+   * 3 行有 2 行被误杀(实测 3/3 复现),整段回退英文。
+   */
+  function validateChineseDisplayUnit(text, opts) {
     var raw = String(text == null ? "" : text);
     var s = raw.trim();
     if (!s) return { ok: false, reason: "empty" };
     if (/\r|\n/.test(raw)) return { ok: false, reason: "internal-newline" };
-    if (/[，、：；,……]$/.test(s)) return { ok: false, reason: "non-terminal-punctuation" };
-    if (/(?:虽然|尽管|如果|因为|但是|但|可能|以及|而且|所以|就是|从|到|和|与|或|并且)$/.test(s)) {
-      return { ok: false, reason: "dangling-tail" };
+
+    if (opts === undefined) opts = {};
+    else if (typeof opts === "string") opts = { sourceText: opts };
+
+    var src = String(opts.sourceText == null ? "" : opts.sourceText).trim();
+    // 句子是否在本屏之后继续:显式传入优先;否则由原文自身形态推断
+    // (未以终止标点收尾 = 还没说完,含以单词结尾的情况)。
+    var continues;
+    if (opts.continues != null) {
+      continues = !!opts.continues;
+    } else if (src) {
+      continues = !/[.!?。！？…]["'”’)\]]?$/.test(src);
+    } else {
+      continues = false; // 无上下文:保持原有严格行为
+    }
+
+    if (!continues) {
+      if (/[，、：；,……]$/.test(s)) return { ok: false, reason: "non-terminal-punctuation" };
+      if (/(?:虽然|尽管|如果|因为|但是|但|可能|以及|而且|所以|就是|从|到|和|与|或|并且)$/.test(s)) {
+        return { ok: false, reason: "dangling-tail" };
+      }
     }
     return { ok: true, reason: "ok" };
   }
@@ -1891,6 +1924,10 @@
         unitId: String(unit && unit.unitId || ""),
         tokenStart: Number(unit && unit.tokenStart),
         tokenEnd: Number(unit && unit.tokenEnd),
+        // sourceText 必须带下来:译文合规性要对照原文判断(见 validateChineseDisplayUnit)。
+        // 此前这里只挑了 unitId/tokenStart/tokenEnd,原文被丢掉 → 校验侧永远拿到
+        // undefined,只能按「整句结尾」严格判,把句中切开的正确译文judge成违规。
+        sourceText: String(unit && unit.sourceText || ""),
       };
     });
     var expectedById = {};
@@ -1925,7 +1962,19 @@
       if (!translation.trim()) {
         contentError = "translation coverage empty translation";
       } else {
-        var verdict = validateChineseDisplayUnit(translation);
+        // 该句是否在本屏之后继续。判据只看**本单元原文自身**是否以终止标点收尾:
+        // 没有终止标点 = 整句还没说完,此时忠实译文断在句中是正确的。
+        //
+        // 不能用「本 clip 内是否还有下一单元」来判断:clip 是按时间切的,
+        // 一句话完全可能跨 clip —— 首 clip 末条原文 "...for lots of reasons,"
+        // 正是这种情况(实测该条被误杀 2/3 次)。也不能只看原文末字符是否逗号:
+        // 原文可能以单词结尾却仍未说完(如 "...want to do with")。
+        var srcText = String(source.sourceText == null ? "" : source.sourceText).trim();
+        var midSentence = srcText ? !/[.!?。！？…]["'”’)\]]?$/.test(srcText) : false;
+        var verdict = validateChineseDisplayUnit(translation, {
+          sourceText: source.sourceText,
+          continues: midSentence,
+        });
         if (!verdict.ok) contentError = "translation coverage invalid Chinese unit: " + verdict.reason;
       }
       if (contentError) {
