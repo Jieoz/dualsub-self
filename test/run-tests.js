@@ -3775,6 +3775,103 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     assert.ok(replaced && replaced.units.length === snapshot.units.length, "原样区间替换必须通过词流覆盖校验");
   });
 
+  test("语义区间换入必须保住已有译文：边界内的译文不得被换入丢弃", () => {
+    // 用户实测（视频 BhtgINeaJWg，5.7 分钟真实 ASR 轨）：85 个单元里 53 个 [未翻译]，
+    // 连开头 4-24s 也未翻 —— 开头本该最先翻好，说明它被翻过又丢了。
+    //
+    // 根因：翻译跑在语义恢复前面，按 fallback 断句翻好后，恢复重切边界，
+    // 跨边界的旧译文无法继承（真机 28 条新单元里 17 条交叉切开），只能作废重翻。
+    // 同一段内容翻两遍，这才是「翻译永远跟不上字幕」。
+    //
+    // 修法不是"让跨边界的译文也能救回来"（交叉切开时旧译文确实对不上新单元内容，
+    // 硬拼会产出错误译文），而是**不产生**跨边界的译文：预取截到已恢复边界内
+    // （见上一条门禁）。这里验证在此前提下换入是无损的 —— 边界内已翻的内容，
+    // 换入后必须一条都不丢。
+    const raw = JSON.parse(fs.readFileSync(path.join(__dirname, "fixtures/youtube-bhtg-asr-raw.json"), "utf8"));
+    const cues = Core.cleanupCues(Core.parseJson3(raw));
+    const timeline = Core.buildCanonicalTokenTimeline(cues);
+    const fallbackCues = Core.resegmentCues(cues, { tailTrimMs: 0, maxWords: 12, continuationMaxWords: 14 });
+    const units = Core.buildCueTokenSpanUnits(timeline, fallbackCues);
+
+    const snapshot0 = Core.createTimelineSnapshot({
+      revision: 0, videoId: "BhtgINeaJWg", trackCode: "en", timeline, units, translations: {},
+    });
+    const iv = Core.planSemanticInterval(snapshot0, 0);
+    assert.ok(iv, "首个区间必须存在");
+
+    // 遵守设计约束：只有**区间之外**（已恢复边界之内 = 尚未被本次换入触及）的单元有译文。
+    // 这正是修复后的真实运行状态：预取不会翻到未恢复区间里去。
+    const translations = {};
+    units.slice(iv.endIndex).forEach((u) => { translations[u.id] = "【已翻】" + u.originalText.slice(0, 10); });
+    const snapshot = Core.createTimelineSnapshot({
+      revision: 0, videoId: "BhtgINeaJWg", trackCode: "en", timeline, units, translations,
+    });
+    const before = Object.values(snapshot.translations).filter(Boolean).length;
+    assert.ok(before > 0, "构造前提：区间外必须有已翻单元");
+
+    // 语义恢复真实形状：按语义重切，新边界与旧边界普遍交叉
+    const intervalTokenStart = units[iv.startIndex].tokenStart;
+    const intervalTokenEnd = units[iv.endIndex - 1].tokenEnd;
+    const resegmented = [];
+    let cursor = intervalTokenStart;
+    let step = 0;
+    while (cursor < intervalTokenEnd) {
+      const size = [10, 11, 8][step++ % 3];
+      const end = Math.min(cursor + size, intervalTokenEnd);
+      const tk = timeline.tokens.slice(cursor, end).map((t) => ({ text: t.text, start: t.startMs, end: t.endMs }));
+      resegmented.push({ start: tk[0].start, end: tk[tk.length - 1].end, content: tk.map((t) => t.text).join(" "), tokens: tk });
+      cursor = end;
+    }
+    const after = Core.resegmentTimelineSnapshot(snapshot, iv.startIndex, iv.endIndex, resegmented);
+
+    const coveredBefore = new Set();
+    units.forEach((u) => {
+      if (!translations[u.id]) return;
+      for (let t = u.tokenStart; t < u.tokenEnd; t++) coveredBefore.add(t);
+    });
+    const coveredAfter = new Set();
+    after.units.forEach((u) => {
+      if (!after.translations[u.id]) return;
+      for (let t = u.tokenStart; t < u.tokenEnd; t++) coveredAfter.add(t);
+    });
+    let lost = 0;
+    coveredBefore.forEach((t) => { if (!coveredAfter.has(t)) lost++; });
+    assert.strictEqual(lost, 0,
+      `区间换入丢失了 ${lost}/${coveredBefore.size} 个边界外的已翻词 —— 换入不得影响它触及范围之外的译文`);
+  });
+
+  test("翻译不得越过语义恢复边界：越界翻的内容注定作废重翻", () => {
+    // 语义恢复重切边界后，跨边界的旧译文无法继承（真机 28 条新单元里 17 条交叉切开），
+    // 只能重翻。所以「已恢复到哪」就是「能翻到哪」，越过去纯属浪费算力。
+    const clipStartMs = [];
+    for (let i = 0; i < 30; i++) clipStartMs.push(i * 12000);
+
+    // 已恢复到 60s：预取窗口 [2..5] 里只有起点 < 60s 的段可翻
+    const clamped = Core.planTranslationWindow({
+      currentIdx: 2, clipCount: 30, semanticReadyUntilMs: 60000, clipStartMs,
+    });
+    assert.strictEqual(clamped.reason, "clamped-to-semantic", "越界时必须报告已截断");
+    assert.ok(clamped.plan.every((i) => clipStartMs[i] < 60000),
+      `不得计划恢复边界之外的段，实际 ${JSON.stringify(clamped.plan)}`);
+    assert.ok(clamped.plan.includes(2), "当前段必须始终在计划内（首屏可用性底线）");
+
+    // 恢复已到轨尾（Infinity）时不得截断 —— 否则永远只翻一段
+    const done = Core.planTranslationWindow({
+      currentIdx: 2, clipCount: 30, semanticReadyUntilMs: Infinity, clipStartMs,
+    });
+    assert.ok(done.plan.length >= 4, `恢复完成后窗口不得被截断，实际 ${JSON.stringify(done.plan)}`);
+
+    // 非语义轨（传 null）保持原行为，不受影响
+    const plain = Core.planTranslationWindow({ currentIdx: 2, clipCount: 30, semanticReadyUntilMs: null, clipStartMs });
+    assert.ok(plain.plan.length >= 4, "fallback 轨不得被语义边界截断");
+
+    // 当前段尚未恢复也必须翻：宁可断句将来变，也不能没有中文
+    const cold = Core.planTranslationWindow({
+      currentIdx: 5, clipCount: 30, semanticReadyUntilMs: 0, clipStartMs,
+    });
+    assert.deepStrictEqual(cold.plan, [5], "边界为 0 时仍须保留当前段");
+  });
+
   test("预取调度不得被旁路：prefetchAround 只能经 planTranslationWindow 决定翻哪些段", () => {
     // 为什么需要这条：上一条门禁测的是 planTranslationWindow 这个纯函数，
     // 但缺陷本体是**调用点**上的降级分支（semanticPending 时直接只翻当前段）。
@@ -3789,6 +3886,17 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     const decideAt = body.indexOf("Core.planTranslationWindow(");
     const earlyTranslate = body.slice(0, decideAt).indexOf("translateClip(");
     assert.strictEqual(earlyTranslate, -1, "预取判据之前不得直接 translateClip（绕过调度窗口）");
+
+    // 语义恢复的推进必须领先于**预取窗口**，不是领先于播放位置。
+    // 注入实测：把提前量换回 SEMANTIC_INTERVAL_MS/2（领先播放但落后于预取窗口）时
+    // 纯函数门禁全绿 —— 因为这条约束在调度代码里，只能在源码层锁。
+    // 后果是预取一直撞在恢复边界上被截断，翻译闲着等恢复，反而更慢。
+    const advance = String(src.match(/function maybeAdvanceSemanticInterval[\s\S]*?\n  }\n/) || "");
+    assert.ok(advance, "必须能找到 maybeAdvanceSemanticInterval");
+    assert.ok(/PREFETCH_AHEAD/.test(advance),
+      "恢复推进的提前量必须由预取窗口深度(PREFETCH_AHEAD)推导，不得只按播放位置或区间长度");
+    assert.ok(!/SEMANTIC_INTERVAL_MS\s*\/\s*2/.test(advance),
+      "不得用 SEMANTIC_INTERVAL_MS/2 作提前量：那只领先播放，落后于预取窗口");
 
     // 也不得靠 semanticPending 降级预取：这正是"翻译永远跟不上播放"的根因。
     // 只看可执行代码 —— 注释里解释这段历史是应该的，不能因此判红。
