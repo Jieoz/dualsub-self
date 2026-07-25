@@ -737,7 +737,15 @@
       for (var i = 0; i < words.length; i++) replacementWords.push(words[i]);
       localEnds.push(tokenStart + replacementWords.length - 1);
     });
-    if (replacementWords.length !== sourceWords.length) throw new Error("replacement token coverage mismatch");
+    // 带上实际数字：这条错误最常见的成因是调用方用了另一套下标空间
+    // （原始轨 cue vs snapshot units），只报"mismatch"无法区分。
+    if (replacementWords.length !== sourceWords.length) {
+      throw new Error(
+        "replacement token coverage mismatch: got " + replacementWords.length +
+        " words for units [" + firstUnit + "," + afterUnit + ") = tokens [" +
+        tokenStart + "," + tokenEnd + ") expecting " + sourceWords.length
+      );
+    }
     for (var w = 0; w < sourceWords.length; w++) {
       if (String(replacementWords[w]).toLowerCase() !== String(sourceWords[w]).toLowerCase()) {
         throw new Error("replacement token text mismatch at " + w);
@@ -1981,6 +1989,75 @@
     return total > 0 && timed / total >= min;
   }
 
+  // 语义恢复一次处理多少播放时间。
+  //
+  // 取值依据（37 分钟真实轨实测，6257 token / 单块 16.4s）：
+  // 旧的整轨一次性恢复 = 35 块 ≈ 9.5 分钟，期间预取被降级 → 翻译永远追不上播放；
+  // 且无论用户看多久都要先付满 35 块。
+  //
+  // 改为按播放位置滑动后，区间长度的取舍（数字为模型块数，35 = 旧实现基线）：
+  //        看1min  看5min  看10min  看全片
+  //   90s     4       8       16       47
+  //   120s    3       8       16       42
+  //   180s    4      11       14       40
+  //   300s    6      11       16       37
+  // 取 120s：短时长观看（占绝大多数）最省或持平，看全片也只比 180s 多 5%。
+  // 区间边界会切出零头块，因此看全片比整轨基线多约 20% —— 这是换取
+  // 「按需付费 + 全程跟得上」的代价，短观看的节省远大于它（看 5 分钟 = 旧的 23%）。
+  //
+  // 单次恢复 3 块 ≈ 49s，覆盖 120s 播放 → 恢复速度约为播放速度的 2.4 倍，
+  // 足以持续领先播放。
+  var SEMANTIC_INTERVAL_MS = 120000;
+
+  /**
+   * 选出「该恢复哪一段」—— 语义恢复的滑动窗口。
+   *
+   * 为什么不整轨恢复：整轨要 9.5 分钟（实测），期间无论怎么调度都跟不上播放，
+   * 而且无论用户看多久都要为全部 35 块付 token。按播放位置滑动后，
+   * token 消耗正比于实际观看时长，且每一段仍是 semantic 断句（质量不降）。
+   *
+   * 区间必须定义在 **timeline snapshot 的 units 下标空间**上，而不是原始轨 cue 上。
+   * 原因（实测踩过，browser-replay 报 replacement token coverage mismatch）：
+   * 原始轨 cue 与 snapshot units 是两套下标 —— snapshot 由 fallback 重组产生
+   * （197 条原始 cue → 150 条 fallback 单元），拿原始轨下标去调
+   * resegmentTimelineSnapshot 会取到完全不同的 token 跨度。
+   *
+   * 送模型的词流直接取自 snapshot.timeline.tokens 的对应跨度，
+   * 与替换校验用的是同一份 token —— 覆盖校验因此天然成立。
+   *
+   * 返回 { startIndex, endIndex, tokens }（下标为 snapshot.units 下标，
+   * endIndex 为开区间）；无可恢复区间时返回 null。
+   */
+  function planSemanticInterval(snapshot, positionMs, opts) {
+    opts = opts || {};
+    if (!snapshot || !snapshot.timeline || !Array.isArray(snapshot.units)) return null;
+    var units = snapshot.units;
+    var tokens = snapshot.timeline.tokens || [];
+    if (!units.length || !tokens.length) return null;
+    var pos = Number(positionMs);
+    if (!Number.isFinite(pos)) pos = 0;
+    var spanMs = Number(opts.intervalMs);
+    if (!Number.isFinite(spanMs) || spanMs <= 0) spanMs = SEMANTIC_INTERVAL_MS;
+
+    // 起点：当前播放位置所在（或之后的第一个）单元。
+    var startIndex = -1;
+    for (var i = 0; i < units.length; i++) {
+      if (Number(units[i].endMs) > pos) { startIndex = i; break; }
+    }
+    if (startIndex < 0) return null;
+
+    // 终点：覆盖到起点 + spanMs 为止，且至少含一个单元。
+    var limit = Number(units[startIndex].startMs) + spanMs;
+    var endIndex = startIndex + 1;
+    while (endIndex < units.length && Number(units[endIndex].startMs) < limit) endIndex++;
+
+    var tokenStart = units[startIndex].tokenStart;
+    var tokenEnd = units[endIndex - 1].tokenEnd;
+    var slice = tokens.slice(tokenStart, tokenEnd);
+    if (!slice.length) return null;
+    return { startIndex: startIndex, endIndex: endIndex, tokens: slice };
+  }
+
   // JSON3 滚动 event 常会把上一 event 的尾词重复一次。先在严格的词流层
   // 去重，模型看到的才是一条连续语音，而不是 ASR 事件碎片的拼接。
   function collectSemanticTokens(cues) {
@@ -2814,6 +2891,31 @@
    *          clipCount），让接近段尾时自动加深窗口。不传 opts 时行为与旧版完全一致。
    * 返回升序、已裁越界的下标数组。currentIdx 越界/clipCount<=0 时返回 []。
    */
+  /**
+   * 决定"这一刻该翻哪些 clip"—— 预取窗口的唯一权威判据。
+   *
+   * 之前这个决策内联在 isolated.js 的 prefetchAround 里，因此无法被测试覆盖，
+   * 于是一个致命回归长期没人发现：整轨语义恢复期间（semanticPending）计划被砍成
+   * [idx]（只翻当前正在播的那一段）。实测这段时间在 37 分钟轨上长达 9.5 分钟
+   * （6261 token / 35 块 × 单块 16.4s，且刻意用最低优先级只吃富余并发），
+   * 期间单 clip 翻译约 9.5s 而一个 clip 只覆盖约 14s 播放 —— 边播边翻，
+   * 译文永远追着播放跑。整轨模拟覆盖率 0%。
+   *
+   * 现在语义恢复改为跟着播放位置滑动（区间恢复），不再存在"长期 pending"，
+   * 因此预取窗口不再因恢复而降级：任何时刻都按 ahead 深度预取。
+   *
+   * 返回 { plan, reason }。reason 供门禁与诊断使用，不影响行为。
+   */
+  function planTranslationWindow(opts) {
+    opts = opts || {};
+    var idx = Number(opts.currentIdx);
+    var count = Number(opts.clipCount);
+    if (!Number.isFinite(count) || count <= 0) return { plan: [], reason: "no-clips" };
+    if (!Number.isFinite(idx) || idx < 0 || idx >= count) return { plan: [], reason: "idx-out-of-range" };
+    var plan = planPrefetch(idx, count, opts.ahead, { remainMsInCurrent: opts.remainMsInCurrent });
+    return { plan: prioritizePrefetch(plan, Math.floor(idx)), reason: "window" };
+  }
+
   function planPrefetch(currentIdx, clipCount, ahead, opts) {
     var n = Number(clipCount);
     if (!Number.isFinite(n) || n <= 0) return [];
@@ -3629,6 +3731,9 @@
     migrateConfig: migrateConfig,
     computeFontPx: computeFontPx,
     planPrefetch: planPrefetch,
+    planTranslationWindow: planTranslationWindow,
+    planSemanticInterval: planSemanticInterval,
+    SEMANTIC_INTERVAL_MS: SEMANTIC_INTERVAL_MS,
     prioritizePrefetch: prioritizePrefetch,
     planCoverageBatches: planCoverageBatches,
     makeSemaphore: makeSemaphore,
