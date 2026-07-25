@@ -726,6 +726,18 @@
     if (!Number.isInteger(firstUnit) || !Number.isInteger(afterUnit) || firstUnit < 0 || afterUnit <= firstUnit || afterUnit > snapshot.units.length) {
       throw new Error("replacement unit range invalid");
     }
+    // 语义恢复结果的合法性校验属于**这里**（装载时），不属于翻译路径。
+    // 模型返回明显超长的边界 = 结果不可信，fail-closed 保住当前可用时间轴。
+    // 此约束曾错放在 translateClipWithBoundaryRepair 的输入卫士里并按 mode 分叉，
+    // 导致区间外的合法 fallback 单元被连坐拒翻（真机实测 59% 覆盖率）—— 见该函数注释。
+    (replacementCues || []).forEach(function (cue, ci) {
+      var n = restoredWords(String(cue && cue.content || "")).length;
+      // 上限用 SOURCE_UNIT_MAX_WORDS：语义恢复为保住语法续接本来就会产出 13-14 词单元
+      // （实测按 12 拒会让整个区间恢复失败）。这里只拦真正异常的超长结果。
+      if (n > SOURCE_UNIT_MAX_WORDS) {
+        throw new Error("semantic replacement unit " + ci + " has " + n + " words (cap " + SOURCE_UNIT_MAX_WORDS + ")");
+      }
+    });
     var tokenStart = snapshot.units[firstUnit].tokenStart;
     var tokenEnd = snapshot.units[afterUnit - 1].tokenEnd;
     var sourceWords = snapshot.timeline.tokens.slice(tokenStart, tokenEnd).map(function (token) { return token.text; });
@@ -900,6 +912,14 @@
   // 被自己的超时掐断，重试也常常再次超时，整个 clip 全成 [未翻译] —— 用户看到的
   // 大面积未翻译有一半来自这里，与语言无关。上限仍需存在，否则卡死的请求会永远
   // 占住重试队列。
+  // 一个源单元的词数上限，断句层与翻译守卫层的**唯一权威**。
+  //
+  // DISPLAY = 舒适阅读宽度（断句的目标值）；SOURCE_UNIT_MAX = 语法续接允许的硬上限。
+  // 两者曾在断句处（continuationMaxWords: 14）与翻译守卫处（cap 12）各写一份且不一致，
+  // 导致 13-14 词的合法续接单元永远翻不了 —— 真机才暴露，离线门禁全绿。
+  var DISPLAY_UNIT_MAX_WORDS = 12;
+  var SOURCE_UNIT_MAX_WORDS = 14;
+
   var TRANSLATE_TIMEOUT_MS = 90000;
 
   function restoredWords(text) {
@@ -2633,7 +2653,16 @@
     opts = opts || {};
     var cues = (opts.cues || []).slice();
     if (!cues.length) return { cues: [], lines: [], coverage: [], repaired: false };
-    var maxSourceWords = opts.segmentationMode === "fallback-translation" ? 14 : 12;
+    // 这个守卫是**翻译前的输入卫士**：唯一职责是拦住模型收不下的超长单元。
+    // 那个上限就是 SOURCE_UNIT_MAX_WORDS，与断句模式无关。
+    //
+    // 曾按 segmentationMode 分叉（semantic 给 12、其他给 14），混进了本不属于这里的
+    // 职责 —— "semantic 恢复结果应 ≤12 词" 是**断句质量**约束，属于恢复装载时的校验，
+    // 不该由翻译路径承担。混淆的后果（真机实测）：语义恢复只覆盖当前区间，区间外仍是
+    // fallback 断句(允许续接到 14 词)，却因全局 mode 已是 "semantic" 而按 12 词拒翻，
+    // 那些单元永远翻不了、反复退避重试到 failed，屏幕留 [未翻译]。
+    // 真机日志：clip 3 翻译失败：oversized source unit before translation: 14 words (cap 12)
+    var maxSourceWords = SOURCE_UNIT_MAX_WORDS;
     for (var i = 0; i < cues.length; i++) {
       var sourceWords = unitWordCount(cues[i]);
       if (sourceWords > maxSourceWords) throw new Error("oversized source unit before translation: " + sourceWords + " words (cap " + maxSourceWords + ")");
@@ -3808,6 +3837,8 @@
     computeFontPx: computeFontPx,
     planPrefetch: planPrefetch,
     planTranslationWindow: planTranslationWindow,
+    DISPLAY_UNIT_MAX_WORDS: DISPLAY_UNIT_MAX_WORDS,
+    SOURCE_UNIT_MAX_WORDS: SOURCE_UNIT_MAX_WORDS,
     PREFETCH_AHEAD: PREFETCH_AHEAD,
     planSemanticInterval: planSemanticInterval,
     SEMANTIC_INTERVAL_MS: SEMANTIC_INTERVAL_MS,

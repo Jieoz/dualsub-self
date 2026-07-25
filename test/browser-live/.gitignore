@@ -1,0 +1,3 @@
+# 真机验证用的 ASR 轨由 yt-dlp 现抓，不入库（单条 80-250KB，且会随 YouTube 更新变化）。
+# 准备方式见 README-live.md。
+*.json3

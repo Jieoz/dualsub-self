@@ -139,6 +139,10 @@
       !(context.controller && context.controller.signal && context.controller.signal.aborted);
   }
 
+  // 区间换入时无条件废弃全部在途请求。曾考虑按源文本指纹保留区间外的在途请求
+  // （每次换入砍掉约 2 个），但那需要同时绕过 requestGeneration 失效判定，而这个
+  // epoch 不变量是防止旧断句译文错写进新时间轴的唯一保障 —— 收益(每 120s 省 1-2 次
+  // 请求)远小于风险，故保持全砍。
   function invalidateRuntimeRequests() {
     if (state.srtJob && (state.srtJob.status === "running" || state.srtJob.status === "cancelling")) {
       state.srtJob.cancelRequested = true;
@@ -339,7 +343,7 @@
       chunkWords: Core.SEMANTIC_CHUNK_WORDS,
       overlapWords: Core.SEMANTIC_OVERLAP_WORDS,
       preferredMaxWords: 10,
-      maxWords: 12,
+      maxWords: Core.DISPLAY_UNIT_MAX_WORDS,
     });
     var semanticGeneration = state.requestGeneration;
     var cached = cachedSemanticCues(await readSemanticCacheEntry(cacheKey), tokens);
@@ -360,7 +364,7 @@
         chunkWords: Core.SEMANTIC_CHUNK_WORDS,
         overlapWords: Core.SEMANTIC_OVERLAP_WORDS,
         preferredMaxWords: 10,
-        maxWords: 12,
+        maxWords: Core.DISPLAY_UNIT_MAX_WORDS,
         attempts: 2,
         timeoutMs: Core.TRANSLATE_TIMEOUT_MS,
         // 整轨语义恢复走同一个全局并发闸门，但用最低优先级(0)：首屏 fallback(100)/预取(20)/
@@ -673,7 +677,7 @@
       // 先立即建立稳定 fallback 原文时间轴；技术 cue 不翻译。语义恢复是整轨模型工作，不能阻塞首字幕。
       state.rawTrackCues = cues;
       var sourceTimeline = Core.buildCanonicalTokenTimeline(cues);
-      var fallbackCues = Core.resegmentCues(cues, { tailTrimMs: config.tailTrimMs, maxWords: 12, continuationMaxWords: 14 });
+      var fallbackCues = Core.resegmentCues(cues, { tailTrimMs: config.tailTrimMs, maxWords: Core.DISPLAY_UNIT_MAX_WORDS, continuationMaxWords: Core.SOURCE_UNIT_MAX_WORDS });
       if (!installCueTimeline(fallbackCues, "fallback", { sourceTimeline: sourceTimeline })) {
         retryLater("解析后无有效字幕");
         return;
@@ -1265,6 +1269,7 @@
         clip = adopted.clip;
         requestGeneration = state.requestGeneration;
         timelineEpoch = state.timelineEpoch;
+        // 边界修复换了 clip，快照要按**新 clip 自身**的断句来源重取，不是取全局字段
         segmentationModeAtStart = state.segmentationMode;
       }
       applyClipLines(idx, clip, result.key, result.lines, { skipCacheWrite: true });
