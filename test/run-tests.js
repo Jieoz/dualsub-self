@@ -301,16 +301,21 @@ test("filterUnsafeRescueMarks 保留可配自然中文的引导片段，只拒�
   assert.strictEqual(Core.filterUnsafeRescueMarks(periodWords, periodMarks)[10], "", "内部句点也不得绕过显式关系主语保护");
 });
 
-asyncTest("restoreAndPackTokens 条件从句无安全短边界时显式回退而不是制造 21 词屏", async () => {
+asyncTest("restoreAndPackTokens 条件从句无书面句边界时用连续语流保底切分而不是整轨作废", async () => {
+  // 连续口语长句(无书面句边界)在真实字幕轨里必然出现。旧设计遇到它整轨抛错退回
+  // 碎片 fallback,导致 semantic 路径在真实完整轨上 100% 失败。现在用 flow 保底切分:
+  // 词流完整、屏长达标、无孤字尾屏,让整轨 semantic 恢复能真正跑通。
   const source = "If you're a human person one of those things you're going to want to do with some regularity is boil water";
   const tokens = source.split(" ").map((text, i) => ({ text, start: i * 200, end: (i + 1) * 200 }));
-  let call = 0;
-  await assert.rejects(() => Core.restoreAndPackTokens({
-    tokens, apiBaseUrl: "https://example.test", apiKey: "x", apiModel: "m", chunkWords: 80,
+  const units = await Core.restoreAndPackTokens({
+    tokens, apiBaseUrl: "https://example.test", apiKey: "k", apiModel: "m", chunkWords: 80,
     preferredMaxWords: 16, maxWords: 16, attempts: 1,
-    fetchImpl: async (_url, req) => ({ ok: true, json: async () => ({ choices: [{ message: { content: (++call, boundaryJson(req, [])) } }] }) }),
-  }), /unresolved oversized semantic unit/i);
-  assert.strictEqual(call, 2, "超过硬上限且无自然边界时只做一次有界 rescue 后回退");
+    fetchImpl: async (_url, req) => ({ ok: true, json: async () => ({ choices: [{ message: { content: boundaryJson(req, []) } }] }) }),
+  });
+  assert.ok(units.length >= 2, "长口语句必须被切成多屏而不是整轨作废");
+  assert.ok(units.every(u => u.content.split(/\s+/).length <= 16), "保底切分绝不产生超过硬上限的屏");
+  assert.ok(units.every(u => u.content.split(/\s+/).length >= 2), "保底切分不产生孤字尾屏");
+  assert.strictEqual(units.map(u => u.content).join(" "), source, "保底切分不丢词不改写原文(词流完整是唯一红线)");
 });
 
 asyncTest("restoreAndPackTokens 行长优先且绝不在 than 比较结构中间切屏", async () => {
@@ -352,19 +357,28 @@ test("partitionReadableTokenUnit 有界恢复 14/11/9 屏并拒绝无安全候�
   assert.ok(marks);
   const units = Core.packRestoredTokens(tokens, marks, { maxWords: 16 });
   assert.deepStrictEqual(units.map((u) => u.content.split(/\s+/).length), [14, 11, 9]);
-  assert.strictEqual(Core.partitionReadableTokenUnit("these words provide no recognized safe boundary for deterministic partitioning whatsoever today".split(" ").map((text, i) => ({ text, start: i, end: i + 1 })), [], { preferredWords: 6, hardWords: 8, minWords: 4 }), null);
+  // 无 strict 书面句边界时,不再返回 null(那会让整轨 semantic 作废),而是用连续语流
+  // 保底切分:词流完整、每屏不超硬上限。这是让 semantic 在真实字幕轨跑通的关键。
+  const noSafe = "these words provide no recognized safe boundary for deterministic partitioning whatsoever today".split(" ").map((text, i) => ({ text, start: i, end: i + 1 }));
+  const forced = Core.partitionReadableTokenUnit(noSafe, [], { preferredWords: 6, hardWords: 8, minWords: 4 });
+  assert.ok(forced, "无安全边界时也必须给出保底切分而不是 null");
+  const forcedUnits = Core.packRestoredTokens(noSafe, forced, { maxWords: 8 });
+  assert.ok(forcedUnits.length >= 2, "过长无边界句必须被保底切成多屏");
+  assert.ok(forcedUnits.every((u) => u.content.split(/\s+/).length <= 8), "保底切分每屏不超硬上限");
+  assert.strictEqual(forcedUnits.map((u) => u.content).join(" "), noSafe.map((t) => t.text).join(" "), "保底切分不丢词不改写");
 });
 
-asyncTest("restoreAndPackTokens 对无安全边界的超长句显式失败而不是返回超长显示单元", async () => {
+asyncTest("restoreAndPackTokens 对无安全边界的超长句用保底切分产出合规显示单元而不是整轨作废", async () => {
   const source = "these deliberately opaque tokens provide no recognized semantic boundary and remain impossible to partition safely without fabricating a hard cut today";
   const tokens = source.split(" ").map((text, i) => ({ text, start: i * 100, end: (i + 1) * 100, nativeTiming: true }));
-  let calls = 0;
-  await assert.rejects(() => Core.restoreAndPackTokens({
+  const units = await Core.restoreAndPackTokens({
     tokens, apiBaseUrl: "https://example.test", apiKey: "x", apiModel: "m",
     preferredMaxWords: 16, maxWords: 16, attempts: 1,
-    fetchImpl: async (_url, req) => ({ ok: true, json: async () => ({ choices: [{ message: { content: (++calls, boundaryJson(req, [])) } }] }) }),
-  }), /unresolved oversized semantic unit/i);
-  assert.strictEqual(calls, 2, "只允许首轮恢复加一次有界 rescue");
+    fetchImpl: async (_url, req) => ({ ok: true, json: async () => ({ choices: [{ message: { content: boundaryJson(req, []) } }] }) }),
+  });
+  assert.ok(units.length >= 2, "无安全边界的超长句必须被保底切成多屏而不是整轨作废");
+  assert.ok(units.every(u => u.content.split(/\s+/).length <= 16), "保底切分绝不返回超过硬上限的显示单元");
+  assert.strictEqual(units.map(u => u.content).join(" "), source, "保底切分不丢词不改写(词流完整是唯一红线)");
 });
 
 asyncTest("restoreAndPackTokens 把 15/8 外边界归一化为 5/10/8 且不浪费 rescue", async () => {
