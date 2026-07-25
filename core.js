@@ -350,6 +350,39 @@
     return buildTokenSpanUnits(timeline, boundaries);
   }
 
+  // 一条字幕至少要可读这么久。短句(尤其被长句从中间切开后的后半截)的
+  // token 跨度可能只有 100-300ms,照抄就是一闪而过、几乎看不见。
+  var MIN_VISIBLE_MS = 1200;
+
+  /**
+   * 给过短的显示单元补足可读时长 —— 只向后延进**真正的静音**里。
+   *
+   * 单元时间原本直接照抄自身 token 跨度(buildTokenSpanUnits),没有任何下限:
+   * 实测真机轨 449 个单元中有 63 个短于 1200ms,最短仅 113ms("I")。
+   * 长句在句中被切开时,后半截尤其容易只分到很短的跨度。
+   *
+   * 约束(不能靠加时长换来别的毛病):
+   *  - 只吃掉与下一单元之间的空隙,绝不与下一单元重叠 —— 否则字幕会串行/抢位;
+   *  - 不改 startMs —— 出现时刻必须仍然精确对齐语音,这是上一版刚修好的;
+   *  - 借不够就借多少算多少(能改善就改善),不硬凑,不挪动别人的时间。
+   */
+  function padShortUnitsIntoSilence(units, minVisibleMs) {
+    var list = Array.isArray(units) ? units : [];
+    var floor = minVisibleMs != null ? minVisibleMs : MIN_VISIBLE_MS;
+    for (var i = 0; i < list.length; i++) {
+      var u = list[i];
+      if (!u) continue;
+      var dur = u.endMs - u.startMs;
+      if (dur >= floor) continue;
+      var next = list[i + 1];
+      // 末条没有后继约束,可以直接补到下限
+      var limit = next ? next.startMs : u.startMs + floor;
+      var target = Math.min(u.startMs + floor, limit);
+      if (target > u.endMs) u.endMs = target;
+    }
+    return list;
+  }
+
   function buildTokenSpanUnits(timeline, boundaries) {
     var tokens = timeline && Array.isArray(timeline.tokens) ? timeline.tokens : [];
     if (!tokens.length) return [];
@@ -365,7 +398,7 @@
     });
     if (ends[ends.length - 1] !== tokens.length - 1) ends.push(tokens.length - 1);
     var first = 0;
-    return ends.map(function (last, index) {
+    var built = ends.map(function (last, index) {
       var span = tokens.slice(first, last + 1);
       var unit = {
         id: timeline.sourceFingerprint + ":u" + index + ":" + first + "-" + (last + 1),
@@ -379,6 +412,11 @@
       first = last + 1;
       return unit;
     });
+    // 这里**不做**可读时长补偿:units 是 canonical provenance,
+    // validateTokenSpanCoverage 明确要求 startMs/endMs 与 token 跨度逐一相等
+    // (source timing mismatch),这是刻意的 fail-closed 契约。
+    // 补时长属于呈现层,落在 renderUnits 上(见 padShortUnitsIntoSilence 调用处)。
+    return built;
   }
 
   function invalidCoverage(reason, coveredTokens) {
@@ -444,6 +482,10 @@
         endMs: unit.endMs,
       };
     });
+    // 可读时长补偿只作用于呈现层:units 必须与 token 跨度严格一致
+    // (validateTokenSpanCoverage 的 fail-closed 契约),renderUnits 才是真正
+    // 拿去画的那份。只延 endMs、只吃真实静音、不动 startMs、不动 token 跨度。
+    padShortUnitsIntoSilence(renderUnits);
     var snapshot = {
       version: "timeline-snapshot-v1",
       revision: Math.max(0, toInt(opts.revision, 0)),
