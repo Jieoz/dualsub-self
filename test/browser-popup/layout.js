@@ -39,6 +39,10 @@ const MIN_USABLE_CONTENT_HEIGHT = 300;
 // 首屏必须可直接操作的常用控件：总开关、API 三项、字号、保存。
 const CRITICAL_CONTROLS = ["enabled", "apiBaseUrl", "apiKey", "apiModel", "fontSize", "saveBtn"];
 
+// 折叠区内的控件：不要求首屏可见，但展开后必须存在且可点击（有非零尺寸）。
+// 新增导出按钮时如果忘了接线或被 CSS 藏掉，这里会红。
+const COLLAPSED_SECTION_CONTROLS = ["exportSrtBtn", "exportProgressSrtBtn", "srtMode"];
+
 class CDP {
   constructor(ws) {
     this.ws = ws;
@@ -156,6 +160,12 @@ const MEASURE = `(() => {
   expand(true);
   const expandedHeight = bodyH();
   const expandedContent = content ? content.scrollHeight : 0;
+  // 折叠区控件只在展开态测量：要求存在且有可点击尺寸
+  const collapsedControls = {};
+  for (const id of ${JSON.stringify(COLLAPSED_SECTION_CONTROLS)}) {
+    const el = d.getElementById(id);
+    collapsedControls[id] = el ? rect(el) : null;
+  }
   expand(false);
   return {
     bodyHeight: collapsedHeight,
@@ -166,6 +176,7 @@ const MEASURE = `(() => {
     expandedContentScrollHeight: expandedContent,
     detailsCount: details.length,
     controls,
+    collapsedControls,
   };
 })()`;
 
@@ -224,6 +235,16 @@ function checkLayout(m) {
     // 控件必须落在面板可见范围内，而不是被挤到 0 高容器之外。
     if (r.bottom <= 0 || r.top >= m.bodyHeight) {
       problems.push(`控件在面板可见区之外：#${id} top=${r.top} bottom=${r.bottom} 面板高=${m.bodyHeight}`);
+    }
+  }
+  // 折叠区控件：展开后必须存在且有可点击尺寸（不检查首屏位置，它们本就在折叠区里）
+  for (const [id, r] of Object.entries(m.collapsedControls || {})) {
+    if (!r) {
+      problems.push(`折叠区控件缺失：#${id}`);
+      continue;
+    }
+    if (r.w <= 0 || r.h <= 0) {
+      problems.push(`折叠区控件展开后仍不可点击：#${id} 尺寸 ${r.w}x${r.h}`);
     }
   }
   return problems;
