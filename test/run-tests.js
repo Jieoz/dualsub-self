@@ -3386,6 +3386,42 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     assert.strictEqual(normalTl.tokens[normalTl.tokens.length - 1].endMs, 4000,
       "正常语速 cue 被误改: " + normalTl.tokens[normalTl.tokens.length - 1].endMs);
 
+    // ★ 有原生词级时间时，token 时间必须来自 tokens 本身，不得退回 cue.start/end 均摊。
+    // 这条是承重的：真实线上 ASR 轨实测 587/587 cue（100%）都带原生 tokens，
+    // 整条轨的时间正确性全押在"优先取 native tokens"这一个行为上
+    // （timelineTokensForCue: return native.length ? native : fallbackCueTokens(cue)）。
+    // 一旦它退化成按 cue 时长均摊，就是把唯一精确贴合音轨的测量值换成猜测 ——
+    // v0.7.3 漂移回归的同类形态。手造样本命中不到，因为手造 cue 通常不带 tokens。
+    //
+    // 注：repairImplausibleCueTiming 里的 tokens guard 是冗余的第二道防线
+    // （它只改 cue.end，而带 tokens 的 cue 压根不读 cue.end），移除它测不出变化，
+    // 所以门禁必须打在上面这个真正承重的点上，而不是那个 guard。
+    const nativeCue = [
+      // 13 词 / 1000ms = 77ms/词，符合"失真"判据，但它带原生词级时间 -> 必须不动
+      {
+        start: 1000, end: 2000, nativeTiming: true,
+        content: "one two three four five six seven eight nine ten eleven twelve thirteen",
+        tokens: Array.from({ length: 13 }, (_, i) => ({
+          text: String(i), start: 1000 + i * 76, end: 1000 + i * 76 + 76, nativeTiming: true,
+        })),
+      },
+      { start: 9000, end: 9500, content: "next", nativeTiming: true, tokens: [{ text: "next", start: 9000, end: 9500, nativeTiming: true }] },
+    ];
+    const nativeTl = Core.buildCanonicalTokenTimeline(nativeCue);
+    // 末词 endMs 必须仍是原生测量值，绝不被延进后方 7 秒静音
+    const lastNative = nativeTl.tokens[12];
+    assert.strictEqual(lastNative.endMs, 1000 + 12 * 76 + 76,
+      "带原生词级时间的 cue 被失真修复改动了 endMs: " + lastNative.endMs);
+    assert.strictEqual(nativeTl.tokens[0].startMs, 1000,
+      "带原生词级时间的 cue 被改动了 startMs: " + nativeTl.tokens[0].startMs);
+    // 反向：同样形状但去掉 tokens，就必须被修（证明门禁测的是 guard 本身，不是恒真断言）
+    const strippedTl = Core.buildCanonicalTokenTimeline(
+      nativeCue.map((c) => ({ start: c.start, end: c.end, content: c.content }))
+    );
+    const strippedSpan = strippedTl.tokens[12].endMs - strippedTl.tokens[0].startMs;
+    assert.ok(strippedSpan / 13 >= 150,
+      `去掉 tokens 后仍未被修复，说明上面的断言恒真、门禁无效: ${Math.round(strippedSpan / 13)}ms/词`);
+
     // 静音不足时只能借多少算多少,仍不许重叠
     const tightTl = {
       sourceFingerprint: "fp-tight",
