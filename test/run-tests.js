@@ -1677,6 +1677,64 @@ test("诊断统计必须能定位读不完的单元", () => {
 });
 
 
+test("滚动窗口 ASR 轨（json3 原生词级时间）去重叠必须同时收敛 token 时间，否则重叠回到渲染层", () => {
+  // 回归来源：真实 YouTube 自动字幕轨是滚动窗口形状——相邻 cue 大幅重叠，
+  // 同一句话在连续几条里反复出现。旧 cleanupCues 只把 cue 外层 end 压到下一条 start，
+  // 但下游 buildCueTokenSpanUnits 取的是 **token 跨度**，token 时间没被压，
+  // 于是重叠原封不动回到渲染层，实测 3 条字幕同时上屏。
+  function mk(start, end, words) {
+    const step = (end - start) / words.length;
+    return {
+      start: start,
+      end: end,
+      content: words.join(" "),
+      tokens: words.map((w, i) => ({
+        text: w,
+        start: Math.round(start + i * step),
+        end: Math.round(start + (i + 1) * step),
+        nativeTiming: true,
+      })),
+    };
+  }
+  const cues = [
+    mk(160, 4160, ["If", "youre", "a", "human", "person", "one", "of", "those"]),
+    mk(2639, 7040, ["things", "youre", "going", "to", "want", "to", "do", "with"]),
+    mk(7040, 12320, ["We", "do", "it", "for", "lots", "of", "reasons", "from"]),
+    mk(10000, 13440, ["cleaning", "and", "disinfecting", "to", "other", "things"]),
+  ];
+  const rawOverlaps = cues.filter((c, i) => cues[i + 1] && c.end > cues[i + 1].start).length;
+  assert.equal(rawOverlaps, 2, "样本必须真的带重叠，否则这条门禁测不到东西");
+
+  const clean = Core.cleanupCues(cues);
+  // cleanupCues 只压 cue 外层，token 原生时间必须保留：
+  // 它是 appendTimelineTokens 判定滚动重复词的唯一依据，抹平会导致重复词被渲染两次。
+  const timeline = Core.buildCanonicalTokenTimeline(clean);
+  // canonical token 流是唯一权威时间源，必须严格单调不重叠
+  for (let i = 0; i < timeline.tokens.length - 1; i++) {
+    const cur = timeline.tokens[i];
+    const next = timeline.tokens[i + 1];
+    assert.ok(
+      cur.endMs <= next.startMs,
+      `canonical token#${i} 与下一个重叠：[${cur.startMs}-${cur.endMs}] vs [${next.startMs}-${next.endMs}]`
+    );
+    assert.ok(cur.startMs <= next.startMs, `canonical token#${i} 时间非单调`);
+  }
+  const units = Core.buildCueTokenSpanUnits(timeline, clean);
+  const snapshot = Core.createTimelineSnapshot({
+    revision: 0, videoId: "rolling", trackCode: "en", timeline: timeline, units: units,
+  });
+  const rendered = snapshot.renderUnits.filter((u) => String(u.originalText || "").trim());
+  const overlaps = rendered.filter((u, i) => rendered[i + 1] && u.endMs > rendered[i + 1].startMs);
+  assert.equal(
+    overlaps.length, 0,
+    "渲染层仍有重叠（字幕会同时上屏）：" + overlaps.map((u) => `[${u.startMs}-${u.endMs}]`).join(" ")
+  );
+  // 压时间不能丢词：原文必须逐词守恒，否则 coverage 会 fail-closed
+  const got = rendered.map((u) => u.originalText).join(" ").split(/\s+/).length;
+  const want = cues.reduce((a, c) => a + c.content.split(/\s+/).length, 0);
+  assert.equal(got, want, `去重叠丢词：${got} != ${want}`);
+});
+
 test("isolated 生命周期：disable 与同视频换轨必须先失效旧 generation", () => {
   const src = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
   assert.match(src, /if \(!config\.enabled\) \{[\s\S]{0,260}?invalidateRuntimeRequests\(\)[\s\S]{0,260}?teardownRuntime\(true\)/, "disable 必须先 abort/失效再拆 UI");

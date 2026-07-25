@@ -21,7 +21,13 @@
 
 ## 安装（加载已解压的扩展程序）
 
-当前版本：**v0.7.2**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.7.2) 下载 Chrome MV3 安装包。
+当前版本：**v0.7.3**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.7.3) 下载 Chrome MV3 安装包。
+
+v0.7.3 的主要变化（修复滚动窗口 ASR 轨的字幕重叠 —— 这是「长句显示混乱」的真实根因）：
+- **半数字幕互相重叠、最多 3 条同时上屏**：YouTube 自动字幕是滚动窗口轨，相邻 cue 大幅重叠，同一句话在连续几条里反复出现。`cleanupCues` 只把 cue 外层 `end` 压到下一条 `start`，但真正拿去渲染的是 **token 跨度**，token 原生时间没被收敛，重叠原封不动回到渲染层。实测真实轨 439 个单元里 **233 个（53%）与下一条重叠**，重叠中位 2479ms、最长 10010ms，同一时刻最多 3 条字幕叠在一起。
+- 修复落在 `buildCanonicalTokenTimeline`：canonical token 流是唯一权威时间源，在生成 fingerprint 之前收敛为严格单调不重叠。收敛用**按词序前推**而不是把前一条的 `end` 压到后一条的 `start` —— 后者在嵌套窗口上会把整条单元压成 0ms（字幕根本不显示）。
+- 真实轨验证：重叠 **233 → 0**，同时在屏 **3 → 1** 条，0ms 单元 0 个，词数守恒。
+- 新增 fixture `test/fixtures/youtube-rolling-window-cues.json`（439 条真实滚动窗口轨），门禁复现重叠形状；退回未收敛实现立刻变红。
 
 v0.7.2 的主要变化（新增「导出当前进度」诊断快照）：
 - 弹窗「导出字幕（SRT）」区新增 **导出当前进度（诊断用）** 按钮：按**当前已翻译的内容**原样导出，**不发起任何翻译请求、不产生任何费用**。

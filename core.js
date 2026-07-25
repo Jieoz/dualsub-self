@@ -218,6 +218,9 @@
   // 源 cue 时间失真的判定阈值。低于此值即认为该 cue 自报的时长不可能是真实语速
   // (200ms/词 ≈ 300 wpm 已是极快语速的地板)。
   var IMPLAUSIBLE_MS_PER_WORD = 200;
+  // 滚动窗口去重叠时每个词至少保留的时长：嵌套窗口顺延后不能塌成 0ms。
+  // 取值只需保证单元非零可见，实际可读时长由呈现层 padShortUnitsIntoSilence 负责。
+  var MIN_TOKEN_MS = 40;
 
   /**
    * 修复源轨自报时间失真的 cue —— 这是「字幕后半段几乎看不见」的**根**。
@@ -278,6 +281,27 @@
         nativeTiming: token.nativeTiming === true,
       };
     });
+    // 唯一权威时间源在这里收敛为严格不重叠的单调词流。
+    // 滚动窗口 ASR 轨（json3 自动字幕）相邻 cue 大幅重叠，appendTimelineTokens 去掉了
+    // 重复词，但保留下来的词仍带各自窗口的原生时间：前一个词的 endMs 可以远超后一个词的
+    // startMs，甚至整条窗口被完全嵌套。渲染单元的 startMs/endMs 直接取自 token 跨度，
+    // 这里不收敛，重叠就会出现在屏幕上（实测同一时刻 3 条字幕同时显示）。
+    //
+    // 收敛方式是按词序前推，不是把前一个词的 endMs 压到后一个词的 startMs：
+    // 后者在嵌套窗口上会把整条单元压成 0ms（字幕一闪而过甚至不显示）。
+    // 前推只在重叠区内让时间顺延，原生时间追上后自然重新对齐音轨。
+    // 必须在 fingerprint 之前收敛：fingerprint 要对最终时间敏感，缓存才不会串。
+    var flowMs = -1;
+    for (var c = 0; c < canonical.length; c++) {
+      var token = canonical[c];
+      var startMs = Math.max(token.startMs, flowMs);
+      // 嵌套窗口里整条窗口都落在前一条内部，只做 max() 会把它压成 0ms（字幕根本不显示）。
+      // 给每个词留最小可见时长，重叠区内顺延；原生时间追上后自然重新贴合音轨。
+      var endMs = Math.max(token.endMs, startMs + MIN_TOKEN_MS);
+      token.startMs = startMs;
+      token.endMs = endMs;
+      flowMs = endMs;
+    }
     var identity = canonical.map(function (token) {
       return [token.text, token.startMs, token.endMs, token.nativeTiming ? 1 : 0].join("\x1f");
     }).join("\x1e");
@@ -1000,7 +1024,10 @@
 
     list.sort((a, b) => a.start - b.start || a.end - b.end);
 
-    // 去重叠：把前一句的 end 压到不超过后一句的 start
+    // 去重叠：把前一句的 end 压到不超过后一句的 start。
+    // 注意只压 cue 外层：token 时间的真实重叠是 appendTimelineTokens 判定滚动重复词的
+    // 唯一依据，在这里抹平会让去重复词失效（同一句话被重复渲染）。渲染时间的去重叠
+    // 收敛在 buildCanonicalTokenTimeline —— 那里是唯一权威时间源。
     for (let i = 0; i < list.length - 1; i++) {
       if (list[i].end > list[i + 1].start) {
         list[i].end = list[i + 1].start;
