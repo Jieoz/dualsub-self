@@ -31,15 +31,18 @@
         color: var(--fg);
       }
       /* 三段式布局：顶栏 / 可滚动内容 / 底栏。
-         用显式 flex 滚动容器而不是 position:sticky —— Chrome popup 里
-         body 自身作为滚动容器时 sticky 行为不可靠，flex + overflow 是确定的。
-         max-height 594px 略低于 Chrome popup 的 600px 上限，避免外层再出现滚动条。 */
-      html, body { height: 100%; }
+
+         关键约束：Chrome 扩展 popup 的高度是【由内容反推】的，不存在一个预先
+         给定的视口高度。因此绝不能写 html,body{height:100%} —— 父级高度未定时
+         百分比高度解析为 0，body 高度塌缩成 0px，flex:1 的内容区随之拿到 0 高
+         度，再叠加 overflow:hidden 就把整个设置面板锁死（v0.6.4 回归：用户只
+         看到两个标题、任何控件都无法操作）。
+
+         正确做法：让 body 高度由内容自然决定，只对【滚动区】设 max-height 上限。
+         内容少时面板自然收缩，内容超过上限时只有中间区域滚动，顶栏与底栏保持常驻。 */
       body {
         display: flex;
         flex-direction: column;
-        max-height: 594px;
-        overflow: hidden;
       }
       /* 顶栏：标题 + 总开关常驻，不随内容滚动 */
       .topbar {
@@ -55,8 +58,16 @@
       /* 开关样式的启用勾选（仍是原生 checkbox#enabled，逻辑不变） */
       .switch { display: flex; align-items: center; gap: 6px; font-size: 12px; }
       .switch input { width: auto; margin: 0; }
-      /* 唯一滚动区 */
-      .content { flex: 1 1 auto; overflow-y: auto; padding: 10px 14px 8px; }
+      /* 唯一滚动区。
+         max-height 而非 height/flex:1 —— 高度由内容决定，超过上限才滚动。
+         500px 上限 + 顶栏约 43px + 底栏约 49px ≈ 592px，略低于 Chrome popup
+         的 600px 上限，避免外层再出现第二条滚动条。 */
+      .content {
+        flex: 0 1 auto;
+        max-height: 500px;
+        overflow-y: auto;
+        padding: 10px 14px 8px;
+      }
       section {
         border: 1px solid var(--line);
         border-radius: 6px;
