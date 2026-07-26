@@ -859,16 +859,30 @@ asyncTest("translateClipLines coverage 缺失、错 span 或空译文整包 fail
   ]) await assert.rejects(()=>Core.translateClipLines({cues,apiBaseUrl:"https://example.test",apiModel:"m",fetchImpl:async()=>({ok:true,json:async()=>({choices:[{message:{content}}]})})}),/translation coverage/i);
 });
 
-asyncTest("translateClipWithBoundaryRepair 不再合并边界：semantic 12/fallback 14 cap，成功只请求一次", async () => {
-  const cue13={unitId:"u0",tokenStart:0,tokenEnd:13,start:0,end:1300,content:"one two three four five six seven eight nine ten eleven twelve thirteen"};
+asyncTest("translateClipWithBoundaryRepair 不合并边界，15 词超限 fail-closed，成功只请求一次", async () => {
+  // 原门禁锁的是 "semantic 12 / fallback-translation 14" 的 mode 分叉。真机实测证明该分叉
+  // 本身就是缺陷：语义恢复只覆盖当前区间，区间外仍是 fallback 断句(续接到 14 词)，却因
+  // 全局 mode 已是 "semantic" 被按 12 词拒翻 → 永远翻不了。
+  // 正确契约：输入卫士只有一个上限 SOURCE_UNIT_MAX_WORDS(14)，与 mode 无关；
+  // "语义结果该多长" 属于断句质量，已移到 resegmentTimelineSnapshot 装载时校验。
+  const words = (n) => Array.from({length:n},(_,i)=>"w"+i).join(" ");
+  const cue15={unitId:"u0",tokenStart:0,tokenEnd:15,start:0,end:1500,content:words(15)};
   let calls=0;
-  await assert.rejects(()=>Core.translateClipWithBoundaryRepair({cues:[cue13],segmentationMode:"semantic",apiBaseUrl:"https://example.test",apiModel:"m",fetchImpl:async()=>{calls++;throw new Error("must not fetch")}}),/oversized source unit/);
-  assert.strictEqual(calls,0);
-  const result=await Core.translateClipWithBoundaryRepair({cues:[cue13],segmentationMode:"fallback-translation",apiBaseUrl:"https://example.test",apiModel:"m",fetchImpl:async(_u,req)=>{calls++;return {ok:true,json:async()=>({choices:[{message:{content:translationCoverageJson(req,["这是一条完整译文"])}}]})}}});
-  assert.strictEqual(calls,1);
-  assert.strictEqual(result.repaired,false);
-  assert.deepStrictEqual(result.lines,["这是一条完整译文"]);
-  assert.deepStrictEqual(result.cues,[cue13]);
+  // 超过 14 词：任何 mode 都必须 fail-closed，且不发请求
+  for (const mode of ["semantic","fallback","fallback-translation"]) {
+    await assert.rejects(()=>Core.translateClipWithBoundaryRepair({cues:[cue15],segmentationMode:mode,apiBaseUrl:"https://example.test",apiModel:"m",fetchImpl:async()=>{calls++;throw new Error("must not fetch")}}),/oversized source unit/,`mode=${mode} 15 词必须拒`);
+  }
+  assert.strictEqual(calls,0,"超限单元不得触发任何请求");
+  // 14 词：任何 mode 都必须能翻，且只请求一次
+  const cue14={unitId:"u0",tokenStart:0,tokenEnd:14,start:0,end:1400,content:words(14)};
+  for (const mode of ["semantic","fallback","fallback-translation"]) {
+    calls=0;
+    const result=await Core.translateClipWithBoundaryRepair({cues:[cue14],segmentationMode:mode,apiBaseUrl:"https://example.test",apiModel:"m",fetchImpl:async(_u,req)=>{calls++;return {ok:true,json:async()=>({choices:[{message:{content:translationCoverageJson(req,["这是一条完整译文"])}}]})}}});
+    assert.strictEqual(calls,1,`mode=${mode} 应只请求一次`);
+    assert.strictEqual(result.repaired,false);
+    assert.deepStrictEqual(result.lines,["这是一条完整译文"]);
+    assert.deepStrictEqual(result.cues,[cue14]);
+  }
 });
 
 asyncTest("结构化翻译成功才计 usage，并把 coverage 原样返回缓存层", async () => {
@@ -2492,7 +2506,13 @@ async function main() {
   test("isolated 生产语义恢复统一使用 10 词目标与 12 词硬上限", () => {
     const src = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
     assert.strictEqual((src.match(/preferredMaxWords:\s*10/g) || []).length, 2, "缓存身份和真实请求必须使用同一 10 词目标");
-    assert.strictEqual((src.match(/maxWords:\s*12/g) || []).length, 3, "semantic 缓存/请求与 fallback 目标必须统一使用 12 词");
+    // 原断言数字面量 `maxWords: 12` 出现 3 次。字面量散在三处正是"同一上限多个来源"的
+    // 形状，真机因此暴露出 fallback 14 词单元被按 semantic 12 词 cap 拒翻。
+    // 现在三处统一引用 Core 的单一权威，断言改为检查引用（比数字面量更强）。
+    assert.strictEqual((src.match(/maxWords:\s*Core\.DISPLAY_UNIT_MAX_WORDS/g) || []).length, 3,
+      "semantic 缓存/请求与 fallback 目标必须引用同一个 Core.DISPLAY_UNIT_MAX_WORDS");
+    assert.ok(!/maxWords:\s*\d+/.test(src), "不得再出现硬编码词数上限字面量");
+    assert.strictEqual(Core.DISPLAY_UNIT_MAX_WORDS, 12, "显示宽度上限仍应为 12 词");
     assert.ok(!/preferredMaxWords:\s*14/.test(src) && !/maxWords:\s*16/.test(src), "运行时不得残留旧 14/16 行长目标");
     // 旧断言要求存在 translatePreparedClip（整轨恢复的 seed 预热）。整轨恢复已被
     // 区间恢复取代（整轨要 9.5 分钟，期间翻译永远追不上播放），seed 预热随之删除：
@@ -2505,7 +2525,7 @@ async function main() {
     assert.match(src, /function testConnection[\s\S]*?Core\.translateClipLines\s*\(\{[\s\S]*?cues:\s*\[\{ content:\s*"hello world"/, "唯一直调必须受限于 testConnection 的单行连接探针");
     assert.match(src, /function enableFallbackTranslation[\s\S]*?state\.segmentationMode === "semantic"[\s\S]*?state\.segmentationMode === "fallback-translation"[\s\S]*?state\.segmentationMode !== "fallback"[\s\S]*?state\.segmentationMode = "fallback-translation"/, "只有 fallback 可显式迁移进入 14 词 fallback translation，且不得覆盖 semantic 或重复进入");
     assert.ok(!src.includes("maxSourceWords"), "生产调用不得自行计算 12/14 数值上限");
-    assert.match(src, /Core\.resegmentCues\(cues, \{ tailTrimMs: config\.tailTrimMs, maxWords: 12, continuationMaxWords: 14 \}\)/, "生产 fallback 必须显式区分 12 词目标与 14 词续接硬上限");
+    assert.match(src, /Core\.resegmentCues\(cues, \{ tailTrimMs: config\.tailTrimMs, maxWords: Core\.DISPLAY_UNIT_MAX_WORDS, continuationMaxWords: Core\.SOURCE_UNIT_MAX_WORDS \}\)/, "生产 fallback 必须显式区分 12 词目标与 14 词续接硬上限");
     assert.strictEqual((src.match(/Core\.resegmentCues\(/g) || []).length, 1, "isolated 中 resegmentCues 只能用于 fallback，semantic 必须走 restoreAndPackTokens");
   });
 
@@ -2968,7 +2988,7 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     const src = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
     assert.ok(/Core\.hasNativeTokenTiming\(rawCues, 0\.8\)/.test(src), "应有 80% 原生 token timing 门槛（须看带原生 tokens 的原始轨）");
     assert.ok(/Core\.restoreAndPackTokens\b/.test(src), "加载路径应调用生产语义恢复器");
-    assert.ok(/var fallbackCues = Core\.resegmentCues\(cues, \{ tailTrimMs: config\.tailTrimMs, maxWords: 12, continuationMaxWords: 14 \}\)/.test(src), "不满足契约时应完整回退 ASR 重组");
+    assert.ok(/var fallbackCues = Core\.resegmentCues\(cues, \{ tailTrimMs: config\.tailTrimMs, maxWords: Core\.DISPLAY_UNIT_MAX_WORDS, continuationMaxWords: Core\.SOURCE_UNIT_MAX_WORDS \}\)/.test(src), "不满足契约时应完整回退 ASR 重组");
     assert.ok(/installCueTimeline\(fallbackCues, "fallback", \{ sourceTimeline: sourceTimeline \}\)/.test(src), "fallback 必须先安装可播放时间轴");
     // 整轨恢复 + seed 预热已被区间恢复取代：区间换入自身保留已有译文，无需预热 seed。
     assert.ok(/stageSemanticInterval\(result, loadEpoch\)/.test(src), "启用路径必须走区间换入");
@@ -3838,6 +3858,40 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     coveredBefore.forEach((t) => { if (!coveredAfter.has(t)) lost++; });
     assert.strictEqual(lost, 0,
       `区间换入丢失了 ${lost}/${coveredBefore.size} 个边界外的已翻词 —— 换入不得影响它触及范围之外的译文`);
+  });
+
+  test("翻译输入卫士只按源词数上限拦，语义断句质量由恢复装载时校验", () => {
+    // 真机实测缺陷（必须真浏览器 + 真轨 + 真模型才暴露，离线门禁全绿）：
+    // 输入卫士曾按 segmentationMode 分叉（semantic 12 / 其他 14），把"semantic 恢复结果
+    // 该 ≤12 词"这个**断句质量**约束混进了翻译路径。语义恢复只覆盖当前区间，区间外仍是
+    // fallback 断句（允许语法续接到 14 词），却因全局 mode 已是 "semantic" 而被按 12 词
+    // 拒翻 → 永远翻不了、反复退避重试到 failed。
+    // 真机日志：clip 3 翻译失败：oversized source unit before translation: 14 words (cap 12)
+    const guard = String(Core.translateClipWithBoundaryRepair);
+    assert.ok(!/segmentationMode\s*===\s*["']semantic["']\s*\?/.test(guard),
+      "输入卫士不得按 segmentationMode 分叉词数上限");
+
+    // 14 词单元在任何 mode 下都必须能翻（fallback 续接的合法产物）
+    const cue14 = {
+      unitId: "u0", tokenStart: 0, tokenEnd: 14, start: 0, end: 1400,
+      content: "one two three four five six seven eight nine ten eleven twelve thirteen fourteen",
+    };
+    for (const mode of ["semantic", "fallback", "fallback-translation"]) {
+      let called = 0;
+      assert.doesNotReject(() => Core.translateClipWithBoundaryRepair({
+        cues: [cue14], segmentationMode: mode,
+        apiBaseUrl: "https://example.test", apiModel: "m",
+        fetchImpl: async (_u, req) => {
+          called++;
+          return { ok: true, json: async () => ({ choices: [{ message: { content: translationCoverageJson(req, ["这是一条完整译文"]) } }] }) };
+        },
+      }), `mode=${mode} 下 14 词单元必须能翻`);
+    }
+
+    // 语义断句质量约束必须落在恢复装载处：>12 词的恢复结果要 fail-closed
+    const resegment = String(Core.resegmentTimelineSnapshot);
+    assert.ok(/DISPLAY_UNIT_MAX_WORDS|semantic replacement unit/.test(resegment),
+      "resegmentTimelineSnapshot 必须校验恢复结果的单元词数");
   });
 
   test("翻译不得越过语义恢复边界：越界翻的内容注定作废重翻", () => {

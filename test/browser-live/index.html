@@ -1,0 +1,105 @@
+<!doctype html><html><head><meta charset="utf-8"><title>DualSub live-run</title>
+<style>html,body{margin:0;background:#111;color:#eee;font-family:system-ui}
+.html5-video-player{position:relative;width:960px;height:540px;margin:10px auto;background:#172033}
+.html5-main-video{width:100%;height:100%}</style></head><body>
+<div class="html5-video-player"><video class="html5-main-video"></video>
+<div class="ytp-caption-window-container"><span>native captions</span></div></div>
+<script>
+// 真实运行验证：真 ASR 轨 + 真模型 + 真 core.js/isolated.js + 真 DOM 渲染循环。
+// 与 browser-replay 的区别：不 stub 翻译/恢复，不用 fixture 轨，按真实速率播 N 分钟。
+const q=new URLSearchParams(location.search);
+const TRACK=q.get('track'), MINUTES=Number(q.get('minutes')||5), RATE=Number(q.get('rate')||1);
+const CB=q.get('cb')||Date.now(); // 绕脚本缓存：改了 core.js 必须真的重新加载
+const R={track:TRACK,startedAt:performance.now(),events:[],errors:[],warnings:[],
+  paintSamples:[],pauseCalls:0,playCalls:0,seeks:[],finished:false,apiCalls:0,apiFails:0};
+window.__report=R;
+const warn=console.warn.bind(console);
+console.warn=(...a)=>{R.warnings.push(a.map(x=>String(x&&x.message||x)).join(' '));warn(...a)};
+const err=console.error.bind(console);
+console.error=(...a)=>{R.errors.push(a.map(x=>String(x&&x.message||x)).join(' '));err(...a)};
+addEventListener('error',e=>R.errors.push('onerror:'+String(e.error&&e.error.stack||e.message)));
+addEventListener('unhandledrejection',e=>R.errors.push('rejection:'+String(e.reason&&e.reason.stack||e.reason)));
+
+const v=document.querySelector('video');let now=0,paused=false;
+Object.defineProperty(v,'currentTime',{get:()=>now,set(x){now=Number(x)||0;R.seeks.push({at:now,t:performance.now()-R.startedAt})}});
+Object.defineProperty(v,'paused',{get:()=>paused});
+v.pause=()=>{paused=true;R.pauseCalls++};
+v.play=()=>{paused=false;R.playCalls++;return Promise.resolve()};
+// 真实速率推进（rate 可加速，但翻译是真模型真耗时，所以默认 1x）
+setInterval(()=>{if(!paused)now+=0.1*RATE;v.dispatchEvent(new Event('timeupdate'))},100);
+
+const cfg={enabled:true,globalConcurrency:4,apiBaseUrl:window.__DS_BASE,apiKey:window.__DS_KEY,
+  apiModel:window.__DS_MODEL,reasoningEffort:'low',targetLang:'zh-Hans',clipSeconds:12,
+  fontSize:22,showOriginal:true,tailTrimMs:0};
+const store={['dualsub:'+location.origin]:cfg};
+let rl=null;
+window.chrome={storage:{local:{
+    get(k,cb){setTimeout(()=>cb(store),0)},
+    set(o,cb){Object.assign(store,o);if(cb)cb()},
+    remove(keys,cb){for(const k of [].concat(keys||[]))delete store[k];if(cb)cb()}}},
+  runtime:{sendMessage(){},onMessage:{addListener(fn){rl=fn}}}};
+
+// 只把 timedtext 请求换成本地真轨；模型请求走真网络。
+const nf=window.fetch.bind(window);
+window.fetch=(u,o)=>{
+  const url=String(u);
+  if(url.startsWith('https://www.youtube.com/api/timedtext'))return nf('/'+TRACK,o);
+  if(url.includes('/chat/completions')||url.includes('/responses')){
+    R.apiCalls++;
+    R.apiFailDetail=R.apiFailDetail||[];
+    return nf(u,o).then(async r=>{
+      if(!r.ok){R.apiFails++;let body='';try{body=(await r.clone().text()).slice(0,300)}catch{};
+        R.apiFailDetail.push({status:r.status,body,at:Number(now.toFixed(1))})}
+      return r}).catch(e=>{
+        // AbortError 是产品**主动取消**在途请求（区间换入时废弃旧断句的翻译），
+        // 属于设计行为，不是失败。只统计真实的网络/服务端失败。
+        const aborted=e&&(e.name==='AbortError'||/abort/i.test(String(e.message||'')));
+        if(aborted){R.apiAborts=(R.apiAborts||0)+1}
+        else{R.apiFails++;R.apiFailDetail.push({err:String(e&&e.message||e),at:Number(now.toFixed(1))})}
+        throw e});
+  }
+  return nf(u,o);
+};
+
+// 采样"屏幕上到底有没有中文"—— 这是用户真正感知的指标
+function sample(){
+  const o=document.querySelector('.dualsub-orig'),z=document.querySelector('.dualsub-trans');
+  const rd=document.querySelector('.dualsub-renderer');
+  const player=document.querySelector('.html5-video-player');
+  const nc=document.querySelector('.ytp-caption-window-container');
+  R.paintSamples.push({at:Number(now.toFixed(1)),t:performance.now()-R.startedAt,
+    orig:o?o.textContent:'',trans:z?z.textContent:'',paused,
+    unitId:rd&&rd.dataset.unitId||'',
+    nativeHidden:player?player.classList.contains('dualsub-hide-native-captions'):false,
+    nativeDisplay:nc?getComputedStyle(nc).display:''});
+}
+setInterval(sample,500);
+
+function manifest(videoId){
+  // 产品会校验 manifest 的 videoId 与当前页面 URL 的 ?v= 是否一致（防跨视频串轨）。
+  // harness 必须先把 URL 改成对应的 ?v=，否则 manifest 被正确拒绝。
+  history.replaceState(null,'','?track='+encodeURIComponent(TRACK)+'&minutes='+MINUTES+'&cb='+CB+'&v='+videoId);
+  const p=new URLSearchParams({v:videoId,lang:'en',kind:'asr',pot:'signed'});
+  dispatchEvent(new CustomEvent('__dualsub_rpc_8f3ad7c1b2e94__',{detail:{sender:'main',receiver:'isolated',
+    subject:'update-manifest',content:{videoId,files:[{code:'en-asr',languageCode:'en',kind:'asr',
+      url:'https://www.youtube.com/api/timedtext?'+p}]}}}));
+}
+
+const s1=document.createElement('script');s1.src='/core.js?v='+CB;
+s1.onload=()=>{
+  const s2=document.createElement('script');s2.src='/isolated.js?v='+CB;
+  s2.onload=()=>{
+    setTimeout(()=>manifest('live-'+TRACK.replace(/\W/g,'')),50);
+    // 中途 seek 一次，验证 seek 后调度仍正确（真机常见操作）
+    setTimeout(()=>{R.events.push({type:'seek-test',to:90,t:performance.now()-R.startedAt});now=90},Math.min(MINUTES*60000*0.45,120000));
+    setTimeout(()=>{
+      if(rl){
+        rl({type:'get-state'},null,r=>{R.state=r;R.segmentationMode=r&&r.segmentationMode;R.apiUsage=r&&r.apiUsage});
+        rl({type:'export-srt'},null,r=>{R.exportSrt=r;R.finished=true});
+      }else{R.finished=true}
+    },MINUTES*60000);
+  };
+  document.body.appendChild(s2);
+};
+document.body.appendChild(s1);
+</script></body></html>
