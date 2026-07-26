@@ -90,8 +90,14 @@ s1.onload=()=>{
   const s2=document.createElement('script');s2.src='/isolated.js?v='+CB;
   s2.onload=()=>{
     setTimeout(()=>manifest('live-'+TRACK.replace(/\W/g,'')),50);
-    // 中途 seek 一次，验证 seek 后调度仍正确（真机常见操作）
-    setTimeout(()=>{R.events.push({type:'seek-test',to:90,t:performance.now()-R.startedAt});now=90},Math.min(MINUTES*60000*0.45,120000));
+    // 中途注入一次 seek 场景：走 video.currentTime setter（R.seeks 留下可核验凭据），
+    // 再发产品实际依赖的 timeupdate。这里没有真实媒体源，浏览器不会生成原生 seeked；
+    // 所以不伪造 seeked，也不声称验证了浏览器媒体管线，只验证产品收到时间跳转后的调度。
+    setTimeout(()=>{
+      R.events.push({type:'seek-injection',to:90,t:performance.now()-R.startedAt});
+      v.currentTime=90;
+      v.dispatchEvent(new Event('timeupdate'));
+    },Math.min(MINUTES*60000*0.45,120000));
     setTimeout(()=>{
       if(rl){
         rl({type:'get-state'},null,r=>{R.state=r;R.segmentationMode=r&&r.segmentationMode;R.apiUsage=r&&r.apiUsage});

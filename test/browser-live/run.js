@@ -81,14 +81,21 @@ async function evaluate(sock, expr) {
       }
 
       const R = await evaluate(sock, `(()=>{const R=window.__report;const s=R.paintSamples||[];
-        // 首屏之后（跳过前 15s 冷启动）的覆盖率才是"跟得上"的判据
+        // 首屏之后（跳过前 15s 冷启动）评价；但必须区分两种口径：
+        // 1) wallCov = 全部墙钟采样里有中文的比例（会把演讲停顿/无原文静默算作“未译”）
+        // 2) sourceCov = **屏幕有原文时**同步有中文的比例，才是“字幕跟不跟得上”的用户口径
         const after=s.filter(x=>x.at>15);
-        const withTrans=after.filter(x=>x.trans&&x.trans.trim()).length;
-        // 找出连续无中文的最长空窗
-        let gap=0,cur=0;for(const x of after){if(x.trans&&x.trans.trim()){cur=0}else{cur++;if(cur>gap)gap=cur}}
+        const wallTranslated=after.filter(x=>x.trans&&x.trans.trim()).length;
+        const source=after.filter(x=>x.orig&&x.orig.trim());
+        const sourceTranslated=source.filter(x=>x.trans&&x.trans.trim()).length;
+        // 最长漏译空窗只在“有原文却无译文”时累积；静默/无原文会清零，不能诬告产品。
+        let gap=0,cur=0;for(const x of after){
+          if(x.orig&&x.orig.trim()&&!(x.trans&&x.trans.trim())){cur++;if(cur>gap)gap=cur}else{cur=0}
+        }
         const uniqTrans=new Set(after.map(x=>x.trans).filter(Boolean)).size;
         const uniqOrig=new Set(after.map(x=>x.orig).filter(Boolean)).size;
-        return {samples:after.length,withTrans,cov:after.length?Math.round(withTrans/after.length*100):0,
+        return {samples:after.length,wallTranslated,wallCov:after.length?Math.round(wallTranslated/after.length*100):null,
+          sourceSamples:source.length,sourceTranslated,sourceCov:source.length?Math.round(sourceTranslated/source.length*100):null,
           maxGapSec:gap*0.5,uniqTrans,uniqOrig,api:R.apiCalls,fail:R.apiFails,aborts:R.apiAborts||0,
           errors:R.errors.slice(0,5),warnings:R.warnings.slice(0,5),apiFailDetail:R.apiFailDetail||[],
           mode:R.segmentationMode,pauseCalls:R.pauseCalls,playCalls:R.playCalls,
@@ -97,8 +104,9 @@ async function evaluate(sock, expr) {
         exportUntranslated:R.exportSrt&&R.exportSrt.untranslated};})()`);
 
       console.log(`\n[${track}] 结果`);
-      console.log(`  首屏后覆盖率 : ${R.cov}% (${R.withTrans}/${R.samples})`);
-      console.log(`  最长无中文空窗: ${R.maxGapSec}s`);
+      console.log(`  有原文时译文覆盖: ${R.sourceCov == null ? "N/A（无原文样本）" : R.sourceCov + "% (" + R.sourceTranslated + "/" + R.sourceSamples + ")"}`);
+      console.log(`  墙钟中文覆盖率  : ${R.wallCov == null ? "N/A" : R.wallCov + "% (" + R.wallTranslated + "/" + R.samples + ")"}（含静默，仅诊断）`);
+      console.log(`  最长真实漏译空窗: ${R.maxGapSec}s`);
       console.log(`  不同译文条数 : ${R.uniqTrans}（原文 ${R.uniqOrig}）`);
       console.log(`  API          : ${R.api} 次，失败 ${R.fail}，主动取消 ${R.aborts}（区间换入废弃旧断句，预期）`);
       console.log(`  断句模式     : ${R.mode} | 原生字幕已隐藏: ${R.nativeHidden}`);
@@ -107,8 +115,9 @@ async function evaluate(sock, expr) {
       console.log(`  导出 SRT     : ${R.exportOk ? "全片可导出" : "未全译(预期，只播了 " + MINUTES + " 分钟)"}`);
       if (R.errors.length) { console.log(`  ✗ JS 错误:`); R.errors.forEach((e) => console.log("    " + String(e).slice(0, 200))); failed++; }
       if (R.warnings.length) { console.log(`  警告:`); R.warnings.forEach((w) => console.log("    " + String(w).slice(0, 160))); }
-      if (R.cov < 90) { console.log(`  ✗ 覆盖率 ${R.cov}% < 90%`); failed++; }
-      if (R.maxGapSec > 12) { console.log(`  ✗ 空窗 ${R.maxGapSec}s > 12s`); failed++; }
+      if (!R.sourceSamples) { console.log(`  ✗ 首屏后无原文样本，无法评价跟随效果`); failed++; }
+      else if (R.sourceCov < 90) { console.log(`  ✗ 有原文时译文覆盖 ${R.sourceCov}% < 90%`); failed++; }
+      if (R.maxGapSec > 12) { console.log(`  ✗ 真实漏译空窗 ${R.maxGapSec}s > 12s`); failed++; }
       if (R.fail > 0) {
         console.log(`  ✗ 有 ${R.fail} 次 API 失败`);
         (R.apiFailDetail || []).slice(0, 4).forEach((d) => console.log(`    ${JSON.stringify(d).slice(0, 260)}`));
