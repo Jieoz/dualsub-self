@@ -10,6 +10,7 @@ const CDP = process.env.DUALSUB_CDP_URL;
 const HOST = process.env.DUALSUB_REPLAY_HOST;
 const TRACKS = (process.env.DUALSUB_LIVE_TRACKS || "").split(",").filter(Boolean);
 const MINUTES = Number(process.env.DUALSUB_LIVE_MINUTES || 5);
+const SOURCE_LANG = process.env.DUALSUB_LIVE_LANG || "en";
 const BASE = process.env.DS_BASE, MODEL = process.env.DS_MODEL, KEY = process.env.DS_KEY;
 assert.ok(CDP && HOST, "need DUALSUB_CDP_URL + DUALSUB_REPLAY_HOST");
 assert.ok(TRACKS.length, "need DUALSUB_LIVE_TRACKS");
@@ -51,7 +52,7 @@ async function evaluate(sock, expr) {
 (async () => {
   let failed = 0;
   for (const track of TRACKS) {
-    const url = `http://${HOST}:8899/test/browser-live/index.html?track=${encodeURIComponent(track)}&minutes=${MINUTES}&cb=${Date.now()}`;
+    const url = `http://${HOST}:8899/test/browser-live/index.html?track=${encodeURIComponent(track)}&minutes=${MINUTES}&lang=${encodeURIComponent(SOURCE_LANG)}&cb=${Date.now()}`;
     const tab = await newTab("about:blank");
     const sock = await ws(tab.webSocketDebuggerUrl);
     try {

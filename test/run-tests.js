@@ -3676,6 +3676,64 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     assert.equal(Core.restoredWords("미마스는 토성의").length, 2, "韩文被误当连写文字");
   });
 
+  test("语言无关：纯标点不得成为 canonical token，真实日语 ASR 必须能建立时间轴", () => {
+    // PCZhLRE7avE 的 ja-orig 真实轨：Script_Extensions 会把日文句号“。”和逗号“、”
+    // 也判进 Hiragana/Katakana 集合。旧正则因此产生纯标点 token；wordKey() 随后把它
+    // 清成空键，display 侧跳过、canonical 侧保留，从第一个句号起永久错位，整轨拒载。
+    // 规则必须语言无关：一个“词”至少含 Unicode 字母/组合记号/数字，纯标点一律不是词。
+    assert.deepEqual(Core.restoredWords("いいね。いいやつ。"), ["い", "い", "ね", "い", "い", "や", "つ"]);
+    assert.deepEqual(Core.restoredWords("え、1回集合、1回集合"), ["え", "1", "回", "集", "合", "1", "回", "集", "合"]);
+
+    const fixture = JSON.parse(fs.readFileSync(path.join(__dirname, "fixtures/youtube-pczh-ja-asr-head.json"), "utf8"));
+    const cues = Core.cleanupCues(Core.parseJson3(fixture));
+    // 锁调用点而不只锁正则纯函数：同一词跨 YouTube seg 时，parseJson3 必须先拼 event
+    // 再分词。fixture 中真实形状是 ["6", "TV", "へ。"]，canonical 必须得到 "6TV"。
+    assert.ok(cues.some((cue) => (cue.tokens || []).some((token) => token.text === "6TV")), "跨 seg 的同一词被错误拆开");
+    const spaced = Core.parseJson3({ events: [{ tStartMs: 0, dDurationMs: 1000, segs: [
+      { utf8: "hello", tOffsetMs: 0 }, { utf8: " " }, { utf8: "world", tOffsetMs: 500 },
+    ] }] });
+    assert.deepEqual(spaced[0].tokens.map((token) => token.text), ["hello", "world"], "纯空白 seg 被丢弃后错误粘词");
+    assert.equal(spaced[0].tokens[0].end, 500, "无 offset 的空白 seg 吞掉了后一个原生时间边界");
+    assert.equal(spaced[0].tokens[1].start, 500, "空白 seg 后文本未从自己的原生 offset 开始");
+
+    // 性质门禁：seg 怎么切都不能改变词流。以下样例只覆盖不同 Unicode 结构；产品代码
+    // 不读取语言，也没有这些语言的分支。左右两侧必须共用同一个 RESTORE_WORD_RE 权威。
+    [
+      ["pur", "pose-built"],           // 拉丁 + 连字符
+      ["при", "вет"],                 // 西里尔
+      ["مر", "حبا"],                  // 阿拉伯
+      ["नम", "स्ते"],                 // 天城文 + 组合记号
+      ["안", "녕", " ", "하세요"], // 韩文 + 空白 seg
+      ["NASA", "が", "温", "度"],  // 空格/连写文字混排
+      ["6", "TV"],                    // 数字字母混排
+    ].forEach((parts) => {
+      const eventText = parts.join("");
+      const parsed = Core.parseJson3({ events: [{
+        tStartMs: 0,
+        dDurationMs: 1000,
+        segs: parts.map((utf8, index) => ({ utf8, tOffsetMs: index * 100 })),
+      }] });
+      assert.deepEqual(
+        parsed[0].tokens.map((token) => token.text),
+        Core.restoredWords(eventText),
+        "seg 切法改变了权威词流: " + JSON.stringify(parts)
+      );
+      parsed[0].tokens.forEach((token) => {
+        assert.ok(token.start >= 0 && token.end >= token.start && token.end <= 1000, "token 时间越出源 event");
+      });
+    });
+
+    const timeline = Core.buildCanonicalTokenTimeline(cues);
+    const display = Core.resegmentCues(cues, {
+      tailTrimMs: 0,
+      maxWords: Core.DISPLAY_UNIT_MAX_WORDS,
+      continuationMaxWords: Core.SOURCE_UNIT_MAX_WORDS,
+    });
+    const units = Core.buildCueTokenSpanUnits(timeline, display);
+    assert.ok(units.length > 0, "真实日语轨未建立显示单元");
+    assert.equal(units[units.length - 1].tokenEnd, timeline.tokens.length, "日语显示单元未完整覆盖 canonical token");
+  });
+
   test("语言无关：把词拼回文本时连写文字之间不得插入空格", () => {
     // 一字一词之后，若无脑 join(" ")，45 字中文会变成 89 字的散字，屏上全是空隙。
     assert.equal(Core.joinRestoredWords(["米", "玛", "斯"]), "米玛斯");
