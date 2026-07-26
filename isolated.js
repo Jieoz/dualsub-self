@@ -4,8 +4,8 @@
  * 职责：
  *  1. 接收 main.js 推来的字幕轨道清单（RPC）。
  *  2. 拉取并解析字幕（json3 / vtt），清洗时间轴。
- *  3. 调用用户配置的 OpenAI 兼容翻译 API：每个 clip 进入 translateClipWithBoundaryRepair（模型先尝试一步到位
- *     直接吐自然分行的中文字幕行）→ buildClipUnits 配时间轴；预取 + 缓存 + 失败退避重试。
+ *  3. 调用用户配置的 OpenAI 兼容翻译 API：连续 cue block 整体翻译并由目标语言自然分屏；
+ *     源、译使用独立时间轴，配合预取、缓存和失败退避重试。
  *  4. 渲染双语叠加层，跟随 <video> 的 timeupdate 显示当前 cue。
  *  5. 读写 chrome.storage.local（按 origin 存配置）。
  *  6. 与 popup 通信（chrome.runtime.onMessage）：配置变更、测试连接。
@@ -29,15 +29,13 @@
   // ---- 配置 ----
   var STORAGE_KEY = "dualsub:" + location.origin; // 按 origin 存
   // 每个缓存 entry 使用独立 storage key；不同标签页写不同 entry 不再共享对象 RMW 覆盖。
-  var CACHE_ENTRY_PREFIX = "dualsub:cache-entry-v72:";
+  var CACHE_ENTRY_PREFIX = "dualsub:cache-entry-v90:";
   var CACHE_MAX_ENTRIES = 800;
-  var SEMANTIC_CACHE_ENTRY_PREFIX = "dualsub:semantic-cache-entry-v71:";
-  var SEMANTIC_CACHE_MAX_ENTRIES = 24;
   var DEFAULT_CONFIG = Core.DEFAULT_CONFIG;
 
   // 跨 clip 的全局 in-flight 翻译请求上限（每个内容脚本实例一个信号量）。
   // 滑动窗口预取(planPrefetch)会让当前/下一个/下下个… clip 几乎同时各发起一次
-  // translateClipWithBoundaryRepair（通常一个 clip = 一次请求，边界拒绝时仅再试一次）。若不封顶，瞬时并发可达窗口深度
+  // translateContextBlock（一个 block = 一次请求）。若不封顶，瞬时并发可达窗口深度
   // → 网关 429 → 退避 → 反而更卡。这里把所有 clip 的请求收敛到一个全局上限下排队，
   // 在 cap 内仍尽量保持最大领先，但绝不冲垮网关。可被 config.globalConcurrency 覆盖。
   var GLOBAL_INFLIGHT_DEFAULT = 4;
@@ -65,7 +63,7 @@
     cues: [], // 最终原文 cue（由 timelineSnapshot 的 token spans 唯一重建）
     sourceTimeline: null, // 当前轨唯一 canonical token 流；fallback/semantic/renderer/SRT 共享
     timelineSnapshot: null, // 不可变 TimelineSnapshot；所有译文提交均生成新 revision
-    segmentationMode: "fallback", // 'semantic' | 'fallback' | 'fallback-translation'，用于缓存隔离与可观测性
+    segmentationMode: "block", // 连续源 cue block 整体翻译；原文与译文使用独立时间轴
     timelineEpoch: 0, // 每次整轨切换递增，拒绝旧异步翻译结果写入新分段
     requestGeneration: 0, // 视频/轨道/翻译身份变化即递增；所有异步副作用都必须持有同代快照
     requestControllers: [], // 当前代在途 fetch；身份失效时主动 abort，而非只拒绝迟到写入
@@ -73,24 +71,13 @@
     cacheWriteChain: Promise.resolve(), // chrome.storage read-modify-write 串行化，防并发覆盖
     clips: [], // 按 cue 边界切的 clip
     cueMap: [], // 全局 cue 下标 -> {clipIdx,cueIdx}（cueClipIndexMap 建表）
-    // 每个 clip 先经 translateClipWithBoundaryRepair 的 source-cap/锁边门禁，再由 buildClipUnits 得到渲染单元。
-    // 单元结构 [{srcStart,srcEnd,originalText,translation,startMs,endMs}]（buildClipUnits 产物）。
-    // 统一了旧的 clipCache(逐行)/clipSentences(句级) 两套语义 —— 新架构只有这一种。
+    // 每个 block 直接产出 [{srcStart,srcEnd,originalText,translation,startMs,endMs}]。
     clipUnits: {}, // clipIndex -> 渲染单元数组（成功翻译才有；缺失=未翻/翻译中→回退显原文）
     renderUnits: [], // 全局渲染时间轴（各 clip 的渲染单元按 start 升序拼接）。findCueIndexAt 在此上查当前行
     clipState: {}, // clipIndex -> 'pending'|'done'|'error'|'failed'（error=可重试；failed=达 maxFails 终态）
     clipBackoff: {}, // clipIndex -> backoff 控制器（失败退避）
     clipInflight: {}, // clipIndex -> bool：translateClip 进行中（重入互斥，防同 clip 并发）
     retryTimer: null, // 后台失败重试调度器 id（第2层；只在有 error clip 时活跃）
-    semanticFallbackTimer: null, // 语义恢复过慢时先翻 fallback，避免 1–2 分钟只有英文
-    // semantic 区间恢复是否在途。仅用于诊断/避免重复发起同一区间，
-    // **不再**用来降级预取窗口（那条降级曾让翻译永远跟不上播放）。
-    semanticPending: false,
-    // 语义断句已恢复到哪个播放位置（ms）。播放接近它时再恢复下一区间。
-    semanticDoneUntilMs: 0,
-    // 原始轨 cue（带原生词级 tokens）。区间推进时要据此复查 token 时序可靠性；
-    // state.cues 是重组后的单元，已不带原生 tokens，不能用于该判断。
-    rawTrackCues: [],
     renderer: null, // 叠加层 DOM
     videoEl: null,
     fontObserver: null, // ResizeObserver：观察播放器高度变化，同比缩放字号（全屏放大）
@@ -291,104 +278,6 @@
     return true;
   }
 
-  function readSemanticCacheEntry(key) { return readEntry(SEMANTIC_CACHE_ENTRY_PREFIX, key); }
-
-  function writeSemanticCache(key, cues, generation) {
-    return writeEntry(SEMANTIC_CACHE_ENTRY_PREFIX, key, {
-      cues: (cues || []).map(function (cue) { return { start: cue.start, end: cue.end, content: cue.content }; }),
-    }, SEMANTIC_CACHE_MAX_ENTRIES, generation);
-  }
-
-  function cachedSemanticCues(entry, tokens) {
-    if (!entry || !Array.isArray(entry.cues) || !entry.cues.length) return null;
-    var cleaned = Core.cleanupCues(entry.cues);
-    if (!cleaned.length) return null;
-    var sourceWords = Core.restoredWords((tokens || []).map(function (t) { return t.text || ""; }).join(" "));
-    var cachedText = cleaned.map(function (cue) { return cue.content || ""; }).join(" ");
-    return Core.sameRestoredWords(sourceWords, cachedText) ? cleaned : null;
-  }
-
-  /**
-   * 恢复「播放位置附近」这一段的语义断句。
-   *
-   * 为什么不整轨一次性恢复：整轨在 37 分钟轨上实测 6261 token / 35 块 / 单块 16.4s
-   * ≈ 9.5 分钟，且刻意用最低优先级只吃富余并发。旧实现在这 9.5 分钟里把预取窗口
-   * 降级成「只翻当前段」，于是翻译永远追着播放跑（整轨模拟覆盖率 0%）。
-   * 而且无论用户看多久，都要为全部 35 块付 token。
-   *
-   * 改为跟着播放位置滑动后：单次只 2-3 块（实测首个区间 294 token / 2 块 / 覆盖 90s），
-   * token 消耗正比于实际观看时长（看 5 分钟 = 8 块，而非 35 块），
-   * 每一段仍是 semantic 断句 —— 质量不降，只是按需产生。
-   *
-   * 缓存键用区间自身的 token 指纹（makeSemanticCacheKey 已含 semanticTokenFingerprint），
-   * 因此天然是区间粒度：跳着看、看一半退出下次接着看，都能各自复用。
-   */
-  async function restoreSemanticIntervalIfAvailable(snapshot, rawCues, positionMs) {
-    if (!config.apiBaseUrl || !config.apiKey || !config.apiModel) return null;
-    // token 时序可靠性看原始轨（fallback 重组后的单元不带原生 tokens）。
-    if (!Core.hasNativeTokenTiming(rawCues, 0.8)) return null;
-    // 区间下标必须来自 snapshot.units —— 与 resegmentTimelineSnapshot 同一空间。
-    var interval = Core.planSemanticInterval(snapshot, positionMs);
-    if (!interval) return null;
-    var tokens = interval.tokens;
-    if (!tokens.length) return null;
-    var restorationPrompt = Core.DEFAULT_RESTORATION_PROMPT;
-    var cacheKey = Core.makeSemanticCacheKey({
-      videoId: state.videoId,
-      trackCode: state.activeTrack ? state.activeTrack.code : "",
-      apiBaseUrl: config.apiBaseUrl,
-      apiModel: config.apiModel,
-      tokens: tokens,
-      systemPrompt: restorationPrompt,
-      chunkWords: Core.SEMANTIC_CHUNK_WORDS,
-      overlapWords: Core.SEMANTIC_OVERLAP_WORDS,
-      preferredMaxWords: 10,
-      maxWords: Core.DISPLAY_UNIT_MAX_WORDS,
-    });
-    var semanticGeneration = state.requestGeneration;
-    var cached = cachedSemanticCues(await readSemanticCacheEntry(cacheKey), tokens);
-    if (semanticGeneration !== state.requestGeneration || !config.enabled) return null;
-    if (cached) return { cues: cached, startIndex: interval.startIndex, endIndex: interval.endIndex };
-    try {
-      var semanticRequest = beginRuntimeRequest();
-      var pendingUsage = [];
-      var restored;
-      try {
-        restored = await Core.restoreAndPackTokens({
-        tokens: tokens,
-        apiBaseUrl: config.apiBaseUrl,
-        apiKey: config.apiKey,
-        apiModel: config.apiModel,
-        reasoningEffort: config.reasoningEffort,
-        systemPrompt: restorationPrompt,
-        chunkWords: Core.SEMANTIC_CHUNK_WORDS,
-        overlapWords: Core.SEMANTIC_OVERLAP_WORDS,
-        preferredMaxWords: 10,
-        maxWords: Core.DISPLAY_UNIT_MAX_WORDS,
-        attempts: 2,
-        timeoutMs: Core.TRANSLATE_TIMEOUT_MS,
-        // 整轨语义恢复走同一个全局并发闸门，但用最低优先级(0)：首屏 fallback(100)/预取(20)/
-        // 导出(1)全部抢先，semantic 恢复只用富余容量，绝不 flood 端点拖慢首屏中文首包。
-        runRequest: function (fn) { return ensureGate().run(fn, 0); },
-        fetchImpl: function (u, o) { return fetch(u, o); },
-        onUsage: function (usage) { pendingUsage.push(usage); },
-        signal: semanticRequest.controller ? semanticRequest.controller.signal : undefined,
-        });
-      } finally {
-        endRuntimeRequest(semanticRequest);
-      }
-      if (!isRuntimeRequestCurrent(semanticRequest)) return null;
-      var cleaned = restored && restored.length ? Core.cleanupCues(restored) : null;
-      if (cleaned && cleaned.length) await writeSemanticCache(cacheKey, cleaned, semanticRequest.generation);
-      if (!isRuntimeRequestCurrent(semanticRequest)) return null;
-      commitPendingUsage(semanticRequest, pendingUsage);
-      return cleaned ? { cues: cleaned, startIndex: interval.startIndex, endIndex: interval.endIndex } : null;
-    } catch (e) {
-      console.warn("[dualsub] 语义恢复未通过词流契约，回退 ASR 重组：", e && e.message);
-      return null;
-    }
-  }
-
   function clipCueFingerprint(clip) {
     return (clip && clip.cues || []).map(function (cue) {
       return [cue.start, cue.end, String(cue.content || "").replace(/\s+/g, " ").trim()].join(":");
@@ -418,7 +307,7 @@
       systemPrompt: identity.systemPrompt || "",
       reasoningEffort: identity.reasoningEffort,
       maxLineChars: identity.maxLineChars,
-      contractVersion: "coverage-v1",
+      contractVersion: "block-v1",
       segmentationMode: segmentationMode || state.segmentationMode,
       clipStartMs: clip.startMs,
       cueFingerprint: clipCueFingerprint(clip),
@@ -503,8 +392,6 @@
     if (!track || !track.url) return;
     invalidateRuntimeRequests();
     state.timelineEpoch++;
-    state.semanticPending = false;
-    clearSemanticFallbackTimer();
     clearTrackRetryTimer();
     state.trackFailure = null;
     state.activeTrack = track;
@@ -538,57 +425,23 @@
     state.clipInflight = {};
     state.lastHitCueIdx = -1;
     state.lastPrefetchMs = -1e9;
-    clearSemanticFallbackTimer();
     clearTrackRetryTimer();
     state.trackFailure = null;
     restoreNativeCaptions();
     clearRenderer();
   }
 
-  function clearSemanticFallbackTimer() {
-    if (state.semanticFallbackTimer != null) {
-      clearTimeout(state.semanticFallbackTimer);
-      state.semanticFallbackTimer = null;
-    }
-  }
 
   /**
-   * 选轨道：
-   *  - sourceLang === "auto"：优先非中文 ASR → 优先英文 → 任意非中文轨 → 第一条 ASR/第一条。
-   *  - 否则按 languageCode / code 精确或前缀匹配。
-   *  - skipChineseSource 时：若最终选中轨是中文，返回 null（调用方跳过本视频）。
-   *
-   * auto 下必须显式优先英文，不能拿"第一条非中文轨"当默认。
-   * captionTracks 的顺序由 YouTube 决定且不保证语言：实测视频 scWj1BMRHUA
-   * 有 7 条人工轨（en/el/id/pl/pt/ru/es-419）且全部 kind=null（无 ASR），
-   * 于是 nonZhAny 命中的是列表里恰好排在前面的那条 —— 用户实际拿到波兰语轨，
-   * 屏上是波兰语原文配错乱译文。轨序不可依赖，必须按语言判定。
+   * 先尊重用户显式 sourceLang；auto 使用 manifest 给出的候选顺序。
+   * 确定候选语言后，只在同一 languageCode 内统一优先人工轨，不维护任何语言名单。
    */
-  function isAsrTrack(t) {
-    return t && (/-asr$/.test(t.code) || t.kind === "asr");
-  }
-  function isEnglishTrack(t) {
-    var lang = String((t && (t.languageCode || t.code)) || "").toLowerCase();
-    return /^en(\b|[-_.]|$)/.test(lang);
-  }
-  function isChineseTrack(t) {
-    return !!(t && Core.shouldSkipChineseSource(t, {
-      skipChineseSource: true, // 只复用语言判定
-      sourceLang: "auto",
-    }));
-  }
   function pickTrack(tracks, sourceLang) {
     if (!tracks || !tracks.length) return null;
     var list = tracks;
-    var picked = null;
+    var picked;
     if (!sourceLang || sourceLang === "auto") {
-      var nonZhAsr = list.find(function (t) { return isAsrTrack(t) && !isChineseTrack(t); });
-      // 英文优先于"列表里第一条非中文轨"：轨序由 YouTube 决定，多语言人工字幕
-      // 视频上第一条可能是任意语言（实测 scWj1BMRHUA 命中波兰语）。
-      var enTrack = list.find(function (t) { return isEnglishTrack(t) && !isChineseTrack(t); });
-      var nonZhAny = list.find(function (t) { return !isChineseTrack(t); });
-      var anyAsr = list.find(isAsrTrack);
-      picked = nonZhAsr || enTrack || nonZhAny || anyAsr || list[0];
+      picked = list[0];
     } else {
       var exact = list.find(function (t) {
         return t.code === sourceLang || t.languageCode === sourceLang;
@@ -596,18 +449,9 @@
       var prefix = list.find(function (t) {
         return (t.languageCode || "").split("-")[0] === sourceLang.split("-")[0];
       });
-      picked = exact || prefix || list[0];
+      picked = exact || prefix || null;
     }
-    if (
-      picked &&
-      Core.shouldSkipChineseSource(picked, {
-        skipChineseSource: config.skipChineseSource,
-        sourceLang: sourceLang || config.sourceLang,
-      })
-    ) {
-      return null;
-    }
-    return picked;
+    return Core.preferManualTrack(list, picked);
   }
 
   /* =====================================================
@@ -675,57 +519,16 @@
         return;
       }
       // 先立即建立稳定 fallback 原文时间轴；技术 cue 不翻译。语义恢复是整轨模型工作，不能阻塞首字幕。
-      state.rawTrackCues = cues;
       var sourceTimeline = Core.buildCanonicalTokenTimeline(cues);
       var fallbackCues = Core.resegmentCues(cues, { tailTrimMs: config.tailTrimMs, maxWords: Core.DISPLAY_UNIT_MAX_WORDS, continuationMaxWords: Core.SOURCE_UNIT_MAX_WORDS });
-      if (!installCueTimeline(fallbackCues, "fallback", { sourceTimeline: sourceTimeline })) {
+      if (!installCueTimeline(fallbackCues, "block", { sourceTimeline: sourceTimeline })) {
         retryLater("解析后无有效字幕");
         return;
       }
       state.trackFailure = null;
-      // 完整验证成功后才原子切换到语义时间轴；失败保持已工作的 fallback。
-      // 但语义恢复慢不能阻塞首屏中文字幕：短阈值后先翻 fallback，后续 semantic 准备好再升级。
-      // 关键：整轨 semantic 恢复的模型请求走同一个全局并发闸门(ensureGate)但用最低优先级，
-      // 这样首屏 fallback(优先级 100)永远抢先，semantic 恢复只用富余容量，绝不 flood 端点拖慢首包。
-      var loadEpoch = state.timelineEpoch;
-      state.semanticPending = true;
-      clearSemanticFallbackTimer();
-      state.semanticFallbackTimer = setTimeout(function () {
-        state.semanticFallbackTimer = null;
-        enableFallbackTranslation(loadEpoch);
-      }, 700);
-      setTimeout(function () {
-        // 只恢复播放位置附近这一段。后续区间由 maybeAdvanceSemanticInterval 跟着播放推进，
-        // 因此 semanticPending 是短暂的（单区间 2-3 块），不再长期压制预取窗口。
-        restoreSemanticIntervalIfAvailable(state.timelineSnapshot, cues, currentTimeMs()).then(async function (result) {
-          if (loadEpoch !== state.timelineEpoch) return;
-          clearSemanticFallbackTimer();
-          if (!result || !result.cues || !result.cues.length) {
-            finishSemanticPending(loadEpoch);
-            enableFallbackTranslation(loadEpoch);
-            return;
-          }
-          var installed = await stageSemanticInterval(result, loadEpoch);
-          finishSemanticPending(loadEpoch);
-          // 无论区间恢复成功与否，都要让 fallback 翻译跑起来：
-          // 语义恢复只提升断句质量，绝不是「有译文」的前提条件。
-          enableFallbackTranslation(installed ? state.timelineEpoch : loadEpoch);
-        }).catch(function (e) {
-          // Semantic restoration is optional. If it fails, translate the already resegmented
-          // fallback timeline instead of leaving the page permanently English-only.
-          // A stale epoch (track switch / config reload / new video / disable) or an aborted
-          // in-flight request is an EXPECTED cancellation, not a failure: skip it silently so
-          // config switches and teardown do not surface phantom "restore failed" warnings.
-          if (loadEpoch !== state.timelineEpoch) return;
-          clearSemanticFallbackTimer();
-          if (!(e && (e.name === "AbortError" || e.name === "DOMException"))) {
-            console.warn("[dualsub] semantic restore failed; translating fallback timeline", e);
-          }
-          finishSemanticPending(loadEpoch);
-          enableFallbackTranslation(loadEpoch);
-        });
-      }, 0);
-    } catch (e) {
+      // 原文立即可见；同一批连续 cue 直接整块翻译并由目标语言自然重组。
+      // 不再先恢复源文 display/semantic 边界，也不要求译文逐 cue 对齐。
+      } catch (e) {
       if (requestContext && !isRuntimeRequestCurrent(requestContext)) return;
       endRuntimeRequest(requestContext);
       requestContext = null;
@@ -755,41 +558,18 @@
     }
   }
 
-  function finishSemanticPending(loadEpoch) {
-    if (loadEpoch !== state.timelineEpoch) return false;
-    state.semanticPending = false;
-    if (state.segmentationMode === "fallback-translation") {
-      state.lastPrefetchMs = -1e9;
-      prefetchAround(currentTimeMs(), true);
-    }
-    return true;
-  }
-
-  function enableFallbackTranslation(loadEpoch) {
-    if (loadEpoch !== state.timelineEpoch) return false;
-    if (state.segmentationMode === "semantic") return false;
-    if (state.segmentationMode === "fallback-translation") return false;
-    if (state.segmentationMode !== "fallback") return false;
-    state.segmentationMode = "fallback-translation";
-    // The English fallback is already visible, so degraded translation must never pause playback.
-    state.firstClipReady = true;
-    state.lastPrefetchMs = -1e9;
-    prefetchAround(currentTimeMs(), true);
-    requestRender();
-    return true;
-  }
-
   function sliceTimelineClips(cues) {
-    var firstSec = Number(config.firstClipSeconds);
-    if (!Number.isFinite(firstSec) || firstSec <= 0) firstSec = config.clipSeconds;
-    var configuredMaxCues = Math.floor(Number(config.maxCuesPerClip) || 0);
-    // 全轨 coverage 的硬协议上限是 8 source units；源 clip 在唯一切分入口就必须满足，
-    // planCoverageBatches 仍会对任何违反该不变量的单项 fail-closed。
-    var hardMaxCues = configuredMaxCues > 0 ? Math.min(configuredMaxCues, 8) : 8;
-    return Core.sliceClipsByCue(cues, config.clipSeconds * 1000, {
-      firstTargetMs: firstSec * 1000,
-      maxCuesPerClip: hardMaxCues,
-      maxSourceChars: config.maxSourceCharsPerClip || 0,
+    // 新 block 翻译需要足够上下文；旧 4 条/12 秒 clip 会重新制造逐碎片翻译。
+    // 用户配置仍可把块调大，但不能低于保证上下文的产品下限。
+    var blockSeconds = Math.max(30, Number(config.clipSeconds) || 0);
+    var firstSeconds = Math.max(12, Number(config.firstClipSeconds) || 0);
+    var maxCues = Math.min(20, Math.max(12, Math.floor(Number(config.maxCuesPerClip) || 0)));
+    var maxChars = Math.max(600, Math.floor(Number(config.maxSourceCharsPerClip) || 0));
+    return Core.sliceClipsByCue(cues, blockSeconds * 1000, {
+      firstTargetMs: firstSeconds * 1000,
+      maxCuesPerClip: maxCues,
+      maxSourceChars: maxChars,
+      keepSemanticGroups: false,
     });
   }
 
@@ -807,12 +587,12 @@
     var key = clipCacheKey(clip, segmentationMode, identity);
     var cached = await readCacheEntry(key);
     if (generation !== state.requestGeneration || !config.enabled) throw runtimeAbortError();
-    if (!cached || !Array.isArray(cached.coverage)) return null;
+    if (!cached || !Array.isArray(cached.segments)) return null;
     try {
-      var expectedCoverage = Core.translationCoverageUnitsFromCues(clip.cues);
-      var verifiedCoverage = Core.parseTranslationCoverageResponse(JSON.stringify({ translations: cached.coverage }), expectedCoverage, { lenient: true });
-      return { key: key, cues: clip.cues, lines: verifiedCoverage.map(function (entry) { return entry.translation; }), coverage: verifiedCoverage, repaired: false, fromCache: true };
+      var units = Core.materializeBlockTranslation(cached.segments, clip.cues, { maxVisualWidth: identity.maxLineChars, requireIntegrity: true });
+      return { key: key, cues: clip.cues, segments: cached.segments, units: units, fromCache: true };
     } catch (_) {
+      try { await storageRemove([entryStorageKey(CACHE_ENTRY_PREFIX, key)]); } catch (_) {}
       return null;
     }
   }
@@ -834,18 +614,21 @@
           var cachedResult = await readVerifiedClipCache(clip, segmentationMode, identity, generation);
           if (cachedResult) return { cached: cachedResult };
           if (!identity.apiBaseUrl || !identity.apiModel) throw new Error("translation configuration missing");
-          var result = await Core.translateClipWithBoundaryRepair({
+          var contextBefore = state.cues.slice(Math.max(0, clip.startIndex - 3), clip.startIndex);
+          var contextAfter = state.cues.slice(clip.startIndex + clip.cues.length, clip.startIndex + clip.cues.length + 3);
+          var result = await Core.translateContextBlock({
             cues: clip.cues,
+            contextBefore: contextBefore,
+            contextAfter: contextAfter,
             apiBaseUrl: identity.apiBaseUrl,
             apiKey: identity.apiKey,
             apiModel: identity.apiModel,
             targetLang: identity.targetLang,
             systemPrompt: identity.systemPrompt,
             reasoningEffort: identity.reasoningEffort,
-            maxLineChars: identity.maxLineChars,
-            segmentationMode: segmentationMode,
+            maxVisualWidth: identity.maxLineChars,
             timeoutMs: Core.TRANSLATE_TIMEOUT_MS,
-            lenient: true, // 运行时：单句坏译文只回退那一句英文，不连坐整个 clip（导出 SRT 仍严格）
+
             fetchImpl: function (u, o) { return fetch(u, o); },
             onUsage: function (usage) { pendingUsage.push(usage); },
             signal: context.controller ? context.controller.signal : undefined,
@@ -857,13 +640,12 @@
         var result = payload.translated;
         var out = {
           key: key,
-          cues: result && result.repaired ? result.cues : clip.cues,
-          lines: result && result.lines ? result.lines : [],
-          coverage: result && result.coverage ? result.coverage : [],
-          repaired: !!(result && result.repaired),
+          cues: clip.cues,
+          segments: result && result.segments ? result.segments : [],
+          units: result && result.units ? result.units : [],
           fromCache: false,
         };
-        if (out.lines.length) await writeCache(key, { lines: out.lines, coverage: out.coverage }, generation);
+        if (out.units.length) await writeCache(key, { segments: out.segments }, generation);
         if (!isRuntimeRequestCurrent(context) || generation !== state.requestGeneration) throw runtimeAbortError();
         commitPendingUsage(context, pendingUsage);
         return out;
@@ -877,83 +659,6 @@
       return await task;
     } finally {
       if (state.translationInflight[key] === task) delete state.translationInflight[key];
-    }
-  }
-
-  // Keep the working fallback visible while translating the semantic clip at the current playhead.
-  /**
-   * 把已恢复的一个区间就地换入当前时间轴。
-   *
-   * 与旧的整轨 stageSemanticTimeline 的关键差别：旧实现走 installCueTimeline，
-   * 它会把 clipUnits / clipState 全部清空、只留一个 seed clip —— 已经翻好的
-   * 其他 clip 全部作废重翻。这里改用 Core.resegmentTimelineSnapshot：
-   * 它按 token 跨度保留 translations（未被替换的单元跨度不变 → 译文原样保留），
-   * 只有真正被重新断句的那一段需要重翻。
-   *
-   * 词流契约由 resegmentTimelineSnapshot 强制校验（覆盖数/文本逐词比对），
-   * 恢复结果若与源词流不一致会直接抛错，不会污染时间轴 —— fail-closed。
-   */
-  async function stageSemanticInterval(result, loadEpoch) {
-    if (loadEpoch !== state.timelineEpoch) return false;
-    if (!state.timelineSnapshot || !result || !result.cues || !result.cues.length) return false;
-    var trimmed = Core.applyTailTrim(result.cues, config.tailTrimMs);
-    if (!trimmed || !trimmed.length) return false;
-    try {
-      var nextSnapshot = Core.resegmentTimelineSnapshot(
-        state.timelineSnapshot,
-        result.startIndex,
-        result.endIndex,
-        trimmed
-      );
-      var nextCues = Core.cuesFromTimelineSnapshot(nextSnapshot);
-      var nextClips = sliceTimelineClips(nextCues);
-      if (!nextClips.length) return false;
-
-      // 被替换区间覆盖的 clip 需要重翻；其余 clip 的已翻结果按 cue 指纹继续复用。
-      var preservedUnits = {};
-      var preservedState = {};
-      for (var ci = 0; ci < nextClips.length; ci++) {
-        var oldIdx = clipIdxAtIn(state.clips, nextClips[ci].startMs);
-        if (oldIdx < 0) continue;
-        if (state.clipState[oldIdx] !== "done") continue;
-        var oldClip = state.clips[oldIdx];
-        var oldUnits = state.clipUnits[oldIdx];
-        if (!oldClip || !oldUnits) continue;
-        // 只在这个 clip 的源文本完全未变时复用，避免把旧断句的译文错配到新断句上。
-        if (clipCueFingerprint(oldClip) !== clipCueFingerprint(nextClips[ci])) continue;
-        preservedUnits[ci] = oldUnits;
-        preservedState[ci] = "done";
-      }
-
-      invalidateRuntimeRequests();
-      state.timelineEpoch++;
-      state.segmentationMode = "semantic";
-      state.firstClipReady = true;
-      state.timelineSnapshot = nextSnapshot;
-      state.sourceTimeline = nextSnapshot.timeline;
-      state.cues = nextCues;
-      state.clips = nextClips;
-      state.cueMap = Core.cueClipIndexMap(nextClips);
-      state.clipUnits = preservedUnits;
-      state.clipState = preservedState;
-      state.clipBackoff = {};
-      state.clipInflight = {};
-      state.lastHitCueIdx = -1;
-      // 已恢复到哪个播放位置：取被替换区间末尾单元的结束时刻。
-      // 区间之后还有单元 → 记录边界；已到轨尾 → Infinity（推进器据此停止）。
-      var doneUnits = nextSnapshot.units || [];
-      var lastReplaced = trimmed.length ? result.startIndex + trimmed.length - 1 : result.startIndex;
-      state.semanticDoneUntilMs = lastReplaced + 1 < doneUnits.length
-        ? Number(doneUnits[lastReplaced].endMs) || 0
-        : Infinity;
-      rebuildRenderTimeline();
-      state.lastPrefetchMs = -1e9;
-      prefetchAround(currentTimeMs(), true);
-      return true;
-    } catch (e) {
-      // 词流契约不通过 = 恢复结果不可信，保持当前可用时间轴。
-      console.warn("[dualsub] 语义区间换入失败，保留当前时间轴：", e && e.message);
-      return false;
     }
   }
 
@@ -988,28 +693,11 @@
     var nextCueMap = Core.cueClipIndexMap(nextClips);
     var nextClipUnits = {};
     var nextClipState = {};
-    if (prepared && prepared.seeds) {
-      for (var preparedIdx in prepared.seeds) {
-        var seedIdx = parseInt(preparedIdx, 10);
-        var seedLines = prepared.seeds[preparedIdx];
-        var seedClip = nextClips[seedIdx];
-        if (!seedClip || !seedLines || !seedLines.length) continue;
-        nextClipUnits[seedIdx] = Core.buildClipUnits(
-          seedLines,
-          seedClip.startMs,
-          seedClip.endMs,
-          seedClip.cues,
-          { lenient: true }
-        );
-        nextClipState[seedIdx] = "done";
-      }
-    }
+
 
     invalidateRuntimeRequests();
     state.timelineEpoch++;
-    clearSemanticFallbackTimer();
-    // fallback 已经给用户可播放首屏；后台语义切换绝不再次暂停视频等翻译。
-    if (mode === "semantic") state.firstClipReady = true;
+
     state.segmentationMode = mode;
     state.sourceTimeline = nextSnapshot.timeline;
     state.timelineSnapshot = nextSnapshot;
@@ -1054,7 +742,7 @@
    * 独立发起 translateClip——"下下个"不被"下一个还 pending"阻塞。窗口由全局信号量
    * (ensureGate)封顶，避免多 clip 并发冲垮网关。
    * 已翻 / 正在翻 / 退避中的 clip 由 translateClip 内部跳过。
-   * semantic 模式：一个 clip = 一次 translateClipLines，按完整语义单元编号 1:1 返回；fallback 不进入翻译。
+   * block 模式：一个连续源块一次请求，模型可自由合并并返回任意数量目标语言屏。
    */
 
   function clearWaitTimer() {
@@ -1097,8 +785,7 @@
 
   function prefetchAround(ms, force) {
     if (!config.enabled || !state.clips.length) return;
-    // 语义恢复尚未结束时，纯 fallback 只保证原文立即可见，避免与整轨恢复抢请求。
-    // 若恢复失败，enableFallbackTranslation 切到 fallback-translation，翻译已重组的稳定 cue。
+    // 语义恢复尚未结束时，fallback 只保证原文立即可见；机械碎片绝不进入翻译。
     if (state.segmentationMode === "fallback") return;
     // 节流：预取循环低频(1.5s)调用，位置没明显移动就不重复跑昂贵逻辑
     if (!force && Math.abs(ms - state.lastPrefetchMs) < 1000) return;
@@ -1119,9 +806,7 @@
 
     // 滑动窗口下标列表（含当前段）。每段整段一起翻。
     // 调度判据收敛到 Core.planTranslationWindow（单一权威 + 可被门禁覆盖）。
-    // 此处原先有一条降级：semanticPending 期间只翻当前段 [idx]。那条降级是
-    // 「翻译永远跟不上播放」的根因 —— 整轨语义恢复要 9.5 分钟，期间等于边播边翻。
-    // 语义恢复已改为跟着播放位置滑动，不再长期 pending，因此不再降级窗口。
+    // 所有 block 统一由 planTranslationWindow 决定当前与后续预取，不在调用点旁路。
     var plan = Core.planTranslationWindow({
       currentIdx: idx,
       clipCount: state.clips.length,
@@ -1135,7 +820,7 @@
       //
       // 语义恢复比播放快 3.5x，因此把预取截到已恢复边界内不会让翻译闲着 ——
       // 只是不再把算力花在马上要作废的断句上。
-      semanticReadyUntilMs: state.segmentationMode === "semantic" ? state.semanticDoneUntilMs : null,
+      semanticReadyUntilMs: null,
       clipStartMs: state.clips.map(function (c) { return c ? c.startMs : NaN; }),
     }).plan;
     // force（刚加载/seek）时：先只踢当前段，下一 macrotask 再铺后续预取，
@@ -1154,63 +839,6 @@
         translateClip(plan[i], plan[i] === idx ? 100 : (plan[i] === idx + 1 && remainMsInCurrent < 15000 ? 60 : 10));
       }
     }
-    // 语义断句跟着播放推进：接近已恢复区间的末尾时恢复下一段。
-    maybeAdvanceSemanticInterval(ms);
-  }
-
-  /**
-   * 播放接近「已恢复到的位置」时，恢复下一个区间。
-   *
-   * 这是"整轨一次性恢复"被替换掉之后的推进器：整轨恢复要 9.5 分钟且必须先付
-   * 全部 35 块的 token；改为跟着播放滑动后，token 消耗正比于实际观看时长
-   * （看 5 分钟 = 8 块），而每一段仍是 semantic 断句，质量不降。
-   *
-   * 提前量取一个预取窗口（SEMANTIC_INTERVAL_MS 的一半）：早于播放到达就开始恢复，
-   * 使换入发生在字幕上屏之前，用户看不到断句变化。
-   */
-  function maybeAdvanceSemanticInterval(ms) {
-    if (state.semanticPending) return;                       // 已有区间在途
-    // 只在这条轨确实在用语义断句时才推进。
-    // "fallback" = 首屏恢复还没结束；"fallback-translation" = 恢复已失败并降级，
-    // 此时再推进只会把同一个失败重复一遍（刷日志 + 白烧 token）。
-    if (state.segmentationMode !== "semantic") return;
-    if (!state.cues.length || !state.timelineSnapshot) return;
-    var doneUntil = Number(state.semanticDoneUntilMs);
-    if (!Number.isFinite(doneUntil)) return;                  // Infinity = 已恢复到轨尾
-    // 推进时机必须**领先于预取窗口**，不是领先于播放位置。
-    //
-    // 旧条件是 ms + INTERVAL/2 < doneUntil 就跳过，即播放走到已恢复区间的后半段才恢复
-    // 下一段。但预取窗口领先播放约 56s —— 它会先撞上恢复边界被截断（clamped-to-semantic），
-    // 于是翻译闲着等恢复，反而变慢。恢复必须先把路铺到预取窗口之外。
-    //
-    // 取窗口深度 + 一个 clip 的余量：恢复比播放快 3.5x，铺在前面不会成为瓶颈。
-    var prefetchLeadMs = (Core.PREFETCH_AHEAD + 2) * config.clipSeconds * 1000;
-    if (ms + prefetchLeadMs < doneUntil) return;
-
-    var loadEpoch = state.timelineEpoch;
-    state.semanticPending = true;
-    restoreSemanticIntervalIfAvailable(state.timelineSnapshot, state.rawTrackCues, Math.max(ms, doneUntil)).then(async function (result) {
-      if (loadEpoch !== state.timelineEpoch) { state.semanticPending = false; return; }
-      if (!result || !result.cues || !result.cues.length) {
-        // 没有可恢复区间（轨尾）或恢复不可用：停止推进，保留当前断句。
-        state.semanticDoneUntilMs = Infinity;
-        state.semanticPending = false;
-        return;
-      }
-      var ok = await stageSemanticInterval(result, loadEpoch);
-      // 换入失败（词流契约不通过）说明这条轨的恢复结果不可信 —— 停止推进。
-      // 否则每个预取周期都会重试，把同一个错误刷满日志、白烧 token。
-      if (!ok && loadEpoch === state.timelineEpoch) state.semanticDoneUntilMs = Infinity;
-      state.semanticPending = false;
-    }).catch(function (e) {
-      state.semanticPending = false;
-      if (loadEpoch !== state.timelineEpoch) return;
-      // 同上：恢复本身抛错也不再反复重试，避免刷日志和重复烧 token。
-      state.semanticDoneUntilMs = Infinity;
-      if (!(e && (e.name === "AbortError" || e.name === "DOMException"))) {
-        console.warn("[dualsub] 语义区间推进失败，保留当前断句：", e && e.message);
-      }
-    });
   }
 
   function getBackoff(idx) {
@@ -1218,34 +846,6 @@
     // 达 maxFails 才真正放弃(clipState=failed 终态，UI 可见标「翻译失败」)。
     if (!state.clipBackoff[idx]) state.clipBackoff[idx] = Core.makeBackoff({ maxFails: 6, baseMs: 2000, maxMs: 30000 });
     return state.clipBackoff[idx];
-  }
-
-  function adoptRepairedClipTimeline(idx, repairedCues) {
-    var oldClip = state.clips[idx];
-    if (!oldClip || !state.timelineSnapshot) throw new Error("cannot resegment missing timeline clip");
-    var nextSnapshot = Core.resegmentTimelineSnapshot(
-      state.timelineSnapshot,
-      oldClip.startIndex,
-      oldClip.startIndex + oldClip.cues.length,
-      repairedCues
-    );
-    var nextCues = Core.cuesFromTimelineSnapshot(nextSnapshot);
-    var nextClips = sliceTimelineClips(nextCues);
-    var nextIdx = clipIdxAtIn(nextClips, oldClip.startMs);
-    if (nextIdx < 0) throw new Error("resegmented clip not found");
-    invalidateRuntimeRequests();
-    state.timelineEpoch++;
-    state.timelineSnapshot = nextSnapshot;
-    state.sourceTimeline = nextSnapshot.timeline;
-    state.cues = nextCues;
-    state.clips = nextClips;
-    state.cueMap = Core.cueClipIndexMap(nextClips);
-    state.clipUnits = {};
-    state.clipState = {};
-    state.clipBackoff = {};
-    state.clipInflight = {};
-    state.lastHitCueIdx = -1;
-    return { idx: nextIdx, clip: nextClips[nextIdx] };
   }
 
   async function translateClip(idx, priority) {
@@ -1263,16 +863,7 @@
       if (idx === 0) maybePauseForFirstTranslation(0);
       var result = await loadOrTranslateClip(clip, segmentationModeAtStart, priority);
       if (requestGeneration !== state.requestGeneration || timelineEpoch !== state.timelineEpoch || segmentationModeAtStart !== state.segmentationMode) return;
-      if (result.repaired) {
-        var adopted = adoptRepairedClipTimeline(idx, result.cues);
-        idx = adopted.idx;
-        clip = adopted.clip;
-        requestGeneration = state.requestGeneration;
-        timelineEpoch = state.timelineEpoch;
-        // 边界修复换了 clip，快照要按**新 clip 自身**的断句来源重取，不是取全局字段
-        segmentationModeAtStart = state.segmentationMode;
-      }
-      applyClipLines(idx, clip, result.key, result.lines, { skipCacheWrite: true });
+      applyBlockUnits(idx, clip, result.key, result.units, { skipCacheWrite: true });
     } catch (e) {
       var stale = requestGeneration !== state.requestGeneration || timelineEpoch !== state.timelineEpoch || segmentationModeAtStart !== state.segmentationMode;
       var aborted = e && (e.name === "AbortError" || /aborted|superseded/i.test(String(e.message || "")));
@@ -1298,33 +889,31 @@
   }
 
   /**
-   * 处理 translateClipLines 的产出（v0.4.0 主路径收尾）。
-   *  - lines 非空：buildClipUnits 按字符占比配时间轴 → 存 clipUnits[idx] → done + 写缓存(lines)。
-   *  - lines 空（模型空响应）：不算硬失败但也没内容 → error + 退避，交后台调度器重试；
+   * 处理 translateContextBlock 已验证并物化的目标语言单元。
+   *  - units 非空：直接存入独立译文时间轴；
+   *  - units 空：error + 退避，交后台调度器重试；
    *    渲染层此时对该 clip 回退显原文（rebuildRenderTimeline 用 cue 铺空译文单元）。
    * 不再有「部分接受 / 缺口逐行补翻」—— 模型一步到位直接分行，代码只配时间轴。
    */
-  function applyClipLines(idx, clip, key, lines, opts) {
+  function applyBlockUnits(idx, clip, key, units, opts) {
     opts = opts || {};
     var backoff = getBackoff(idx);
-    // lenient 运行时：lines 里坏句为空串（该句回退英文）。只要还有至少一句有译文就算 clip 部分成功，
-    // 落地渲染（坏句显英文、好句显中文），不再因单句连坐整组回退重试。全空才当作模型空响应退避重试。
-    var hasAnyTranslation = !!(lines && lines.length && lines.some(function (line) {
-      return line != null && String(line).trim() !== "";
+    var valid = !!(units && units.length && units.every(function (unit) {
+      return unit && unit.endMs > unit.startMs && String(unit.translation || "").trim();
     }));
-    if (hasAnyTranslation) {
-      state.clipUnits[idx] = Core.buildClipUnits(lines, clip.startMs, clip.endMs, clip.cues, { lenient: true });
+    if (valid) {
+      state.clipUnits[idx] = units;
       state.clipState[idx] = "done";
       if (idx === 0) maybeResumeAfterFirstTranslation(0);
       backoff.reset();
-      if (!opts.skipCacheWrite) writeCache(key, { lines: lines, cues: clip.cues });
+      if (!opts.skipCacheWrite) console.warn("[dualsub] block units without normalized segments are not cached");
       if (!opts.deferRender) {
         rebuildRenderTimeline();
         requestRender();
       }
     } else {
       // 模型空响应：无译文 → 退避重试（不写缓存，避免把空结果固化）。
-      console.warn("[dualsub] clip", idx, "模型空响应（无字幕行）→ 退避重试");
+      console.warn("[dualsub] clip", idx, "模型空响应（无 block units）→ 退避重试");
       delete state.clipUnits[idx];
       state.clipState[idx] = "error";
       backoff.fail();
@@ -1365,61 +954,18 @@
   }
 
   async function translateFullSrtBatch(batch, job, identity, mode) {
-    var cues = [];
-    batch.forEach(function (item) { cues = cues.concat(item.clip.cues || []); });
-    var context = beginRuntimeRequest();
-    job.activeContext = context;
-    var pendingUsage = [];
-    try {
-      var result = await ensureGate().run(function () {
-        if (!isRuntimeRequestCurrent(context)) throw runtimeAbortError();
-        return Core.translateClipWithBoundaryRepair({
-          cues: cues,
-          apiBaseUrl: identity.apiBaseUrl,
-          apiKey: identity.apiKey,
-          apiModel: identity.apiModel,
-          targetLang: identity.targetLang,
-          systemPrompt: identity.systemPrompt,
-          reasoningEffort: identity.reasoningEffort,
-          maxLineChars: identity.maxLineChars,
-          segmentationMode: mode,
-          timeoutMs: Core.TRANSLATE_TIMEOUT_MS,
-          fetchImpl: function (u, o) { return fetch(u, o); },
-          onUsage: function (usage) { pendingUsage.push(usage); },
-          signal: context.controller ? context.controller.signal : undefined,
-        });
-      }, 1);
-      if (!isRuntimeRequestCurrent(context) || job.generation !== state.requestGeneration) throw runtimeAbortError();
-      var offset = 0;
-      var commits = [];
-      for (var i = 0; i < batch.length; i++) {
-        var item = batch[i];
-        var count = item.clip.cues.length;
-        var lines = result.lines.slice(offset, offset + count);
-        var coverage = result.coverage.slice(offset, offset + count);
-        offset += count;
-        if (lines.length !== count || coverage.length !== count) throw new Error("full SRT batch coverage mismatch");
-        var key = clipCacheKey(item.clip, mode, identity);
-        var accepted = await writeCache(key, { lines: lines, coverage: coverage }, job.generation, function () {
-          return !job.cancelRequested && isRuntimeRequestCurrent(context) && job.generation === state.requestGeneration;
-        });
-        if (!accepted || job.cancelRequested || !isRuntimeRequestCurrent(context) || job.generation !== state.requestGeneration) throw runtimeAbortError();
-        commits.push({ item: item, key: key, lines: lines, count: count });
-      }
-      if (!isRuntimeRequestCurrent(context) || job.generation !== state.requestGeneration) throw runtimeAbortError();
-      for (var ci = 0; ci < commits.length; ci++) {
-        var commit = commits[ci];
-        applyClipLines(commit.item.idx, commit.item.clip, commit.key, commit.lines, { skipCacheWrite: true, deferRender: true });
-        job.completedUnits += commit.count;
-      }
-      commitPendingUsage(context, pendingUsage);
-      job.completedBatches++;
-      rebuildRenderTimeline();
-      requestRender();
-    } finally {
-      if (job.activeContext === context) job.activeContext = null;
-      endRuntimeRequest(context);
-    }
+    if (!batch || batch.length !== 1) throw new Error("full SRT block batch must contain exactly one clip");
+    var item = batch[0];
+    var clip = item.clip;
+    // 完整 SRT 与前台播放/seek 必须共享同一 keyed in-flight Promise。
+    // 取消 full-SRT 只停止这个等待者；不能 abort 可能同时被前台使用的请求。
+    var result = await loadOrTranslateClip(clip, mode, 1);
+    if (job.cancelRequested || job.generation !== state.requestGeneration || !config.enabled) throw runtimeAbortError();
+    applyBlockUnits(item.idx, clip, result.key, result.units, { skipCacheWrite: true, deferRender: true });
+    job.completedUnits += clip.cues.length;
+    job.completedBatches++;
+    rebuildRenderTimeline();
+    requestRender();
   }
 
   async function runFullSrtPreparation(job) {
@@ -1436,7 +982,7 @@
         }
         var cached = await readVerifiedClipCache(clip, mode, identity, job.generation);
         if (cached) {
-          applyClipLines(idx, clip, cached.key, cached.lines, { skipCacheWrite: true, deferRender: true });
+          applyBlockUnits(idx, clip, cached.key, cached.units, { skipCacheWrite: true, deferRender: true });
           job.completedUnits += clip.cues.length;
         } else {
           missing.push({ idx: idx, clip: clip, cues: clip.cues });
@@ -1444,7 +990,7 @@
       }
       rebuildRenderTimeline();
       requestRender();
-      var batches = Core.planCoverageBatches(missing, 8);
+      var batches = missing.map(function (item) { return [item]; });
       job.totalBatches = batches.length;
       for (var bi = 0; bi < batches.length; bi++) {
         if (job.cancelRequested) {
@@ -1528,7 +1074,7 @@
   /**
    * 重建全局渲染时间轴 state.renderUnits（v0.4.0：clip 渲染单元优先、原文兜底）。
    * 按 clip 顺序遍历，每个 clip：
-   *  - 已翻好(clipUnits[idx]) → 直接用其渲染单元（buildClipUnits 已配好时间轴 + 就近归并原文 + 译文）；
+   *  - 已翻好(clipUnits[idx]) → 直接使用目标语言独立渲染单元；
    *  - 未翻好 → 逐条 cue 铺一个单元，原文用 cue.content、译文留空（未到时显原文 / 转「翻译中…」）。
    * 产出按 start 升序的单元数组，渲染 tick 用 findCueIndexAt 在其上二分查当前行。
    * 每个单元：{ start, end, originalText, translation, clipIdx }。
@@ -1540,40 +1086,44 @@
       updateNativeCaptionVisibility();
       return;
     }
-    var translations = Object.assign({}, state.timelineSnapshot.translations || {});
+    var render = [];
     for (var ci = 0; ci < state.clips.length; ci++) {
       var clip = state.clips[ci];
-      var clipUnits = state.clipUnits[ci];
-      if (!clip || !clipUnits || clipUnits.length !== clip.cues.length) continue;
-      for (var local = 0; local < clipUnits.length; local++) {
-        var globalIndex = clip.startIndex + local;
-        var sourceUnit = state.timelineSnapshot.units[globalIndex];
-        if (!sourceUnit) continue;
-        translations[sourceUnit.id] = String(clipUnits[local].translation == null ? "" : clipUnits[local].translation);
+      var translated = state.clipState[ci] === "done" ? state.clipUnits[ci] : null;
+      if (clip && translated && translated.length) {
+        for (var ti = 0; ti < translated.length; ti++) {
+          var unit = translated[ti];
+          render.push({
+            unitId: "block:" + ci + ":" + ti,
+            sourceFingerprint: state.timelineSnapshot.sourceFingerprint || "",
+            tokenStart: null,
+            tokenEnd: null,
+            start: unit.startMs,
+            end: unit.endMs,
+            originalText: unit.originalText,
+            translation: unit.translation,
+            clipIdx: ci,
+          });
+        }
+      } else if (clip) {
+        for (var fi = 0; fi < clip.cues.length; fi++) {
+          var cue = clip.cues[fi];
+          render.push({
+            unitId: cue.unitId || "source:" + ci + ":" + fi,
+            sourceFingerprint: cue.sourceFingerprint || clipCueFingerprint(clip),
+            tokenStart: Number.isInteger(cue.tokenStart) ? cue.tokenStart : null,
+            tokenEnd: Number.isInteger(cue.tokenEnd) ? cue.tokenEnd : null,
+            start: cue.start,
+            end: cue.end,
+            originalText: cue.content,
+            translation: null,
+            clipIdx: ci,
+          });
+        }
       }
     }
-    state.timelineSnapshot = Core.createTimelineSnapshot({
-      revision: state.timelineSnapshot.revision + 1,
-      videoId: state.timelineSnapshot.videoId,
-      trackCode: state.timelineSnapshot.trackCode,
-      timeline: state.timelineSnapshot.timeline,
-      units: state.timelineSnapshot.units,
-      translations: translations,
-    });
-    state.renderUnits = state.timelineSnapshot.renderUnits.map(function (unit, index) {
-      var map = state.cueMap[index];
-      return {
-        unitId: unit.unitId,
-        sourceFingerprint: unit.sourceFingerprint,
-        tokenStart: unit.tokenStart,
-        tokenEnd: unit.tokenEnd,
-        start: unit.startMs,
-        end: unit.endMs,
-        originalText: unit.originalText,
-        translation: unit.translation || null,
-        clipIdx: map ? map.clipIdx : -1,
-      };
-    });
+    render.sort(function (a, b) { return a.start - b.start || a.end - b.end; });
+    state.renderUnits = render;
     updateNativeCaptionVisibility();
     state.lastHitCueIdx = -1;
   }
@@ -2054,14 +1604,16 @@
 
     var unit = state.renderUnits[unitIdx];
     var trans = unit.translation;
+    // 原文与译文是两条独立时间轴：译文可自由合并/重分屏，原文始终按当前源 cue 显示。
+    var sourceIdx = Core.findCueIndexAt(state.cues, ms, -1);
+    var sourceText = sourceIdx >= 0 && state.cues[sourceIdx] ? String(state.cues[sourceIdx].content || "") : "";
     var st = state.clipState[unit.clipIdx];
     // 未翻好时的指示标记（纯函数，见 core.clipDisplayFlags，便于单测）：
     //  - 有译文 → 都 false。
     //  - 无译文 + failed(达 maxFails) → 显「翻译失败」。
     //  - 无译文 + 未结案(undefined=未翻 / pending=在翻) → 显「翻译中…」。
     //  - 无译文 + 已结案(done/error 但该行无译文=覆盖缺口/降级) → 优雅显原文，不再永久转圈(症状1)。
-    // 纯 fallback 尚在等待语义恢复，译文层保持空白；fallback-translation 与 semantic
-    // 都走真实 clip 翻译状态，避免恢复失败后页面永久只有英文。
+    // fallback 尚在等待完整语义边界，译文层保持空白；只有 semantic 走真实翻译状态。
     var flags = state.segmentationMode !== "fallback" ? Core.clipDisplayFlags(trans, st) : {
       failed: false,
       pending: false,
@@ -2071,14 +1623,14 @@
 
     // 命中键：单元下标 + 译文 + 状态标记。键未变 → 不动 DOM（idle 零开销）
     var stTag = pending ? "p" : failed ? "f" : "";
-    var key = unitIdx + ":" + (trans || "") + ":" + stTag;
+    var key = unitIdx + ":" + sourceIdx + ":" + (trans || "") + ":" + stTag;
     if (key === lastRenderedKey) return;
     lastRenderedKey = key;
     state.renderer.dataset.unitId = unit.unitId || "";
     state.renderer.dataset.tokenStart = String(unit.tokenStart);
     state.renderer.dataset.tokenEnd = String(unit.tokenEnd);
     state.renderer.dataset.sourceFingerprint = unit.sourceFingerprint || "";
-    setRendererText(unit.originalText, trans, pending, failed);
+    setRendererText(sourceText, trans, pending, failed);
   }
 
   /**
@@ -2244,9 +1796,7 @@
         // 禁用先失效代际并主动取消，再拆循环/DOM；任何迟到 continuation 都无法提交。
         invalidateRuntimeRequests();
         state.timelineEpoch++;
-        state.semanticPending = false;
-        clearSemanticFallbackTimer();
-        teardownRuntime(true);
+                teardownRuntime(true);
       } else {
         ensureRenderer();
         // 源语言变了 → 重新选轨并重载
@@ -2290,8 +1840,6 @@
       if (state.srtJob && state.srtJob.status === "running") {
         state.srtJob.cancelRequested = true;
         state.srtJob.status = "cancelling";
-        var activeSrtContext = state.srtJob.activeContext;
-        try { if (activeSrtContext && activeSrtContext.controller) activeSrtContext.controller.abort(); } catch (e) {}
       }
       sendResponse(Object.assign({ ok: true }, fullSrtStatus()));
       return true;
@@ -2307,9 +1855,9 @@
       // 时间轴重建一次确保最新；renderUnits 内部用 start/end，转成 startMs/endMs 供 Core.buildSrt。
       rebuildRenderTimeline();
       var exportSnapshot = state.timelineSnapshot;
-      var realUnits = exportSnapshot ? exportSnapshot.renderUnits.filter(function (u) {
+      var realUnits = state.renderUnits.filter(function (u) {
         return u && String(u.originalText || "").trim() !== "";
-      }) : [];
+      });
       var allTranslated = realUnits.length > 0 && realUnits.every(function (u) {
         return String(u.translation || "").trim() !== "";
       });
@@ -2318,20 +1866,20 @@
         videoId: state.videoId,
         targetLang: config.targetLang,
         sourceFingerprint: exportSnapshot ? exportSnapshot.sourceFingerprint : "",
-        snapshotRevision: exportSnapshot ? exportSnapshot.revision : 0,
+        snapshotRevision: state.timelineEpoch,
         missingUnits: realUnits.filter(function (u) { return !String(u.translation || "").trim(); }).length,
         preparation: fullSrtStatus(),
-        units: exportSnapshot ? exportSnapshot.renderUnits.map(function (u) {
+        units: state.renderUnits.map(function (u) {
           return {
             unitId: u.unitId,
             tokenStart: u.tokenStart,
             tokenEnd: u.tokenEnd,
-            startMs: u.startMs,
-            endMs: u.endMs,
+            startMs: u.start,
+            endMs: u.end,
             originalText: u.originalText,
             translation: u.translation,
           };
-        }) : [],
+        }),
       });
       return true;
     }
@@ -2359,8 +1907,8 @@
     }
     try {
       var connectionUsage = null;
-      var lines = await Core.translateClipLines({
-        cues: [{ content: "hello world" }],
+      var result = await Core.translateContextBlock({
+        cues: [{ start: 0, end: 1200, content: "hello world" }],
         apiBaseUrl: cfg.apiBaseUrl,
         apiKey: cfg.apiKey,
         apiModel: cfg.apiModel,
@@ -2369,7 +1917,7 @@
         reasoningEffort: cfg.reasoningEffort,
         onUsage: function (usage) { connectionUsage = usage; },
       });
-      return { ok: true, sample: lines && lines[0] ? lines[0] : "(空响应)", usage: connectionUsage };
+      return { ok: true, sample: result.units && result.units[0] ? result.units[0].translation : "(空响应)", usage: connectionUsage };
     } catch (e) {
       return { ok: false, error: String(e && e.message ? e.message : e) };
     }

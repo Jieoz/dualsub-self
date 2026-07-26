@@ -266,14 +266,13 @@
         <div class="body">
           <label for="sourceLang">源语言（当前视频字幕轨道）</label>
           <select id="sourceLang">
-            <option value="auto">自动（优先自动字幕 ASR）</option>
+            <option value="auto">自动（视频默认顺序）</option>
           </select>
           <label for="targetLang">译文语言</label>
           <select id="targetLang">
             <option value="zh-Hans">简体中文（zh-Hans）</option>
           </select>
-          <div class="inline"><input type="checkbox" id="skipChineseSource" /><label for="skipChineseSource">跳过中文源字幕</label></div>
-          <div class="hint">当前版本译文固定为简体中文。跳过中文源默认开启：源轨是中文/粤语时不请求翻译；手动把源语言指定为中文轨时仍会翻译。</div>
+          <div class="hint">当前版本译文固定为简体中文；所有源语言使用同一翻译流程。</div>
         </div>
       </details>
 

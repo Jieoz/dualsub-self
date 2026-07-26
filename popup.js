@@ -21,7 +21,7 @@
   var TEXT_FIELDS = ["apiBaseUrl", "apiKey", "apiModel", "targetLang", "fontFamily"];
   var NUM_FIELDS = ["fontSize", "bottomOffset", "tailTrimMs", "maxCharsPerScreen", "maxDurPerScreen"];
   var COLOR_FIELDS = ["fontColor", "transColor", "strokeColor"];
-  var BOOL_FIELDS = ["enabled", "background", "transOnTop", "showOriginal", "showLoading", "skipChineseSource", "waitForFirstTranslation"];
+  var BOOL_FIELDS = ["enabled", "background", "transOnTop", "showOriginal", "showLoading", "waitForFirstTranslation"];
   var SELECT_FIELDS = ["sourceLang", "fontWeight", "shadowStrength"];
   // strokeWidth 是 0–3 的小数滑块，单独处理（NUM_FIELDS 走 parseInt 会截断小数）。
 
@@ -198,7 +198,7 @@
     sel.innerHTML = "";
     var optAuto = document.createElement("option");
     optAuto.value = "auto";
-    optAuto.textContent = "自动（优先自动字幕 ASR）";
+    optAuto.textContent = "自动（视频默认顺序）";
     sel.appendChild(optAuto);
     (tracks || []).forEach(function (t) {
       var o = document.createElement("option");

@@ -1,17 +1,16 @@
 /*
  * test/e2e-harness.js — 真·E2E 调试 harness（node 直接跑，零外部依赖除 fetch）
  * =============================================================================
- * v0.6.0 架构：模型按 unitId/token span 返回完整 coverage，译文/原文/时间轴 1:1。
+ * block-v1 架构：连续源 cue block 整体翻译，目标语言可自然合并和重新分屏。
  *   本 harness 跑完整主链路：cleanupCues → resegmentCues → sliceClipsByCue
- *     → translateClipLines(结构化 coverage 验证)
- *     → buildClipUnits(沿用 immutable cue 原文与时间轴) → buildSrt
+ *     → translateContextBlock(严格 segments JSON)
+ *     → materializeBlockTranslation(粗粒度时间映射 + 缓存 round-trip) → buildSrt
  *   产出 SRT + 并排 HTML（原文 | 译文 | 时间轴）供肉眼核对断句/丢字，并打点延迟统计。
  *
  * 两种模型后端：
  *  --real   走真实 OpenAI 兼容网关（base/key/model 见下）。需要 key。
- *  --mock   (默认) 离线结构 mock：为当前重组后的每个 semantic unit 返回一条短、完整、
- *           可合法排版的确定性占位译文。旧 ref_zh 属于另一版逐 cue 分段，不能按时间或位置
- *           强行映射到当前 semantic unit。mock 只验证 1:1、时间轴、空响应和延迟，不冒充语言质量。
+ *  --mock   (默认) 离线结构 mock：合并连续源 cue，并返回与源 cue 数量不同的目标字幕屏。
+ *           mock 只验证 block JSON、粗时间轴、缓存 round-trip 和失败兜底，不冒充语言质量。
  *
  * API key 注入优先级（--real 时）：
  *   --key=<k>  >  env DUALSUB_API_KEY  >  env OPENAI_API_KEY  >  --key-file=<path>
@@ -91,35 +90,20 @@ function loadOriginalCues(limit) {
   }));
 }
 
-/* ---------------- mock 模型：按 token-span coverage 1:1 返回中文 ---------------- */
-function structuralMockZh(index) {
-  return "完整译文" + String(index + 1) + "。";
-}
-
+/* ---------------- mock 模型：连续源范围返回非 1:1 block segments ---------------- */
+function structuralMockZh(index) { return "完整块译文" + String(index + 1); }
 function makeMockFetch(stats, opts) {
-  opts = opts || {};
-  const REASON_MS = opts.reasonMs != null ? opts.reasonMs : 20;
-  const PER_CHAR_MS = opts.perCharMs != null ? opts.perCharMs : 1;
-  return function mockFetch(url, fetchOpts) {
-    const body = JSON.parse(fetchOpts.body);
-    const user = (body.messages[1] && body.messages[1].content) || "";
-    const payload = JSON.parse(user);
-    const content = JSON.stringify({ translations: payload.units.map((unit, index) => ({
-      unitId: unit.unitId,
-      coverFrom: unit.coverFrom,
-      coverTo: unit.coverTo,
-      translation: structuralMockZh(index),
-    })) });
-    const t0 = Date.now();
-    const thinkMs = REASON_MS + content.length * PER_CHAR_MS;
-    return new Promise((resolve) => setTimeout(() => {
-      stats.requestMs.push(Date.now() - t0);
-      resolve({
-        ok: true, status: 200,
-        json: async () => ({ choices: [{ message: { content } }] }),
-        text: async () => "",
-      });
-    }, thinkMs));
+  opts=opts||{};const REASON_MS=opts.reasonMs!=null?opts.reasonMs:20,PER_CHAR_MS=opts.perCharMs!=null?opts.perCharMs:1;
+  return function mockFetch(url,fetchOpts){
+    const body=JSON.parse(fetchOpts.body),payload=JSON.parse((body.messages[1]&&body.messages[1].content)||"{}");
+    const source=payload.sourceCues||[],segments=[];let from=0;
+    for(let i=1;i<=source.length;i++){
+      const boundary=i===source.length||source[i].startMs-source[i-1].endMs>=750;
+      if(!boundary)continue;
+      segments.push({sourceFrom:source[from].id,sourceTo:source[i-1].id,lines:[structuralMockZh(segments.length)]});from=i;
+    }
+    const content=JSON.stringify({segments}),t0=Date.now(),thinkMs=REASON_MS+content.length*PER_CHAR_MS;
+    return new Promise(resolve=>setTimeout(()=>{stats.requestMs.push(Date.now()-t0);resolve({ok:true,status:200,json:async()=>({choices:[{message:{content}}]}),text:async()=>""})},thinkMs));
   };
 }
 
@@ -133,6 +117,11 @@ function makeRealFetch(stats) {
       return resp;
     });
   };
+}
+
+function assertBlockRoundTrip(networkUnits,cachedUnits,clipIndex){
+  const pick=u=>({startMs:u.startMs,endMs:u.endMs,translation:u.translation,srcStart:u.srcStart,srcEnd:u.srcEnd});
+  if(JSON.stringify(networkUnits.map(pick))!==JSON.stringify(cachedUnits.map(pick)))throw new Error("clip "+clipIndex+" cache round-trip drift");
 }
 
 /* ============================== 主链路编排 ============================== */
@@ -168,7 +157,7 @@ async function run() {
     a.apiKey = "mock-key";
     a.base = "http://mock.local/v1";
     fetchImpl = makeMockFetch(stats, {});
-    mode = "MOCK (offline token-span coverage 1:1)";
+    mode = "MOCK (offline block-v1 non-1:1)";
   }
 
   console.log("\n=== dualsub E2E harness (v" + EXT_VERSION + ") ===");
@@ -188,32 +177,26 @@ async function run() {
 
   const t0 = Date.now();
   const renderUnits = [];
+  let cacheRoundTrips = 0;
   for (let ci = 0; ci < clips.length; ci++) {
-    const clip = clips[ci];
-    const ct0 = Date.now();
-    let lines;
+    const clip = clips[ci], ct0 = Date.now();
+    let result;
     try {
-      lines = await Core.translateClipLines(Object.assign({ cues: clip.cues }, apiCfg));
-    } catch (e) {
-      console.warn("[harness] clip", ci, "翻译失败：", e.message);
-      stats.clipFallbacks++;
-      lines = [];
+      const before=reseg.slice(Math.max(0,clip.startIndex-3),clip.startIndex);
+      const after=reseg.slice(clip.startIndex+clip.cues.length,clip.startIndex+clip.cues.length+3);
+      result=await Core.translateContextBlock(Object.assign({cues:clip.cues,contextBefore:before,contextAfter:after,maxVisualWidth:48},apiCfg));
+    } catch(e) { console.warn("[harness] clip",ci,"翻译失败：",e.message);stats.clipFallbacks++;result=null; }
+    if(!result||!result.units||!result.units.length){
+      stats.emptyClips++;for(const cue of clip.cues)renderUnits.push({start:cue.start,end:cue.end,originalText:cue.content,translation:""});
+    }else{
+      const cached=Core.materializeBlockTranslation(JSON.parse(JSON.stringify(result.segments)),clip.cues,{maxVisualWidth:48});
+      assertBlockRoundTrip(result.units,cached,ci);cacheRoundTrips++;
+      for(const u of result.units)renderUnits.push({start:u.startMs,end:u.endMs,originalText:u.originalText,translation:u.translation});
+      if(stats.firstUnitMs==null)stats.firstUnitMs=Date.now()-t0;
     }
-    if (!lines || !lines.length) {
-      stats.emptyClips++;
-      // 兜底：每条 cue 一行、译文留空（渲染层回退显原文）。仍配时间轴。
-      for (const cue of clip.cues) {
-        renderUnits.push({ start: cue.start, end: cue.end, originalText: cue.content, translation: "" });
-      }
-    } else {
-      const units = Core.buildClipUnits(lines, clip.startMs, clip.endMs, clip.cues);
-      for (const u of units) {
-        renderUnits.push({ start: u.startMs, end: u.endMs, originalText: u.originalText, translation: u.translation });
-      }
-      if (stats.firstUnitMs == null) stats.firstUnitMs = Date.now() - t0;
-    }
-    stats.clipMs.push(Date.now() - ct0);
+    stats.clipMs.push(Date.now()-ct0);
   }
+  stats.cacheRoundTrips=cacheRoundTrips;
   stats.totalMs = Date.now() - t0;
 
   writeOutputs(renderUnits, stats, a, mode);
@@ -221,15 +204,15 @@ async function run() {
   // 切词/丢字自检：先跑检测器自检（对照样本必须 FAIL），再审真实产物（应 PASS）。
   const detectorOk = auditSelfTest();
   const audit = auditWordCuts(renderUnits);
-  const oneToOneOk = renderUnits.length === reseg.length &&
-    renderUnits.every((u) => u.originalText && u.translation && u.start < u.end);
-  const noChineseFullStop = renderUnits.every((u) => !(u.translation || "").includes("。"));
-  console.log("结构 1:1      :", oneToOneOk ? "PASS" : "FAIL");
-  console.log("中文字幕无句号:", noChineseFullStop ? "PASS" : "FAIL");
-  if (!detectorOk || !oneToOneOk || !noChineseFullStop || (a.real && !audit.pass)) process.exitCode = 1;
-  if (!a.real) {
-    console.log("说明          : MOCK 使用确定性占位译文，只验证 1:1/时轴/空响应；不冒充真实模型语言质量。" );
-  }
+  const timelineOk=renderUnits.every((u,i)=>u.originalText&&u.translation&&u.end>u.start&&(!i||u.start>=renderUnits[i-1].end));
+  const nonOneToOne=renderUnits.length!==reseg.length;
+  const noChineseFullStop=renderUnits.every(u=>!(u.translation||"").includes("。"));
+  const cacheOk=stats.cacheRoundTrips===clips.length;
+  console.log("block 非 1:1   :",nonOneToOne?"PASS":"FAIL");
+  console.log("时间轴/缓存往返:",timelineOk&&cacheOk?"PASS":"FAIL");
+  console.log("中文字幕无句号:",noChineseFullStop?"PASS":"FAIL");
+  if(!detectorOk||!nonOneToOne||!timelineOk||!cacheOk||!noChineseFullStop||(a.real&&!audit.pass))process.exitCode=1;
+  if(!a.real)console.log("说明          : MOCK 验证 block JSON、非 1:1、时间轴与缓存往返；不冒充真实模型语言质量。" );
 }
 
 /* ============================== 产物输出 ============================== */
