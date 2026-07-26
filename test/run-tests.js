@@ -3250,6 +3250,45 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     assert.strictEqual(Core.sanitizeSubtitleLine("这是一句话。"), "这是一句话");
     // 汉字之间的多余空格压掉，拉丁词两侧空格保留
     assert.strictEqual(Core.sanitizeSubtitleLine("这 是 一句话"), "这是一句话");
+
+    // 模型会在 URL 内部插空格（实测俄语轨真实输出 "https:// example. com/ kettle"）。
+    // 空格一进去这段就不再是 URL 原子，保护与宽度判定全部失效、用户复制不出链接。
+    // 必须由程序确定性收回，且不得吞掉 URL 之后属于句子的空格。
+    assert.strictEqual(
+      Core.sanitizeSubtitleLine("详情请看网站 https:// example. com/ kettle"),
+      "详情请看网站 https://example.com/kettle",
+      "模型在 URL 内插的空格必须被程序删除"
+    );
+    assert.strictEqual(
+      Core.sanitizeSubtitleLine("详情请看网站 https://example.com/kettle"),
+      "详情请看网站 https://example.com/kettle",
+      "正确的 URL 不得被改动"
+    );
+    assert.strictEqual(
+      Core.sanitizeSubtitleLine("看 https://example.com/a 了解更多"),
+      "看 https://example.com/a 了解更多",
+      "URL 之后属于句子的空格不得被吞"
+    );
+    assert.strictEqual(
+      Core.sanitizeSubtitleLine("打开 https:// example.com/p? a=1& b=2 试试"),
+      "打开 https://example.com/p?a=1&b=2 试试",
+      "查询串里的空格也必须收回"
+    );
+    assert.strictEqual(
+      Core.sanitizeSubtitleLine("访问 www. example. com 查看"),
+      "访问 www.example.com 查看",
+      "www 形式同样处理"
+    );
+    assert.strictEqual(
+      Core.sanitizeSubtitleLine("见 https:// a. com 和 https:// b. com"),
+      "见 https://a.com 和 https://b.com",
+      "多个 URL 分别收回"
+    );
+    assert.strictEqual(
+      Core.sanitizeSubtitleLine("地址是 https://example.com/a，记住"),
+      "地址是 https://example.com/a，记住",
+      "URL 后的中文标点不得被算进链接"
+    );
   });
 
   test("翻译超时必须容得下真实网关延迟，且全系统只有一处定义", () => {
