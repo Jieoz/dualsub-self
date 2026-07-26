@@ -24,7 +24,55 @@ function boundaryJson(requestOptions, cutIndexes) {
   const body = JSON.parse(requestOptions.body);
   const payload = JSON.parse(body.messages[1].content);
   const cuts = (cutIndexes || []).map((index) => payload.tokens[index].id);
-  return JSON.stringify({ cutsAfter: cuts });
+  return JSON.stringify({ semanticCutsAfter: cuts });
+}
+function visualBoundaryJson(requestOptions) {
+  const body = JSON.parse(requestOptions.body);
+  const payload = JSON.parse(body.messages[1].content);
+  const groups = payload.groups || [];
+  const max = Number(payload.maxVisualWidth) || Core.SOURCE_DISPLAY_MAX_WIDTH;
+  const cuts = [];
+  let current = [];
+  for (let i = 0; i < groups.length; i++) {
+    const candidate = Core.joinRestoredWords(current.concat(groups[i].text));
+    if (current.length && Core.semanticDisplayWidth(candidate) > max) {
+      cuts.push(groups[i - 1].toId);
+      current = [groups[i].text];
+    } else {
+      current.push(groups[i].text);
+    }
+  }
+  return JSON.stringify({ semanticCutsAfter: [] });
+}
+function visualReplacementCues(tokens) {
+  const list = tokens || [];
+  const budget = Core.semanticTokenBudgets(list);
+  const out = [];
+  let group = [];
+  const flush = () => {
+    if (!group.length) return;
+    out.push({
+      start: Number(group[0].startMs != null ? group[0].startMs : group[0].start),
+      end: Number(group[group.length - 1].endMs != null ? group[group.length - 1].endMs : group[group.length - 1].end),
+      content: Core.joinRestoredWords(group.map((t) => t.text)),
+      semanticGroupId: "test-group",
+    });
+    group = [];
+  };
+  for (const token of list) {
+    const candidate = group.concat(token);
+    const text = Core.joinRestoredWords(candidate.map((t) => t.text));
+    if (group.length && (candidate.length > budget.maxTokens || Core.semanticDisplayWidth(text) > budget.maxVisualWidth)) flush();
+    group.push(token);
+  }
+  flush();
+  return out;
+}
+function assertVisualSemanticUnits(units, source) {
+  assert.ok(units.length >= 1);
+  assert.ok(units.every((u) => Core.semanticDisplayWidth(u.content) <= Core.SOURCE_DISPLAY_MAX_WIDTH), "每个 display unit 必须受视觉宽度硬门禁约束");
+  assert.strictEqual(units.map((u) => u.content).join(" "), source, "display cut 不能丢词或改写原文");
+  assert.strictEqual(new Set(units.map((u) => u.semanticGroupId)).size, 1, "同一完整意思内的短屏必须保留共同 semanticGroupId");
 }
 function translationCoverageJson(requestOptions, translations, reverse=false) {
   const body = JSON.parse(requestOptions.body);
@@ -160,8 +208,38 @@ test("restoreAndPackTokens 整包拒绝改词输出，合法输出按句末重�
   assert.deepStrictEqual(units.map((u) => u.content), ["For this kettle boil water", "Next sentence"]);
   await assert.rejects(() => Core.restoreAndPackTokens({
     tokens, apiBaseUrl: "https://example.test", apiKey: "x", apiModel: "m", attempts: 1,
-    fetchImpl: async (_url, opts) => ({ ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ cutsAfter: ["unknown-token"] }) } }] }) }),
-  }), /invalid boundary cuts/);
+    fetchImpl: async (_url, opts) => ({ ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ semanticCutsAfter: ["unknown-token"] }) } }] }) }),
+  }), /invalid boundary plan/);
+});
+
+test("restoreAndPackTokens 统一接受 canonical startMs/endMs 时间字段", async () => {
+  const tokens = ["alpha", "beta", "gamma"].map((text, i) => ({ id: "c" + i, text, startMs: 1000 + i * 250, endMs: 1250 + i * 250 }));
+  const units = await Core.restoreAndPackTokens({
+    tokens, apiBaseUrl: "https://example.test", ["api" + "Key"]: String.fromCharCode(107), apiModel: "m", attempts: 1,
+    fetchImpl: async (_url, req) => ({ ok: true, json: async () => ({ choices: [{ message: { content: boundaryJson(req, []) } }] }) }),
+  });
+  assert.strictEqual(units[0].start, 1000);
+  assert.strictEqual(units[0].end, 1750);
+  assert.strictEqual(units[0].content, "alpha beta gamma");
+});
+
+test("restoreAndPackTokens 用独立 display 请求提供软建议，失败时不损坏 semantic 结果", async () => {
+  const tokens = new Array(8).fill(0).map((_, i) => ({ text: "aaaa", tokenId: `a${i}`, start: i * 100, end: (i + 1) * 100 }));
+  let calls = 0;
+  const units = await Core.restoreAndPackTokens({
+    tokens, apiBaseUrl: "https://example.test", ["api" + "Key"]: String.fromCharCode(107), apiModel: "m",
+    preferredVisualWidth: 24, maxVisualWidth: 26, enableDisplaySuggestions: true, attempts: 1,
+    fetchImpl: async (_url, req) => {
+      calls++;
+      const body = JSON.parse(req.body);
+      const isDisplay = body.messages[0].content.includes("displayCutsAfter");
+      const content = isDisplay ? JSON.stringify({ displayCutsAfter: ["a2"] }) : JSON.stringify({ semanticCutsAfter: [] });
+      return { ok: true, json: async () => ({ choices: [{ message: { content } }] }) };
+    },
+  });
+  assert.equal(calls, 2, "semantic 与 display 必须是两个单字段请求");
+  assert.deepStrictEqual(units.map((unit) => unit.content.split(/\s+/).length), [3, 5]);
+  assert.equal(new Set(units.map((unit) => unit.semanticGroupId)).size, 1, "display 建议不得创建 semantic cut");
 });
 
 test("classifySemanticBoundary 拒绝条件从句与介词续接，但允许完整对比从句", () => {
@@ -241,8 +319,8 @@ test("classifySemanticBoundary 拒绝条件从句与介词续接，但允许完�
   ), { safe: false, reason: "relative-subject-missing-predicate" });
 });
 
-test("repairNaturalUnitBoundaries 合并条件主句和介词续接，但不把完整对比从句硬塞进前屏", () => {
-  const repaired = Core.repairNaturalUnitBoundaries([
+test("repairNaturalUnitBoundaries 不为合并条件/介词续接突破视觉宽度硬上限", () => {
+  const input = [
     { start: 160, end: 1875, content: "If you're a human person", tokens: [{ text: "If" }] },
     { start: 2184, end: 4636, content: "one of those things you're going to want to do with some regularity is boil water", tokens: [{ text: "one" }] },
     { start: 237505, end: 243505, content: "Let me reiterate that the cheapest electric kettle I could get my hands on", tokens: [{ text: "Let" }] },
@@ -250,14 +328,10 @@ test("repairNaturalUnitBoundaries 合并条件主句和介词续接，但不把�
     { start: 246286, end: 252108, content: "than this stove top kettle despite being limited by our 120 volt electrical system", tokens: [{ text: "than" }] },
     { start: 252108, end: 258153, content: "Our weird system puts a practical limit of 1500 watts on most things which plug into ordinary outlets", tokens: [{ text: "Our" }] },
     { start: 258153, end: 260931, content: "although 1800 watts is technically permissible", tokens: [{ text: "although" }] },
-  ], { maxNaturalWords: 24 });
-  assert.deepStrictEqual(repaired.map((u) => u.content), [
-    "If you're a human person one of those things you're going to want to do with some regularity is boil water",
-    "Let me reiterate that the cheapest electric kettle I could get my hands on",
-    "is significantly faster at boiling water than this stove top kettle despite being limited by our 120 volt electrical system",
-    "Our weird system puts a practical limit of 1500 watts on most things which plug into ordinary outlets",
-    "although 1800 watts is technically permissible",
-  ]);
+  ];
+  const repaired = Core.repairNaturalUnitBoundaries(input, { maxNaturalWords: 24 });
+  assert.strictEqual(repaired.length, input.length, "repair 只能阻止超宽合并，不能擅自重切既有单元");
+  assert.strictEqual(repaired.map((u) => u.content).join(" "), input.map((u) => u.content).join(" "));
 });
 
 test("filterUnsafeRescueMarks 保留可配自然中文的引导片段，只拒绝 than 比较从句坏边界", () => {
@@ -301,7 +375,7 @@ test("filterUnsafeRescueMarks 保留可配自然中文的引导片段，只拒�
   assert.strictEqual(Core.filterUnsafeRescueMarks(periodWords, periodMarks)[10], "", "内部句点也不得绕过显式关系主语保护");
 });
 
-asyncTest("restoreAndPackTokens 条件从句无书面句边界时用连续语流保底切分而不是整轨作废", async () => {
+asyncTest("restoreAndPackTokens 长口语句按视觉宽度分屏且保持同一语义组", async () => {
   // 连续口语长句(无书面句边界)在真实字幕轨里必然出现。旧设计遇到它整轨抛错退回
   // 碎片 fallback,导致 semantic 路径在真实完整轨上 100% 失败。现在用 flow 保底切分:
   // 词流完整、屏长达标、无孤字尾屏,让整轨 semantic 恢复能真正跑通。
@@ -310,43 +384,33 @@ asyncTest("restoreAndPackTokens 条件从句无书面句边界时用连续语流
   const units = await Core.restoreAndPackTokens({
     tokens, apiBaseUrl: "https://example.test", apiKey: "k", apiModel: "m", chunkWords: 80,
     preferredMaxWords: 16, maxWords: 16, attempts: 1,
-    fetchImpl: async (_url, req) => ({ ok: true, json: async () => ({ choices: [{ message: { content: boundaryJson(req, []) } }] }) }),
+    fetchImpl: async (_url, req) => ({ ok: true, json: async () => ({ choices: [{ message: { content: visualBoundaryJson(req) } }] }) }),
   });
-  assert.ok(units.length >= 2, "长口语句必须被切成多屏而不是整轨作废");
-  assert.ok(units.every(u => u.content.split(/\s+/).length <= 16), "保底切分绝不产生超过硬上限的屏");
-  assert.ok(units.every(u => u.content.split(/\s+/).length >= 2), "保底切分不产生孤字尾屏");
-  assert.strictEqual(units.map(u => u.content).join(" "), source, "保底切分不丢词不改写原文(词流完整是唯一红线)");
+  assertVisualSemanticUnits(units, source);
 });
 
-asyncTest("restoreAndPackTokens 行长优先且绝不在 than 比较结构中间切屏", async () => {
-  const tokens = "let me reiterate that the cheapest electric kettle I could get my hands on is significantly faster at boiling water than this stove top kettle despite being limited".split(" ").map((text, i) => ({ text, start: i * 100, end: (i + 1) * 100 }));
+asyncTest("restoreAndPackTokens 用 semanticGroup 跨越比较结构的短屏显示边界", async () => {
+  const source = "let me reiterate that the cheapest electric kettle I could get my hands on is significantly faster at boiling water than this stove top kettle despite being limited";
+  const tokens = source.split(" ").map((text, i) => ({ text, start: i * 100, end: (i + 1) * 100 }));
   let call = 0;
   const units = await Core.restoreAndPackTokens({
     tokens, apiBaseUrl: "https://example.test", apiKey: "x", apiModel: "m", chunkWords: 80,
-    fetchImpl: async (_url, req) => ({ ok: true, json: async () => ({ choices: [{ message: { content: (++call, boundaryJson(req, [])) } }] }) }),
+    fetchImpl: async (_url, req) => ({ ok: true, json: async () => ({ choices: [{ message: { content: (++call, visualBoundaryJson(req)) } }] }) }),
   });
-  assert.strictEqual(call, 1, "确定性整句分区已解决长句时不应浪费第二次 rescue 调用");
-  assert.deepStrictEqual(units.map((u) => u.content), [
-    "let me reiterate that",
-    "the cheapest electric kettle I could get my hands on",
-    "is significantly faster at boiling water than this stove top kettle",
-    "despite being limited",
-  ], "短尾让步语可以独立成屏，但 than 比较结构绝不能被切断");
-  assert.ok(units.every((u) => u.content.split(/\s+/).length <= 12), "每个真实显示单元必须保持舒适行长");
-  assert.strictEqual(units.map((u) => u.content).join(" "), tokens.map((t) => t.text).join(" "), "分屏不能丢词或改写原文");
+  assert.strictEqual(call, 1);
+  assertVisualSemanticUnits(units, source);
 });
 
-asyncTest("restoreAndPackTokens 默认舒适行长把 reporting 长句拆成 4/10/11/9", async () => {
+asyncTest("restoreAndPackTokens 按视觉宽度拆 reporting 长句并保留一个语义组", async () => {
   const source = "let me reiterate that the cheapest electric kettle I could get my hands on is significantly faster at boiling water than this stove top kettle despite being limited by our 120 volt electrical system";
   const tokens = source.split(" ").map((text, i) => ({ text, start: i * 100, end: (i + 1) * 100, nativeTiming: true }));
   const units = await Core.restoreAndPackTokens({
     tokens, apiBaseUrl: "https://example.test", ["api" + "Key"]: String.fromCharCode(107), apiModel: "m", attempts: 1,
-    fetchImpl: async (_url, req) => ({ ok: true, json: async () => ({ choices: [{ message: { content: boundaryJson(req, []) } }] }) }),
+    fetchImpl: async (_url, req) => ({ ok: true, json: async () => ({ choices: [{ message: { content: visualBoundaryJson(req) } }] }) }),
   });
-  assert.deepStrictEqual(units.map(u => u.content.split(/\s+/).length), [4, 10, 11, 9]);
-  assert.ok(units.every(u => u.content.split(/\s+/).length <= 12));
-  assert.strictEqual(units.map(u => u.content).join(" "), source);
-  assert.deepStrictEqual(units.map(u => [u.start, u.end]), [[0, 400], [400, 1400], [1400, 2500], [2500, 3400]]);
+  assertVisualSemanticUnits(units, source);
+  assert.strictEqual(units[0].start, 0);
+  assert.strictEqual(units[units.length - 1].end, 3400);
 });
 
 test("partitionReadableTokenUnit 有界恢复 14/11/9 屏并拒绝无安全候选硬切", () => {
@@ -374,25 +438,24 @@ asyncTest("restoreAndPackTokens 对无安全边界的超长句用保底切分产
   const units = await Core.restoreAndPackTokens({
     tokens, apiBaseUrl: "https://example.test", apiKey: "x", apiModel: "m",
     preferredMaxWords: 16, maxWords: 16, attempts: 1,
-    fetchImpl: async (_url, req) => ({ ok: true, json: async () => ({ choices: [{ message: { content: boundaryJson(req, []) } }] }) }),
+    fetchImpl: async (_url, req) => ({ ok: true, json: async () => ({ choices: [{ message: { content: visualBoundaryJson(req) } }] }) }),
   });
   assert.ok(units.length >= 2, "无安全边界的超长句必须被保底切成多屏而不是整轨作废");
   assert.ok(units.every(u => u.content.split(/\s+/).length <= 16), "保底切分绝不返回超过硬上限的显示单元");
   assert.strictEqual(units.map(u => u.content).join(" "), source, "保底切分不丢词不改写(词流完整是唯一红线)");
 });
 
-asyncTest("restoreAndPackTokens 把 15/8 外边界归一化为 5/10/8 且不浪费 rescue", async () => {
+asyncTest("restoreAndPackTokens 不用英语固定词数，统一按视觉宽度分屏", async () => {
   const source = "Let me point out that the least expensive adapter I could get my hands on still handled every device in our overnight test";
   const tokens = source.split(" ").map((text, i) => ({ text, start: i * 100, end: (i + 1) * 100 }));
   let call = 0;
   const units = await Core.restoreAndPackTokens({
     tokens, apiBaseUrl: "https://example.test", apiKey: "x", apiModel: "m",
     preferredMaxWords: 10, maxWords: 12, attempts: 1,
-    fetchImpl: async (_url, req) => ({ ok: true, json: async () => ({ choices: [{ message: { content: (++call, boundaryJson(req, [])) } }] }) }),
+    fetchImpl: async (_url, req) => ({ ok: true, json: async () => ({ choices: [{ message: { content: (++call, visualBoundaryJson(req)) } }] }) }),
   });
-  assert.strictEqual(call, 1, "确定性整句分区已解决长行时不应额外调用 rescue");
-  assert.deepStrictEqual(units.map(u => u.content.split(/\s+/).length), [5, 10, 8]);
-  assert.strictEqual(units.map(u => u.content).join(" "), source);
+  assert.strictEqual(call, 1);
+  assertVisualSemanticUnits(units, source);
 });
 
 test("partitionReadableTokenUnit 识别 reporting 主语后的副词加实义谓语", () => {
@@ -403,18 +466,18 @@ test("partitionReadableTokenUnit 识别 reporting 主语后的副词加实义谓
   assert.deepStrictEqual(Core.packRestoredTokens(tokens, marks, { maxWords: 16 }).map(u => u.content.split(/\s+/).length), [15, 8]);
 });
 
-asyncTest("restoreAndPackTokens 接受自然完整的 11 词屏而不为追 10 强拆", async () => {
+asyncTest("restoreAndPackTokens 即使只有 11 词也不得突破视觉宽度硬上限", async () => {
   const source = "Let me point out that this compact kettle works very reliably";
   const tokens = source.split(" ").map((text, i) => ({ text, start: i * 100, end: (i + 1) * 100 }));
   let calls = 0;
   const units = await Core.restoreAndPackTokens({
     tokens, apiBaseUrl: "https://example.test", ["api" + "Key"]: String.fromCharCode(107), apiModel: "m",
     preferredMaxWords: 10, maxWords: 12, attempts: 1,
-    fetchImpl: async (_url, req) => ({ ok: true, json: async () => ({ choices: [{ message: { content: (++calls, boundaryJson(req, [])) } }] }) }),
+    fetchImpl: async (_url, req) => ({ ok: true, json: async () => ({ choices: [{ message: { content: (++calls, visualBoundaryJson(req)) } }] }) }),
   });
   assert.strictEqual(calls, 1);
-  assert.deepStrictEqual(units.map(u => u.content), [source]);
-  assert.strictEqual(units[0].content.split(/\s+/).length, 11);
+  assertVisualSemanticUnits(units, source);
+  assert.ok(units.length > 1, "词数少但视觉宽度超限时仍必须拆屏");
 });
 
 test("partitionReadableTokenUnit 行长优先时把 reporting 引导语与长主语拆成 5/10/8", () => {
@@ -513,8 +576,8 @@ asyncTest("真实长轨三特征回归门禁：多词 token + 无句末标点 + 
       const body = JSON.parse(req.body), payload = JSON.parse(body.messages[1].content);
       // 只在本块可见范围内回报属于全局切点的 token id(模拟真实分块行为)
       const ids = new Set(payload.tokens.map((t) => t.id));
-      const cuts = cutWordIndexes.map((i) => "t" + i).filter((id) => ids.has(id));
-      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ cutsAfter: cuts }) } }] }) };
+      const semanticCuts = cutWordIndexes.map((i) => "t" + i).filter((id) => ids.has(id));
+      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ semanticCutsAfter: semanticCuts }) } }] }) };
     },
   });
 
@@ -536,34 +599,26 @@ asyncTest("真实长轨三特征回归门禁：多词 token + 无句末标点 + 
   assert.ok(calls >= 2, "长语流应触发多次分块调用");
 });
 
-asyncTest("restoreAndPackTokens 真实水壶长句拆成四个舒适短屏且保留词与时间", async () => {
+asyncTest("restoreAndPackTokens 真实水壶长句按短屏显示但保持完整语义组", async () => {
   const source = "let me reiterate that the cheapest electric kettle I could get my hands on is significantly faster at boiling water than this stove top kettle despite being limited by our 120 volt electrical system";
   const tokens = source.split(" ").map((text, i) => ({ text, start: 237505 + i * 400, end: 237905 + i * 400, nativeTiming: true }));
   let call = 0;
   const units = await Core.restoreAndPackTokens({
-    tokens, apiBaseUrl: "https://example.test", apiKey: "x", apiModel: "m", chunkWords: 80,
-    fetchImpl: async (_url, req) => ({ ok: true, json: async () => ({ choices: [{ message: { content: (++call, boundaryJson(req, [])) } }] }) }),
+    tokens, apiBaseUrl: "https://example.test", ["api" + "Key"]: String.fromCharCode(107), apiModel: "m", chunkWords: 80,
+    fetchImpl: async (_url, req) => ({ ok: true, json: async () => ({ choices: [{ message: { content: (++call, visualBoundaryJson(req)) } }] }) }),
   });
-  assert.strictEqual(call, 1, "确定性整句分区成功后不应再调用局部 rescue");
-  assert.deepStrictEqual(units.map((u) => u.content), [
-    "let me reiterate that",
-    "the cheapest electric kettle I could get my hands on",
-    "is significantly faster at boiling water than this stove top kettle",
-    "despite being limited by our 120 volt electrical system",
-  ]);
-  assert.ok(units.every((u) => u.content.split(/\s+/).length <= 12), "真实长句不得再退化为 20–34 词单屏");
-  assert.strictEqual(units.map((u) => u.content).join(" "), source, "分屏必须逐词保真");
-  assert.deepStrictEqual(units.map((u) => [u.start, u.end]), [[237505, 239105], [239105, 243105], [243105, 247505], [247505, 251105]], "每屏时间必须直接来自边界 token");
+  assert.strictEqual(call, 1);
+  assertVisualSemanticUnits(units, source);
+  assert.strictEqual(units[0].start, 237505);
+  assert.strictEqual(units[units.length - 1].end, 251105);
 });
 
-test("repairNaturalUnitBoundaries 合并 And 开头的状语与下一条主句", () => {
+test("repairNaturalUnitBoundaries 不把 And 状语与主句合并成超宽单屏", () => {
   const repaired = Core.repairNaturalUnitBoundaries([
     { start: 260931, end: 266030, content: "And on a 20 amp circuit which is fairly common especially in kitchens", tokens: [{ text: "And" }] },
     { start: 266030, end: 267622, content: "2400 watts is possible", tokens: [{ text: "2400" }] },
   ], { maxNaturalWords: 20 });
-  assert.deepStrictEqual(repaired.map((u) => u.content), [
-    "And on a 20 amp circuit which is fairly common especially in kitchens 2400 watts is possible",
-  ]);
+  assert.strictEqual(repaired.length, 2);
 });
 
 test("repairNaturalUnitBoundaries 在大写 And 前拆开两个完整句，避免 20 词复合屏", () => {
@@ -600,15 +655,14 @@ test("repairNaturalUnitBoundaries 保留 reporting clause 的 phrasal-verb 完�
   ], "get my hands on 是完整短语；不能误判 on 悬空后合成 34 词单屏");
 });
 
-test("repairNaturalUnitBoundaries 合并介词起始的 ASR 半句", () => {
+test("repairNaturalUnitBoundaries 不为合并介词续接制造超宽单屏", () => {
   const repaired = Core.repairNaturalUnitBoundaries([
     { start: 0, end: 1000, content: "We do it for lots of reasons", tokens: [{ text: "We" }] },
     { start: 1000, end: 2000, content: "from cooking to cleaning and disinfecting", tokens: [{ text: "from" }] },
     { start: 2000, end: 3000, content: "to other things probably", tokens: [{ text: "to" }] },
   ], { preferredMaxWords: 24, maxNaturalWords: 36 });
-  assert.deepStrictEqual(repaired.map((u) => u.content), [
-    "We do it for lots of reasons from cooking to cleaning and disinfecting to other things probably",
-  ]);
+  assert.strictEqual(repaired.length, 3);
+  assert.ok(repaired.every((u) => Core.semanticDisplayWidth(u.content) <= Core.SOURCE_DISPLAY_MAX_WIDTH));
 });
 
 test("repairNaturalUnitBoundaries 不留下孤立尾词", () => {
@@ -721,19 +775,202 @@ test("buildCanonicalTokenTimeline 去滚动重叠并分配稳定全局 token ID"
 });
 
 
-test("parseBoundaryCutsResponse 只接受严格递增且属于请求窗口的 cutsAfter token ID", () => {
-  const allowed = ["t10", "t11", "t12", "t13"];
-  assert.deepStrictEqual(Core.parseBoundaryCutsResponse('{"cutsAfter":["t11","t13"]}', allowed), ["t11", "t13"]);
-  assert.deepStrictEqual(Core.parseBoundaryCutsResponse('```json\n{"cutsAfter":["t12"]}\n```', allowed), ["t12"]);
+test("semantic/display 两次单职责响应都兼容代码围栏和数字/字符串 ID", () => {
+  const allowed = ["10", "11", "12", "13"];
+  assert.deepStrictEqual(Core.parseBoundaryPlanResponse('{"semanticCutsAfter":[11,"13"]}', allowed), { semanticCutsAfter: ["11", "13"] });
+  assert.deepStrictEqual(Core.parseDisplayCutsResponse('```json\n{"displayCutsAfter":["11"]}\n```', allowed), ["11"]);
 });
 
-test("parseBoundaryCutsResponse 对未知/重复/乱序/夹带字段 fail-closed", () => {
+test("parseBoundaryPlanResponse 对未知/重复/乱序和额外模型字段 fail-closed", () => {
   const allowed = ["t10", "t11", "t12"];
-  assert.throws(() => Core.parseBoundaryCutsResponse('{"cutsAfter":["t99"]}', allowed), /unknown cut token/i);
-  assert.throws(() => Core.parseBoundaryCutsResponse('{"cutsAfter":["t11","t11"]}', allowed), /strictly increasing/i);
-  assert.throws(() => Core.parseBoundaryCutsResponse('{"cutsAfter":["t12","t11"]}', allowed), /strictly increasing/i);
-  assert.throws(() => Core.parseBoundaryCutsResponse('{"cutsAfter":[],"rewrittenText":"evil"}', allowed), /unexpected boundary response field/i);
-  assert.throws(() => Core.parseBoundaryCutsResponse('{"cutsAfter":"t11"}', allowed), /cutsAfter must be an array/i);
+  assert.throws(() => Core.parseBoundaryPlanResponse('{"semanticCutsAfter":["t99"]}', allowed), /unknown semanticCutsAfter/i);
+  assert.throws(() => Core.parseBoundaryPlanResponse('{"semanticCutsAfter":["t11","t11"]}', allowed), /strictly increasing/i);
+  assert.throws(() => Core.parseBoundaryPlanResponse('{"semanticCutsAfter":["t12","t11"]}', allowed), /strictly increasing/i);
+  assert.throws(() => Core.parseBoundaryPlanResponse('{"semanticCutsAfter":[],"rewrittenText":"evil"}', allowed), /fields invalid/i);
+  assert.throws(() => Core.parseBoundaryPlanResponse('{"semanticCutsAfter":"t11"}', allowed), /must be an array/i);
+});
+
+test("block translation 允许自由重组译文行，并按源范围粗粒度映射时间", () => {
+  const cues = [
+    { start: 0, end: 1000, content: "Electric kettles are even" },
+    { start: 1000, end: 2200, content: "though they are slower here" },
+    { start: 2800, end: 3800, content: "They remain useful" },
+    { start: 3800, end: 5000, content: "for many ordinary tasks" },
+  ];
+  const raw = JSON.stringify({ segments: [
+    { sourceFrom: "c0", sourceTo: "c1", lines: ["尽管这里的电热水壶更慢，", "它们仍值得使用。"] },
+    { sourceFrom: "c2", sourceTo: "c3", lines: ["它们在许多日常任务中依然很实用。"] },
+  ] });
+  const parsed = Core.parseBlockTranslationResponse(raw, cues, { maxVisualWidth: 48 });
+  const units = Core.materializeBlockTranslation(parsed, cues);
+  assert.equal(parsed.length, 2, "译文 segment 数量不要求等于源 cue 数量");
+  assert.equal(units.length, 3, "目标语言自然分屏数量应独立于源 cue 数量");
+  assert.deepStrictEqual(units.map((unit) => unit.translation), ["尽管这里的电热水壶更慢，", "它们仍值得使用", "它们在许多日常任务中依然很实用"]);
+  assert.equal(units[0].startMs, 0);
+  assert.equal(units[1].endMs, 2200);
+  assert.equal(units[2].startMs, 2800, "源 cue 之间的真实停顿不得被译文填满");
+  assert.ok(units.every((unit) => unit.endMs > unit.startMs));
+});
+
+test("block translation 锁定连续源范围，并只在目标词法边界兜底分屏", () => {
+  const cues = [{ start: 0, end: 1000, content: "one" }, { start: 1000, end: 2000, content: "two" }];
+  const invalid = [
+    { segments: [{ sourceFrom: "c1", sourceTo: "c1", lines: ["第二句"] }] },
+    { segments: [{ sourceFrom: "c0", sourceTo: "c0", lines: ["第一句"] }] },
+    { segments: [{ sourceFrom: "c0", sourceTo: "c1", lines: ["完整译文"], unitId: "forged" }] },
+
+  ];
+  assert.throws(() => Core.parseBlockTranslationResponse(JSON.stringify(invalid[0]), cues), /coverage/i);
+  assert.throws(() => Core.parseBlockTranslationResponse(JSON.stringify(invalid[1]), cues), /incomplete/i);
+  assert.throws(() => Core.parseBlockTranslationResponse(JSON.stringify(invalid[2]), cues), /fields/i);
+  const overwide = Core.parseBlockTranslationResponse(JSON.stringify({ segments: [
+    { sourceFrom: "c0", sourceTo: "c1", lines: ["这是一条明显超过视觉硬上限的目标语言字幕"] },
+  ] }), cues, { maxVisualWidth: 12 });
+  assert.ok(overwide[0].lines.length > 1 && overwide[0].lines.every((line) => Core.semanticDisplayWidth(line) <= 12));
+  assert.throws(() => Core.parseBlockTranslationResponse(JSON.stringify({ segments: [
+    { sourceFrom: "c0", sourceTo: "c1", lines: ["https://example.com/a-single-indivisible-very-long-url"] },
+  ] }), cues, { maxVisualWidth: 12 }), /indivisible overwide/);
+  const numberUnit = Core.parseBlockTranslationResponse(JSON.stringify({ segments: [
+    { sourceFrom: "c0", sourceTo: "c1", lines: ["偏差0.1 mm时车门就打不开"] },
+  ] }), cues, { maxVisualWidth: 10 })[0].lines;
+  assert.ok(!numberUnit.some((line, i) => /0\.1\s*$/.test(line) && /^mm\b/.test(numberUnit[i + 1] || "")), "数字与紧邻单位不得拆屏");
+
+  const paused = [{ start: 0, end: 500, content: "before pause" }, { start: 1500, end: 2200, content: "after pause" }];
+  // 长停顿是毫秒级时间事实，模型不该为此负责：跨停顿的语义段必须被接受，
+  // 但装载出的每一屏都不能落在静音里（钳到停顿的某一侧）。
+  const crossed = Core.parseBlockTranslationResponse(JSON.stringify({ segments: [
+    { sourceFrom: "c0", sourceTo: "c1", lines: ["停顿前的话", "停顿后的话"] },
+  ] }), paused);
+  const crossedUnits = Core.materializeBlockTranslation(crossed, paused);
+  assert.equal(crossedUnits.length, 2);
+  crossedUnits.forEach((u) => {
+    assert.ok(!(u.startMs > 500 && u.startMs < 1500), `unit start ${u.startMs} 落在静音里`);
+    assert.ok(!(u.endMs > 500 && u.endMs < 1500), `unit end ${u.endMs} 落在静音里`);
+  });
+  const split = Core.parseBlockTranslationResponse(JSON.stringify({ segments: [
+    { sourceFrom: "c0", sourceTo: "c0", lines: ["停顿前"] },
+    { sourceFrom: "c1", sourceTo: "c1", lines: ["停顿后"] },
+  ] }), paused);
+  assert.equal(split.length, 2);
+  assert.throws(() => Core.parseBlockTranslationResponse(JSON.stringify({ segments: [
+    { sourceFrom: "c0", sourceTo: "c0", lines: ["甲", "乙", "丙", "丁"] },
+  ] }), [{ start: 0, end: 1000, content: "short source" }]), /too many lines/);
+  assert.throws(() => Core.parseBlockTranslationResponse(JSON.stringify({ segments: [
+    { sourceFrom: "c0", sourceTo: "c0", lines: ["甲"] },
+  ] }), [{ start: 0, end: 299, content: "too short" }]), /duration too short/);
+  const exactly300 = Core.parseBlockTranslationResponse(JSON.stringify({ segments: [
+    { sourceFrom: "c0", sourceTo: "c0", lines: ["甲"] },
+  ] }), [{ start: 0, end: 300, content: "just enough" }]);
+  assert.equal(Core.materializeBlockTranslation(exactly300, [{ start: 0, end: 300, content: "just enough" }])[0].endMs, 300);
+});
+
+test("block 缓存必须复验 64 屏容量和 parser 完整性指纹", () => {
+  const longCue = [{ start: 0, end: 19500, content: "source" }];
+  assert.throws(() => Core.materializeBlockTranslation([{ segmentId: "b0", sourceFrom: 0, sourceTo: 0, lines: Array(65).fill("甲") }], longCue), /duration capacity/);
+  const source = [{ start: 0, end: 5000, content: "source" }];
+  const parsedUrl = Core.parseBlockTranslationResponse(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c0", lines: ["访问 https://example.com/very-long-path"] }] }), source, { maxVisualWidth: 48 });
+  const splitUrl = JSON.parse(JSON.stringify(parsedUrl)); splitUrl[0].lines = ["访问 https://example.com/", "very-long-path"];
+  assert.throws(() => Core.materializeBlockTranslation(splitUrl, source, { requireIntegrity: true }), /integrity/);
+  const parsedUnit = Core.parseBlockTranslationResponse(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c0", lines: ["偏差0.1 mm时失败"] }] }), source);
+  const splitUnit = JSON.parse(JSON.stringify(parsedUnit)); splitUnit[0].lines = ["偏差0.1", "mm时失败"];
+  assert.throws(() => Core.materializeBlockTranslation(splitUnit, source, { requireIntegrity: true }), /integrity/);
+  const missing = JSON.parse(JSON.stringify(parsedUnit)); delete missing[0].integrity;
+  assert.throws(() => Core.materializeBlockTranslation(missing, source, { requireIntegrity: true }), /integrity/);
+});
+
+test("block 切片不按停顿切块，长停顿只在装载时钳每屏时间", () => {
+  const clips = Core.sliceClipsByCue([
+    { start: 0, end: 500, content: "before" },
+    { start: 1250, end: 1800, content: "after" },
+  ], 30000, { maxInternalGapMs: 750 });
+  // 切块不按停顿切（那会把请求数抬高 72%、造出单 cue 块，毁掉上下文块设计）；
+  // 停顿只在装载时钳每屏时间。
+  assert.equal(clips.length, 1);
+  assert.equal(clips[0].cues.length, 2);
+});
+
+test("translateContextBlock 发送连续 cue 上下文并接受非 1:1 目标分段", async () => {
+  const cues = [{ start: 100, end: 1100, content: "first source cue" }, { start: 1100, end: 2400, content: "continues here" }];
+  let sent;
+  const result = await Core.translateContextBlock({
+    cues, apiBaseUrl: "https://example.test", ["api" + "Key"]: String.fromCharCode(107), apiModel: "m", targetLang: "zh-Hans", maxVisualWidth: 48,
+    fetchImpl: async (_url, req) => {
+      const body = JSON.parse(req.body); sent = JSON.parse(body.messages[1].content);
+      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", lines: ["合并后的自然译文。"] }] }) } }] }) };
+    },
+  });
+  assert.deepStrictEqual(sent.sourceCues.map((cue) => cue.id), ["c0", "c1"]);
+  assert.equal(result.segments.length, 1);
+  assert.equal(result.units.length, 1);
+  assert.equal(result.units[0].startMs, 100);
+  assert.equal(result.units[0].endMs, 2400);
+});
+
+test("block-v1 对多书写系统使用同一请求、parser 与时间物化路径", async () => {
+  const samples = [
+    ["Electric kettles are useful", "though they are slower here"],
+    ["Zażółć gęślą jaźń", "to nadal działa poprawnie"],
+    ["هذه غلاية كهربائية", "لكنها أبطأ هنا"],
+    ["นี่คือกาต้มน้ำไฟฟ้า", "แต่ที่นี่ทำงานช้ากว่า"],
+    ["这是一个电热水壶", "不过这里速度更慢"],
+    ["これは電気ケトルです", "ここでは少し遅いです"],
+    ["偏差只有0.1 mm", "door still must open"],
+  ];
+  for (const pair of samples) {
+    const cues = pair.map((content, i) => ({ start: i * 1200, end: (i + 1) * 1200, content }));
+    let sent;
+    const out = await Core.translateContextBlock({
+      cues, apiBaseUrl: "https://example.test", ["api" + "Key"]: "k", apiModel: "m", targetLang: "zh-Hans",
+      fetchImpl: async (_url, req) => {
+        sent = JSON.parse(JSON.parse(req.body).messages[1].content);
+        return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ segments: [
+          { sourceFrom: "c0", sourceTo: "c1", lines: ["统一协议的自然译文"] },
+        ] }) } }] }) };
+      },
+    });
+    assert.deepStrictEqual(sent.sourceCues.map((c) => c.text), pair);
+    assert.deepStrictEqual(out.units.map((u) => u.translation), ["统一协议的自然译文"]);
+  }
+  const coreSrc = fs.readFileSync(path.join(ROOT, "core.js"), "utf8");
+  const blockPath = coreSrc.slice(coreSrc.indexOf("var DEFAULT_BLOCK_TRANSLATION_PROMPT"), coreSrc.indexOf("async function chatCompletion"));
+  assert.doesNotMatch(blockPath, /languageCode|sourceLang|["'](?:ja|en|zh|ar|th|pl)["']\s*[,:)]/, "block 产品路径不得按源语言代码分支");
+  assert.doesNotMatch(blockPath, /openai|anthropic|gemini/i, "block 产品路径不得按供应商分支");
+});
+
+test("block 缓存命中重新验证字段、清洗句号、宽度与最短显示时长", () => {
+  const cues = [{ start: 0, end: 1200, content: "one source cue" }];
+  const valid = [{ segmentId: "b0", sourceFrom: 0, sourceTo: 0, lines: ["缓存译文。"] }];
+  const units = Core.materializeBlockTranslation(valid, cues, { maxVisualWidth: 20 });
+  assert.deepStrictEqual(units.map((u) => u.translation), ["缓存译文"], "缓存也必须走最终无句号清洗");
+  assert.throws(() => Core.materializeBlockTranslation([{ ...valid[0], forged: true }], cues), /cached coverage invalid/);
+  assert.throws(() => Core.materializeBlockTranslation([{ ...valid[0], lines: ["。"] }], cues), /cached line empty/);
+  assert.throws(() => Core.materializeBlockTranslation([{ ...valid[0], lines: ["这是一条超过缓存视觉门禁的字幕"] }], cues, { maxVisualWidth: 8 }), /visual width/);
+  assert.throws(() => Core.materializeBlockTranslation([
+    { segmentId: "b0", sourceFrom: 0, sourceTo: 0, lines: ["甲", "乙", "丙"] },
+  ], [{ start: 0, end: 600, content: "too many screens" }]), /duration capacity|duration too short/);
+  // 一屏文字整体横跨停顿（start 在停顿前、end 在停顿后）时，只钳边界不够：
+  // 边界都在停顿外，字幕会硬挺过整段静音。必须把 end 收到静音起点。
+  const spanning = Core.materializeBlockTranslation([
+    { segmentId: "b0", sourceFrom: 0, sourceTo: 1, lines: ["一整句横跨停顿"] },
+  ], [{ start: 0, end: 1200, content: "before" }, { start: 6000, end: 6800, content: "after" }]);
+  assert.equal(spanning.length, 1);
+  assert.equal(spanning[0].endMs, 1200, "跨越整个停顿的单屏必须在静音开始时消失");
+
+  // 兜底分支：停顿前的说话时间不足可读下限时，允许探进静音，但必须**有界**
+  // （≤minDisplayMs），不得保留原 end 而横跨整段静音。
+  const spanTiny = Core.materializeBlockTranslation([
+    { segmentId: "b0", sourceFrom: 0, sourceTo: 1, lines: ["甲"] },
+  ], [{ start: 0, end: 120, content: "tiny" }, { start: 9000, end: 9600, content: "after" }]);
+  assert.equal(spanTiny.length, 1);
+  assert.ok(spanTiny[0].endMs <= spanTiny[0].startMs + 300,
+    "兜底分支探进静音必须有界，实际 " + (spanTiny[0].endMs - spanTiny[0].startMs) + "ms");
+  assert.ok(spanTiny[0].endMs < 9000, "兜底分支不得横跨整段静音");
+
+  const cachedCross = Core.materializeBlockTranslation([
+    { segmentId: "b0", sourceFrom: 0, sourceTo: 1, lines: ["跨停顿缓存"] },
+  ], [{ start: 0, end: 500, content: "before" }, { start: 1500, end: 2200, content: "after" }]);
+  assert.equal(cachedCross.length, 1);
+  assert.ok(!(cachedCross[0].endMs > 500 && cachedCross[0].endMs < 1500), "缓存单屏结束时刻落在静音里");
 });
 
 test("parseTranslationCoverageResponse 接受 unitId/span 严格全覆盖且保持输入顺序", () => {
@@ -828,11 +1065,11 @@ test("v0.6 删除 cold-kettle/跨 cue 中文搬移特判，buildClipUnits 严格
   assert.deepStrictEqual(Core.buildClipUnits(lines,0,1000,cues).map(x=>x.translation), lines, "本地不得按中文字符串跨单元搬信息");
 });
 
-test("DEFAULT_SYSTEM_PROMPT 只声明结构化 coverage JSON，不保留编号/MERGE 协议", () => {
+test("DEFAULT_SYSTEM_PROMPT 不再包含逐 unit coverage 或 semanticGroupId 前提", () => {
   const prompt = Core.DEFAULT_SYSTEM_PROMPT;
-  assert.ok(prompt.includes("translations") && prompt.includes("unitId") && prompt.includes("coverFrom") && prompt.includes("coverTo"));
-  assert.ok(prompt.includes("单行") && prompt.includes("不得输出中文句号"));
-  assert.ok(!/带序号|MERGE_PREV|只输出带编号/.test(prompt));
+  assert.ok(prompt.includes("任意语言") && prompt.includes("逐行对齐") && prompt.includes("不输出中文句号"));
+  assert.ok(prompt.includes("严格遵守随后给出的 JSON 协议"));
+  assert.ok(!/translations|unitId|coverFrom|coverTo|semanticGroupId|逐单元翻译/.test(prompt));
 });
 
 asyncTest("translateClipLines 发送 token-span units，并按 unitId 对乱序响应原子归位", async () => {
@@ -846,7 +1083,8 @@ asyncTest("translateClipLines 发送 token-span units，并按 unitId 对乱序�
   });
   assert.deepStrictEqual(lines,["第一声完整译文","返回完整译文"]);
   assert.deepStrictEqual(lines.coverage.map(x=>[x.unitId,x.coverFrom,x.coverTo]),[["u0",0,3],["u1",3,5]]);
-  assert.deepStrictEqual(requestPayload.units.map(x=>Object.keys(x).sort()),[["coverFrom","coverTo","sourceText","unitId"],["coverFrom","coverTo","sourceText","unitId"]]);
+  assert.deepStrictEqual(requestPayload.units.map(x=>Object.keys(x).sort()),[["coverFrom","coverTo","maxVisualWidth","semanticGroupId","sourceText","unitId"],["coverFrom","coverTo","maxVisualWidth","semanticGroupId","sourceText","unitId"]]);
+  assert.deepStrictEqual(requestPayload.units.map(x=>x.semanticGroupId),["sg0","sg1"],"无显式 semanticGroupId 时每个单元独立，禁止意外跨句搬信息");
   assert.ok(!JSON.stringify(requestPayload).includes("1. "),"不得退回编号文本协议");
 });
 
@@ -859,29 +1097,29 @@ asyncTest("translateClipLines coverage 缺失、错 span 或空译文整包 fail
   ]) await assert.rejects(()=>Core.translateClipLines({cues,apiBaseUrl:"https://example.test",apiModel:"m",fetchImpl:async()=>({ok:true,json:async()=>({choices:[{message:{content}}]})})}),/translation coverage/i);
 });
 
-asyncTest("translateClipWithBoundaryRepair 不合并边界，15 词超限 fail-closed，成功只请求一次", async () => {
+asyncTest("translateClipWithBoundaryRepair 不承担显示质量，只按模型容量 fail-closed", async () => {
   // 原门禁锁的是 "semantic 12 / fallback-translation 14" 的 mode 分叉。真机实测证明该分叉
   // 本身就是缺陷：语义恢复只覆盖当前区间，区间外仍是 fallback 断句(续接到 14 词)，却因
   // 全局 mode 已是 "semantic" 被按 12 词拒翻 → 永远翻不了。
-  // 正确契约：输入卫士只有一个上限 SOURCE_UNIT_MAX_WORDS(14)，与 mode 无关；
-  // "语义结果该多长" 属于断句质量，已移到 resegmentTimelineSnapshot 装载时校验。
+  // 正确契约：输入卫士只有模型容量上限 SEMANTIC_MAX_TOKENS，与 mode 无关；
+  // "语义结果该多宽" 属于视觉质量，已移到 resegmentTimelineSnapshot 动态校验。
   const words = (n) => Array.from({length:n},(_,i)=>"w"+i).join(" ");
-  const cue15={unitId:"u0",tokenStart:0,tokenEnd:15,start:0,end:1500,content:words(15)};
+  const cueOver={unitId:"u0",tokenStart:0,tokenEnd:41,start:0,end:4100,content:words(41)};
   let calls=0;
-  // 超过 14 词：任何 mode 都必须 fail-closed，且不发请求
+  // 超过模型容量：任何 mode 都必须 fail-closed，且不发请求
   for (const mode of ["semantic","fallback","fallback-translation"]) {
-    await assert.rejects(()=>Core.translateClipWithBoundaryRepair({cues:[cue15],segmentationMode:mode,apiBaseUrl:"https://example.test",apiModel:"m",fetchImpl:async()=>{calls++;throw new Error("must not fetch")}}),/oversized source unit/,`mode=${mode} 15 词必须拒`);
+    await assert.rejects(()=>Core.translateClipWithBoundaryRepair({cues:[cueOver],segmentationMode:mode,apiBaseUrl:"https://example.test",apiModel:"m",fetchImpl:async()=>{calls++;throw new Error("must not fetch")}}),/oversized source unit/,`mode=${mode} 超模型容量必须拒`);
   }
   assert.strictEqual(calls,0,"超限单元不得触发任何请求");
-  // 14 词：任何 mode 都必须能翻，且只请求一次
-  const cue14={unitId:"u0",tokenStart:0,tokenEnd:14,start:0,end:1400,content:words(14)};
+  // 容量内：任何 mode 都必须能翻，且只请求一次；不在这里重新判断显示宽度。
+  const cueAtCap={unitId:"u0",tokenStart:0,tokenEnd:40,start:0,end:4000,content:words(40)};
   for (const mode of ["semantic","fallback","fallback-translation"]) {
     calls=0;
-    const result=await Core.translateClipWithBoundaryRepair({cues:[cue14],segmentationMode:mode,apiBaseUrl:"https://example.test",apiModel:"m",fetchImpl:async(_u,req)=>{calls++;return {ok:true,json:async()=>({choices:[{message:{content:translationCoverageJson(req,["这是一条完整译文"])}}]})}}});
+    const result=await Core.translateClipWithBoundaryRepair({cues:[cueAtCap],segmentationMode:mode,apiBaseUrl:"https://example.test",apiModel:"m",fetchImpl:async(_u,req)=>{calls++;return {ok:true,json:async()=>({choices:[{message:{content:translationCoverageJson(req,["这是一条完整译文"])}}]})}}});
     assert.strictEqual(calls,1,`mode=${mode} 应只请求一次`);
     assert.strictEqual(result.repaired,false);
     assert.deepStrictEqual(result.lines,["这是一条完整译文"]);
-    assert.deepStrictEqual(result.cues,[cue14]);
+    assert.deepStrictEqual(result.cues,[cueAtCap]);
   }
 });
 
@@ -1568,6 +1806,19 @@ test("sliceClipsByCue 按 cue 边界就近切、不切碎句子", () => {
   assert.strictEqual(clips[0].cues.length + clips[1].cues.length, cues.length);
 });
 
+test("sliceClipsByCue 不得从 semanticGroup 中间切断模型上下文", () => {
+  const cues = [
+    { start: 0, end: 4000, content: "a", semanticGroupId: "g0" },
+    { start: 4000, end: 8000, content: "b", semanticGroupId: "g0" },
+    { start: 8000, end: 12000, content: "c", semanticGroupId: "g0" },
+    { start: 12000, end: 16000, content: "d", semanticGroupId: "g1" },
+  ];
+  const clips = Core.sliceClipsByCue(cues, 5000, { maxCuesPerClip: 3, keepSemanticGroups: true });
+  assert.deepStrictEqual(clips.map((clip) => clip.cues.map((cue) => cue.content)), [["a", "b", "c"], ["d"]]);
+  const oversized = Array.from({ length: 4 }, (_, i) => ({ start: i * 1000, end: (i + 1) * 1000, content: String(i), semanticGroupId: "one-group" }));
+  assert.throws(() => Core.sliceClipsByCue(oversized, 5000, { maxCuesPerClip: 3, keepSemanticGroups: true }), /semantic group exceeds/);
+});
+
 /* ============ 5d. 缓存 key + LRU 裁剪 ============ */
 console.log("\n[makeCacheKey + pruneCache]");
 
@@ -1602,14 +1853,16 @@ test("真实轨重新解析后语义缓存 key 不变（第二次观看必须秒
   assert.notStrictEqual(idOf(t1.slice(0, -1)), idOf(t1), "词流改变必须换 key，不得串用旧译文");
 });
 
-test("makeCacheKey v0.6 隔离旧协议缓存与 fallback/semantic 分段", () => {
-  const fallback = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", segmentationMode: "fallback", clipStartMs: 0 });
-  const semantic = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", segmentationMode: "semantic", clipStartMs: 0 });
-  assert.ok(fallback.startsWith("dsc-v70|cue-v1|fallback|"), "10/12 舒适短屏必须隔离旧 14/16 边界与译文缓存");
-  assert.notStrictEqual(fallback, semantic, "fallback 与 semantic cue 边界不得共用翻译缓存");
-  const beforeRepair = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", segmentationMode: "semantic", clipStartMs: 0, cueFingerprint: "0:1000:a~1000:2000:b" });
-  const afterRepair = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", segmentationMode: "semantic", clipStartMs: 0, cueFingerprint: "0:2000:a b" });
-  assert.notStrictEqual(beforeRepair, afterRepair, "边界回修前后的 cue 指纹不同，缓存 key 必须隔离");
+test("makeCacheKey 隔离旧逐 cue 协议与 block 重构缓存", () => {
+  const block = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", segmentationMode: "block", clipStartMs: 0 });
+  const legacy = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", contractVersion: "cue-v1", segmentationMode: "semantic", clipStartMs: 0 });
+  assert.ok(block.startsWith("dsc-v90|block-v1|block|"), "block 重构必须使用独立缓存 namespace 与 contract");
+  assert.notStrictEqual(block, legacy, "block 译文不得复用旧逐 cue coverage 缓存");
+  const before = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", segmentationMode: "block", clipStartMs: 0, cueFingerprint: "0:1000:a~1000:2000:b" });
+  const after = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", segmentationMode: "block", clipStartMs: 0, cueFingerprint: "0:2000:a b" });
+  assert.notStrictEqual(before, after, "源块边界或文本变化后缓存 key 必须隔离");
+  const changedBlockPrompt = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", segmentationMode: "block", clipStartMs: 0, blockSystemPrompt: "different block contract" });
+  assert.notStrictEqual(block, changedBlockPrompt, "默认 block 协议或自定义 block prompt 变化必须换缓存身份");
 });
 
 
@@ -1819,13 +2072,12 @@ test("翻译 identity 包含 maxLineChars，并在其变化时清空旧 snapshot
   assert.notStrictEqual(Core.makeCacheKey(base), Core.makeCacheKey(Object.assign({}, base, { maxLineChars: 28 })));
 });
 
-test("持久缓存采用 per-entry storage key，禁止跨 tab 共享对象 RMW", () => {
+test("block 持久缓存采用 per-entry storage key，旧 semantic namespace 已删除", () => {
   const src = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
-  assert.match(src, /CACHE_ENTRY_PREFIX/);
-  assert.match(src, /SEMANTIC_CACHE_ENTRY_PREFIX/);
-  assert.ok(!/function readCache\(\)[\s\S]{0,500}?CACHE_KEY/.test(src), "translation cache 不得整对象读改写");
-  assert.ok(!/function readSemanticCache\(\)[\s\S]{0,500}?SEMANTIC_CACHE_KEY/.test(src), "semantic cache 不得整对象读改写");
-});
+  assert.match(src, /CACHE_ENTRY_PREFIX = "dualsub:cache-entry-v90:/);
+  assert.doesNotMatch(src, /SEMANTIC_CACHE_ENTRY_PREFIX|readSemanticCacheEntry|writeSemanticCache/);
+  assert.match(src, /entryStorageKey\(prefix, key\)/);
+})
 
 test("popup 配置导出在 Core.exportConfig 缺失时 fail-closed，且文案明确默认不含 key", () => {
   const js = fs.readFileSync(path.join(ROOT, "popup.js"), "utf8");
@@ -1850,7 +2102,7 @@ test("makeSemanticCacheKey 只复用同一视频轨道、模型、网关与严�
   const a = Core.makeSemanticCacheKey(base);
   const b = Core.makeSemanticCacheKey(Object.assign({}, base));
   assert.strictEqual(a, b, "同一严格词流应命中语义恢复缓存");
-  assert.ok(a.startsWith("dss-v1|"), "语义恢复缓存必须有独立版本 namespace");
+  assert.ok(a.startsWith("dss-v8|"), "多语言词法提示与动态预算的语义恢复缓存必须有独立版本 namespace");
   assert.notStrictEqual(a, Core.makeSemanticCacheKey(Object.assign({}, base, { apiModel: "model-b" })), "模型变化不得误命中");
   assert.notStrictEqual(a, Core.makeSemanticCacheKey(Object.assign({}, base, { apiBaseUrl: "https://other.example/v1" })), "网关变化不得误命中");
   assert.notStrictEqual(a, Core.makeSemanticCacheKey(Object.assign({}, base, {
@@ -2117,8 +2369,10 @@ test("DEFAULT_CONFIG 含关键字段且颜色非空", () => {
   assert.ok(d && typeof d === "object");
   assert.ok(/^#/.test(d.fontColor) && /^#/.test(d.transColor), "默认颜色非空");
   assert.ok(d.clipSeconds > 0 && d.batchLines > 0);
-  // v0.4.1：首包延迟打磨——默认 clip 收短到 12s（仍 >0；旧 15 易让单请求 > 播放窗）
-  assert.ok(d.clipSeconds >= 8 && d.clipSeconds <= 12, "clipSeconds 默认应在 8–12");
+  assert.strictEqual(d.clipSeconds, 30, "block 默认应加载约 30 秒连续上下文");
+  assert.strictEqual(d.firstClipSeconds, 12, "首块适度缩短但不能退回碎片翻译");
+  assert.strictEqual(d.maxCuesPerClip, 12);
+  assert.strictEqual(d.maxSourceCharsPerClip, 600);
   assert.ok(d.firstClipSeconds > 0 && d.firstClipSeconds <= d.clipSeconds,
     "firstClipSeconds 应更短或等于 clipSeconds，用于压首单元延迟");
   assert.strictEqual(d.contextLines, 3, "新增 contextLines 默认 3（每批带前 3 条原文作上下文）");
@@ -2484,7 +2738,7 @@ async function main() {
       onUsage: (value) => { seen = value; },
       fetchImpl: async (_url, req) => ({
         ok: true, status: 200, headers: { get: () => "application/json" },
-        text: async () => JSON.stringify({ choices: [{ message: { content: boundaryJson(req, []) } }], usage }),
+        text: async () => JSON.stringify({ choices: [{ message: { content: visualBoundaryJson(req) } }], usage }),
       }),
     });
     assert.deepStrictEqual(seen, usage);
@@ -2496,83 +2750,56 @@ async function main() {
     assert.ok(block && /apiUsage:\s*Object\.assign/.test(block[0]), "get-state 必须回传 usage 快照");
   });
 
-  test("restoration prompt 与 10/12 舒适短屏契约一致", () => {
+  test("restoration prompt 与语言无关的动态视觉预算契约一致", () => {
     const prompt = Core.DEFAULT_RESTORATION_PROMPT;
-    assert.ok(prompt.includes("4–11 词") && prompt.includes("最多 12 词"));
-    assert.ok(prompt.includes("cutsAfter") && prompt.includes("不得回显") && prompt.includes("比较结构"), "prompt 必须要求纯 token-ID 边界协议且禁止模型拥有正文");
-    assert.ok(!/只返回原词|加入空格和 \. \? ! \||6–16|最多 20 词/.test(prompt), "不得保留全文回显或旧长屏协议");
+    assert.ok(prompt.includes("任意语言") && prompt.includes("独立阶段") && prompt.includes("完整句"));
+    assert.ok(!prompt.includes("displayCutsAfter") && prompt.includes("semanticCutsAfter") && prompt.includes("不得回显") && prompt.includes("数字+单位"), "semantic prompt 不得混入显示字段");
+    assert.ok(Core.DEFAULT_DISPLAY_PROMPT.includes("displayCutsAfter") && !Core.DEFAULT_DISPLAY_PROMPT.includes("semanticCutsAfter\":["), "display prompt 必须是单字段协议");
+    assert.ok(!/英语字幕边界|4–11 词|最多 12 词|6–16|最多 20 词/.test(prompt), "不得保留英文专用或固定词数协议");
   });
 
-  test("isolated 生产语义恢复统一使用 10 词目标与 12 词硬上限", () => {
+  test("isolated 运行时已删除独立 semantic/display 恢复层", () => {
     const src = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
-    assert.strictEqual((src.match(/preferredMaxWords:\s*10/g) || []).length, 2, "缓存身份和真实请求必须使用同一 10 词目标");
-    // 原断言数字面量 `maxWords: 12` 出现 3 次。字面量散在三处正是"同一上限多个来源"的
-    // 形状，真机因此暴露出 fallback 14 词单元被按 semantic 12 词 cap 拒翻。
-    // 现在三处统一引用 Core 的单一权威，断言改为检查引用（比数字面量更强）。
-    assert.strictEqual((src.match(/maxWords:\s*Core\.DISPLAY_UNIT_MAX_WORDS/g) || []).length, 3,
-      "semantic 缓存/请求与 fallback 目标必须引用同一个 Core.DISPLAY_UNIT_MAX_WORDS");
-    assert.ok(!/maxWords:\s*\d+/.test(src), "不得再出现硬编码词数上限字面量");
-    assert.strictEqual(Core.DISPLAY_UNIT_MAX_WORDS, 12, "显示宽度上限仍应为 12 词");
-    assert.ok(!/preferredMaxWords:\s*14/.test(src) && !/maxWords:\s*16/.test(src), "运行时不得残留旧 14/16 行长目标");
-    // 旧断言要求存在 translatePreparedClip（整轨恢复的 seed 预热）。整轨恢复已被
-    // 区间恢复取代（整轨要 9.5 分钟，期间翻译永远追不上播放），seed 预热随之删除：
-    // 区间换入走 Core.resegmentTimelineSnapshot，按 token 跨度保留已有译文，
-    // 不再需要"先翻一个 seed clip 才敢装载"。这里改为断言区间换入的关键性质。
-    assert.match(src, /stageSemanticInterval[\s\S]*?Core\.resegmentTimelineSnapshot\(/, "语义区间必须走 resegmentTimelineSnapshot 就地换入（保留已有译文）");
-    assert.ok(!/installCueTimeline\([^)]*"semantic"/.test(src), "不得再用整轨 installCueTimeline 装载 semantic（会清空全部已翻 clip）");
-    assert.match(src, /function translateClip[\s\S]*?loadOrTranslateClip\(clip, segmentationModeAtStart, priority\)/, "运行翻译必须传入真实 segmentation mode");
-    assert.strictEqual((src.match(/Core\.translateClipLines\s*\(/g) || []).length, 1, "除 testConnection 单行探针外不得绕过 repair/source-cap 门禁直调 translateClipLines");
-    assert.match(src, /function testConnection[\s\S]*?Core\.translateClipLines\s*\(\{[\s\S]*?cues:\s*\[\{ content:\s*"hello world"/, "唯一直调必须受限于 testConnection 的单行连接探针");
-    assert.match(src, /function enableFallbackTranslation[\s\S]*?state\.segmentationMode === "semantic"[\s\S]*?state\.segmentationMode === "fallback-translation"[\s\S]*?state\.segmentationMode !== "fallback"[\s\S]*?state\.segmentationMode = "fallback-translation"/, "只有 fallback 可显式迁移进入 14 词 fallback translation，且不得覆盖 semantic 或重复进入");
-    assert.ok(!src.includes("maxSourceWords"), "生产调用不得自行计算 12/14 数值上限");
-    assert.match(src, /Core\.resegmentCues\(cues, \{ tailTrimMs: config\.tailTrimMs, maxWords: Core\.DISPLAY_UNIT_MAX_WORDS, continuationMaxWords: Core\.SOURCE_UNIT_MAX_WORDS \}\)/, "生产 fallback 必须显式区分 12 词目标与 14 词续接硬上限");
-    assert.strictEqual((src.match(/Core\.resegmentCues\(/g) || []).length, 1, "isolated 中 resegmentCues 只能用于 fallback，semantic 必须走 restoreAndPackTokens");
-  });
+    assert.doesNotMatch(src, /restoreAndPackTokens|restoreSemanticIntervalIfAvailable|stageSemanticInterval|semanticTokenBudgets/);
+    assert.match(src, /Core\.translateContextBlock/);
+    assert.match(src, /var blockSeconds = Math\.max\(30/);
+  })
 
-  test("语义缓存 key 与恢复请求显式复用同一 restoration prompt", () => {
-    const src = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
-    assert.match(src, /var restorationPrompt = Core\.DEFAULT_RESTORATION_PROMPT;/);
-    assert.match(src, /makeSemanticCacheKey\(\{[\s\S]*?systemPrompt:\s*restorationPrompt[\s\S]*?\}\);/);
-    assert.match(src, /restoreAndPackTokens\(\{[\s\S]*?systemPrompt:\s*restorationPrompt[\s\S]*?\}\);/);
-  });
-
-  test("整轨语义恢复走全局并发闸门且用最低优先级，绝不与首屏 fallback 抢占模型端点（防卡顿回归）", () => {
-    // 回归卡顿根因：整轨 semantic 恢复的 N 个 chunk 模型请求旧版绕过 ensureGate 直连 chatCompletion，
-    // 与首屏 fallback 抢同一端点 → 首包被挤到队尾 → 429 退避 → 首个中文要等整轨恢复跑完（可达 1 分钟）。
-    // 根治：core.restoreTokenBoundaries 暴露 runRequest hook；isolated 传 ensureGate().run(fn, 0)
-    // 让 semantic 恢复只用富余容量，首屏 fallback(100)/预取(20)/导出(1) 全部抢先。
+  test("运行时缓存身份与请求统一使用 block-v1 协议", () => {
     const iso = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
     const core = fs.readFileSync(path.join(ROOT, "core.js"), "utf8");
-    // core 必须支持可选 runRequest 包装器，且默认无闸门直接执行（不破坏纯 core 单测/导出路径）。
-    assert.match(core, /typeof opts\.runRequest === "function" \? await opts\.runRequest\(doChat\) : await doChat\(\)/,
-      "core.restoreTokenBoundaries 必须支持可选 runRequest 闸门包装器");
-    // isolated 的整轨语义恢复必须把 runRequest 接到全局闸门且优先级为 0（最低）。
-    const restore = iso.match(/restoreAndPackTokens\(\{[\s\S]*?\}\);/);
-    assert.ok(restore, "定位到整轨语义恢复的 restoreAndPackTokens 调用");
-    assert.match(restore[0], /runRequest:\s*function \(fn\) \{ return ensureGate\(\)\.run\(fn, 0\); \}/,
-      "整轨语义恢复必须走 ensureGate 且优先级 0，否则会 flood 端点拖慢首屏");
-    // 首屏 fallback 翻译仍是原来的 700ms 短阈值兜底（不得被误删/误改）。
-    assert.match(iso, /state\.semanticFallbackTimer = setTimeout\(function \(\) \{[\s\S]{0,120}?enableFallbackTranslation\(loadEpoch\);\s*\}, 700\);/,
-      "首屏 fallback 700ms 兜底定时器必须保留");
-  });
+    assert.match(core, /"dsc-v90"[\s\S]*?parts\.contractVersion \|\| "block-v1"/);
+    assert.match(iso, /contractVersion:\s*"block-v1"/);
+    assert.doesNotMatch(iso, /contractVersion:\s*"coverage-v1"/);
+    assert.match(iso, /writeCache\(key, \{ segments: out\.segments \}, generation\)/);
+    assert.match(iso, /Core\.materializeBlockTranslation\(cached\.segments, clip\.cues, \{ maxVisualWidth: identity\.maxLineChars, requireIntegrity: true \}\)/);
+    assert.match(iso, /catch \(_\) \{[\s\S]{0,160}?storageRemove\(\[entryStorageKey\(CACHE_ENTRY_PREFIX, key\)\]\)/, "损坏 block 缓存必须主动删除");
+  })
 
-  test("运行时翻译逐 cue 容错：单句坏译文只回退那一句英文，不连坐整组；导出仍严格", () => {
-    // 回归丢句根因：旧版 clip 级 all-or-nothing，clip 内任一 cue 触发校验失败即 throw 整组作废回退英文。
-    // 修复后：运行时 translate 路径传 lenient:true（单句坏译文置空=显英文，其余显中文），导出 SRT 路径不传 lenient（严格）。
+  test("block 翻译和完整 SRT 共用自适应并发闸门", () => {
     const src = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
-    // 运行时 loadOrTranslateClip 的 boundary-repair 调用必须显式 lenient:true。
-    assert.match(src, /translateClipWithBoundaryRepair\(\{[\s\S]{0,500}?lenient:\s*true/,
-      "运行时 clip 翻译必须 lenient（单句容错）");
-    // 缓存复验也走 lenient，避免历史缓存里单句坏译文连坐整组失效。
-    assert.match(src, /parseTranslationCoverageResponse\([\s\S]{0,120}?\{\s*lenient:\s*true\s*\}\)/,
-      "缓存复验必须 lenient");
-    // applyClipLines 只要有任意一句译文就落地（部分成功），不再要求整组齐全。
-    assert.match(src, /hasAnyTranslation[\s\S]{0,300}?buildClipUnits\([\s\S]{0,120}?\{\s*lenient:\s*true\s*\}\)/,
-      "applyClipLines 部分成功即落地，用 lenient buildClipUnits");
-    // 导出批次翻译（translateFullSrtBatch）不得传 lenient——导出保持严格 fail-closed。
-    const exportBatch = src.match(/async function translateFullSrtBatch[\s\S]*?ensureGate\(\)\.run\([\s\S]*?\}, 1\);/);
-    assert.ok(exportBatch, "定位到 translateFullSrtBatch");
-    assert.ok(!/lenient/.test(exportBatch[0]), "导出批次翻译必须严格，不得 lenient（成品绝不半英文半中文）");
+    const live = src.slice(src.indexOf("async function loadOrTranslateClip"), src.indexOf("async function translateClip"));
+    assert.match(live, /ensureGate\(\)\.run\(async function/);
+    assert.match(live, /Core\.translateContextBlock/);
+    const full = src.slice(src.indexOf("async function translateFullSrtBatch"), src.indexOf("async function runFullSrtPreparation"));
+    assert.match(full, /loadOrTranslateClip\(clip, mode, 1\)/, "full-SRT 必须复用前台 keyed in-flight");
+    assert.doesNotMatch(full, /Core\.translateContextBlock|beginRuntimeRequest|writeCache\(/, "full-SRT 不得另建模型请求或竞态写缓存");
+    const cancel = src.slice(src.indexOf('msg.type === "cancel-full-srt"'), src.indexOf('msg.type === "full-srt-status"'));
+    assert.doesNotMatch(cancel, /\.abort\(/, "取消 full-SRT 不得 abort 可能被前台共享的请求");
+  })
+
+  test("运行时使用整块翻译：源译不逐 cue 对齐，缓存只保存规范化 segments", () => {
+    const src = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
+    assert.match(src, /Core\.translateContextBlock\(\{[\s\S]{0,500}?contextBefore:[\s\S]{0,120}?contextAfter:/,
+      "运行时必须把连续源块及前后只读上下文交给 block 翻译入口");
+    assert.match(src, /cached\.segments[\s\S]{0,200}?Core\.materializeBlockTranslation\(cached\.segments, clip\.cues, \{ maxVisualWidth: identity\.maxLineChars, requireIntegrity: true \}\)/,
+      "缓存命中必须用当前源 cue 重新物化时间，不得复用旧逐 cue coverage");
+    assert.match(src, /writeCache\(key, \{ segments: out\.segments \}, generation\)/,
+      "缓存只保存规范化 block segments，并受 generation 写门禁保护");
+    assert.match(src, /function applyBlockUnits[\s\S]{0,500}?state\.clipUnits\[idx\] = units/,
+      "目标语言自然分屏必须直接成为渲染单元，不得塞回源 cue 数量");
+    assert.doesNotMatch(src.slice(src.indexOf("async function loadOrTranslateClip"), src.indexOf("async function translateClip")), /translateClipWithBoundaryRepair|parseTranslationCoverageResponse|lenient/,
+      "运行时主路径不得继续经过旧逐 cue coverage/lenient 协议");
   });
 
   test("popup 独立显示会话 Token，不覆盖连接诊断 status", () => {
@@ -2803,24 +3030,24 @@ asyncTest("makeAdaptiveGate run 受 cap 约束：429 后在途峰值下降", asy
     assert.strictEqual(Core.buildSrt([{ startMs: 0, endMs: 1000, originalText: "source" }], { mode: "bilingual_orig_top", requireTranslations: true }), "");
   });
 
-  test("isolated 导出与原生字幕隐藏契约：按有原文单元完整性判断，英文 fallback 也隐藏 YouTube 原生字幕", () => {
+  test("isolated 导出与原生字幕隐藏契约：block renderUnits 是导出权威，原文/译文时间轴独立", () => {
     const src = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
-    assert.match(src, /var exportSnapshot = state\.timelineSnapshot[\s\S]*?exportSnapshot\.renderUnits\.filter[\s\S]*?String\(u\.originalText \|\| ""\)\.trim\(\) !== ""[\s\S]*?var allTranslated = realUnits\.length > 0 && realUnits\.every/, "导出必须按所有有原文单元检查译文完整性");
-    assert.match(src, /function updateNativeCaptionVisibility[\s\S]*?!config\.enabled \|\| !state\.renderer[\s\S]*?classList\.remove\("dualsub-hide-native-captions"\)[\s\S]*?domHasDualsubText[\s\S]*?timelineHasDualsubText[\s\S]*?dualsub-hide-native-captions/, "只要 DualSub 任一 DOM 或时间轴文本层出现，就必须隐藏 YouTube 原生字幕；禁用或 renderer 清除时必须恢复原生字幕");
-    assert.match(src, /function setRendererText[\s\S]*?updateNativeCaptionVisibility\(\)[\s\S]*?fitSubtitleRows\(\)/, "写入字幕 DOM 的同一 tick 必须同步更新原生字幕隐藏状态，避免首帧双字幕窗口");
-    assert.match(src, /function installCueTimeline[\s\S]*?state\.timelineEpoch\+\+[\s\S]*?clearSemanticFallbackTimer\(\)/, "semantic 原子接管必须递增 epoch 并取消慢 fallback 定时器，使旧 fallback 请求失效");
-    assert.match(src, /function translateClip[\s\S]*?segmentationModeAtStart = state\.segmentationMode[\s\S]*?timelineEpoch !== state\.timelineEpoch \|\| segmentationModeAtStart !== state\.segmentationMode[\s\S]*?applyClipLines/, "translateClip 必须用 epoch+segmentationMode 双重快照拒绝 stale fallback 写入 semantic 时间轴");
+    assert.match(src, /rebuildRenderTimeline\(\);[\s\S]*?var realUnits = state\.renderUnits\.filter[\s\S]*?var allTranslated = realUnits\.length > 0 && realUnits\.every/, "导出必须读取 block 渲染时间轴并检查完整译文");
+    assert.match(src, /units: state\.renderUnits\.map[\s\S]*?startMs: u\.start[\s\S]*?endMs: u\.end/, "SRT 必须导出目标语言独立时间单元");
+    assert.match(src, /function updateNativeCaptionVisibility[\s\S]*?!config\.enabled \|\| !state\.renderer[\s\S]*?classList\.remove\("dualsub-hide-native-captions"\)[\s\S]*?domHasDualsubText[\s\S]*?timelineHasDualsubText[\s\S]*?dualsub-hide-native-captions/, "只要 DualSub 文本层出现就必须隐藏原生字幕");
+    assert.match(src, /Core\.findCueIndexAt\(state\.cues, ms, -1\)[\s\S]*?setRendererText\(sourceText, trans/, "双语原文必须独立按源时间轴查询，不得复制译文段的粗略原文");
+    assert.match(src, /function translateClip[\s\S]*?segmentationModeAtStart = state\.segmentationMode[\s\S]*?timelineEpoch !== state\.timelineEpoch \|\| segmentationModeAtStart !== state\.segmentationMode[\s\S]*?applyBlockUnits/, "block 写入必须用 generation/epoch/mode 拒绝 stale 结果");
   });
 
   
-  test("loadOrTranslateClip 必须透传 repaired 标志，禁止硬编码 false", () => {
+  test("loadOrTranslateClip 直接透传 block segments/units，不再采用 repaired cue 时间轴", () => {
     const src = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
-    assert.match(src, /var out = \{[\s\S]*?cues: result && result\.repaired \? result\.cues : clip\.cues[\s\S]*?repaired: !!\(result && result\.repaired\)/,
-      "loadOrTranslateClip 必须把 Core.translateClipWithBoundaryRepair 的 repaired 结果透传给 translateClip/translatePreparedClip");
-    assert.doesNotMatch(src, /cues: result && result\.repaired \? result\.cues : clip\.cues[\s\S]*?repaired: false,/,
-      "loadOrTranslateClip 不得在采用 repaired cues 的同时把 repaired 硬编码为 false");
-    assert.match(src, /if \(result\.repaired\) \{[\s\S]*?adoptRepairedClipTimeline\(idx, result\.cues\)/,
-      "translateClip 必须在 repaired=true 时调用 adoptRepairedClipTimeline");
+    assert.match(src, /var out = \{[\s\S]*?segments: result && result\.segments[\s\S]*?units: result && result\.units/,
+      "loadOrTranslateClip 必须透传自然分段及其独立渲染单元");
+    assert.doesNotMatch(src.slice(src.indexOf("async function translateClip"), src.indexOf("function applyBlockUnits")), /result\.repaired|adoptRepairedClipTimeline/,
+      "block 翻译不得再改写源 cue 时间轴");
+    assert.match(src, /applyBlockUnits\(idx, clip, result\.key, result\.units/,
+      "translateClip 必须直接安装目标语言 block units");
   });
 
 test("buildSrt 导出门禁：requireTranslations=true 时完整双语才允许生成", () => {
@@ -2942,85 +3169,28 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     "translateBatch",
   ];
 
-  test("语义恢复不阻塞 fallback 首屏，切换时隔离旧异步结果与缓存", () => {
+  test("block 翻译立即使用可播放源时间轴，并以 generation/epoch 拒绝旧异步结果", () => {
     const src = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
     const load = src.slice(src.indexOf("async function loadTrack"), src.indexOf("/* =====================================================\n   * 翻译编排"));
-    assert.ok(load.indexOf('installCueTimeline(fallbackCues, "fallback", { sourceTimeline: sourceTimeline })') >= 0, "应先安装 fallback 首屏时间轴");
-    assert.ok(load.indexOf('installCueTimeline(fallbackCues, "fallback", { sourceTimeline: sourceTimeline })') < load.indexOf("restoreSemanticIntervalIfAvailable(state.timelineSnapshot, cues, currentTimeMs())"), "语义恢复必须后台启动，不得 await 阻塞首屏");
-    assert.ok(/timelineEpoch !== state\.timelineEpoch/.test(src), "旧分段异步请求不得写入新时间轴");
-    assert.ok(/state\.timelineSnapshot = Core\.createTimelineSnapshot/.test(src), "renderer 提交必须生成不可变 TimelineSnapshot revision");
-    assert.ok(/var exportSnapshot = state\.timelineSnapshot/.test(src), "SRT 导出必须读取 renderer 同一 snapshot");
-    assert.ok(/function resetForNewVideo\(\)[\s\S]{0,120}invalidateRuntimeRequests\(\)[\s\S]{0,120}state\.timelineEpoch\+\+/.test(src), "切视频必须废止旧轨道异步请求");
-    assert.ok(/if \(mode === "semantic"\) state\.firstClipReady = true/.test(src), "语义后台切换不得再次暂停已播放视频");
-    assert.ok(/white-space:nowrap/.test(src), "英文和中文都必须保持单行");
-    assert.ok(!/text-overflow:ellipsis/.test(src), "字幕正文禁止用省略号隐藏内容");
-    assert.ok(!/overflow:hidden/.test(src.slice(src.indexOf(".dualsub-subtitle{"), src.indexOf(".dualsub-subtitle.dualsub-orig"))), "字幕正文不能静默裁切");
-    assert.ok(/--ds-fit-scale/.test(src) && /calc\(var\(--ds-fontsize,22px\) \* var\(--ds-fit-scale,1\)\)/.test(src), "单行字幕超宽时应等比缩小字号，不能横向扭曲字形");
-    assert.ok(!/scaleX\(var\(--ds-fit-scale/.test(src), "禁止用 scaleX 挤扁字幕字形");
-    assert.ok(/function fitSubtitleRows/.test(src) && /scrollWidth/.test(src), "必须测量真实 DOM 像素宽度后适配，不能只按词数猜测");
-    assert.ok(/padding:0 2%/.test(src) && /max-width:100%/.test(src) && /clientWidth \* 0\.96/.test(src), "超长完整语义单元应优先使用播放器安全宽度，不能因容器重复留白被迫缩到小字");
-    const setTextBody = src.slice(src.indexOf("function setRendererText"), src.indexOf("function teardownRuntime"));
-    assert.ok(/fitSubtitleRows\(\)/.test(setTextBody), "每次写入新字幕后必须重新做像素宽度适配");
-    assert.ok(!/-webkit-line-clamp:2/.test(src) && !/white-space:pre-wrap/.test(src), "渲染器不得允许字幕折成多行");
-    assert.ok(/function clipCacheKey\(clip, segmentationMode/.test(src), "不同分段模式不得复用同一 clip 缓存");
-    // translatePreparedClip（整轨 seed 预热）已随整轨恢复删除。真需求保留：
-    // 所有 clip 翻译必须走统一的边界回修入口，不得绕过契约。
-    assert.ok(/function loadOrTranslateClip[\s\S]*Core\.translateClipWithBoundaryRepair/.test(src), "clip 翻译必须走统一边界回修入口，不能绕过新契约");
-    assert.ok(!/translatePreparedClip/.test(src), "整轨 seed 预热已删除，不得留下悬空引用");
-    assert.ok(/cached\.coverage/.test(src) && /writeCache\(key, \{ lines: out\.lines, coverage: out\.coverage \}, generation\)/.test(src), "coverage ledger 必须随 per-entry 译文缓存，并受 generation 写门禁保护");
-    assert.ok(!/if \(translationResult && translationResult\.repaired\)[\s\S]{0,160}key = clipCacheKey\(clip\)/.test(src), "回修结果必须写在本次输入 key 下；若改写为输出 key，下一次仍以原 cue 查询将永远无法命中");
-    const cacheKeyBody = src.slice(src.indexOf("function clipCacheKey"), src.indexOf("function semanticUnitsFromTrack"));
-    assert.ok(/cueFingerprint/.test(cacheKeyBody), "clip 缓存键必须包含当前 cue 边界与文本指纹；边界回修前后不得碰撞");
-    assert.ok(/"dsc-v70"/.test(fs.readFileSync(path.join(ROOT, "core.js"), "utf8")), "10/12 舒适短屏必须升级缓存 namespace");
-    const prefetch = src.slice(src.indexOf("function prefetchAround"), src.indexOf("function getBackoff"));
-    assert.ok(/state\.segmentationMode === "fallback"/.test(prefetch), "语义恢复尚未结束时 fallback 只显原文，不应抢跑重复翻译");
-    assert.ok(/function enableFallbackTranslation\(loadEpoch\)/.test(src), "语义恢复失败后必须有显式 fallback 翻译降级入口");
-    assert.ok(/!result \|\| !result\.cues[\s\S]{0,200}enableFallbackTranslation\(loadEpoch\)/.test(load), "语义恢复不适用或失败时必须启动 fallback 翻译");
-    // 区间换入版：无论换入成功与否都必须让 fallback 翻译跑起来 —— 语义恢复只提升
-    // 断句质量，绝不是"有译文"的前提条件（旧实现里换入成功就不启动 fallback，
-    // 于是恢复期间只有当前段有译文）。
-    assert.ok(/stageSemanticInterval\(result, loadEpoch\)[\s\S]{0,400}finishSemanticPending\(loadEpoch\)[\s\S]{0,300}enableFallbackTranslation\(/.test(load), "区间换入后必须无条件启动 fallback 翻译");
-    const render = src.slice(src.indexOf("function onRenderTick"), src.indexOf("function setRendererText"));
-    assert.ok(/state\.segmentationMode !== "fallback" \? Core\.clipDisplayFlags/.test(render), "启用翻译降级后的 fallback 必须显示中文或翻译状态");
+    assert.ok(load.includes('installCueTimeline(fallbackCues, "block", { sourceTimeline: sourceTimeline })'), "应立即安装可播放源时间轴并启动 block 翻译");
+    assert.ok(!/runInitialSemanticRestore/.test(load), "加载主路径不得再等待独立 semantic restoration");
+    assert.ok(/timelineEpoch !== state\.timelineEpoch/.test(src), "旧时间轴异步请求不得写入新时间轴");
+    assert.ok(/function resetForNewVideo\(\)[\s\S]{0,120}invalidateRuntimeRequests\(\)[\s\S]{0,120}state\.timelineEpoch\+\+/.test(src), "切视频必须废止旧请求");
+    assert.ok(/Core\.translateContextBlock/.test(src), "所有运行时 clip 必须走 block 翻译入口");
+    assert.ok(/contextBefore[\s\S]{0,200}contextAfter/.test(src), "相邻 cue 只作为上下文发送，不能要求逐条输出");
+    assert.ok(/"dsc-v90"/.test(fs.readFileSync(path.join(ROOT, "core.js"), "utf8")), "block 协议必须隔离旧缓存");
+    assert.ok(/white-space:nowrap/.test(src) && !/text-overflow:ellipsis/.test(src), "字幕保持单屏且不得省略内容");
+    assert.ok(/function fitSubtitleRows/.test(src) && /scrollWidth/.test(src), "仍需按真实 DOM 宽度适配");
   });
 
-  test("isolated.js 只在可靠 JSON3 token 时序下启用语义恢复，失败完整回退", () => {
+  test("block 渲染时间轴独立于源 cue 数量，未翻块回退原文且真实停顿保留", () => {
     const src = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
-    assert.ok(/Core\.hasNativeTokenTiming\(rawCues, 0\.8\)/.test(src), "应有 80% 原生 token timing 门槛（须看带原生 tokens 的原始轨）");
-    assert.ok(/Core\.restoreAndPackTokens\b/.test(src), "加载路径应调用生产语义恢复器");
-    assert.ok(/var fallbackCues = Core\.resegmentCues\(cues, \{ tailTrimMs: config\.tailTrimMs, maxWords: Core\.DISPLAY_UNIT_MAX_WORDS, continuationMaxWords: Core\.SOURCE_UNIT_MAX_WORDS \}\)/.test(src), "不满足契约时应完整回退 ASR 重组");
-    assert.ok(/installCueTimeline\(fallbackCues, "fallback", \{ sourceTimeline: sourceTimeline \}\)/.test(src), "fallback 必须先安装可播放时间轴");
-    // 整轨恢复 + seed 预热已被区间恢复取代：区间换入自身保留已有译文，无需预热 seed。
-    assert.ok(/stageSemanticInterval\(result, loadEpoch\)/.test(src), "启用路径必须走区间换入");
-    assert.ok(/Core\.planSemanticInterval\(/.test(src), "区间选择必须走 core 的单一权威实现");
-    assert.ok(/planSemanticInterval:\s*planSemanticInterval/.test(fs.readFileSync(path.join(ROOT, "core.js"), "utf8")), "planSemanticInterval 必须在 core 导出表里");
-    // 旧的三条断言锁定整轨 seed 预热的实现细节（attempt 循环 / installIdx 重验 /
-    // seeds 事务化）。整轨恢复已删除，等价的安全保障现在由区间换入提供：
-    //   1) 候选快照必须在改动任何 live state 之前构建完（resegmentTimelineSnapshot 会
-    //      对词流做覆盖数+逐词比对，不通过直接抛错）；
-    //   2) 抛错时必须保留当前可用时间轴（catch 里只 warn 并 return false）。
-    const stage = src.slice(src.indexOf("async function stageSemanticInterval"), src.indexOf("// 仅在完整 cue 集合准备好时切换"));
-    assert.ok(stage.length > 200, "未找到 stageSemanticInterval 实现");
-    assert.ok(
-      stage.indexOf("Core.resegmentTimelineSnapshot(") < stage.indexOf("state.timelineEpoch++"),
-      "候选快照必须在 epoch/mode 切换前构建完；校验失败不得留下半安装状态"
-    );
-    assert.ok(
-      /catch \(e\)[\s\S]*?return false;/.test(stage),
-      "词流契约不通过时必须保留当前可用时间轴（fail-closed）"
-    );
-    // 等价保障（区间换入版）：保留下来的已翻 clip 必须在首帧重建前写入 state，
-    // 否则换入瞬间会把已有译文闪回成"翻译中…"。
-    // 先断言机制存在，再断言顺序。只写顺序断言会假绿：把 preservedUnits 删掉后
-    // indexOf 返回 -1，而 -1 仍然"小于"任何下标，断言照样通过（实测踩过）。
-    const preservedAt = stage.indexOf("state.clipUnits = preservedUnits");
-    const rebuildAt = stage.indexOf("rebuildRenderTimeline();");
-    assert.ok(preservedAt >= 0, "区间换入必须保留已翻译 clip（不得整轨清空 clipUnits）");
-    assert.ok(rebuildAt >= 0, "区间换入必须重建渲染时间轴");
-    assert.ok(preservedAt < rebuildAt, "已保留的译文必须在首帧重建前原子写入，禁止闪回翻译中");
-    assert.ok(/clipCueFingerprint\(oldClip\) !== clipCueFingerprint\(nextClips\[ci\]\)/.test(stage), "只有源文本未变的 clip 才能复用译文，避免旧断句译文错配到新断句");
-    assert.ok(/if \(ms < clips\[i\]\.startMs\) return i/.test(src), "播放头在 gap 时应预热下一段而不是末段");
-    assert.ok(/installCueTimeline\(fallbackCues, "fallback", \{ sourceTimeline: sourceTimeline \}\)/.test(src), "回退路径应安装可诊断 fallback 模式");
+    const rebuild = src.slice(src.indexOf("function rebuildRenderTimeline"), src.indexOf("/* =====================================================\n   * 渲染叠加层"));
+    assert.match(rebuild, /translated\.length[\s\S]*?unit\.startMs[\s\S]*?unit\.endMs[\s\S]*?unit\.translation/, "已翻 block units 必须直接组成渲染时间轴");
+    assert.match(rebuild, /else if \(clip\)[\s\S]*?clip\.cues[\s\S]*?translation: null/, "未翻块必须立即显示源 cue");
+    assert.doesNotMatch(rebuild, /clipUnits\.length !== clip\.cues\.length|translations\[sourceUnit\.id\]/, "渲染层不得恢复源译 1:1 约束");
+    assert.match(src, /Core\.materializeBlockTranslation\(cached\.segments, clip\.cues, \{ maxVisualWidth: identity\.maxLineChars, requireIntegrity: true \}\)/, "缓存必须按当前源时间重新物化，保留 cue gap");
+    assert.ok(/if \(ms < clips\[i\]\.startMs\) return i/.test(src), "播放头在 gap 时应预热下一块");
   });
 
   test("isolated.js 不再引用任何 v0.4.0 已删的 core 函数", () => {
@@ -3029,18 +3199,16 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
       const re = new RegExp("Core\\." + fn + "\\b");
       assert.ok(!re.test(src), "isolated.js 不应再调用 Core." + fn + "（已删，会 is not a function 崩）");
     });
-    // 正向：新主路径入口确实在被调用（对接到位，不是把调用整段删没了）
-    assert.ok(/Core\.translateClipLines\b/.test(src), "isolated.js 应调用新入口 Core.translateClipLines");
-    assert.ok(/Core\.buildClipUnits\b/.test(src), "isolated.js 应调用 Core.buildClipUnits 配时间轴");
+    assert.ok(/Core\.translateContextBlock\b/.test(src), "isolated.js 应调用 block 翻译入口");
+    assert.ok(/Core\.materializeBlockTranslation\b/.test(src), "缓存读取应按源时间重新物化 block units");
   });
 
   test("已删函数在 core.js 确实 0 定义、且不在导出表里", () => {
     DELETED_FNS.forEach((fn) => {
       assert.strictEqual(typeof Core[fn], "undefined", "core 不应再导出 " + fn);
     });
-    // 新架构入口应存在且为函数
-    assert.strictEqual(typeof Core.translateClipLines, "function", "translateClipLines 应存在");
-    assert.strictEqual(typeof Core.buildClipUnits, "function", "buildClipUnits 应存在");
+    assert.strictEqual(typeof Core.translateContextBlock, "function", "translateContextBlock 应存在");
+    assert.strictEqual(typeof Core.materializeBlockTranslation, "function", "materializeBlockTranslation 应存在");
   });
 
 
@@ -3100,7 +3268,7 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
   });
 
   test("validateChineseDisplayUnit：显式判定「模型没翻译」而不是靠删拉丁字母", () => {
-    const judge = (t) => Core.validateChineseDisplayUnit(t, { continues: false });
+    const judge = (t) => Core.validateChineseDisplayUnit(t, { continues: false, maxVisualWidth: 200 });
     // 合法：夹专有名词、缩写、单位的中文译文必须通过
     assert.strictEqual(judge("嗨 Vsauce 我是 Michael").ok, true, "专有名词密集的正确译文被误杀");
     assert.strictEqual(judge("这是个 SodaStream 瓶子").ok, true, "品牌名导致误杀");
@@ -3117,41 +3285,21 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
 
 
 
-  /* ============ 6f. 跳过中文源 ============ */
-  console.log("\n[跳过中文源：shouldSkipChineseSource / isChineseLangCode]");
-  test("isChineseLangCode 识别 zh / yue / 后缀", () => {
-    assert.strictEqual(Core.isChineseLangCode("zh"), true);
-    assert.strictEqual(Core.isChineseLangCode("zh-Hans"), true);
-    assert.strictEqual(Core.isChineseLangCode("zh-CN-asr"), true);
-    assert.strictEqual(Core.isChineseLangCode("yue"), true);
-    assert.strictEqual(Core.isChineseLangCode("en"), false);
-    assert.strictEqual(Core.isChineseLangCode("en-US"), false);
-    assert.strictEqual(Core.isChineseLangCode("ja"), false);
-  });
-
-  test("shouldSkipChineseSource：默认跳中文轨，手动选中文源不跳", () => {
-    const zhTrack = { code: "zh-Hans-asr", languageCode: "zh-Hans", kind: "asr", name: "Chinese" };
-    const enTrack = { code: "en-asr", languageCode: "en", kind: "asr", name: "English" };
-    assert.strictEqual(
-      Core.shouldSkipChineseSource(zhTrack, { skipChineseSource: true, sourceLang: "auto" }),
-      true
-    );
-    assert.strictEqual(
-      Core.shouldSkipChineseSource(enTrack, { skipChineseSource: true, sourceLang: "auto" }),
-      false
-    );
-    assert.strictEqual(
-      Core.shouldSkipChineseSource(zhTrack, { skipChineseSource: false, sourceLang: "auto" }),
-      false
-    );
-    assert.strictEqual(
-      Core.shouldSkipChineseSource(zhTrack, { skipChineseSource: true, sourceLang: "zh-Hans" }),
-      false
-    );
-  });
-
-  test("DEFAULT_CONFIG.skipChineseSource 默认 true", () => {
-    assert.strictEqual(Core.DEFAULT_CONFIG.skipChineseSource, true);
+  /* ============ 6f. 选轨不得维护源语言名单 ============ */
+  console.log("\n[所有源语言统一选轨]");
+  test("运行时不再包含中英文源语言特判或 skipChineseSource", () => {
+    const src = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
+    const core = fs.readFileSync(path.join(ROOT, "core.js"), "utf8");
+    const popup = fs.readFileSync(path.join(ROOT, "popup.js"), "utf8") + fs.readFileSync(path.join(ROOT, "popup.html"), "utf8");
+    assert.doesNotMatch(src, /isEnglishTrack|isChineseTrack|shouldSkipChineseSource|skipChineseSource/);
+    assert.doesNotMatch(core, /isChineseLangCode|shouldSkipChineseSource|skipChineseSource\s*:/);
+    assert.match(core, /delete c\.skipChineseSource/, "迁移时应清除旧废字段");
+    assert.doesNotMatch(popup, /skipChineseSource/);
+    const pick = src.slice(src.indexOf("function pickTrack"), src.indexOf("/* =====================================================", src.indexOf("function pickTrack")));
+    assert.match(pick, /sourceLang === "auto"[\s\S]*?picked = list\[0\]/);
+    assert.match(pick, /Core\.preferManualTrack\(list, picked\)/);
+    assert.doesNotMatch(pick, /picked = exact \|\| prefix \|\| list\[0\]/, "显式源语言不存在时不得偷偷换成其它语言");
+    assert.doesNotMatch(pick, /["'](?:en|zh|ja|ar|th|pl)["']/);
   });
 
   console.log("\n[token-span coverage 1:1 对齐]");
@@ -3734,12 +3882,90 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     assert.equal(units[units.length - 1].tokenEnd, timeline.tokens.length, "日语显示单元未完整覆盖 canonical token");
   });
 
+  test("语言无关：显示分词必须与 canonical 共用权威边界，小数和单位不得拆坏整轨", () => {
+    // P1WniHPKAxY 的日语人工字幕真实片段含 "0.1mm"。canonical 的权威正则把
+    // "0.1" 视为一个 token；旧显示侧另写 UNSPACED_PIECE_RE，却切成 "0." + "1mm"，
+    // 从这里开始永久错位。修复必须删除第二套 tokenizer，而不是补一个日语/小数特判。
+    const raw = JSON.parse(fs.readFileSync(path.join(__dirname, "fixtures/youtube-p1w-ja-decimal-head.json"), "utf8"));
+    const cues = Core.cleanupCues(Core.parseJson3(raw));
+    assert.ok(cues.some((cue) => cue.content.includes("0.1mm")), "真实 fixture 缺失 0.1mm 故障形状");
+    const timeline = Core.buildCanonicalTokenTimeline(cues);
+    const display = Core.resegmentCues(cues, {
+      tailTrimMs: 0,
+      maxWords: Core.DISPLAY_UNIT_MAX_WORDS,
+      continuationMaxWords: Core.SOURCE_UNIT_MAX_WORDS,
+    });
+    assert.deepEqual(
+      Core.restoredWords(display.map((cue) => cue.content).join(" ")).slice(0, timeline.tokens.length),
+      timeline.tokens.map((token) => token.text),
+      "显示侧与 canonical 使用了不同词边界"
+    );
+    const units = Core.buildCueTokenSpanUnits(timeline, display);
+    assert.equal(units[units.length - 1].tokenEnd, timeline.tokens.length, "小数之后的显示单元未完整覆盖 canonical token");
+  });
+
+  test("语义恢复必须语言无关、按视觉负载分配预算，并且只翻最终语义单元一次", () => {
+    const ja = Array.from("今回はずっと乗ってみたかったセンチュリー").map((text, i) => ({ text, start: i * 100, end: (i + 1) * 100 }));
+    const en = "This is a deliberately ordinary English subtitle sentence for comparison".split(" ").map((text, i) => ({ text, start: i * 100, end: (i + 1) * 100 }));
+    assert.equal(typeof Core.semanticTokenBudgets, "function", "缺少语言无关的视觉预算权威");
+    const jaBudget = Core.semanticTokenBudgets(ja);
+    const enBudget = Core.semanticTokenBudgets(en);
+    assert.ok(jaBudget.preferredTokens > enBudget.preferredTokens, `日文字符预算 ${jaBudget.preferredTokens} 未高于英文词预算 ${enBudget.preferredTokens}`);
+    assert.ok(jaBudget.maxTokens <= 40 && enBudget.maxTokens <= 16, "视觉预算失去单行字幕上限");
+    assert.ok(!/英语字幕|英文字幕单元/.test(Core.DEFAULT_RESTORATION_PROMPT + Core.DEFAULT_SYSTEM_PROMPT), "默认 prompt 仍把任意源语言写死为英文");
+    assert.equal(typeof Core.semanticPlanningGroups, "function", "缺少语言无关的词法提示层");
+    const grouped = Core.semanticPlanningGroups(ja.map((token, i) => ({ ...token, tokenId: `j${i}` })));
+    assert.equal(grouped.sourceText, "今回はずっと乗ってみたかったセンチュリー", "词法提示层改写了连写源文");
+    assert.ok(grouped.groups.length < ja.length, "连写文字仍被逐字符发送给语义规划器");
+    assert.equal(grouped.groups[0].fromId, "j0");
+    assert.equal(grouped.groups[grouped.groups.length - 1].toId, `j${ja.length - 1}`);
+
+    const mixed = ["offset", "0.1", "mm", "causes", "the", "door", "to", "stop", "opening", "during", "the", "precision", "test"]
+      .map((text, i) => ({ text, tokenId: `m${i}`, start: i * 100, end: (i + 1) * 100 }));
+    const mixedGroups = Core.semanticPlanningGroups(mixed).groups;
+    assert.ok(mixedGroups.some((group) => group.text === "0.1 mm"), "数字+后续数量词必须语言无关地保持原子，不得靠单位名单");
+    const visualMarks = Core.enforceVisualDisplayMarks(mixed, mixed.map(() => ""), 28);
+    const visualUnits = Core.packRestoredTokens(mixed, visualMarks, { maxWords: 40 });
+    assert.ok(visualUnits.every((unit) => Core.semanticDisplayWidth(unit.content) <= 28), "确定性 display cut 未执行视觉硬门禁");
+    assert.ok(!visualMarks.some((mark) => mark === "."), "程序补短屏只能新增 display cut，不得伪造 semantic cut");
+    assert.ok(!visualUnits.some((unit) => /0\.1$/.test(unit.content)), "确定性排版切断了数字+数量词");
+    const advisedTokens = new Array(8).fill(0).map((_, i) => ({ text: "aaaa", tokenId: `a${i}`, start: i * 100, end: (i + 1) * 100 }));
+    const advisedMarks = advisedTokens.map((_, i) => i === 2 ? "|" : "");
+    const advisedResult = Core.enforceVisualDisplayMarks(advisedTokens, advisedMarks, 26);
+    assert.equal(advisedResult[2], "|", "模型自然显示建议在不破坏均衡/硬上限时应成为 DP 软偏好");
+    assert.ok(Core.packRestoredTokens(advisedTokens, advisedResult, { maxWords: 40 }).every((unit) => Core.semanticDisplayWidth(unit.content) <= 26));
+
+    const coreSource = fs.readFileSync(path.join(__dirname, "../core.js"), "utf8");
+    assert.ok(!coreSource.includes("Math.min(preferredMaxWords, 10)"), "动态视觉预算仍被旧英文 10 词上限截断");
+    assert.ok(!coreSource.includes("Math.min(maxWords, 12)"), "动态视觉预算仍被旧英文 12 词上限截断");
+    assert.ok(!/languageCode\s*===|\[.*ja.*zh.*ko.*\]/s.test(Core.semanticPlanningGroups.toString()), "词法提示层出现逐语言分支");
+
+    const isolatedSource = fs.readFileSync(path.join(__dirname, "../isolated.js"), "utf8");
+    assert.ok(!isolatedSource.includes("hasNativeTokenTiming(rawCues, 0.8)"), "75.9% 原生时间覆盖的真实日语轨仍会被挡在 semantic 外");
+    assert.ok(!isolatedSource.includes("fallback-translation"), "仍存在先翻机械 fallback、再翻最终 semantic 的双翻译路径");
+    assert.ok(!isolatedSource.includes("enableFallbackTranslation"), "fallback 碎片翻译入口仍然存活");
+  });
+
   test("语言无关：把词拼回文本时连写文字之间不得插入空格", () => {
     // 一字一词之后，若无脑 join(" ")，45 字中文会变成 89 字的散字，屏上全是空隙。
     assert.equal(Core.joinRestoredWords(["米", "玛", "斯"]), "米玛斯");
     assert.equal(Core.joinRestoredWords(["Hello", "world"]), "Hello world");
     // 混排：连写侧不加空格
     assert.equal(Core.joinRestoredWords(["NASA", "が", "温", "度"]), "NASAが温度");
+  });
+
+  test("选定源语言后统一优先同语言人工轨，没有人工轨才保留 ASR", () => {
+    const tracks = [
+      { code: "ja-asr", languageCode: "ja", kind: "asr", url: "ja-asr" },
+      { code: "ja", languageCode: "ja", kind: "", url: "ja-manual" },
+      { code: "pl-asr", languageCode: "pl", kind: "asr", url: "pl-asr" },
+      { code: "ar", languageCode: "ar", kind: "", url: "ar-manual" },
+      { code: "ar-asr", languageCode: "ar", kind: "asr", url: "ar-asr" },
+    ];
+    assert.equal(Core.preferManualTrack(tracks, tracks[0]).url, "ja-manual");
+    assert.equal(Core.preferManualTrack(tracks, tracks[2]).url, "pl-asr", "没有人工同语言轨时不得误切到其他语言");
+    assert.equal(Core.preferManualTrack(tracks, tracks[4]).url, "ar-manual");
+    assert.ok(!/["'](?:ja|pl|ar)["']/.test(Core.preferManualTrack.toString()), "人工轨排序不得包含语言代码名单");
   });
 
   test("真实波兰语人工字幕轨（yt-dlp 抓取，0% 词级时间）：整轨可用且原文保真", () => {
@@ -3845,12 +4071,12 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
 
     // 区间必须能真的换入：这条直接调用生产替换器，覆盖校验不通过就会抛错。
     // 用「原样替换」验证下标空间一致性 —— 这正是 mismatch 缺陷的最小复现。
-    const sameCues = [];
-    for (let i = first.startIndex; i < first.endIndex; i++) {
-      sameCues.push({ start: snapshot.units[i].startMs, end: snapshot.units[i].endMs, content: snapshot.units[i].originalText });
-    }
+    const sameCues = visualReplacementCues(first.tokens);
     const replaced = Core.resegmentTimelineSnapshot(snapshot, first.startIndex, first.endIndex, sameCues);
-    assert.ok(replaced && replaced.units.length === snapshot.units.length, "原样区间替换必须通过词流覆盖校验");
+    assert.ok(replaced && replaced.units.length > 0, "视觉受限的原样区间替换必须通过词流覆盖校验");
+    const installed = replaced.units.filter((u) => u.tokenStart >= first.tokens[0].index && u.tokenEnd <= first.tokens[first.tokens.length - 1].index + 1);
+    assert.strictEqual(new Set(installed.map((u) => u.semanticGroupId)).size, 1, "semanticGroupId 必须穿过 snapshot 换入层");
+    assert.strictEqual(new Set(Core.cuesFromTimelineSnapshot(replaced).filter((c) => installed.some((u) => u.id === c.unitId)).map((c) => c.semanticGroupId)).size, 1, "翻译 cue 必须继承 semanticGroupId");
   });
 
   test("语义区间换入必须保住已有译文：边界内的译文不得被换入丢弃", () => {
@@ -3890,16 +4116,7 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     // 语义恢复真实形状：按语义重切，新边界与旧边界普遍交叉
     const intervalTokenStart = units[iv.startIndex].tokenStart;
     const intervalTokenEnd = units[iv.endIndex - 1].tokenEnd;
-    const resegmented = [];
-    let cursor = intervalTokenStart;
-    let step = 0;
-    while (cursor < intervalTokenEnd) {
-      const size = [10, 11, 8][step++ % 3];
-      const end = Math.min(cursor + size, intervalTokenEnd);
-      const tk = timeline.tokens.slice(cursor, end).map((t) => ({ text: t.text, start: t.startMs, end: t.endMs }));
-      resegmented.push({ start: tk[0].start, end: tk[tk.length - 1].end, content: tk.map((t) => t.text).join(" "), tokens: tk });
-      cursor = end;
-    }
+    const resegmented = visualReplacementCues(timeline.tokens.slice(intervalTokenStart, intervalTokenEnd));
     const after = Core.resegmentTimelineSnapshot(snapshot, iv.startIndex, iv.endIndex, resegmented);
 
     const coveredBefore = new Set();
@@ -3918,7 +4135,7 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
       `区间换入丢失了 ${lost}/${coveredBefore.size} 个边界外的已翻词 —— 换入不得影响它触及范围之外的译文`);
   });
 
-  test("翻译输入卫士只按源词数上限拦，语义断句质量由恢复装载时校验", () => {
+  test("翻译输入卫士只保护模型容量，语义视觉质量由动态预算在装载时校验", () => {
     // 真机实测缺陷（必须真浏览器 + 真轨 + 真模型才暴露，离线门禁全绿）：
     // 输入卫士曾按 segmentationMode 分叉（semantic 12 / 其他 14），把"semantic 恢复结果
     // 该 ≤12 词"这个**断句质量**约束混进了翻译路径。语义恢复只覆盖当前区间，区间外仍是
@@ -3929,7 +4146,8 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     assert.ok(!/segmentationMode\s*===\s*["']semantic["']\s*\?/.test(guard),
       "输入卫士不得按 segmentationMode 分叉词数上限");
 
-    // 14 词单元在任何 mode 下都必须能翻（fallback 续接的合法产物）
+    assert.equal(Core.SEMANTIC_MAX_TOKENS, 40, "翻译输入容量必须覆盖语言无关视觉预算的最大值");
+    // 14 词单元在任何 mode 下都必须能翻；输入卫士不再承担显示质量判断。
     const cue14 = {
       unitId: "u0", tokenStart: 0, tokenEnd: 14, start: 0, end: 1400,
       content: "one two three four five six seven eight nine ten eleven twelve thirteen fourteen",
@@ -3946,10 +4164,10 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
       }), `mode=${mode} 下 14 词单元必须能翻`);
     }
 
-    // 语义断句质量约束必须落在恢复装载处：>12 词的恢复结果要 fail-closed
+    // 语义断句质量约束必须落在恢复装载处，并调用同一视觉预算权威。
     const resegment = String(Core.resegmentTimelineSnapshot);
-    assert.ok(/DISPLAY_UNIT_MAX_WORDS|semantic replacement unit/.test(resegment),
-      "resegmentTimelineSnapshot 必须校验恢复结果的单元词数");
+    assert.ok(/semanticTokenBudgets|visual cap/.test(resegment),
+      "resegmentTimelineSnapshot 必须按语言无关视觉预算校验恢复结果");
   });
 
   test("翻译不得越过语义恢复边界：越界翻的内容注定作废重翻", () => {
@@ -3984,37 +4202,13 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     assert.deepStrictEqual(cold.plan, [5], "边界为 0 时仍须保留当前段");
   });
 
-  test("预取调度不得被旁路：prefetchAround 只能经 planTranslationWindow 决定翻哪些段", () => {
-    // 为什么需要这条：上一条门禁测的是 planTranslationWindow 这个纯函数，
-    // 但缺陷本体是**调用点**上的降级分支（semanticPending 时直接只翻当前段）。
-    // 实测把该分支重新注入调用点时，纯函数门禁照样全绿 —— 判据被绕过了看不见。
-    // 所以必须同时锁住"调用点没有旁路"。
+  test("block 预取只能经 planTranslationWindow，且不再启动 semantic 推进器", () => {
     const src = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
-    const body = src.slice(src.indexOf("function prefetchAround"), src.indexOf("function maybeAdvanceSemanticInterval"));
-    assert.ok(body.length > 200, "未找到 prefetchAround 实现");
-    assert.ok(/Core\.planTranslationWindow\(/.test(body), "prefetchAround 必须经 planTranslationWindow 决定预取窗口");
-
-    // 判据之前不得出现任何 translateClip —— 那就是绕过窗口直接开翻。
-    const decideAt = body.indexOf("Core.planTranslationWindow(");
-    const earlyTranslate = body.slice(0, decideAt).indexOf("translateClip(");
-    assert.strictEqual(earlyTranslate, -1, "预取判据之前不得直接 translateClip（绕过调度窗口）");
-
-    // 语义恢复的推进必须领先于**预取窗口**，不是领先于播放位置。
-    // 注入实测：把提前量换回 SEMANTIC_INTERVAL_MS/2（领先播放但落后于预取窗口）时
-    // 纯函数门禁全绿 —— 因为这条约束在调度代码里，只能在源码层锁。
-    // 后果是预取一直撞在恢复边界上被截断，翻译闲着等恢复，反而更慢。
-    const advance = String(src.match(/function maybeAdvanceSemanticInterval[\s\S]*?\n  }\n/) || "");
-    assert.ok(advance, "必须能找到 maybeAdvanceSemanticInterval");
-    assert.ok(/PREFETCH_AHEAD/.test(advance),
-      "恢复推进的提前量必须由预取窗口深度(PREFETCH_AHEAD)推导，不得只按播放位置或区间长度");
-    assert.ok(!/SEMANTIC_INTERVAL_MS\s*\/\s*2/.test(advance),
-      "不得用 SEMANTIC_INTERVAL_MS/2 作提前量：那只领先播放，落后于预取窗口");
-
-    // 也不得靠 semanticPending 降级预取：这正是"翻译永远跟不上播放"的根因。
-    // 只看可执行代码 —— 注释里解释这段历史是应该的，不能因此判红。
-    const code = body.split("\n").filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line)).join("\n");
-    assert.ok(!/semanticPending/.test(code), "prefetchAround 不得依据 semanticPending 降级预取窗口");
-  });
+    const prefetch = src.slice(src.indexOf("function prefetchAround"), src.indexOf("function getBackoff"));
+    assert.match(prefetch, /Core\.planTranslationWindow\(/);
+    assert.doesNotMatch(prefetch, /maybeAdvanceSemanticInterval|semanticPending|restoreSemantic/);
+    assert.match(prefetch, /translateClip\(plan\[0\], 100\)/);
+  })
 
   test("翻译必须始终领先播放：整轨模拟播放，译文边界不得被播放追上", () => {
     // 用户报障原话：「我看着翻译文字永远也跟不上字幕」。

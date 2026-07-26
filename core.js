@@ -768,10 +768,11 @@
         end: unit.endMs,
         duration: Math.max(0, unit.endMs - unit.startMs),
         content: unit.originalText,
-        unitId: unit.unitId,
+        unitId: unit.id,
         tokenStart: unit.tokenStart,
         tokenEnd: unit.tokenEnd,
         sourceFingerprint: unit.sourceFingerprint,
+        semanticGroupId: unit.semanticGroupId != null ? String(unit.semanticGroupId) : String(unit.id),
         tokens: span.map(function (token) {
           return {
             id: token.id,
@@ -793,20 +794,18 @@
     if (!Number.isInteger(firstUnit) || !Number.isInteger(afterUnit) || firstUnit < 0 || afterUnit <= firstUnit || afterUnit > snapshot.units.length) {
       throw new Error("replacement unit range invalid");
     }
-    // 语义恢复结果的合法性校验属于**这里**（装载时），不属于翻译路径。
-    // 模型返回明显超长的边界 = 结果不可信，fail-closed 保住当前可用时间轴。
-    // 此约束曾错放在 translateClipWithBoundaryRepair 的输入卫士里并按 mode 分叉，
-    // 导致区间外的合法 fallback 单元被连坐拒翻（真机实测 59% 覆盖率）—— 见该函数注释。
-    (replacementCues || []).forEach(function (cue, ci) {
-      var n = restoredWords(String(cue && cue.content || "")).length;
-      // 上限用 SOURCE_UNIT_MAX_WORDS：语义恢复为保住语法续接本来就会产出 13-14 词单元
-      // （实测按 12 拒会让整个区间恢复失败）。这里只拦真正异常的超长结果。
-      if (n > SOURCE_UNIT_MAX_WORDS) {
-        throw new Error("semantic replacement unit " + ci + " has " + n + " words (cap " + SOURCE_UNIT_MAX_WORDS + ")");
-      }
-    });
     var tokenStart = snapshot.units[firstUnit].tokenStart;
     var tokenEnd = snapshot.units[afterUnit - 1].tokenEnd;
+    // 装载质量门禁必须与生成这些单元的同一份语言无关视觉预算一致。固定 12/14
+    // 会把连写文字按“字符数”拒掉，而空格语言按“词数”通过，形成隐蔽语言分支。
+    var replacementBudget = semanticTokenBudgets(snapshot.timeline.tokens.slice(tokenStart, tokenEnd));
+    (replacementCues || []).forEach(function (cue, ci) {
+      var n = restoredWords(String(cue && cue.content || "")).length;
+      var width = semanticDisplayWidth(String(cue && cue.content || ""));
+      if (n > SEMANTIC_MAX_TOKENS || width > replacementBudget.maxVisualWidth) {
+        throw new Error("semantic replacement unit " + ci + " has " + n + " tokens / " + width + " width");
+      }
+    });
     var sourceWords = snapshot.timeline.tokens.slice(tokenStart, tokenEnd).map(function (token) { return token.text; });
     var replacementWords = [];
     var localEnds = [];
@@ -836,6 +835,21 @@
     boundaries = boundaries.concat(localEnds);
     for (var right = afterUnit; right < snapshot.units.length; right++) boundaries.push(snapshot.units[right].tokenEnd - 1);
     var nextUnits = buildTokenSpanUnits(snapshot.timeline, boundaries);
+    // semanticGroupId 必须穿过 snapshot 换入层；否则 display cut 一装载就退化成
+    // “每屏各自翻译”，完整语义与短屏又会重新绑死。区间 tokenStart 作为 namespace，
+    // 防止不同滑动区间里的 sg0/sg1 相撞。
+    var replacementGroupsByEnd = {};
+    (replacementCues || []).forEach(function (cue, index) {
+      replacementGroupsByEnd[localEnds[index] + 1] = "sem:" + tokenStart + ":" + String(cue.semanticGroupId || "sg" + index);
+    });
+    nextUnits.forEach(function (unit) {
+      if (unit.tokenStart >= tokenStart && unit.tokenEnd <= tokenEnd) {
+        unit.semanticGroupId = replacementGroupsByEnd[unit.tokenEnd] || "sem:" + tokenStart + ":sg" + unit.tokenStart;
+        return;
+      }
+      var prior = snapshot.units.find(function (oldUnit) { return oldUnit.tokenStart === unit.tokenStart && oldUnit.tokenEnd === unit.tokenEnd; });
+      if (prior && prior.semanticGroupId != null) unit.semanticGroupId = prior.semanticGroupId;
+    });
 
     // 译文继承必须按「词」判定，不能要求 token 跨度逐字节相等。
     //
@@ -995,6 +1009,15 @@
   // 导致 13-14 词的合法续接单元永远翻不了 —— 真机才暴露，离线门禁全绿。
   var DISPLAY_UNIT_MAX_WORDS = 12;
   var SOURCE_UNIT_MAX_WORDS = 14;
+  // 仅作为模型输入容量的绝对保险丝；实际显示硬门禁是 SOURCE_DISPLAY_MAX_WIDTH
+  // 的语言无关半角视觉宽度。值不能低于短 token 书写系统中一个合规短屏的容量。
+  var SEMANTIC_MAX_TOKENS = 40;
+  // 所有源语言共用半角视觉宽度，而不是“英文词数/日文字符数”。源文单屏硬上限
+  // 52，中文译文更紧凑到 48；完整语义允许跨多个显示单元，但任何实际行都不能靠
+  // 缩成小字来塞下。
+  var SOURCE_DISPLAY_PREFERRED_WIDTH = 48;
+  var SOURCE_DISPLAY_MAX_WIDTH = 52;
+  var TRANSLATION_DISPLAY_MAX_WIDTH = 48;
 
   var TRANSLATE_TIMEOUT_MS = 90000;
 
@@ -1010,34 +1033,31 @@
   // 相邻两个词只要有一侧属于连写文字，就直接相接不加空格；两侧都是空格分词语言
   // （英/波/俄/越…）才加空格。这样中英混排 "NASAが温度" 也能正确还原。
   var UNSPACED_EDGE_RE = new RegExp("^" + UNSPACED_SCRIPT_SOURCE + "$", "u");
-  // 判断一个词内部是否含连写文字（用于决定要不要再切一层）
-  var UNSPACED_CHAR_RE = new RegExp(UNSPACED_SCRIPT_SOURCE, "u");
-  // 把含连写文字的词切成"一字一片"，同时让紧跟其后的标点/闭合引号留在该字上，
-  // 使句末判定仍能在正确的片上看到句号。非连写字符（拉丁字母、数字）按连续块保留，
-  // 这样 "NASAが温度" 会切成 ["NASA","が","温","度"] 而不是逐个字母散开。
-  // 拉丁分支同样必须用 SPACED_LETTER（排除连写文字），否则 \p{L} 会让 "NASA" 把
-  // 后面的 "が温度マップ…" 一起吞进同一片，整段又变成不可再切的巨词（实测 42 词）。
-  var UNSPACED_PIECE_RE = new RegExp(
-    UNSPACED_SCRIPT_SOURCE + "[^\\p{L}\\p{M}\\p{N}\\s]*" +
-    "|" + SPACED_LETTER + "+(?:['’-]" + SPACED_LETTER + "+)*[^\\p{L}\\p{M}\\p{N}\\s]*" +
-    "|[^\\p{L}\\p{M}\\p{N}\\s]+",
-    "gu"
-  );
-  // 切分成"显示用词"：空格分词语言按空白切（词上保留原标点，句末判定要用），
-  // 连写文字再按字细切一层，标点跟随所属的字。
-  // 与 restoredWords() 的区别只在于保留标点，词的边界口径完全一致 —— 这样
-  // 「显示侧算几个词」与「canonical 侧几个 token」不会错位。
+  // 切分成“显示用词”：词边界必须完全来自唯一权威 RESTORE_WORD_RE；显示侧只负责
+  // 把被权威正则忽略的标点附着回相邻 token，绝不能另写一套 tokenizer。
+  //
+  // 每个空白块内按 newWordRe() 的 match span 取 token：首 token 吸收前置标点，
+  // 各 token 吸收到下一个 token 前的尾随标点。这样既保留句末判定所需的标点，又保证
+  // restoredWords(displayPiece) 与 canonical token 一一对应：
+  //   “0.1mmず” → [“0.1”, “mm”, “ず”]，不会再变成 [“0.”,“1mm”,“ず”]。
   function splitDisplayWords(text) {
     var out = [];
     var rawWords = collapseWhitespace(text).split(" ").filter(Boolean);
     for (var i = 0; i < rawWords.length; i++) {
       var raw = rawWords[i];
-      if (!UNSPACED_CHAR_RE.test(raw)) { out.push(raw); continue; }
-      var pieces = raw.match(UNSPACED_PIECE_RE);
-      if (pieces && pieces.length > 1) {
-        for (var p = 0; p < pieces.length; p++) out.push(pieces[p]);
-      } else {
-        out.push(raw);
+      var matches = [];
+      var re = newWordRe();
+      var match;
+      while ((match = re.exec(raw)) !== null) {
+        if (!match[0]) { re.lastIndex++; continue; }
+        matches.push({ text: match[0], start: match.index, end: match.index + match[0].length });
+      }
+      if (!matches.length) { out.push(raw); continue; }
+      for (var p = 0; p < matches.length; p++) {
+        var current = matches[p];
+        var nextStart = p + 1 < matches.length ? matches[p + 1].start : raw.length;
+        var prefix = p === 0 ? raw.slice(0, current.start) : "";
+        out.push(prefix + current.text + raw.slice(current.end, nextStart));
       }
     }
     return out;
@@ -1126,7 +1146,14 @@
       ends.push(end);
       start = end + 1;
     }
-    return segmentTokensByBoundaries(list, ends);
+    var units = segmentTokensByBoundaries(list, ends);
+    var semanticGroup = 0;
+    for (var ui = 0; ui < units.length; ui++) {
+      units[ui].semanticGroupId = "sg" + semanticGroup;
+      var endIndex = ends[ui];
+      if (marks[endIndex] === ".") semanticGroup++;
+    }
+    return units;
   }
 
   // 语义恢复的边界来自模型，但长句 rescue 仍可能在数字/介词/连词处给出
@@ -1257,6 +1284,7 @@
   function repairNaturalUnitBoundaries(units, opts) {
     opts = opts || {};
     var maxNaturalWords = Math.max(1, Math.floor(Number(opts.maxNaturalWords) || 24));
+    var maxVisualWidth = Math.max(12, Math.floor(Number(opts.maxVisualWidth) || SOURCE_DISPLAY_MAX_WIDTH));
     var maxJoinGapMs = opts.maxJoinGapMs != null ? Math.max(0, Number(opts.maxJoinGapMs)) : 2200;
     var out = [];
     for (var i = 0; i < (units || []).length; i++) {
@@ -1300,7 +1328,9 @@
       var isPredicateContinuation = /^(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did)\b/i.test(String(current.content || ""));
       var previousIsReportingUnit = previous && REPORTING_CLAUSE_PREFIX_RE.test(normalizeBoundaryText(previous.content));
       var gapMs = previous ? Math.max(0, toInt(current.start, 0) - toInt(previous.end, 0)) : Infinity;
-      if (previous && gapMs <= maxJoinGapMs && (startsContinuation || isLowercaseOrphan || previousTail || previousIsSubordinate || previousIsAndAdverbial) && !(previousIsReportingUnit && isPredicateContinuation) && unitWordCount(previous) + unitWordCount(current) <= maxNaturalWords) {
+      var mergedVisualWidth = previous ? semanticDisplayWidth(joinRestoredWords([previous.content, current.content])) : Infinity;
+      var sameSemanticGroup = !previous || previous.semanticGroupId == null || current.semanticGroupId == null || previous.semanticGroupId === current.semanticGroupId;
+      if (previous && sameSemanticGroup && gapMs <= maxJoinGapMs && (startsContinuation || isLowercaseOrphan || previousTail || previousIsSubordinate || previousIsAndAdverbial) && !(previousIsReportingUnit && isPredicateContinuation) && unitWordCount(previous) + unitWordCount(current) <= maxNaturalWords && mergedVisualWidth <= maxVisualWidth) {
         out[out.length - 1] = mergeNaturalUnits(previous, current);
       } else {
         out.push(current);
@@ -1703,12 +1733,9 @@
     apiBaseUrl: "",
     apiKey: "",
     apiModel: "gpt-4o-mini",
-    sourceLang: "auto", // auto = 优先非中文 ASR / 非中文轨，再退回第一条
-    // 源字幕轨语言是中文（zh/zh-Hans/zh-CN/yue…）时自动跳过：不拉轨、不翻译、不叠加。
-    // 默认开：目标常为 zh-Hans，中文片再翻中文既浪费又挡画面。手动指定 sourceLang=zh* 时仍会跑。
-    skipChineseSource: true,
+    sourceLang: "auto", // auto = 使用 manifest 候选顺序；显式值按 languageCode 选择
     targetLang: "zh-Hans",
-    systemPrompt: "", // 空 = 用 core 默认「源 cue 1:1 对齐」prompt
+    systemPrompt: "", // 空 = 使用语言/供应商无关的连续 block 翻译角色
     sentencePrompt: "", // 已废弃；保留键仅为兼容旧导出配置，不再使用
     waitForFirstTranslation: true,
     waitForFirstTranslationMs: 8000,
@@ -1729,16 +1756,12 @@
     transOnTop: true, // true=译文在上，原文在下
     showOriginal: true, // 是否显示原文行
     showLoading: true, // 译文未到时显示轻量"翻译中…"指示（false=只显原文）
-    clipSeconds: 12,
-    // 首个 clip 单独用更短目标（秒）。开场长 ASR 句在 clipSeconds=12 时仍可能吃进 3–4 条 cue、
-    // 源文 200+ 字 → 首包 4–6s+。firstClipSeconds 压首单元 token，后续 clip 仍用 clipSeconds。
-    firstClipSeconds: 4,
-    // 单 clip 源文字符软上限（0=关闭）。防止超长 cue 组把一次请求撑爆；只在 cue 边界断开。
-    maxSourceCharsPerClip: 160,
-    // 单 clip 最多 cue 条数软上限（0=关闭）。
-    maxCuesPerClip: 4, // 每个翻译 clip 多少秒（按 cue 边界就近切）。v0.4.1 从 15 收到 12：
-    //                  推理模型(gpt-5.x-mini) prompt 越长 reasoning token 越多、首单元越慢；
-    //                  更短 clip → 单次请求更轻 → 首包/换段更稳（见 e2e-harness A/B）。
+    clipSeconds: 30,
+    // 首块适度缩短首包，但仍要有足够上下文，不能退回逐碎片翻译。
+    firstClipSeconds: 12,
+    // block 只在源 cue 边界切分；字符与 cue 上限用于保护模型容量，不定义译文行数。
+    maxSourceCharsPerClip: 600,
+    maxCuesPerClip: 12,
     batchLines: 14, // 已废弃（v0.4.0 一个 clip = 一次请求，不再 clip 内分批）；保留键兼容旧配置。
     contextLines: 3, // 已废弃（v0.4.0 整 clip 一次翻，模型自带上下文）；保留键兼容旧配置。
     globalConcurrency: 4, // 跨 clip 的全局 in-flight 翻译请求上限（信号量）。滑动窗口预取
@@ -1808,6 +1831,7 @@
 
   function migrateConfig(config) {
     var c = Object.assign({}, config || {});
+    delete c.skipChineseSource;
     c.targetLang = normalizeTargetLang(c.targetLang) || DEFAULT_CONFIG.targetLang;
     if (c.strokeWidth == null) {
       // 旧 stroke 显式 false → 无描边(0)；否则用默认粗细
@@ -1891,46 +1915,29 @@
    * 后处理兜底：按编号落槽、保留必要中文标点并清洗格式噪声；缺槽拒绝缓存并交给调用方退避重试。
    */
 
-  // 已验证 system prompt（直接写死规则 + 压 reasoning）。{TARGET_LANG} 仅在调用方
-  // 传自定义 prompt 时替换；默认 prompt 面向简体中文，无占位符（替换为 no-op）。
+  // 通用翻译角色；具体 block JSON schema、覆盖和分屏规则由调用路径追加。
+  // {TARGET_LANG} 仅供自定义 prompt 替换。
   var DEFAULT_SYSTEM_PROMPT =
-    "你是专业中文字幕翻译。输入是同一段连续语流中已经过本地 token 边界验证的英文字幕单元。先结合前后文理解整段，再逐单元翻译为简体中文。\n" +
-    "每条译文只能承载对应 sourceText 的信息，不得把信息挪到相邻单元，不得遗漏、重复或补入源文没有的意思。\n" +
-    "每条译文必须自然闭合、简洁、适合单行字幕；可用代词或自然改写承接上下文，但不得返回悬空逗号半句。\n" +
-    "中文字幕不得输出中文句号“。”；疑问句和感叹句保留问号或感叹号。不要输出英文、解释或思考过程。\n" +
-    "只返回严格 JSON：{\"translations\":[{\"unitId\":\"...\",\"coverFrom\":0,\"coverTo\":1,\"translation\":\"...\"}]}。" +
-    "每个输入 unitId 必须恰好返回一次，coverFrom/coverTo 必须原样复制，不得返回其它字段。";
+    "你是专业中文字幕翻译。源字幕可以是任意语言。先理解给出的连续语流和上下文，再用自然、准确、简洁的简体中文表达说话者的完整意思。\n" +
+    "理解和可读性优先于逐词、逐行对齐；不得遗漏、重复、臆造或把只读上下文的信息提前写入当前译文。\n" +
+    "中文字幕不输出中文句号“。”；疑问句和感叹句保留问号或感叹号，必要的逗号可以保留。专名、数字、单位和固定表达必须保持完整。\n" +
+    "严格遵守随后给出的 JSON 协议，只返回 JSON，不要返回 Markdown、解释或思考过程。";
 
-  /** 是否中文相关 BCP47 / YouTube languageCode（zh, zh-Hans, zh-CN, yue, cmn…） */
-  function isChineseLangCode(code) {
-    var s = String(code || "").trim().toLowerCase();
-    if (!s) return false;
-    // 去掉 -asr 后缀再判
-    s = s.replace(/-asr$/, "");
-    var base = s.split(/[-_]/)[0];
-    if (base === "zh" || base === "yue" || base === "cmn" || base === "zhx") return true;
-    // 少数轨道直接标 chinese
-    if (/chinese|中文|普通话|粤语|国语/.test(s)) return true;
-    return false;
-  }
 
-  /**
-   * 该源轨是否应跳过翻译（中文片保护）。
-   *  - skipChineseSource 关闭 → 永不跳
-   *  - 用户手动指定 sourceLang 且其本身是中文 → 不跳（尊重显式选择）
-   *  - 否则看轨 languageCode / code
-   */
-  function shouldSkipChineseSource(track, opts) {
-    opts = opts || {};
-    if (!opts.skipChineseSource) return false;
-    var sourceLang = opts.sourceLang;
-    // 用户显式选了中文源轨：不跳
-    if (sourceLang && sourceLang !== "auto" && isChineseLangCode(sourceLang)) return false;
-    if (!track) return false;
-    if (isChineseLangCode(track.languageCode) || isChineseLangCode(track.code)) return true;
-    // name 兜底（无 languageCode 时）
-    if (isChineseLangCode(track.name)) return true;
-    return false;
+  // 先确定源语言，再在同一 languageCode 内选择质量更高的轨。人工轨只有 cue 级
+  // 时间也能由 canonical timeline 映射，不能再为了 ASR 的词级 offset 牺牲原文质量。
+  // 该排序只看 YouTube 的 kind/code 数据契约，不包含任何语言名单。
+  function preferManualTrack(tracks, candidate) {
+    if (!candidate || !Array.isArray(tracks)) return candidate || null;
+    var language = String(candidate.languageCode || candidate.code || "").replace(/-asr$/i, "").toLowerCase();
+    if (!language) return candidate;
+    var manual = tracks.find(function (track) {
+      if (!track) return false;
+      var trackLanguage = String(track.languageCode || track.code || "").replace(/-asr$/i, "").toLowerCase();
+      var isAsr = track.kind === "asr" || /-asr$/i.test(String(track.code || ""));
+      return trackLanguage === language && !isAsr;
+    });
+    return manual || candidate;
   }
 
   function buildSystemPrompt(targetLang, customPrompt) {
@@ -1989,6 +1996,8 @@
     else if (typeof opts === "string") opts = { sourceText: opts };
 
     var src = String(opts.sourceText == null ? "" : opts.sourceText).trim();
+    var maxVisualWidth = Math.max(1, Math.floor(Number(opts.maxVisualWidth) || TRANSLATION_DISPLAY_MAX_WIDTH));
+    if (semanticDisplayWidth(s) > maxVisualWidth) return { ok: false, reason: "visual-width" };
     // 句子是否在本屏之后继续:显式传入优先;否则由原文自身形态推断
     // (未以终止标点收尾 = 还没说完,含以单词结尾的情况)。
     var continues;
@@ -2068,35 +2077,149 @@
   }
 
   var DEFAULT_RESTORATION_PROMPT =
-    "你是英语字幕边界规划器。输入是按顺序排列的不可修改 token，每个 token 都有唯一 id 和 text。\n" +
+    "你是多语言字幕语义边界规划器。源文可能是任意语言；sourceText 是完整连续原文，groups 是按 Unicode 词法边界映射回 canonical token 的原子组。\n" +
     "只决定应在哪些 token 之后结束一个字幕单元；不得回显、改写、添加、删除、合并、拆分或重排任何 token。\n" +
-    "每个单元优先 4–11 词，最多 12 词。不得切开限定词+名词、名词短语、动词短语、短语动词、介词短语、不定式、助动词+动词、比较结构、数字+单位、专名、URL 或复合词。\n" +
-    "只返回严格 JSON：{\"cutsAfter\":[\"token-id\",...]}; cutsAfter 必须按输入顺序严格递增，不要返回其它字段、正文、Markdown 或解释。";
+    "只判断完整句、完整分句或自然话语的含义在哪里结束；短屏排版由独立阶段处理。不得在条件与结果、否定范围、因果、转折、指代、短语、修饰关系、数字+单位、专名、URL、复合词或不可分割表达中间结束语义。\n" +
+    "只返回严格 JSON：{\"semanticCutsAfter\":[\"token-id\",...]}; 每个 id 必须是 group.toId 且严格递增。不要返回其它字段、正文、Markdown 或解释。";
 
-  function parseBoundaryCutsResponse(raw, allowedTokenIds) {
+  // 语义字幕长度不能再用“英文词数”一把尺子量所有语言。这里按实际字符视觉负载
+  // 计算 token 预算，不读取 languageCode，也没有逐语言分支：全宽东亚字符约占两个
+  // 半宽字符，其余字符按一个计；预算只由当前 token 流本身决定。
+  var DISPLAY_WIDE_CHAR_RE = /[\p{sc=Han}\p{sc=Hiragana}\p{sc=Katakana}\p{sc=Hangul}\p{sc=Bopomofo}\uFF01-\uFF60\uFFE0-\uFFE6]/u;
+  function semanticDisplayWidth(text) {
+    var width = 0;
+    Array.from(String(text || "")).forEach(function (ch) {
+      if (/\p{M}/u.test(ch)) return;
+      width += DISPLAY_WIDE_CHAR_RE.test(ch) ? 2 : 1;
+    });
+    return width;
+  }
+  function semanticTokenBudgets(tokens, opts) {
+    opts = opts || {};
+    var preferredVisualWidth = Math.max(12, Math.floor(Number(opts.preferredVisualWidth) || SOURCE_DISPLAY_PREFERRED_WIDTH));
+    var maxVisualWidth = Math.max(preferredVisualWidth, Math.floor(Number(opts.maxVisualWidth) || SOURCE_DISPLAY_MAX_WIDTH));
+    var words = (tokens || []).filter(function (t) { return t && String(t.text || "").trim(); });
+    if (!words.length) return { preferredTokens: 8, maxTokens: 10, averageVisualWidth: 1, preferredVisualWidth: preferredVisualWidth, maxVisualWidth: maxVisualWidth };
+    var joined = joinRestoredWords(words.map(function (t) { return String(t.text); }));
+    var average = semanticDisplayWidth(joined) / words.length;
+    var preferred = Math.max(6, Math.min(28, Math.floor(preferredVisualWidth / Math.max(1, average))));
+    var max = Math.max(8, Math.min(SEMANTIC_MAX_TOKENS, Math.floor(maxVisualWidth / Math.max(1, average))));
+    if (max < preferred) max = preferred;
+    return { preferredTokens: preferred, maxTokens: max, averageVisualWidth: average, preferredVisualWidth: preferredVisualWidth, maxVisualWidth: maxVisualWidth };
+  }
+
+  // 给语义模型看的“词法提示层”。canonical token 仍是唯一时间/覆盖权威；这里仅用
+  // 标准 Intl.Segmenter 在重建全文上形成不可切开的候选组，并把每组映射回 canonical
+  // token ID。没有 languageCode、脚本名单或逐语言规则；不支持 Segmenter 的运行时则
+  // 安全退回一 token 一组。模型只能返回组末 token ID，正文和时间都不能被它改写。
+  function semanticPlanningGroups(tokens) {
+    var list = (tokens || []).filter(function (t) { return t && String(t.text || "").trim(); });
+    if (!list.length) return { sourceText: "", groups: [] };
+    var texts = list.map(function (t) { return String(t.text); });
+    var sourceText = joinRestoredWords(texts);
+    var spans = [];
+    var cursor = 0;
+    for (var i = 0; i < texts.length; i++) {
+      var at = sourceText.indexOf(texts[i], cursor);
+      if (at < 0) at = cursor;
+      spans.push({ start: at, end: at + texts[i].length });
+      cursor = at + texts[i].length;
+    }
+    var segments = [];
+    try {
+      if (typeof Intl !== "undefined" && typeof Intl.Segmenter === "function") {
+        segments = Array.from(new Intl.Segmenter(undefined, { granularity: "word" }).segment(sourceText))
+          .filter(function (seg) { return seg && seg.isWordLike; });
+      }
+    } catch (ignored) { segments = []; }
+    if (!segments.length) {
+      segments = spans.map(function (span) { return { index: span.start, segment: sourceText.slice(span.start, span.end) }; });
+    }
+    var groups = [];
+    segments.forEach(function (seg) {
+      var start = Number(seg.index) || 0;
+      var end = start + String(seg.segment || "").length;
+      var first = -1;
+      var last = -1;
+      for (var si = 0; si < spans.length; si++) {
+        if (spans[si].end <= start || spans[si].start >= end) continue;
+        if (first < 0) first = si;
+        last = si;
+      }
+      if (first < 0) return;
+      var previous = groups[groups.length - 1];
+      if (previous && first < previous.tokenEnd) {
+        previous.tokenEnd = Math.max(previous.tokenEnd, last + 1);
+        previous.toId = String(list[previous.tokenEnd - 1].tokenId);
+        previous.text = joinRestoredWords(texts.slice(previous.tokenStart, previous.tokenEnd));
+        return;
+      }
+      groups.push({
+        fromId: String(list[first].tokenId),
+        toId: String(list[last].tokenId),
+        text: joinRestoredWords(texts.slice(first, last + 1)),
+        visualWidth: semanticDisplayWidth(joinRestoredWords(texts.slice(first, last + 1))),
+        tokenStart: first,
+        tokenEnd: last + 1,
+      });
+    });
+    // Segmenter 只返回 word-like 段；确保任何未覆盖 canonical token 都仍有合法 cut owner。
+    for (var ti = 0; ti < list.length; ti++) {
+      var covered = groups.some(function (g) { return ti >= g.tokenStart && ti < g.tokenEnd; });
+      if (!covered) groups.push({ fromId: String(list[ti].tokenId), toId: String(list[ti].tokenId), text: texts[ti], tokenStart: ti, tokenEnd: ti + 1 });
+    }
+    groups.sort(function (a, b) { return a.tokenStart - b.tokenStart; });
+    // 数字+后续量词/单位/名词是跨语言都不可悬空的数量短语。这里只看 token 文本形态，
+    // 不维护 volt/mm/公里等语言名单；字面数字后紧邻的下一个 word-like group 原子合并。
+    var quantityGroups = [];
+    groups.forEach(function (group) {
+      var previous = quantityGroups[quantityGroups.length - 1];
+      if (previous && previous.tokenEnd === group.tokenStart && /^[+-]?\d+(?:[.,]\d+)*$/u.test(previous.text)) {
+        previous.tokenEnd = group.tokenEnd;
+        previous.toId = group.toId;
+        previous.text = joinRestoredWords(texts.slice(previous.tokenStart, previous.tokenEnd));
+        previous.visualWidth = semanticDisplayWidth(previous.text);
+      } else quantityGroups.push(group);
+    });
+    groups = quantityGroups;
+    return { sourceText: sourceText, groups: groups };
+  }
+
+  var DEFAULT_DISPLAY_PROMPT =
+    "你是多语言字幕自然显示边界规划器。semanticCutsAfter 已由语义阶段确定且不可修改；你只建议完整语义跨度内部适合换屏的位置。不得改写或回显正文，不得切开短语、修饰关系、数字+单位、专名、URL、复合词或不可分割表达。\n" +
+    "只返回严格 JSON：{\"displayCutsAfter\":[\"token-id\",...]}; 每个 id 必须是 group.toId 且严格递增。不要返回其它字段、Markdown 或解释。";
+
+  function parseTokenCutsResponse(raw, allowedTokenIds, field) {
     var text = String(raw || "").trim();
     var fenced = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
     if (fenced) text = fenced[1].trim();
     var value;
-    try { value = JSON.parse(text); } catch (_) { throw new Error("invalid boundary response JSON"); }
-    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("boundary response must be an object");
-    Object.keys(value).forEach(function (key) {
-      if (key !== "cutsAfter") throw new Error("unexpected boundary response field: " + key);
-    });
-    if (!Array.isArray(value.cutsAfter)) throw new Error("cutsAfter must be an array");
+    try { value = JSON.parse(text); } catch (_) { throw new Error("invalid " + field + " JSON"); }
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(field + " response must be an object");
+    var keys = Object.keys(value).sort();
+    if (keys.join("|") !== field) throw new Error(field + " fields invalid");
+    if (!Array.isArray(value[field])) throw new Error(field + " must be an array");
     var allowed = (allowedTokenIds || []).map(String);
     var positions = {};
     allowed.forEach(function (id, index) { positions[id] = index; });
     var previous = -1;
-    return value.cutsAfter.map(function (rawId) {
-      if (typeof rawId !== "string" && typeof rawId !== "number") throw new Error("cut token ID must be a string or number");
+    return value[field].map(function (rawId) {
+      if (typeof rawId !== "string" && typeof rawId !== "number") throw new Error(field + " token ID invalid");
       var id = String(rawId);
-      if (!Object.prototype.hasOwnProperty.call(positions, id)) throw new Error("unknown cut token ID: " + id);
+      if (!Object.prototype.hasOwnProperty.call(positions, id)) throw new Error("unknown " + field + " token ID: " + id);
       var position = positions[id];
-      if (position <= previous) throw new Error("cutsAfter must be strictly increasing");
+      if (position <= previous) throw new Error(field + " must be strictly increasing");
       previous = position;
       return id;
     });
+  }
+
+  function parseBoundaryPlanResponse(raw, allowedTokenIds) {
+    return { semanticCutsAfter: parseTokenCutsResponse(raw, allowedTokenIds, "semanticCutsAfter") };
+  }
+
+  function parseDisplayCutsResponse(raw, allowedTokenIds) {
+    return parseTokenCutsResponse(raw, allowedTokenIds, "displayCutsAfter");
   }
 
   function tokenWords(tokens) {
@@ -2232,7 +2355,9 @@
     opts = opts || {};
     var tokens = (opts.tokens || []).filter(function (t) { return t && t.text; }).map(function (token, index) {
       var copy = Object.assign({}, token);
-      copy.tokenId = String(token.tokenId != null ? token.tokenId : "t" + index);
+      copy.tokenId = String(token.tokenId != null ? token.tokenId : (token.id != null ? token.id : "t" + index));
+      copy.start = toInt(token.start != null ? token.start : token.startMs, 0);
+      copy.end = Math.max(copy.start, toInt(token.end != null ? token.end : token.endMs, copy.start));
       return copy;
     });
     if (!tokens.length) return { tokens: [], marks: [] };
@@ -2247,13 +2372,18 @@
     for (var ri = 0; ri < ranges.length; ri++) {
       var range = ranges[ri];
       var chunk = tokens.slice(range.start, range.end);
-      var ids = chunk.map(function (token) { return token.tokenId; });
+      var planning = semanticPlanningGroups(chunk);
+      var ids = planning.groups.map(function (group) { return group.toId; });
       var request = JSON.stringify({
+        sourceText: planning.sourceText,
+        groups: planning.groups.map(function (group) { return { fromId: group.fromId, toId: group.toId, text: group.text, visualWidth: group.visualWidth }; }),
         tokens: chunk.map(function (token) { return { id: token.tokenId, text: String(token.text) }; }),
-        preferredWords: Math.max(1, Math.floor(Number(opts.preferredMaxWords) || 10)),
-        maxWords: Math.max(1, Math.floor(Number(opts.maxWords) || 12)),
+        preferredTokens: Math.max(1, Math.floor(Number(opts.preferredMaxWords) || 10)),
+        maxTokens: Math.max(1, Math.floor(Number(opts.maxWords) || 12)),
+        preferredVisualWidth: Math.max(12, Math.floor(Number(opts.preferredVisualWidth) || SOURCE_DISPLAY_PREFERRED_WIDTH)),
+        maxVisualWidth: Math.max(12, Math.floor(Number(opts.maxVisualWidth) || SOURCE_DISPLAY_MAX_WIDTH)),
       });
-      var cuts = null;
+      var plan = null;
       var attempts = opts.attempts != null ? Math.max(1, Number(opts.attempts)) : 2;
       for (var attempt = 0; attempt < attempts; attempt++) {
         try {
@@ -2275,24 +2405,67 @@
             });
           };
           var response = typeof opts.runRequest === "function" ? await opts.runRequest(doChat) : await doChat();
-          cuts = parseBoundaryCutsResponse(response, ids);
+          plan = parseBoundaryPlanResponse(response, ids);
           break;
         } catch (error) {
           if (error && /translate aborted|translate timeout|translate network|translate HTTP/i.test(String(error.message || error))) throw error;
-          cuts = null;
+          plan = null;
         }
       }
-      if (!cuts) throw new Error("invalid boundary cuts chunk " + ri);
-      var cutSet = {};
-      cuts.forEach(function (id) { cutSet[id] = true; });
+      if (!plan) throw new Error("invalid boundary plan chunk " + ri);
+      var semanticSet = {};
+      plan.semanticCutsAfter.forEach(function (id) { semanticSet[id] = true; });
       for (var pos = range.commitStart; pos < range.commitEnd; pos++) {
-        if (cutSet[tokens[pos].tokenId]) marks[pos] = "|";
+        var tokenId = tokens[pos].tokenId;
+        if (semanticSet[tokenId]) marks[pos] = ".";
       }
     }
     return { tokens: tokens, marks: marks };
   }
 
-  // 局部 rescue 的 | 只在两侧都可作为连续字幕阅读时保留。
+  async function suggestDisplayTokenBoundaries(tokens, semanticMarks, opts) {
+    opts = opts || {};
+    var list = tokens || [];
+    if (!list.length) return [];
+    var planning = semanticPlanningGroups(list);
+    var ids = list.map(function (token) { return String(token.tokenId); });
+    var semanticCuts = [];
+    (semanticMarks || []).forEach(function (mark, index) { if (mark === ".") semanticCuts.push(ids[index]); });
+    var payload = {
+      sourceText: planning.sourceText,
+      tokens: list.map(function (token) { return { id: String(token.tokenId), text: token.text }; }),
+      groups: planning.groups.map(function (group) {
+        return { fromId: group.fromId, toId: group.toId, text: group.text, visualWidth: semanticDisplayWidth(group.text) };
+      }),
+      semanticCutsAfter: semanticCuts,
+      preferredVisualWidth: Math.max(12, Math.floor(Number(opts.preferredVisualWidth) || SOURCE_DISPLAY_PREFERRED_WIDTH)),
+      maxVisualWidth: Math.max(12, Math.floor(Number(opts.maxVisualWidth) || SOURCE_DISPLAY_MAX_WIDTH)),
+    };
+    try {
+      var doChat = function () {
+        return chatCompletion({
+          apiBaseUrl: opts.apiBaseUrl,
+          apiKey: opts.apiKey,
+          apiModel: opts.apiModel,
+          reasoningEffort: opts.reasoningEffort,
+          systemContent: opts.displaySystemPrompt || DEFAULT_DISPLAY_PROMPT,
+          userContent: JSON.stringify(payload),
+          timeoutMs: opts.timeoutMs || TRANSLATE_TIMEOUT_MS,
+          fetchImpl: opts.fetchImpl,
+          onUsage: opts.onUsage,
+          signal: opts.signal,
+        });
+      };
+      var displayRunner = typeof opts.runDisplayRequest === "function" ? opts.runDisplayRequest : opts.runRequest;
+      var response = typeof displayRunner === "function" ? await displayRunner(doChat) : await doChat();
+      return parseDisplayCutsResponse(response, ids);
+    } catch (error) {
+      if (error && /translate aborted/i.test(String(error.message || error))) throw error;
+      return [];
+    }
+  }
+
+  // 以下旧边界判据只供历史诊断测试；生产 semantic 路径不再调用它们。
   // 模型偶尔会给出 "boiling water | than this ..."；删掉这个坏边界后，
   // 同一句仍可保留前面的自然 14/20 分屏，而不是整句退化成 34 词。
   // flow 模式(整轨首遍)只保留破坏词法绑定的硬否决:数字+单位、比较结构。
@@ -2517,72 +2690,97 @@
     return out;
   }
 
+  function enforceVisualDisplayMarks(tokens, marks, maxVisualWidth) {
+    var list = tokens || [];
+    var out = (marks || []).slice();
+    if (out.length !== list.length) throw new Error("visual display marks length mismatch");
+    var cap = Math.max(12, Math.floor(Number(maxVisualWidth) || SOURCE_DISPLAY_MAX_WIDTH));
+    var suggested = {};
+    for (var si = 0; si < out.length; si++) {
+      if (out[si] === "|") { suggested[si] = true; out[si] = ""; }
+    }
+    var originalEnds = [];
+    for (var i = 0; i < out.length; i++) if (out[i] === ".") originalEnds.push(i);
+    if (originalEnds[originalEnds.length - 1] !== list.length - 1) originalEnds.push(list.length - 1);
+    var segmentStart = 0;
+    originalEnds.forEach(function (segmentEnd) {
+      var segment = list.slice(segmentStart, segmentEnd + 1);
+      if (semanticDisplayWidth(joinRestoredWords(segment.map(function (t) { return t.text; }))) <= cap) {
+        segmentStart = segmentEnd + 1;
+        return;
+      }
+      var groups = semanticPlanningGroups(segment).groups;
+      var widthOf = function (start, end) {
+        return semanticDisplayWidth(joinRestoredWords(groups.slice(start, end).map(function (group) { return group.text; })));
+      };
+      for (var atom = 0; atom < groups.length; atom++) {
+        if (widthOf(atom, atom + 1) > cap) throw new Error("lexical group exceeds visual width cap");
+      }
+      var totalWidth = widthOf(0, groups.length);
+      var minPieces = Math.max(2, Math.ceil(totalWidth / cap));
+      var bestCuts = null;
+      for (var pieces = minPieces; pieces <= groups.length && !bestCuts; pieces++) {
+        var target = totalWidth / pieces;
+        var dp = Array.from({ length: pieces + 1 }, function () { return new Array(groups.length + 1).fill(null); });
+        dp[0][0] = { score: 0, cuts: [] };
+        for (var piece = 1; piece <= pieces; piece++) {
+          for (var end = piece; end <= groups.length; end++) {
+            for (var start = piece - 1; start < end; start++) {
+              if (!dp[piece - 1][start]) continue;
+              var width = widthOf(start, end);
+              if (width > cap) continue;
+              var penalty = Math.pow(width - target, 2);
+              if (width < target * 0.45) penalty += Math.pow(target, 2) * 4;
+              var proposedCut = end < groups.length ? segmentStart + groups[end - 1].tokenEnd - 1 : -1;
+              if (proposedCut >= 0 && suggested[proposedCut]) penalty -= Math.pow(target, 2) * 0.2;
+              var score = dp[piece - 1][start].score + penalty;
+              if (!dp[piece][end] || score < dp[piece][end].score) {
+                dp[piece][end] = { score: score, cuts: dp[piece - 1][start].cuts.concat(end < groups.length ? [end] : []) };
+              }
+            }
+          }
+        }
+        if (dp[pieces][groups.length]) bestCuts = dp[pieces][groups.length].cuts;
+      }
+      if (!bestCuts) throw new Error("cannot partition visual display groups");
+      bestCuts.forEach(function (groupEnd) {
+        var cut = segmentStart + groups[groupEnd - 1].tokenEnd - 1;
+        if (out[cut] !== ".") out[cut] = "|";
+      });
+      segmentStart = segmentEnd + 1;
+    });
+    return out;
+  }
+
   async function restoreAndPackTokens(opts) {
     opts = opts || {};
     var restored = await restoreTokenBoundaries(opts);
     var maxWords = opts.maxWords || 12;
     var preferredMaxWords = opts.preferredMaxWords || 10;
-    // 整轨首遍:信任模型已遵守短语规则的从句级分屏(字幕是连续语流,一屏以介词/
-    // 连词/从句引导词开头是自然的)。flow 模式只否决破坏词法绑定的切分(数字+单位、
-    // 比较结构),不做「每屏都要独立成句」的整屏否决——否则连续语流会被整段删光。
-    restored.marks = filterUnsafeRescueMarks(tokenWords(restored.tokens), restored.marks, { mode: "flow" });
-    // 先按整句纠正模型的“4词碎屏 + 21词长屏”等坏组合。确定性分区能同时看见
-    // reporting 主语、限定谓语与 trailing adjunct，避免局部 rescue 丢失句首上下文。
-    restored.marks = normalizeOversizeSentenceMarks(restored.tokens, restored.marks, {
-      preferredWords: Math.min(preferredMaxWords, 10), hardWords: Math.min(maxWords, 12), minWords: 4,
-    });
+    var preferredVisualWidth = Math.max(12, Math.floor(Number(opts.preferredVisualWidth) || SOURCE_DISPLAY_PREFERRED_WIDTH));
+    var maxVisualWidth = Math.max(preferredVisualWidth, Math.floor(Number(opts.maxVisualWidth) || SOURCE_DISPLAY_MAX_WIDTH));
+    // 模型 cut 已经被 parseBoundaryPlanResponse 限定到 Unicode group.toId。不要再用
+    // 英语正则“复审”模型边界：那会在任意其它语言上形成第二套、互相漂移的判定器。
+    // semantic 与 display 使用两次单字段请求，避免弱模型混淆两个概念。显示建议失败时
+    // 保留纯确定性 DP；它永远不能新增、删除或移动 semantic cut。
+    if (opts.enableDisplaySuggestions === true) {
+      var displayIds = await suggestDisplayTokenBoundaries(restored.tokens, restored.marks, opts);
+      var displaySet = {};
+      displayIds.forEach(function (id) { displaySet[id] = true; });
+      for (var di = 0; di < restored.tokens.length; di++) {
+        if (restored.marks[di] !== "." && displaySet[String(restored.tokens[di].tokenId)]) restored.marks[di] = "|";
+      }
+    }
+    restored.marks = enforceVisualDisplayMarks(restored.tokens, restored.marks, maxVisualWidth);
     var units = packRestoredTokens(restored.tokens, restored.marks, { maxWords: maxWords });
-    // 第一轮保守只恢复全文句末；少数仍超长的完整句才做局部 clause rescue。
-    // 同样只接受逐词完全等价的结果，且每个 rescue 至多一次，避免无界模型调用。
-    var prompt = opts.oversizeSystemPrompt ||
-      "你是长字幕单元的边界规划器。输入仍是不可修改的 {id,text} token 数组。\n" +
-      "只返回严格 JSON：{\"cutsAfter\":[\"token-id\",...]}; 不得回显正文或返回其它字段。优先形成约 6–" + preferredMaxWords + " 词的单元，每段最多 " + maxWords + " 词。\n" +
-      "不得切开名词短语、动词短语、短语动词、复合词、限定词+名词、介词短语、不定式、助动词+动词、比较结构、数字+单位、专名或 URL。";
-    for (var ui = 0; ui < units.length; ui++) {
-      var unit = units[ui];
-      var unitWords = restoredWords(unit.content);
-      // 10 词是舒适目标，不是为 11 词自然屏再花一次模型调用的硬断点；
-      // 12 词屏才进入一次有界 rescue，最终仍受 hard maxWords 门禁。
-      if (unitWords.length <= Math.min(maxWords, preferredMaxWords + 1)) continue;
-      var begin = -1;
-      for (var i = 0; i < restored.tokens.length; i++) {
-        if (restored.tokens[i].start === unit.start && restored.tokens[i].end <= unit.end) { begin = i; break; }
-      }
-      if (begin < 0) continue;
-      var end = begin + unitWords.length;
-      var outerBoundary = restored.marks[end - 1];
-      var rescue = await restoreTokenBoundaries(Object.assign({}, opts, {
-        tokens: restored.tokens.slice(begin, end),
-        systemPrompt: prompt,
-        preferredMaxWords: preferredMaxWords,
-        maxWords: maxWords,
-      }));
-      // 单一权威切分:把 rescue 模型给出的 | 直接交给 partitionReadableTokenUnit。
-      // 它内部已是唯一判定器——保留可读的模型 |、DP 重排到目标词长,找不到全程
-      // 「书面完整句」路径就走 flow 保底切分,绝不产出超过 maxWords 的屏。不再先跑
-      // 一遍 strict filter 再看情况补切:那是多余中间层,还会误删候选让 DP 更难成路。
-      // 单一权威切分:把 rescue 模型给出的 | 直接交给 partitionReadableTokenUnit。
-      // 它在 token 空间工作(marks 按 token 索引,与 packRestoredTokens 契约一致),
-      // 返回长度恒等于输入 token 数,写回不会越界。
-      var marked = partitionReadableTokenUnit(rescue.tokens, rescue.marks, {
-        preferredWords: Math.min(preferredMaxWords, 10), hardWords: Math.min(maxWords, 12), minWords: 4,
-      });
-      if (!marked) continue; // 理论上 partitionReadableTokenUnit 对真实文本不返回 null;保守兜底。
-      for (var m = 0; m < marked.length; m++) restored.marks[begin + m] = marked[m];
-      // 局部 rescue 只能细分当前单元，不能删除它与后一单元之间已确认的外边界。
-      if (outerBoundary === "." || outerBoundary === "|") restored.marks[end - 1] = outerBoundary;
-      units = packRestoredTokens(restored.tokens, restored.marks, { maxWords: maxWords });
-    }
-    var repairedUnits = repairNaturalUnitBoundaries(units, {
-      preferredMaxWords: maxWords,
-      maxNaturalWords: Math.min(maxWords, opts.maxNaturalWords || maxWords),
-    });
-    for (var ri = 0; ri < repairedUnits.length; ri++) {
-      if (unitWordCount(repairedUnits[ri]) > maxWords) {
-        throw new Error("unresolved oversized semantic unit: " + unitWordCount(repairedUnits[ri]) + " words");
+    for (var ri = 0; ri < units.length; ri++) {
+      var finalWords = unitWordCount(units[ri]);
+      var finalWidth = semanticDisplayWidth(units[ri].content);
+      if (finalWords > SEMANTIC_MAX_TOKENS || finalWidth > maxVisualWidth) {
+        throw new Error("unresolved oversized semantic unit: " + finalWords + " tokens / " + finalWidth + " width");
       }
     }
-    return repairedUnits;
+    return units;
   }
 
   function translationCoverageUnitsFromCues(cues) {
@@ -2598,6 +2796,8 @@
         tokenEnd: end,
         sourceText: collapseWhitespace(cue && cue.content || ""),
         sourceFingerprint: String(cue && cue.sourceFingerprint || ""),
+        maxVisualWidth: Math.max(1, Math.floor(Number(cue && cue.maxVisualWidth) || TRANSLATION_DISPLAY_MAX_WIDTH)),
+        semanticGroupId: String(cue && cue.semanticGroupId != null ? cue.semanticGroupId : "sg" + index),
       };
     });
   }
@@ -2623,6 +2823,8 @@
         // 此前这里只挑了 unitId/tokenStart/tokenEnd,原文被丢掉 → 校验侧永远拿到
         // undefined,只能按「整句结尾」严格判,把句中切开的正确译文judge成违规。
         sourceText: String(unit && unit.sourceText || ""),
+        maxVisualWidth: Math.max(1, Math.floor(Number(unit && unit.maxVisualWidth) || TRANSLATION_DISPLAY_MAX_WIDTH)),
+        semanticGroupId: String(unit && unit.semanticGroupId != null ? unit.semanticGroupId : ""),
       };
     });
     var expectedById = {};
@@ -2665,10 +2867,13 @@
         // 正是这种情况(实测该条被误杀 2/3 次)。也不能只看原文末字符是否逗号:
         // 原文可能以单词结尾却仍未说完(如 "...want to do with")。
         var srcText = String(source.sourceText == null ? "" : source.sourceText).trim();
-        var midSentence = srcText ? !/[.!?。！？…]["'”’)\]]?$/.test(srcText) : false;
+        var sourceIndex = expected.findIndex(function (unit) { return unit.unitId === source.unitId; });
+        var continuesWithinSemanticGroup = sourceIndex >= 0 && sourceIndex + 1 < expected.length && expected[sourceIndex + 1].semanticGroupId === source.semanticGroupId;
+        var midSentence = continuesWithinSemanticGroup || (srcText ? !/[.!?。！？…]["'”’)\]]?$/.test(srcText) : false);
         var verdict = validateChineseDisplayUnit(translation, {
           sourceText: source.sourceText,
           continues: midSentence,
+          maxVisualWidth: source.maxVisualWidth,
         });
         if (!verdict.ok) contentError = "translation coverage invalid Chinese unit: " + verdict.reason;
       }
@@ -2703,7 +2908,7 @@
     var userContent = JSON.stringify({
       sourceFingerprint: Object.keys(fingerprints)[0] || "",
       units: units.map(function (unit) {
-        return { unitId: unit.unitId, coverFrom: unit.tokenStart, coverTo: unit.tokenEnd, sourceText: unit.sourceText };
+        return { unitId: unit.unitId, coverFrom: unit.tokenStart, coverTo: unit.tokenEnd, sourceText: unit.sourceText, maxVisualWidth: unit.maxVisualWidth, semanticGroupId: unit.semanticGroupId };
       }),
     });
     var content = await chatCompletion({
@@ -2729,16 +2934,9 @@
     opts = opts || {};
     var cues = (opts.cues || []).slice();
     if (!cues.length) return { cues: [], lines: [], coverage: [], repaired: false };
-    // 这个守卫是**翻译前的输入卫士**：唯一职责是拦住模型收不下的超长单元。
-    // 那个上限就是 SOURCE_UNIT_MAX_WORDS，与断句模式无关。
-    //
-    // 曾按 segmentationMode 分叉（semantic 给 12、其他给 14），混进了本不属于这里的
-    // 职责 —— "semantic 恢复结果应 ≤12 词" 是**断句质量**约束，属于恢复装载时的校验，
-    // 不该由翻译路径承担。混淆的后果（真机实测）：语义恢复只覆盖当前区间，区间外仍是
-    // fallback 断句(允许续接到 14 词)，却因全局 mode 已是 "semantic" 而按 12 词拒翻，
-    // 那些单元永远翻不了、反复退避重试到 failed，屏幕留 [未翻译]。
-    // 真机日志：clip 3 翻译失败：oversized source unit before translation: 14 words (cap 12)
-    var maxSourceWords = SOURCE_UNIT_MAX_WORDS;
+    // 输入卫士只保护模型容量；显示质量由 semanticTokenBudgets + 装载门禁负责。
+    // 两者共用 12/14 会把“英文词数”重新变成所有语言的模型输入限制。
+    var maxSourceWords = SEMANTIC_MAX_TOKENS;
     for (var i = 0; i < cues.length; i++) {
       var sourceWords = unitWordCount(cues[i]);
       if (sourceWords > maxSourceWords) throw new Error("oversized source unit before translation: " + sourceWords + " words (cap " + maxSourceWords + ")");
@@ -2748,6 +2946,325 @@
       throw new Error("translation coverage alignment mismatch");
     }
     return { cues: cues, lines: lines, coverage: lines.coverage, repaired: false };
+  }
+
+  var DEFAULT_BLOCK_TRANSLATION_PROMPT =
+    "翻译连续字幕块时先理解完整上下文，再用目标语言自然重组。允许合并或重新划分源 cue，绝不要求源译逐行对应。\n" +
+    "只返回严格 JSON：{\"segments\":[{\"sourceFrom\":\"c0\",\"sourceTo\":\"c3\",\"lines\":[\"目标语言字幕第一屏\",\"第二屏\"]}]}。\n" +
+    "segments 必须按源 cue 顺序连续且恰好覆盖全部输入；相邻源 cue 若有 750ms 或更长停顿，必须成为两个 segment 的边界。每个目标字幕屏必须至少有约 300ms 可显示时间，不得为短源范围生成大量碎屏。每个 lines 项必须是自然、可直接显示的目标语言字幕。优先按目标语言标点断句；复杂长句只在完整词或完整短语之间换屏，坚决不得把词、词组、数字与单位、专名或固定表达拆到两屏。不得返回 Markdown、解释或其它字段。";
+
+  var BLOCK_SEGMENT_MAX_GAP_MS = 750;
+  var BLOCK_MIN_DISPLAY_MS = 300;
+  var BLOCK_MAX_LINES_PER_SEGMENT = 64;
+
+  function maxBlockDisplayLines(activeMs) {
+    var byTime = Math.floor(Math.max(0, Number(activeMs) || 0) / BLOCK_MIN_DISPLAY_MS);
+    if (byTime < 1) throw new Error("block translation source duration too short for one display line");
+    return Math.min(BLOCK_MAX_LINES_PER_SEGMENT, byTime);
+  }
+
+  function blockSegmentIntegrity(segment) {
+    return hashCacheIdentity([
+      "block-lines-v1",
+      String(segment.segmentId || ""),
+      Number(segment.sourceFrom),
+      Number(segment.sourceTo),
+      (segment.lines || []).join("\x1e"),
+    ].join("\x1f"));
+  }
+
+  function targetDisplayAtoms(text) {
+    var source = String(text || "");
+    var records = [];
+    var cursor = 0;
+    var urlRe = /(?:https?:\/\/|www\.)\S+/giu;
+    function addPlain(part) {
+      if (!part) return;
+      if (typeof Intl !== "undefined" && Intl.Segmenter) {
+        var seg = new Intl.Segmenter(undefined, { granularity: "word" });
+        Array.from(seg.segment(part)).forEach(function (item) {
+          records.push({ text: item.segment, wordLike: !!item.isWordLike, protected: false });
+        });
+      } else {
+        var fallback = part.match(/[\p{L}\p{N}\p{M}]+|\s+|[^\p{L}\p{N}\p{M}\s]/gu) || [];
+        fallback.forEach(function (piece) { records.push({ text: piece, wordLike: /[\p{L}\p{N}]/u.test(piece), protected: false }); });
+      }
+    }
+    var match;
+    while ((match = urlRe.exec(source))) {
+      addPlain(source.slice(cursor, match.index));
+      records.push({ text: match[0], wordLike: true, protected: true });
+      cursor = match.index + match[0].length;
+    }
+    addPlain(source.slice(cursor));
+
+    var atoms = [];
+    var pendingPrefix = "";
+    records.forEach(function (record) {
+      if (/^\s+$/u.test(record.text)) {
+        if (atoms.length) atoms[atoms.length - 1].text += record.text;
+        else pendingPrefix += record.text;
+      } else if (!record.wordLike && !record.protected) {
+        if (atoms.length) atoms[atoms.length - 1].text += record.text;
+        else pendingPrefix += record.text;
+      } else {
+        atoms.push({ text: pendingPrefix + record.text, wordLike: record.wordLike, protected: record.protected });
+        pendingPrefix = "";
+      }
+    });
+    if (pendingPrefix) {
+      if (atoms.length) atoms[atoms.length - 1].text += pendingPrefix;
+      else atoms.push({ text: pendingPrefix, wordLike: false, protected: false });
+    }
+    for (var i = 0; i + 1 < atoms.length; i++) {
+      if (/^\s*[+\-−]?\d[\d.,:/％%]*\s*$/u.test(atoms[i].text) && atoms[i + 1].wordLike) {
+        atoms[i].text += atoms[i + 1].text;
+        atoms.splice(i + 1, 1);
+      }
+    }
+    return atoms.map(function (atom) { return atom.text; }).filter(Boolean);
+  }
+
+  function splitTargetDisplayLine(line, maxVisualWidth) {
+    var clean = sanitizeSubtitleLine(String(line == null ? "" : line));
+    if (!clean.trim()) throw new Error("block translation line empty");
+    var cap = Math.max(8, Math.floor(Number(maxVisualWidth) || TRANSLATION_DISPLAY_MAX_WIDTH));
+    if (semanticDisplayWidth(clean) <= cap) return [clean];
+    var atoms = targetDisplayAtoms(clean);
+    if (!atoms.length || atoms.some(function (atom) { return semanticDisplayWidth(atom) > cap; })) {
+      throw new Error("block translation line contains an indivisible overwide target phrase");
+    }
+    var n = atoms.length;
+    var dp = new Array(n + 1); dp[n] = { count: 0, cost: 0, lines: [] };
+    for (var i = n - 1; i >= 0; i--) {
+      var joined = "";
+      for (var j = i; j < n; j++) {
+        joined += atoms[j];
+        var width = semanticDisplayWidth(joined.trim());
+        if (width > cap) break;
+        if (!dp[j + 1]) continue;
+        var target = cap * 0.72;
+        var candidate = { count: 1 + dp[j + 1].count, cost: Math.pow(width - target, 2) + dp[j + 1].cost, lines: [joined.trim()].concat(dp[j + 1].lines) };
+        if (!dp[i] || candidate.count < dp[i].count || (candidate.count === dp[i].count && candidate.cost < dp[i].cost)) dp[i] = candidate;
+      }
+    }
+    if (!dp[0] || !dp[0].lines.length) throw new Error("block translation line cannot be split at target lexical boundaries");
+    return dp[0].lines;
+  }
+
+  function blockSourceCues(cues) {
+    return (cues || []).map(function (cue, index) {
+      var start = Number(cue && cue.start);
+      var end = Number(cue && cue.end);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) throw new Error("block source cue timing invalid");
+      var text = collapseWhitespace(cue && cue.content || "");
+      if (!text) throw new Error("block source cue text empty");
+      return { id: "c" + index, startMs: start, endMs: end, text: text };
+    });
+  }
+
+  function parseBlockTranslationResponse(raw, sourceCues, opts) {
+    opts = opts || {};
+    var source = blockSourceCues(sourceCues);
+    var text = String(raw || "").trim();
+    var fenced = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+    if (fenced) text = fenced[1].trim();
+    var payload;
+    try { payload = JSON.parse(text); } catch (_) { throw new Error("block translation invalid JSON"); }
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error("block translation response must be an object");
+    var outerKeys = Object.keys(payload);
+    if (outerKeys.length !== 1 || outerKeys[0] !== "segments" || !Array.isArray(payload.segments) || !payload.segments.length) {
+      throw new Error("block translation response must contain only non-empty segments");
+    }
+    var maxWidth = Math.max(8, Math.floor(Number(opts.maxVisualWidth) || TRANSLATION_DISPLAY_MAX_WIDTH));
+    var maxInternalGapMs = Math.max(0, Math.floor(Number(opts.maxInternalGapMs) || BLOCK_SEGMENT_MAX_GAP_MS));
+    var cursor = 0;
+    var parsed = payload.segments.map(function (segment, segmentIndex) {
+      if (!segment || typeof segment !== "object" || Array.isArray(segment)) throw new Error("block translation segment invalid");
+      if (Object.keys(segment).sort().join("|") !== "lines|sourceFrom|sourceTo") throw new Error("block translation segment fields invalid");
+      var from = source.findIndex(function (cue) { return cue.id === String(segment.sourceFrom || ""); });
+      var to = source.findIndex(function (cue) { return cue.id === String(segment.sourceTo || ""); });
+      if (from !== cursor || to < from) throw new Error("block translation source coverage gap, overlap, or reorder");
+      if (!Array.isArray(segment.lines) || !segment.lines.length) throw new Error("block translation lines empty");
+      var activeMs = source.slice(from, to + 1).reduce(function (sum, cue) {
+        return sum + Math.max(0, cue.endMs - cue.startMs);
+      }, 0);
+      var maxLines = maxBlockDisplayLines(activeMs);
+      if (segment.lines.length > maxLines) throw new Error("block translation has too many lines for source duration");
+      // 长停顿是毫秒级时间事实，模型看不见也不该负责：这里不拒绝跨停顿的语义段，
+      // 由 materializeBlockTranslation 在装载时把每屏钳到停顿的某一侧，保证静音处没有字幕。
+      var lines = [];
+      segment.lines.forEach(function (line) { lines = lines.concat(splitTargetDisplayLine(line, maxWidth)); });
+      if (lines.length > maxLines) throw new Error("block translation has too many display lines for source duration");
+      cursor = to + 1;
+      var normalized = { segmentId: "b" + segmentIndex, sourceFrom: from, sourceTo: to, lines: lines };
+      normalized.integrity = blockSegmentIntegrity(normalized);
+      return normalized;
+    });
+    if (cursor !== source.length) throw new Error("block translation source coverage incomplete");
+    return parsed;
+  }
+
+  function activeOffsetToTime(cues, offset, startSide) {
+    var remaining = Math.max(0, Number(offset) || 0);
+    for (var i = 0; i < cues.length; i++) {
+      var duration = Math.max(0, Number(cues[i].end) - Number(cues[i].start));
+      if (remaining < duration) return Number(cues[i].start) + remaining;
+      if (remaining === duration) {
+        if (startSide && i + 1 < cues.length) return Number(cues[i + 1].start);
+        return Number(cues[i].end);
+      }
+      remaining -= duration;
+    }
+    return Number(cues[cues.length - 1].end);
+  }
+
+  /** 源轨里所有 ≥ maxInternalGapMs 的真实停顿区间（说话人停下来的静音段） */
+  function longPauseRanges(cues, maxInternalGapMs) {
+    var ranges = [];
+    if (!(maxInternalGapMs > 0)) return ranges;
+    for (var i = 1; i < cues.length; i++) {
+      var gapStart = Number(cues[i - 1].end);
+      var gapEnd = Number(cues[i].start);
+      if (gapEnd - gapStart >= maxInternalGapMs) ranges.push([gapStart, gapEnd]);
+    }
+    return ranges;
+  }
+
+  // 语言无关：一屏字幕不得停留在说话人的长停顿里。落在停顿内的边界钳到停顿的对应一侧，
+  // 这样静音处不显示字幕，同时不牺牲译文的语义完整性。
+  function clampToPauseSide(pauses, ms, startSide) {
+    for (var i = 0; i < pauses.length; i++) {
+      if (ms > pauses[i][0] && ms < pauses[i][1]) return startSide ? pauses[i][1] : pauses[i][0];
+    }
+    return ms;
+  }
+
+  /**
+   * 一屏文字整体横跨了某个停顿时（start 在停顿前、end 在停顿后），只钳边界是不够的
+   * —— 边界都在停顿外，字幕会硬挺过整段静音。实测真实英语轨 3/405 屏是这种情况
+   * （最长 6802ms 覆盖一整个停顿）。这里把 end 收到第一个被跨越停顿的起点，
+   * 让字幕在静音开始时消失。
+   *
+   * 若停顿前的说话时间不足可读下限（这一屏只摊到 <300ms 的真实语音），
+   * 就退让到 startMs + minDisplayMs：仍然会探进静音一点，但**有界**（最多
+   * minDisplayMs，且因停顿本身 ≥750ms 必然仍落在该停顿内），绝不会像早先那样
+   * 保留原 end 而横跨整段静音。宁可多显示 300ms，也不给一闪而过的字幕；
+   * 但"多显示"必须是常数级，不能是任意长的静音。
+   */
+  function trimSpannedPause(pauses, startMs, endMs, minDisplayMs) {
+    for (var i = 0; i < pauses.length; i++) {
+      if (startMs <= pauses[i][0] && endMs >= pauses[i][1]) {
+        if (pauses[i][0] - startMs >= minDisplayMs) return pauses[i][0];
+        return Math.min(endMs, startMs + minDisplayMs);
+      }
+    }
+    return endMs;
+  }
+
+  function materializeBlockTranslation(parsedSegments, sourceCues, opts) {
+    opts = opts || {};
+    var source = blockSourceCues(sourceCues);
+    var raw = sourceCues || [];
+    var units = [];
+    var coverageCursor = 0;
+    var maxWidth = Math.max(8, Math.floor(Number(opts.maxVisualWidth) || TRANSLATION_DISPLAY_MAX_WIDTH));
+    var minDisplayMs = Math.max(1, Math.floor(Number(opts.minDisplayMs) || BLOCK_MIN_DISPLAY_MS));
+    var maxInternalGapMs = Math.max(0, Math.floor(Number(opts.maxInternalGapMs) || BLOCK_SEGMENT_MAX_GAP_MS));
+    var pauses = longPauseRanges(raw, maxInternalGapMs);
+    (parsedSegments || []).forEach(function (segment, segmentIndex) {
+      var cachedKeys = segment && typeof segment === "object" && !Array.isArray(segment) ? Object.keys(segment).sort().join("|") : "";
+      if (!segment || typeof segment !== "object" || Array.isArray(segment) ||
+          (cachedKeys !== "lines|segmentId|sourceFrom|sourceTo" && cachedKeys !== "integrity|lines|segmentId|sourceFrom|sourceTo") ||
+          segment.segmentId !== "b" + segmentIndex ||
+          !Number.isInteger(segment.sourceFrom) || segment.sourceFrom !== coverageCursor ||
+          !Number.isInteger(segment.sourceTo) || segment.sourceTo < segment.sourceFrom || segment.sourceTo >= source.length) {
+        throw new Error("block translation cached coverage invalid");
+      }
+      if (!Array.isArray(segment.lines) || !segment.lines.length) throw new Error("block translation cached lines invalid");
+      var cues = raw.slice(segment.sourceFrom, segment.sourceTo + 1);
+      var totalActive = cues.reduce(function (sum, cue) { return sum + Math.max(0, Number(cue.end) - Number(cue.start)); }, 0);
+      var maxLines = maxBlockDisplayLines(totalActive);
+      if (segment.lines.length > maxLines) throw new Error("block translation cached lines exceed duration capacity");
+      if (opts.requireIntegrity && segment.integrity !== blockSegmentIntegrity(segment)) {
+        throw new Error("block translation cache integrity mismatch");
+      }
+      // 跨长停顿的语义段合法：钳到停顿一侧由下面的 clampToPauseSide 完成，
+      // 静音处永不显示字幕，而语义完整性不因毫秒级时间事实被牺牲。
+      var cleanLines = segment.lines.map(function (line) {
+        var clean = sanitizeSubtitleLine(String(line == null ? "" : line));
+        if (!clean.trim()) throw new Error("block translation cached line empty");
+        if (semanticDisplayWidth(clean) > maxWidth) throw new Error("block translation cached line exceeds visual width");
+        return clean;
+      });
+      coverageCursor = segment.sourceTo + 1;
+      if (!(totalActive > 0)) throw new Error("block translation segment has no active duration");
+      var weights = cleanLines.map(function (line) { return Math.max(1, semanticDisplayWidth(line)); });
+      var totalWeight = weights.reduce(function (a, b) { return a + b; }, 0);
+      var usedWeight = 0;
+      cleanLines.forEach(function (line, lineIndex) {
+        var fromOffset = totalActive * usedWeight / totalWeight;
+        usedWeight += weights[lineIndex];
+        var toOffset = lineIndex + 1 === cleanLines.length ? totalActive : totalActive * usedWeight / totalWeight;
+        var startMs = clampToPauseSide(pauses, activeOffsetToTime(cues, fromOffset, true), true);
+        var endMs = clampToPauseSide(pauses, activeOffsetToTime(cues, toOffset, false), false);
+        endMs = trimSpannedPause(pauses, startMs, endMs, minDisplayMs);
+        if (!(endMs > startMs)) throw new Error("block translation materialized timing invalid");
+        var roundedStart = Math.round(startMs);
+        var roundedEnd = Math.round(endMs);
+        if (roundedEnd - roundedStart < minDisplayMs) throw new Error("block translation display duration too short");
+        var original = cues.filter(function (cue) {
+          return Number(cue.end) > startMs && Number(cue.start) < endMs;
+        }).map(function (cue) { return collapseWhitespace(cue.content || ""); }).filter(Boolean).join(" ");
+        if (!original) original = collapseWhitespace(cues[Math.min(lineIndex, cues.length - 1)].content || "");
+        units.push({
+          blockSegmentId: segment.segmentId,
+          srcStart: segment.sourceFrom + 1,
+          srcEnd: segment.sourceTo + 1,
+          originalText: original,
+          translation: line,
+          startMs: roundedStart,
+          endMs: roundedEnd,
+        });
+      });
+    });
+    if (coverageCursor !== source.length) throw new Error("block translation cached coverage incomplete");
+    return units;
+  }
+
+  async function translateContextBlock(opts) {
+    opts = opts || {};
+    var cues = opts.cues || [];
+    if (!cues.length) return { segments: [], units: [] };
+    var source = blockSourceCues(cues);
+    var contextList = function (list, prefix) {
+      return (list || []).map(function (cue, index) {
+        return { id: prefix + index, startMs: Number(cue.start), endMs: Number(cue.end), text: collapseWhitespace(cue.content || "") };
+      }).filter(function (cue) { return Number.isFinite(cue.startMs) && Number.isFinite(cue.endMs) && cue.endMs > cue.startMs && cue.text; });
+    };
+    var maxWidth = Math.max(8, Math.floor(Number(opts.maxVisualWidth || opts.maxLineChars) || TRANSLATION_DISPLAY_MAX_WIDTH));
+    var sys = buildSystemPrompt(opts.targetLang, opts.systemPrompt) + "\n" + (opts.blockSystemPrompt || DEFAULT_BLOCK_TRANSLATION_PROMPT);
+    var content = await chatCompletion({
+      apiBaseUrl: opts.apiBaseUrl,
+      apiKey: opts.apiKey,
+      apiModel: opts.apiModel,
+      temperature: opts.temperature,
+      reasoningEffort: opts.reasoningEffort,
+      systemContent: sys,
+      userContent: JSON.stringify({
+        maxVisualWidth: maxWidth,
+        contextBefore: contextList(opts.contextBefore, "p"),
+        sourceCues: source,
+        contextAfter: contextList(opts.contextAfter, "n"),
+        instruction: "contextBefore/contextAfter 只供理解，不得出现在输出覆盖范围；segments 只能覆盖 sourceCues。",
+      }),
+      timeoutMs: opts.timeoutMs,
+      fetchImpl: opts.fetchImpl,
+      onUsage: opts.onUsage,
+      signal: opts.signal,
+    });
+    var segments = parseBlockTranslationResponse(content, cues, { maxVisualWidth: maxWidth });
+    return { segments: segments, units: materializeBlockTranslation(segments, cues, { maxVisualWidth: maxWidth }) };
   }
 
   /**
@@ -2963,7 +3480,6 @@
     var maxChars = opts.maxSourceChars != null ? Number(opts.maxSourceChars) : 0;
     if (!Number.isFinite(maxChars) || maxChars < 0) maxChars = 0;
     maxChars = Math.floor(maxChars);
-
     var clips = [];
     var i = 0;
     var n = (cues || []).length;
@@ -2973,6 +3489,30 @@
       var group = [];
       var startIndex = i;
       var charCount = 0;
+      if (opts.keepSemanticGroups) {
+        while (i < n) {
+          var runStart = i;
+          var semanticId = cues[i].semanticGroupId != null ? String(cues[i].semanticGroupId) : "cue:" + i;
+          var runChars = 0;
+          while (i < n) {
+            var currentId = cues[i].semanticGroupId != null ? String(cues[i].semanticGroupId) : "cue:" + i;
+            if (currentId !== semanticId) break;
+            runChars += String(cues[i].content == null ? "" : cues[i].content).length;
+            i++;
+          }
+          var runCount = i - runStart;
+          if (maxCues > 0 && runCount > maxCues) throw new Error("semantic group exceeds clip cue limit");
+          var prospectiveSpan = cues[i - 1].end - startMs;
+          var wouldOverflow = group.length > 0 && (
+            prospectiveSpan >= size ||
+            (maxCues > 0 && group.length + runCount > maxCues) ||
+            (maxChars > 0 && charCount + runChars > maxChars)
+          );
+          if (wouldOverflow) { i = runStart; break; }
+          for (var gi = runStart; gi < i; gi++) group.push(cues[gi]);
+          charCount += runChars;
+        }
+      } else {
       while (i < n) {
         group.push(cues[i]);
         charCount += String(cues[i].content == null ? "" : cues[i].content).length;
@@ -2983,6 +3523,7 @@
         // 软上限：只在 cue 边界断开，绝不切碎单条 cue
         if (maxCues > 0 && group.length >= maxCues) break;
         if (maxChars > 0 && charCount >= maxChars) break;
+      }
       }
       clips.push({
         index: clips.length,
@@ -3390,7 +3931,7 @@
   function makeSemanticCacheKey(parts) {
     parts = parts || {};
     return [
-      "dss-v1",
+      "dss-v8",
       parts.videoId || "",
       parts.trackCode || "",
       parts.apiModel || "",
@@ -3423,15 +3964,15 @@
     parts = parts || {};
     var normalizedBase = normalizeEndpointIdentity(parts.apiBaseUrl);
     return [
-      "dsc-v70",
-      parts.contractVersion || "cue-v1",
+      "dsc-v90",
+      parts.contractVersion || "block-v1",
       parts.segmentationMode || "fallback",
       parts.videoId || "",
       parts.trackCode || "",
       parts.targetLang || "",
       parts.apiModel || "",
       hashCacheIdentity(normalizedBase),
-      hashCacheIdentity(parts.systemPrompt || DEFAULT_SYSTEM_PROMPT),
+      hashCacheIdentity((parts.systemPrompt || DEFAULT_SYSTEM_PROMPT) + "\n" + (parts.blockSystemPrompt || DEFAULT_BLOCK_TRANSLATION_PROMPT)),
       parts.reasoningEffort || "default",
       parts.maxLineChars != null ? Number(parts.maxLineChars) : "",
       parts.clipStartMs != null ? parts.clipStartMs : "",
@@ -3890,6 +4431,8 @@
     createTimelineSnapshot: createTimelineSnapshot,
     hasNativeTokenTiming: hasNativeTokenTiming,
     collectSemanticTokens: collectSemanticTokens,
+    semanticPlanningGroups: semanticPlanningGroups,
+    enforceVisualDisplayMarks: enforceVisualDisplayMarks,
     restoredWords: restoredWords,
     TRANSLATE_TIMEOUT_MS: TRANSLATE_TIMEOUT_MS,
     joinRestoredWords: joinRestoredWords,
@@ -3915,6 +4458,10 @@
     planTranslationWindow: planTranslationWindow,
     DISPLAY_UNIT_MAX_WORDS: DISPLAY_UNIT_MAX_WORDS,
     SOURCE_UNIT_MAX_WORDS: SOURCE_UNIT_MAX_WORDS,
+    SEMANTIC_MAX_TOKENS: SEMANTIC_MAX_TOKENS,
+    SOURCE_DISPLAY_PREFERRED_WIDTH: SOURCE_DISPLAY_PREFERRED_WIDTH,
+    SOURCE_DISPLAY_MAX_WIDTH: SOURCE_DISPLAY_MAX_WIDTH,
+    TRANSLATION_DISPLAY_MAX_WIDTH: TRANSLATION_DISPLAY_MAX_WIDTH,
     PREFETCH_AHEAD: PREFETCH_AHEAD,
     planSemanticInterval: planSemanticInterval,
     SEMANTIC_INTERVAL_MS: SEMANTIC_INTERVAL_MS,
@@ -3927,17 +4474,26 @@
     DEFAULT_CONFIG: DEFAULT_CONFIG,
     DEFAULT_SYSTEM_PROMPT: DEFAULT_SYSTEM_PROMPT,
     DEFAULT_RESTORATION_PROMPT: DEFAULT_RESTORATION_PROMPT,
+    DEFAULT_DISPLAY_PROMPT: DEFAULT_DISPLAY_PROMPT,
+    semanticDisplayWidth: semanticDisplayWidth,
+    semanticTokenBudgets: semanticTokenBudgets,
     buildSystemPrompt: buildSystemPrompt,
     sanitizeSubtitleLine: sanitizeSubtitleLine,
     validateChineseDisplayUnit: validateChineseDisplayUnit,
     buildClipUnits: buildClipUnits,
-    isChineseLangCode: isChineseLangCode,
-    shouldSkipChineseSource: shouldSkipChineseSource,
+    preferManualTrack: preferManualTrack,
     translationCoverageUnitsFromCues: translationCoverageUnitsFromCues,
     parseTranslationCoverageResponse: parseTranslationCoverageResponse,
+    DEFAULT_BLOCK_TRANSLATION_PROMPT: DEFAULT_BLOCK_TRANSLATION_PROMPT,
+    blockSourceCues: blockSourceCues,
+    parseBlockTranslationResponse: parseBlockTranslationResponse,
+    materializeBlockTranslation: materializeBlockTranslation,
+    translateContextBlock: translateContextBlock,
     translateClipLines: translateClipLines,
     translateClipWithBoundaryRepair: translateClipWithBoundaryRepair,
-    parseBoundaryCutsResponse: parseBoundaryCutsResponse,
+    parseBoundaryPlanResponse: parseBoundaryPlanResponse,
+    parseDisplayCutsResponse: parseDisplayCutsResponse,
+    suggestDisplayTokenBoundaries: suggestDisplayTokenBoundaries,
     restoreTokenBoundaries: restoreTokenBoundaries,
     restoreAndPackTokens: restoreAndPackTokens,
     chatCompletion: chatCompletion,
