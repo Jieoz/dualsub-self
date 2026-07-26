@@ -21,7 +21,20 @@
 
 ## 安装（加载已解压的扩展程序）
 
-当前版本：**v0.7.9**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.7.9) 下载 Chrome MV3 安装包。
+当前版本：**v0.7.10**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.7.10) 下载 Chrome MV3 安装包。
+
+v0.7.10 修复非英文/混合文字轨完全不能加载，修法不含任何语言分支：
+- **YouTube `seg` 是时间片，不是词边界。** 同一个词可以拆成多个 seg（真实轨出现
+  `["6", "TV"]`），空白也可能单独占一个 seg。旧解析器逐 seg 分词，canonical 得到
+  `6 / TV`；显示侧对整句分词得到 `6TV`，两条 token 流永久错位，fail-closed 后整轨归零。
+- **`Script_Extensions` 不只包含文字。** 日文句号、逗号等纯标点也可能属于假名/汉字扩展集；
+  旧权威正则把它们当独立 token，但 `wordKey()` 会把纯标点清成空键，造成同样的错位。
+- **统一契约而不是逐语言打补丁。** 解析器先拼完整 event（保留纯空白 seg 作为词间分隔），
+  再只调用一次全系统权威 `RESTORE_WORD_RE`，最后把每个词映射回其覆盖的 seg 时间；一个 token
+  必须至少含 Unicode 字母、组合记号或数字，纯标点在所有文字系统下一律不是 token。
+- 用户真实日语轨 `PCZhLRE7avE` 修前为原文 0/API 0；修后三分钟真机运行：有原文时译文覆盖
+  **100%（277/277）**、真实漏译空窗 **0s**、API/JS 失败 **0**。英语 ASR 与波兰语人工轨
+  同口径回归也均为 100%/0s。
 
 v0.7.9 修一个 v0.6.0 起就存在、所有离线门禁都没抓到的缺陷：
 - **断句层造得出的单元，翻译层收不下。** 断句允许语法续接到 14 词，但翻译输入卫士按

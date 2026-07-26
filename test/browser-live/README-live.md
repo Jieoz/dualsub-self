@@ -26,7 +26,8 @@ python3 -m http.server 8899   # 仓库根，供 Chromium 取 core.js/isolated.js
 
 DUALSUB_CDP_URL=http://<chromium>:9222 \
 DUALSUB_REPLAY_HOST=<本机对 Chromium 可见的 IP> \
-DUALSUB_LIVE_TRACKS=test/browser-live/t1.json3,test/browser-live/t2.json3 \
+DUALSUB_LIVE_TRACKS=test/browser-live/t1.json3 \
+DUALSUB_LIVE_LANG=en \
 DUALSUB_LIVE_MINUTES=5 \
 DS_BASE=<api-base> DS_MODEL=gpt-5.4-mini DS_KEY=<key> \
 node test/browser-live/run.js
@@ -35,6 +36,8 @@ node test/browser-live/run.js
 判定门槛：跳过前 15s 冷启动后，**屏幕有原文时**同步有译文的覆盖率 ≥90%、
 最长「有原文却无译文」空窗 ≤12s、真实 API 失败 0、JS 错误 0。
 墙钟中文覆盖率仅作诊断：演讲停顿时原文和译文都为空，不能把静默诬告成漏译。
+`DUALSUB_LIVE_LANG` 必须填写真实源轨的 BCP47 语言代码（如 `en`、`ja`、`pl`）；
+多条轨语言不同时分开运行，不能用英文元数据冒充非英文轨。
 
 ## 口径要点
 

@@ -23,6 +23,92 @@
    * ------------------------------------------------------------- */
 
   /**
+   * 用整条 json3 event 的连续文本做唯一权威分词，再把词映射回它覆盖的 seg 时间。
+   *
+   * YouTube 的 seg 是时间片，不是词边界：同一个词可被拆成 ["6", "TV"]、
+   * ["pur", "pose"]，空白/换行也可能单独占一个 seg。旧实现逐 seg 调 RESTORE_WORD_RE，
+   * canonical 得到两个 token；显示侧对拼接后的整句分词只得到一个，必然 fail-closed。
+   * 这里不看语言：先拼原始 event（保留纯空白 seg 作为真实分隔），只分词一次；
+   * 时间仍完全来自源 seg，在一个 seg 内按该 seg 覆盖的 token 数均分，与旧口径一致。
+   */
+  function timedJson3EventTokens(segs, start, eventEnd) {
+    var pieces = [];
+    var raw = "";
+    (segs || []).forEach(function (seg) {
+      if (!seg || typeof seg.utf8 !== "string") return;
+      var charStart = raw.length;
+      raw += seg.utf8;
+      pieces.push({
+        charStart: charStart,
+        charEnd: raw.length,
+        offset: Number(seg.tOffsetMs),
+      });
+    });
+
+    // 纯空白/换行 seg 常常没有 offset。一次反向扫描把下一个真实边界传播回来，
+    // 避免前一个词被错误延到 eventEnd，也避免逐 piece 向后查找的平方复杂度。
+    var followingOffset = NaN;
+    for (var pieceIndex = pieces.length - 1; pieceIndex >= 0; pieceIndex--) {
+      var piece = pieces[pieceIndex];
+      var offset = piece.offset;
+      var nextOffset = followingOffset;
+      piece.timeStart = Number.isFinite(offset) ? start + Math.max(0, offset) : start;
+      var timeEnd = Number.isFinite(nextOffset)
+        ? start + Math.max(Math.max(0, offset) || 0, nextOffset)
+        : eventEnd;
+      piece.timeEnd = Math.max(timeEnd, piece.timeStart);
+      piece.nativeTiming = Number.isFinite(offset);
+      if (piece.nativeTiming) followingOffset = offset;
+    }
+
+    var matches = [];
+    var re = newWordRe();
+    var match;
+    while ((match = re.exec(raw)) !== null) {
+      if (!match[0]) { re.lastIndex++; continue; }
+      matches.push({ text: match[0], charStart: match.index, charEnd: match.index + match[0].length });
+    }
+
+    // pieces 与 matches 都按字符位置递增。单调扫描一次，记录每个 token 覆盖的首尾
+    // piece 及它在该 piece 内的序号；不再让每个 token 反复扫描全部 pieces/matches。
+    var matchCursor = 0;
+    pieces.forEach(function (currentPiece) {
+      while (matchCursor < matches.length && matches[matchCursor].charEnd <= currentPiece.charStart) matchCursor++;
+      var indexes = [];
+      for (var i = matchCursor; i < matches.length && matches[i].charStart < currentPiece.charEnd; i++) {
+        if (matches[i].charEnd > currentPiece.charStart) indexes.push(i);
+      }
+      currentPiece.matchCount = indexes.length;
+      indexes.forEach(function (wordIndex, position) {
+        var word = matches[wordIndex];
+        if (!word.firstPiece) {
+          word.firstPiece = currentPiece;
+          word.firstPos = position;
+          word.nativeTiming = currentPiece.nativeTiming;
+        } else {
+          word.nativeTiming = word.nativeTiming && currentPiece.nativeTiming;
+        }
+        word.lastPiece = currentPiece;
+        word.lastPos = position;
+      });
+    });
+
+    return matches.map(function (word) {
+      if (!word.firstPiece || !word.lastPiece) return null;
+      var first = word.firstPiece;
+      var last = word.lastPiece;
+      var tokenStart = first.timeStart + Math.round((first.timeEnd - first.timeStart) * word.firstPos / Math.max(1, first.matchCount));
+      var tokenEnd = last.timeStart + Math.round((last.timeEnd - last.timeStart) * (word.lastPos + 1) / Math.max(1, last.matchCount));
+      return {
+        text: word.text,
+        start: tokenStart,
+        end: Math.max(tokenEnd, tokenStart),
+        nativeTiming: word.nativeTiming,
+      };
+    }).filter(Boolean);
+  }
+
+  /**
    * 解析 YouTube json3 字幕格式。
    * 除 event 的粗粒度时间外，保留 seg.tOffsetMs 推导出的 token 时间。后续语义
    * 重分段可以自由跨 ASR event 重组，仍准确落回原音频区间。
@@ -35,31 +121,12 @@
       const start = toInt(ev.tStartMs, 0);
       const duration = toInt(ev.dDurationMs, 0);
       const eventEnd = start + duration;
-      const rawSegs = ev.segs.filter((seg) => seg && typeof seg.utf8 === "string" && seg.utf8.trim());
+      const rawSegs = ev.segs.filter((seg) => seg && typeof seg.utf8 === "string");
+      // 纯空白 seg 也是词间真实分隔，不能先 filter(trim) 再 join；否则
+      // ["hello", " ", "world"] 会被误拼成 "helloworld"。collapseWhitespace 只用于显示。
       const content = collapseWhitespace(rawSegs.map((seg) => seg.utf8).join(""));
       if (!content) continue;
-      const tokens = [];
-      for (let i = 0; i < rawSegs.length; i++) {
-        const seg = rawSegs[i];
-        const next = rawSegs[i + 1];
-        const offset = Number(seg.tOffsetMs);
-        const nextOffset = next ? Number(next.tOffsetMs) : NaN;
-        const tokenStart = Number.isFinite(offset) ? start + Math.max(0, offset) : start;
-        const tokenEnd = Number.isFinite(nextOffset)
-          ? start + Math.max(Math.max(0, offset) || 0, nextOffset)
-          : eventEnd;
-        // ASR 自带的标点不是词流的一部分。丢掉它后，恢复器才可以安全地
-        // 重建句末而不把错误的 event 标点带入新显示单元。
-        // 词的切分口径必须与全系统唯一权威 RESTORE_WORD_RE 一致(见其定义处注释)。
-        // 曾在此手写 /[A-Za-z0-9]+(?:['’][A-Za-z]+)?/g —— 不含连字符,导致
-        // "purpose-built" 在此被切成 2 个 token 而显示侧算 1 个词,两条词流永久错位。
-        const words = String(seg.utf8).match(newWordRe()) || [];
-        for (let j = 0; j < words.length; j++) {
-          const partStart = tokenStart + Math.round((tokenEnd - tokenStart) * j / words.length);
-          const partEnd = tokenStart + Math.round((tokenEnd - tokenStart) * (j + 1) / words.length);
-          tokens.push({ text: words[j], start: partStart, end: partEnd, nativeTiming: Number.isFinite(offset) });
-        }
-      }
+      const tokens = timedJson3EventTokens(rawSegs, start, eventEnd);
       out.push({ start: start, end: eventEnd, duration: duration, content: content, tokens: tokens });
     }
     return out;
@@ -874,6 +941,15 @@
   var UNSPACED_SET = "\\p{scx=Han}\\p{scx=Hiragana}\\p{scx=Katakana}" +
     "\\p{scx=Thai}\\p{scx=Lao}\\p{scx=Khmer}\\p{scx=Myanmar}";
   var UNSPACED_SCRIPT_SOURCE = "[" + UNSPACED_SET + "]\\p{M}*";
+  // Script_Extensions 不只包含文字：日文句号“。”、逗号“、”、中点“・”等纯标点
+  // 也可能声称属于 Han/Hiragana/Katakana。它们若成为独立 token，wordKey() 必清成
+  // 空键，canonical 侧保留而 display 侧跳过，两条词流从第一个标点起永久错位。
+  //
+  // 不用语言白名单，也不用 Chrome 112+ 的 v 集合交集：在 u 模式下用正向预查，
+  // 要求连写 token 的首字符本身至少是 Unicode 字母/组合记号/数字。长音符“ー”是 Lm，
+  // 仍会保留；纯标点语言无关地排除，与空格分词分支的既有行为一致。
+  var WORD_CONTENT = "[\\p{L}\\p{M}\\p{N}]";
+  var UNSPACED_WORD_SOURCE = "(?=" + WORD_CONTENT + ")" + UNSPACED_SCRIPT_SOURCE;
   // 空格分词语言的字母类必须【排除】连写文字，否则 \p{L} 也匹配汉字/假名，
   // 拉丁分支会贪婪地把后面的连写文字一起吞掉："NASAが温度マップ" 成为一个 token，
   // 而显示侧按一字一词算 —— 两条词流错位，混排轨直接对齐失败（实测）。
@@ -882,7 +958,7 @@
   var SPACED_LETTER = "(?:(?![" + UNSPACED_SET + "])[\\p{L}\\p{M}\\p{N}])";
   var RESTORE_WORD_RE = new RegExp(
     "[0-9]+(?:[.,][0-9]+)+" +
-    "|" + UNSPACED_SCRIPT_SOURCE +
+    "|" + UNSPACED_WORD_SOURCE +
     "|" + SPACED_LETTER + "+(?:['’-]" + SPACED_LETTER + "+)*",
     "gu"
   );

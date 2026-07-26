@@ -9,6 +9,7 @@
 // 与 browser-replay 的区别：不 stub 翻译/恢复，不用 fixture 轨，按真实速率播 N 分钟。
 const q=new URLSearchParams(location.search);
 const TRACK=q.get('track'), MINUTES=Number(q.get('minutes')||5), RATE=Number(q.get('rate')||1);
+const SOURCE_LANG=q.get('lang')||'en';
 const CB=q.get('cb')||Date.now(); // 绕脚本缓存：改了 core.js 必须真的重新加载
 const R={track:TRACK,startedAt:performance.now(),events:[],errors:[],warnings:[],
   paintSamples:[],pauseCalls:0,playCalls:0,seeks:[],finished:false,apiCalls:0,apiFails:0};
@@ -78,10 +79,10 @@ setInterval(sample,500);
 function manifest(videoId){
   // 产品会校验 manifest 的 videoId 与当前页面 URL 的 ?v= 是否一致（防跨视频串轨）。
   // harness 必须先把 URL 改成对应的 ?v=，否则 manifest 被正确拒绝。
-  history.replaceState(null,'','?track='+encodeURIComponent(TRACK)+'&minutes='+MINUTES+'&cb='+CB+'&v='+videoId);
-  const p=new URLSearchParams({v:videoId,lang:'en',kind:'asr',pot:'signed'});
+  history.replaceState(null,'','?track='+encodeURIComponent(TRACK)+'&minutes='+MINUTES+'&lang='+encodeURIComponent(SOURCE_LANG)+'&cb='+CB+'&v='+videoId);
+  const p=new URLSearchParams({v:videoId,lang:SOURCE_LANG,kind:'asr',pot:'signed'});
   dispatchEvent(new CustomEvent('__dualsub_rpc_8f3ad7c1b2e94__',{detail:{sender:'main',receiver:'isolated',
-    subject:'update-manifest',content:{videoId,files:[{code:'en-asr',languageCode:'en',kind:'asr',
+    subject:'update-manifest',content:{videoId,files:[{code:SOURCE_LANG+'-asr',languageCode:SOURCE_LANG,kind:'asr',
       url:'https://www.youtube.com/api/timedtext?'+p}]}}}));
 }
 
