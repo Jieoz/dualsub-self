@@ -1960,8 +1960,16 @@
     // 改为只删真正不该显示的东西：控制字符、以及不属于任何书写系统的私有区/
     // 装饰符号。字母、数字、标记、常见标点全部保留。
     s = s.replace(/[\p{Cc}\p{Cf}\p{Co}\p{Cs}\p{Cn}]/gu, "");
-    // 产品显示契约：中文字幕不显示中文句号“。”；问号、感叹号等语义标点保留。
-    s = s.replace(/。/gu, "");
+    // 中文句号在这里**不删**。
+    //
+    // 产品显示契约仍然是「中文字幕不显示句号」，但句号同时是最强的断屏信号：
+    // 句末 > 句内逗号 > 词组间。若在清洗阶段就删掉，分屏器拿到的文本里句号已不存在，
+    // 只能退而断在逗号上 —— 实测 "…更慢，它们仍值得使用。它们在许多日常任务中…"
+    // 被断成「尽管这里的电热水壶更慢」+「它们仍值得使用它们在许多日常任务中依然很实用」，
+    // 两个独立句子被焊进同一屏。
+    //
+    // 因此句号保留到显示的最后一步再由 stripDisplayPeriods 统一移除：
+    // 先用它断句，再让它消失。
     s = collapseWhitespace(s).trim();
     // 仅压 CJK 之间的多余空格（模型有时会在汉字间加空格）；
     // 拉丁词与数字两侧的空格必须保留，否则 "功率是 8.8 千瓦"、"我是 Michael" 会粘连。
@@ -2963,7 +2971,11 @@
   var DEFAULT_BLOCK_TRANSLATION_PROMPT =
     "翻译连续字幕块时先理解完整上下文，再用目标语言自然重组。允许合并或重新划分源 cue，绝不要求源译逐行对应。\n" +
     "只返回严格 JSON：{\"segments\":[{\"sourceFrom\":\"c0\",\"sourceTo\":\"c3\",\"lines\":[\"目标语言字幕第一屏\",\"第二屏\"]}]}。\n" +
-    "segments 必须按源 cue 顺序连续且恰好覆盖全部输入；相邻源 cue 若有 750ms 或更长停顿，必须成为两个 segment 的边界。每个目标字幕屏必须至少有约 300ms 可显示时间，不得为短源范围生成大量碎屏。每个 lines 项必须是自然、可直接显示的目标语言字幕。优先按目标语言标点断句；复杂长句只在完整词或完整短语之间换屏，坚决不得把词、词组、数字与单位、专名或固定表达拆到两屏。换屏时前一屏不得以结构助词或介词收尾（如「的」「地」「得」「把」「在」「和」），修饰语必须与被修饰成分同屏；句子真正结束时以「的」收尾是允许的。不得返回 Markdown、解释或其它字段。";
+    "segments 必须按源 cue 顺序连续且恰好覆盖全部输入；相邻源 cue 若有 750ms 或更长停顿，必须成为两个 segment 的边界。每个目标字幕屏必须至少有约 300ms 可显示时间，不得为短源范围生成大量碎屏。每个 lines 项必须是自然、可直接显示的目标语言字幕。不得返回 Markdown、解释或其它字段。";
+  // 分屏与断句规则刻意不写进 prompt：那是确定性排版工作，由 splitTargetDisplayLine
+  // 在词法原子上做 DP 得出，程序保证「断在标点 > 断在词组之间」「屏尾不留标点」
+  // 「不拆词/数字+单位/专名/URL」。写进 prompt 既不可靠（模型不一定遵守，还要靠
+  // 真机回放反复验证），又白占 token —— 模型只负责提供译文。
 
   /**
    * block 译文缓存契约版本 —— 单一权威来源。
@@ -2972,7 +2984,14 @@
    * 且 integrity 校验会因内容自洽而通过，导致缓存命中时完全绕过修复。
    * v2: 悬挂定语标记合并（「…的」+「徽章」→「…的徽章」）。
    */
-  var BLOCK_CONTRACT_VERSION = "block-v2";
+  // v3: 两处改动使旧缓存条目的显示形态不再正确，必须整体失效重算。
+  //   1. 每屏原文改为顺序往前取、不回头重播（takeForwardSourceWords）；旧条目里
+  //      存的是按时间区间反查拼出的重复原文，内容自洽会通过 integrity 校验。
+  //   2. block prompt 改为按显示容量生成，模型的分屏结果随之不同。
+  // v4：分屏与时间派生规则整体改变（句号保留到分屏后、长停顿分组、时间由源词范围
+  // 派生、汉字原子黏合）。旧缓存存的是按旧规则分好的 lines，其 integrity 自洽会通过
+  // 校验，不升版就会绕过本次修复继续命中坏分屏。
+  var BLOCK_CONTRACT_VERSION = "block-v4";
 
   var BLOCK_SEGMENT_MAX_GAP_MS = 750;
   var BLOCK_MIN_DISPLAY_MS = 300;
@@ -3087,7 +3106,112 @@
         atoms.splice(i + 1, 1);
       }
     }
+    // 无空格书写系统（汉字等）里，Intl.Segmenter 会把词切成过细的碎片：实测
+    // 「工程师」被切成「工程|师」、「同样贵」被切成「同样|贵」。在这种原子上按
+    // 「原子之间断」的规则断屏，看起来合规，实际就是把词切开 —— 这是之前反复
+    // 事后搬词救不回来的根源。
+    //
+    // 因此把跟在汉字原子后面的**单字**汉字原子黏合上去，使其成为不可分整体。
+    // 判据只有两条：书写系统（Script=Han，无空格分词）与原子长度（单字），
+    // 不含任何词表；对拉丁、日文假名等有空格或有形态标记的书写系统不生效。
+    for (var k = 0; k + 1 < atoms.length; k++) {
+      var cur = atoms[k];
+      var next = atoms[k + 1];
+      if (cur.protected || next.protected) continue;
+      // 含标点的原子不参与黏合：标点是句读边界，黏过去会把两个小句焊成一屏，
+      // 实测产出「它们仍值得使用它们在许多日常任务中依然很实用」。
+      if (/[\p{P}\s]/u.test(cur.text) || /[\p{P}\s]/u.test(next.text)) continue;
+      if (!/^\p{Script=Han}+$/u.test(cur.text)) continue;
+      if (Array.from(next.text).length !== 1 || !/^\p{Script=Han}$/u.test(next.text)) continue;
+      cur.text += next.text;
+      atoms.splice(k + 1, 1);
+      k--;
+    }
     return atoms.map(function (atom) { return atom.text; }).filter(Boolean);
+  }
+
+  /**
+   * 在 atoms[j] 之后断屏的代价 —— 越小越适合作为一屏结尾。
+   *
+   * 判据是标点，不是字表：目标语言的句读本来就由标点标记，在句末标点后断句永远
+   * 读得通，在句内标点（逗号、顿号、分号）后断也成立。没有标点的位置意味着断在
+   * 词与词之间，句子结构未完，代价最高。
+   *
+   * 语言无关：只用 Unicode 标点属性（\p{P}），不含任何语言的词表或语法规则。
+   * 惩罚量级与宽度项（(width-target)^2，量级可达数百）刻意可比 —— 让 DP 愿意为
+   * 一个好断点牺牲一些宽度均匀性，但不至于为此产出极端窄行。
+   */
+  var SENTENCE_FINAL_PUNCT = /[。！？!?…]$/u;
+  var CLAUSE_PUNCT = /[，、；：,;:]$/u;
+
+  /**
+   * 为保住词组允许的极小超宽（半角单位）—— 单一权威常量。
+   *
+   * 用户明确允许「偶尔接受长句」。在无标点可断的长句上，把断点强行压进容量内
+   * 往往只能切在词内部（实测「同样|贵」「工程|师」）；宁可让一屏多出一两个字符，
+   * 也不要把词切开。只在候选断点是词内部时才动用，正常情况下容量仍是 cap。
+   */
+  var DISPLAY_SOFT_OVERFLOW = 2;
+
+  function breakPointPenalty(atoms, j) {
+    // 末尾断点不构成换屏，无需惩罚。
+    if (j + 1 >= atoms.length) return 0;
+    var tail = String(atoms[j] || "").trim();
+    if (!tail) return 0;
+    // 规则 1：断在标点处 —— 句读边界，读起来完整。
+    // 句末标点优于句内标点：句子结束是最强的停顿，一屏一句最好读。两者若同代价，
+    // DP 会取先遇到的断点，实测把「…使用。它们在…」焊成一屏而在逗号处断开。
+    if (SENTENCE_FINAL_PUNCT.test(tail)) return 0;
+    if (CLAUSE_PUNCT.test(tail)) return 1;
+    // 规则 2：标点断不开时，断在词组之间 —— atoms 已是不可再分的词法原子，
+    // 在原子之间断即「词组与词组之间」，不会拆开词、数字+单位、专名或 URL。
+    return 1;
+  }
+
+  /**
+   * 规则 3：屏尾不留标点符号。
+   *
+   * 断屏本身已经表达了停顿，屏尾再挂一个逗号/句号是冗余的视觉噪音。只在断屏处
+   * 移除，句子内部的标点不受影响。语言无关：只用 Unicode 标点属性。
+   *
+   * 实现在下方 stripTrailingBreakPunct。
+   */
+
+  /**
+   * 把模型返回的多行译文接回整段 —— 原样相接，不添加也不删除任何字符。
+   *
+   * 模型换行处若已有标点则直接相连；没有标点说明它把一句话断开了（「却偏要换」+
+   * 「成同样贵」），此时更不能补标点 —— 那会在词内部制造新的断裂。拉丁文字之间
+   * 补一个空格保持分词，CJK 等无空格书写系统直接相连。语言无关：只用 Unicode 属性。
+   */
+  function joinTargetLines(lines) {
+    var out = "";
+    (lines || []).forEach(function (line) {
+      var part = String(line == null ? "" : line).trim();
+      if (!part) return;
+      if (!out) { out = part; return; }
+      var needsSpace = /[A-Za-z\p{N}]$/u.test(out) && /^[A-Za-z\p{N}]/u.test(part);
+      out += (needsSpace ? " " : "") + part;
+    });
+    return out;
+  }
+
+  /**
+   * 显示末端统一处理标点 —— 分屏之后、交付之前的最后一步。
+   *
+   * 两件事，顺序固定：
+   *   1. 屏尾不留标点：断屏本身已表达停顿，屏尾再挂逗号/句号是冗余噪音。
+   *   2. 句号全部移除（产品显示契约）：句号的职责到分屏结束就完成了。屏内残留的
+   *      句号（两句被装进同一屏时）换成一个空格，避免「使用它们」这样粘连成词。
+   *
+   * 问号、感叹号是语义标点，保留在屏内；只有落在屏尾时才由第 1 条移除。
+   */
+  function stripTrailingBreakPunct(text) {
+    var s = String(text).trim().replace(/[。！？!?…，、；：,;:]+$/u, "").trim();
+    // 屏内句号：删掉后左右若都是文字会粘连，用空格隔开；CJK 之间的空格随后压掉。
+    s = s.replace(/。+/gu, " ");
+    s = s.replace(/([\p{scx=Han}\p{scx=Hiragana}\p{scx=Katakana}])\s+(?=[\p{scx=Han}\p{scx=Hiragana}\p{scx=Katakana}])/gu, "$1");
+    return collapseWhitespace(s).trim();
   }
 
   function splitTargetDisplayLine(line, maxVisualWidth) {
@@ -3096,7 +3220,9 @@
     var cap = Math.max(8, Math.floor(Number(maxVisualWidth) || TRANSLATION_DISPLAY_MAX_WIDTH));
     if (semanticDisplayWidth(clean) <= cap) return [clean];
     var atoms = targetDisplayAtoms(clean);
-    if (!atoms.length || atoms.some(function (atom) { return semanticDisplayWidth(atom) > cap; })) {
+    // 原子不可再分。若单个原子本身就超过容量+软超宽，无解 —— 例如一条超长 URL。
+    // 汉字黏合后的原子可能略超 cap，此时软超宽正是为它准备的。
+    if (!atoms.length || atoms.some(function (atom) { return semanticDisplayWidth(atom) > cap + DISPLAY_SOFT_OVERFLOW; })) {
       throw new Error("block translation line contains an indivisible overwide target phrase");
     }
     var n = atoms.length;
@@ -3106,15 +3232,41 @@
       for (var j = i; j < n; j++) {
         joined += atoms[j];
         var width = semanticDisplayWidth(joined.trim());
-        if (width > cap) break;
+        // 容量是硬上限；软超宽只用于「这一屏只装了一个原子」的情形 —— 那时再压缩
+        // 就只能把原子（词）本身切开，而拆词比多两个字符难看得多。
+        var limit = (j === i) ? cap + DISPLAY_SOFT_OVERFLOW : cap;
+        if (width > limit) break;
         if (!dp[j + 1]) continue;
-        var target = cap * 0.72;
-        var candidate = { count: 1 + dp[j + 1].count, cost: Math.pow(width - target, 2) + dp[j + 1].cost, lines: [joined.trim()].concat(dp[j + 1].lines) };
+        // 断点选择只有三条规则，按优先级：
+        //   1. 有标点就断在标点处；
+        //   2. 标点断不开时，断在词组与词组之间；
+        //   3. 屏尾不留标点符号（逗号/句号/分号等在断屏时移除）。
+        // 屏宽只是硬上限 cap，不作为优化目标 —— 早先引入的「屏间均衡度」是多余的
+        // 发明，它与规则 1 争夺同一个代价预算，调参只能在「畸形短屏」和「断在词
+        // 中间」之间平移，两个目标永远无法同时满足。去掉均衡项后规则 1 独占决策，
+        // 不再有妥协。
+        var candidate = {
+          count: 1 + dp[j + 1].count,
+          cost: breakPointPenalty(atoms, j) + dp[j + 1].cost,
+          lines: [joined.trim()].concat(dp[j + 1].lines),
+        };
         if (!dp[i] || candidate.count < dp[i].count || (candidate.count === dp[i].count && candidate.cost < dp[i].cost)) dp[i] = candidate;
       }
     }
     if (!dp[0] || !dp[0].lines.length) throw new Error("block translation line cannot be split at target lexical boundaries");
     return dp[0].lines;
+  }
+
+  function joinLexicalAtoms(atoms) {
+    var out = "";
+    (atoms || []).forEach(function (atom) {
+      var part = String(atom == null ? "" : atom);
+      if (!part) return;
+      if (!out) { out = part; return; }
+      var needsSpace = /[A-Za-z\p{N}]$/u.test(out) && /^[A-Za-z\p{N}]/u.test(part);
+      out += (needsSpace ? " " : "") + part;
+    });
+    return out.trim();
   }
 
   function blockSourceCues(cues) {
@@ -3144,32 +3296,104 @@
     var maxWidth = Math.max(8, Math.floor(Number(opts.maxVisualWidth) || TRANSLATION_DISPLAY_MAX_WIDTH));
     var maxInternalGapMs = Math.max(0, Math.floor(Number(opts.maxInternalGapMs) || BLOCK_SEGMENT_MAX_GAP_MS));
     var cursor = 0;
-    var parsed = payload.segments.map(function (segment, segmentIndex) {
+    var targetParts = [];
+    payload.segments.forEach(function (segment) {
       if (!segment || typeof segment !== "object" || Array.isArray(segment)) throw new Error("block translation segment invalid");
       if (Object.keys(segment).sort().join("|") !== "lines|sourceFrom|sourceTo") throw new Error("block translation segment fields invalid");
       var from = source.findIndex(function (cue) { return cue.id === String(segment.sourceFrom || ""); });
       var to = source.findIndex(function (cue) { return cue.id === String(segment.sourceTo || ""); });
       if (from !== cursor || to < from) throw new Error("block translation source coverage gap, overlap, or reorder");
       if (!Array.isArray(segment.lines) || !segment.lines.length) throw new Error("block translation lines empty");
-      var activeMs = source.slice(from, to + 1).reduce(function (sum, cue) {
-        return sum + Math.max(0, cue.endMs - cue.startMs);
-      }, 0);
-      var maxLines = maxBlockDisplayLines(activeMs);
-      if (segment.lines.length > maxLines) throw new Error("block translation has too many lines for source duration");
-      // 长停顿是毫秒级时间事实，模型看不见也不该负责：这里不拒绝跨停顿的语义段，
-      // 由 materializeBlockTranslation 在装载时把每屏钳到停顿的某一侧，保证静音处没有字幕。
-      // 先按词法边界分屏，再把助词悬挂的屏与后继屏合并（合并函数内部会重新分屏兜底宽度）。
-      var lines = [];
-      segment.lines.forEach(function (line) { lines = lines.concat(splitTargetDisplayLine(line, maxWidth)); });
-      lines = mergeDanglingModifierLines(lines, maxWidth);
-      if (lines.length > maxLines) throw new Error("block translation has too many display lines for source duration");
+      segment.lines.forEach(function (line) { targetParts.push(line); });
       cursor = to + 1;
-      var normalized = { segmentId: "b" + segmentIndex, sourceFrom: from, sourceTo: to, lines: lines };
-      normalized.integrity = blockSegmentIntegrity(normalized);
-      return normalized;
     });
     if (cursor !== source.length) throw new Error("block translation source coverage incomplete");
-    return parsed;
+
+    // 模型的 segment 边界和换行位置一律作废：把译文接回完整文本，由程序统一分屏。
+    //
+    // 模型只负责提供译文，分屏是确定性排版工作。只作废段内换行不够：实测
+    // gpt-5.4-mini 把「同样贵」切在两个 segment 之间，段内分屏无法修复。
+    //
+    // 但整块也不能无条件接成一段：源轨里的长停顿是真实的语音结构边界。实测
+    // browser-replay 的 4 条源 cue 中间有 5303→7211 的静音，接成一段后只分出 2 屏，
+    // 第 2 屏的 end 被停顿钳到 5303，于是 7211–10858 这段语音完全没有字幕 ——
+    // seek 到 7.4s 时画面一直吊着第一句的源回退帧。
+    //
+    // 因此先按长停顿把源切成若干组，每组各自接整段再分屏：组内断点由
+    // splitTargetDisplayLine 在词法原子上决定（标点 > 词组间，屏尾去标点），
+    // 组之间的边界就是静音，屏永远不跨越静音。
+    var groups = groupSourceByLongPause(source, maxInternalGapMs);
+    var targetGroups = allocateTargetToGroups(joinTargetLines(targetParts), groups, maxWidth);
+    var out = [];
+    groups.forEach(function (group, groupIndex) {
+      var lines = mergeDanglingModifierLines(splitTargetDisplayLine(targetGroups[groupIndex], maxWidth), maxWidth);
+      // 屏尾去标点必须是最后一步。
+      //
+      // 标点是悬挂检测的判据：「这就是我要说的，」的逗号说明该屏已是完整小句，
+      // 「的」不悬空。若在分屏时就去掉标点，这个信号消失，悬挂检测会把它误判为
+      // 定语悬挂并强行与下一屏合并（实测产出「这就是我要说的接着看下一处」）。
+      // 因此顺序固定为：分屏 → 悬挂合并 → 去尾标点。
+      lines = lines.map(stripTrailingBreakPunct).filter(Boolean);
+      if (!lines.length) throw new Error("block translation produced no display lines");
+      if (lines.length > maxBlockDisplayLines(group.activeMs)) throw new Error("block translation has too many display lines for source duration");
+      var normalized = { segmentId: "b" + out.length, sourceFrom: group.from, sourceTo: group.to, lines: lines };
+      normalized.integrity = blockSegmentIntegrity(normalized);
+      out.push(normalized);
+    });
+    return out;
+  }
+
+  /**
+   * 按长停顿把源 cue 切成若干连续组。
+   *
+   * 长停顿（≥ maxInternalGapMs 的静音）是真实的语音结构边界，一屏字幕不得跨越它 ——
+   * 跨越的结果是这一屏被钳到停顿的一侧，停顿另一侧的语音就没有字幕可显示。
+   * 语言无关：只用 cue 时间。
+   */
+  function groupSourceByLongPause(source, maxInternalGapMs) {
+    var groups = [{ from: 0, to: 0 }];
+    for (var i = 1; i < source.length; i++) {
+      var gap = source[i].startMs - source[i - 1].endMs;
+      if (maxInternalGapMs > 0 && gap >= maxInternalGapMs) groups.push({ from: i, to: i });
+      else groups[groups.length - 1].to = i;
+    }
+    // activeMs 是该组的实际语音时长（不含组内短间隙），译文按它的比例分配。
+    groups.forEach(function (group) {
+      var activeMs = 0;
+      for (var i = group.from; i <= group.to; i++) activeMs += Math.max(0, source[i].endMs - source[i].startMs);
+      group.activeMs = activeMs;
+    });
+    return groups;
+  }
+
+  /**
+   * 把整块译文分配给各个源组，切点落在词法原子边界上。
+   *
+   * 按各组的语音时长比例切分：译文的推进速度大致跟随语音。只有一组时直接整块返回
+   * （最常见情形，不做任何切分）。切点吸附到最近的原子边界，绝不切在词内部。
+   */
+  function allocateTargetToGroups(joinedTarget, groups, maxWidth) {
+    if (groups.length === 1) return [joinedTarget];
+    var atoms = targetDisplayAtoms(joinedTarget);
+    var durations = groups.map(function (g) { return Math.max(1, g.activeMs || 1); });
+    var totalWidth = atoms.reduce(function (sum, atom) { return sum + semanticDisplayWidth(atom); }, 0);
+    var totalDuration = durations.reduce(function (a, b) { return a + b; }, 0);
+    var out = [];
+    var cursor = 0;
+    for (var g = 0; g < groups.length; g++) {
+      if (g + 1 === groups.length) { out.push(atoms.slice(cursor).join("")); break; }
+      var target = totalWidth * durations[g] / totalDuration;
+      var acc = 0;
+      var take = cursor;
+      while (take < atoms.length - (groups.length - g - 1) && acc < target) {
+        acc += semanticDisplayWidth(atoms[take]);
+        take++;
+      }
+      take = Math.max(cursor + 1, take);
+      out.push(atoms.slice(cursor, take).join(""));
+      cursor = take;
+    }
+    return out;
   }
 
   function activeOffsetToTime(cues, offset, startSide) {
@@ -3182,6 +3406,42 @@
         return Number(cues[i].end);
       }
       remaining -= duration;
+    }
+    return Number(cues[cues.length - 1].end);
+  }
+
+  /**
+   * 把「第几个源词」换算成时间。
+   *
+   * 词序号落在某个 cue 内部时按该 cue 内的词比例插值；正好落在 cue 边界上就直接取
+   * 该边界。这样一屏的时间范围严格等于它实际取用的那几个源 cue 的时间范围，字幕与
+   * 音轨不会错位，也不会侵入下一句。语言无关：只用词数与 cue 时间。
+   */
+  function wordOffsetToTime(cues, cursor, wordOffset, startSide) {
+    var boundaries = cursor.cueBoundaries;
+    if (!cues.length) return 0;
+    var prevBoundary = 0;
+    for (var i = 0; i < boundaries.length && i < cues.length; i++) {
+      var cueWords = boundaries[i] - prevBoundary;
+      var cueStart = Number(cues[i].start);
+      var cueEnd = Number(cues[i].end);
+      // 词序号正好落在 cue 分界上时，start 与 end 的正确答案不同：
+      // 上一屏的 end 是前一个 cue 的**结束**（语音到此为止），下一屏的 start 是这个
+      // cue 的**开始**（语音从此恢复）。两者之间就是静音，不属于任何一屏。
+      // 早先两侧都返回同一个值，导致下一屏的 start 被放到静音起点（实测 2200 而非 2800）。
+      if (wordOffset <= prevBoundary) return cueStart;
+      if (wordOffset < boundaries[i]) {
+        // cue 内部：按词比例插值。
+        var ratio = cueWords > 0 ? (wordOffset - prevBoundary) / cueWords : 0;
+        return cueStart + (cueEnd - cueStart) * ratio;
+      }
+      if (wordOffset === boundaries[i]) {
+        if (!startSide) return cueEnd;
+        // start 侧：落在分界上说明本屏从下一个 cue 开始说话。
+        var next = cues[i + 1];
+        return next ? Number(next.start) : cueEnd;
+      }
+      prevBoundary = boundaries[i];
     }
     return Number(cues[cues.length - 1].end);
   }
@@ -3229,6 +3489,41 @@
     return endMs;
   }
 
+  /**
+   * 从段内源词游标顺序取出本屏原文，永不回头。
+   *
+   * 取多少按本屏译文占整段的显示宽度比例估算 —— 只让原文与译文推进节奏大致一致，
+   * 不追求逐屏严格对应（严格对应会把源文切在语法中间，反而更难读）。切点在 ±2 词
+   * 内吸附到最近的源 cue 边界：那是上游按词法与停顿切好的自然断点。末屏兜掉余下
+   * 全部源词，段内无损。语言无关：只用词边界与源 cue 边界，无源语言判定。
+   */
+  function takeForwardSourceWords(cursor, lineIndex, lineCount) {
+    var words = cursor.words;
+    if (!words.length) return "";
+    var remaining = words.length - cursor.index;
+    if (remaining <= 0) return "";
+    if (lineIndex + 1 === lineCount) {
+      var tail = words.slice(cursor.index);
+      cursor.index = words.length;
+      return tail.join(" ");
+    }
+    var linesLeftAfter = lineCount - lineIndex - 1;
+    var share = words.length * cursor.weights[lineIndex] / cursor.totalWeight;
+    var maxTake = remaining - linesLeftAfter;
+    var take = Math.max(1, Math.min(Math.round(share), maxTake));
+    var best = take;
+    var bestDist = Infinity;
+    for (var bi = 0; bi < cursor.cueBoundaries.length; bi++) {
+      var boundary = cursor.cueBoundaries[bi] - cursor.index;
+      if (boundary < 1 || boundary > maxTake) continue;
+      var dist = Math.abs(boundary - take);
+      if (dist <= 2 && dist < bestDist) { bestDist = dist; best = boundary; }
+    }
+    var slice = words.slice(cursor.index, cursor.index + best);
+    cursor.index += best;
+    return slice.join(" ");
+  }
+
   function materializeBlockTranslation(parsedSegments, sourceCues, opts) {
     opts = opts || {};
     var source = blockSourceCues(sourceCues);
@@ -3259,9 +3554,12 @@
       // 跨长停顿的语义段合法：钳到停顿一侧由下面的 clampToPauseSide 完成，
       // 静音处永不显示字幕，而语义完整性不因毫秒级时间事实被牺牲。
       var cleanLines = segment.lines.map(function (line) {
-        var clean = sanitizeSubtitleLine(String(line == null ? "" : line));
+        // 末端标点处理必须在装载路径上也执行：sanitizeSubtitleLine 不再删句号
+        // （句号要留给分屏做断句判据），所以显示契约由 stripTrailingBreakPunct 收口。
+        // 缓存里存的是已分屏的 lines，对已处理过的文本再跑一次是幂等的。
+        var clean = stripTrailingBreakPunct(sanitizeSubtitleLine(String(line == null ? "" : line)));
         if (!clean.trim()) throw new Error("block translation cached line empty");
-        if (semanticDisplayWidth(clean) > maxWidth) throw new Error("block translation cached line exceeds visual width");
+        if (semanticDisplayWidth(clean) > maxWidth + DISPLAY_SOFT_OVERFLOW) throw new Error("block translation cached line exceeds visual width");
         return clean;
       });
       coverageCursor = segment.sourceTo + 1;
@@ -3269,21 +3567,48 @@
       var weights = cleanLines.map(function (line) { return Math.max(1, semanticDisplayWidth(line)); });
       var totalWeight = weights.reduce(function (a, b) { return a + b; }, 0);
       var usedWeight = 0;
+      // 每屏原文顺序往前取，不回头重播。
+      //
+      // 原先按「本屏时间区间与哪些源 cue 重叠」反查原文。源 cue 通常比一屏译文长，
+      // 同一个 cue 会同时命中相邻两屏，其原文被逐屏重播 —— 画面上就是「中文推进
+      // 一屏、英文把整句重新滚一遍」，拼接后单屏原文可达 26 词并被浏览器折成 3 行。
+      // 真实轨 zsA3X40nz9w 已译区实测 52/75 相邻屏重复、平均重叠 9.2 词。
+      //
+      // 译文分屏由 splitTargetDisplayLine 独立决定，这里不参与、不干预：原文只是
+      // 跟着往前推进，位置大致对应即可，不追求逐屏严格对齐。
+      var cueTexts = cues.map(function (cue) {
+        return collapseWhitespace(cue.content || "");
+      }).filter(Boolean);
+      var cueBoundaries = [];
+      var boundaryAcc = 0;
+      cueTexts.forEach(function (text) {
+        boundaryAcc += text.split(/\s+/).filter(Boolean).length;
+        cueBoundaries.push(boundaryAcc);
+      });
+      var sourceCursor = {
+        index: 0,
+        words: cueTexts.join(" ").split(/\s+/).filter(Boolean),
+        cueBoundaries: cueBoundaries,
+        weights: weights,
+        totalWeight: totalWeight,
+      };
       cleanLines.forEach(function (line, lineIndex) {
-        var fromOffset = totalActive * usedWeight / totalWeight;
-        usedWeight += weights[lineIndex];
-        var toOffset = lineIndex + 1 === cleanLines.length ? totalActive : totalActive * usedWeight / totalWeight;
-        var startMs = clampToPauseSide(pauses, activeOffsetToTime(cues, fromOffset, true), true);
-        var endMs = clampToPauseSide(pauses, activeOffsetToTime(cues, toOffset, false), false);
+        // 时间源只有一个：本屏实际取用的源词范围。
+        //
+        // 早先按「本屏译文宽度占整段的比例」换算时间，但译文宽度与语音时长不成比例
+        // ——实测两屏宽度 38:30、源时长各 2200ms，第一屏 end 被算到 3059ms，越过第二句
+        // 起点占了它的语音时间。takeForwardSourceWords 已经把取词切点吸附到源 cue
+        // 边界（真实语音断点），所以先取词、再用游标位置定时间，两者必然一致。
+        var fromOffset = sourceCursor.index;
+        var original = takeForwardSourceWords(sourceCursor, lineIndex, cleanLines.length);
+        var toOffset = sourceCursor.index;
+        var startMs = clampToPauseSide(pauses, wordOffsetToTime(cues, sourceCursor, fromOffset, true), true);
+        var endMs = clampToPauseSide(pauses, wordOffsetToTime(cues, sourceCursor, toOffset, false), false);
         endMs = trimSpannedPause(pauses, startMs, endMs, minDisplayMs);
         if (!(endMs > startMs)) throw new Error("block translation materialized timing invalid");
         var roundedStart = Math.round(startMs);
         var roundedEnd = Math.round(endMs);
         if (roundedEnd - roundedStart < minDisplayMs) throw new Error("block translation display duration too short");
-        var original = cues.filter(function (cue) {
-          return Number(cue.end) > startMs && Number(cue.start) < endMs;
-        }).map(function (cue) { return collapseWhitespace(cue.content || ""); }).filter(Boolean).join(" ");
-        if (!original) original = collapseWhitespace(cues[Math.min(lineIndex, cues.length - 1)].content || "");
         units.push({
           blockSegmentId: segment.segmentId,
           srcStart: segment.sourceFrom + 1,
@@ -3296,6 +3621,27 @@
       });
     });
     if (coverageCursor !== source.length) throw new Error("block translation cached coverage incomplete");
+    return enforceDisplayMonotonicity(units, minDisplayMs);
+  }
+
+  /**
+   * 保证相邻屏在时间上不重叠。
+   *
+   * 真实 YouTube json3 ASR 轨是滚动窗口：每条源 cue 都与前一条大幅重叠（实测样本
+   * 6/6 条全部重叠）。屏时间由源 cue 时间派生，所以重叠会直接传递到显示层 ——
+   * 实测出现「屏1 end=24399 > 屏2 start=22720」的倒挂，两屏字幕同时在屏上。
+   *
+   * 修法只截 endMs，绝不动 startMs：出现时刻是唯一必须精确贴合音轨的量，前推会让
+   * 整轨累积漂移。若截断后不足最短显示时长，就保留 minDisplayMs 并让下一屏的
+   * startMs 成为硬边界（宁可短暂重叠 <minDisplayMs，也不让字幕早于语音出现）。
+   */
+  function enforceDisplayMonotonicity(units, minDisplayMs) {
+    for (var i = 0; i + 1 < units.length; i++) {
+      var nextStart = units[i + 1].startMs;
+      if (units[i].endMs > nextStart) {
+        units[i].endMs = Math.max(nextStart, units[i].startMs + minDisplayMs);
+      }
+    }
     return units;
   }
 
@@ -4547,6 +4893,9 @@
     semanticTokenBudgets: semanticTokenBudgets,
     buildSystemPrompt: buildSystemPrompt,
     sanitizeSubtitleLine: sanitizeSubtitleLine,
+    // 中文显示契约的收口点（屏尾去标点 + 句号不显示）。与 sanitizeSubtitleLine 同级：
+    // 都是对外可见的产品契约，不是内部辅助，因此可直接断言。
+    stripTrailingBreakPunct: stripTrailingBreakPunct,
     validateChineseDisplayUnit: validateChineseDisplayUnit,
     buildClipUnits: buildClipUnits,
     preferManualTrack: preferManualTrack,
