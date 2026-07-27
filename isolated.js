@@ -432,30 +432,11 @@
   }
 
 
-  /**
-   * 先尊重用户显式 sourceLang；auto 使用 manifest 给出的候选顺序。
-   * 确定候选语言后，只在同一 languageCode 内统一优先人工轨，不维护任何语言名单。
-   */
+  // 选轨是纯函数，实现在 core.js（可被单测直接调用）。此前它住在这里，测试只能用
+  // 正则断言源码文本 —— 于是 auto 判据本身是错的时候门禁依然全绿（实测 3teflb1QNN4
+  // 仍选中西语轨）。行为断言比源码断言可靠，所以逻辑搬到可测的层。
   function pickTrack(tracks, sourceLang) {
-    if (!tracks || !tracks.length) return null;
-    var list = tracks;
-    var picked;
-    if (!sourceLang || sourceLang === "auto") {
-      // auto = 跟视频原语言，而不是「轨道数组第一条」。
-      // YouTube 的轨顺序不保证原语言在首位：实测 E4HGfagANiQ 音轨是 en-US，但西语
-      // 人工轨排在 list[0]，取首条就会给英文视频配上西语源字幕。原语言由采集侧按
-      // vss_id 前缀（".en"）标成 isOriginal。
-      picked = list.find(function (t) { return t.isOriginal; }) || list[0];
-    } else {
-      var exact = list.find(function (t) {
-        return t.code === sourceLang || t.languageCode === sourceLang;
-      });
-      var prefix = list.find(function (t) {
-        return (t.languageCode || "").split("-")[0] === sourceLang.split("-")[0];
-      });
-      picked = exact || prefix || null;
-    }
-    return Core.preferManualTrack(list, picked);
+    return Core.pickTrack(tracks, sourceLang);
   }
 
   /* =====================================================

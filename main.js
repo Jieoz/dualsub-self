@@ -128,18 +128,25 @@
         var isAsr = t.kind === "asr" || /(^|\.)asr/.test(vss);
         var code = isAsr ? lang + "-asr" : lang;
 
-        // 视频原语言判据：YouTube 给原语言轨的 vss_id 以 "." 开头（".en"），
-        // 译制/机翻轨是 "a.en" 或带 tlang。这是唯一可靠的判据 —— 轨道数组顺序
-        // 不保证原语言在首位（实测 E4HGfagANiQ 音轨是 en-US，但西语人工轨排在
-        // list[0]，auto 取首条就选中了西语）。isTranslatable 也是原轨特征之一。
-        var isOriginal = /^\./.test(vss) || t.isTranslatable === true;
+        // 不在这里判「是否原语言」：单条轨的元数据不足以回答这个问题。
+        //
+        // 实测 3teflb1QNN4（音轨英语，另有西语人工翻译轨）的三条轨：
+        //   vssId ".en"      languageCode en      isTranslatable true
+        //   vssId "a.en"     languageCode en      kind "asr"
+        //   vssId ".es-419"  languageCode es-419  isTranslatable true
+        // 可见 vss_id 以 "." 开头只代表「人工上传」，西语翻译轨同样是 ".es-419"；
+        // isTranslatable 三条全为 true（能被 YouTube 机翻的都算）。两者都无法区分
+        // 原语言轨和人工翻译轨。
+        //
+        // 唯一可靠的信号是 ASR 轨的语言：YouTube 只会对音轨的实际语言做语音识别，
+        // 所以 "a.<lang>" 里的 lang 就是音轨语言。这需要看整个轨道列表才能得出，
+        // 因此判定放在选轨点（pickTrack），这里只忠实传递 kind 和 languageCode。
 
         files.push({
           name: trackName(t),
           code: code,
           languageCode: lang,
           kind: t.kind || (isAsr ? "asr" : ""),
-          isOriginal: isOriginal,
           url: url,
         });
       }

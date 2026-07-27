@@ -1968,6 +1968,45 @@
     return manual || candidate;
   }
 
+  /**
+   * 选源字幕轨。先尊重用户显式 sourceLang；auto 跟音轨的实际语言。
+   * 确定语言后在该语言内统一优先人工轨（preferManualTrack），不维护任何语言名单。
+   */
+  function pickTrack(tracks, sourceLang) {
+    if (!tracks || !tracks.length) return null;
+    var list = tracks;
+    var picked;
+    if (!sourceLang || sourceLang === "auto") {
+      // auto = 跟音轨的实际语言，而不是「轨道数组第一条」。
+      //
+      // 轨顺序不保证原语言在首位：3teflb1QNN4（Vsauce，英语音轨 + 西语人工翻译轨）
+      // 取首条就给英文视频配上西语源字幕，整片按西语翻译。
+      //
+      // 音轨语言的唯一可靠信号是 ASR 轨：YouTube 只对音轨实际说的语言做语音识别，
+      // 所以 kind="asr" 那条轨的 languageCode 就是音轨语言。轨的其他元数据都不行 ——
+      // 实测该视频三条轨的 vss_id 分别是 ".en" / "a.en" / ".es-419"，"." 前缀只代表
+      // 人工上传（西语翻译轨也有这个前缀），isTranslatable 三条全是 true。
+      //
+      // 没有 ASR 轨时无从判断音轨语言，保留 YouTube 给的顺序（不猜）。
+      var asr = list.find(function (t) {
+        return t && (t.kind === "asr" || /-asr$/i.test(String(t.code || ""))) && t.languageCode;
+      });
+      var audioLang = asr ? String(asr.languageCode).replace(/-asr$/i, "").split("-")[0].toLowerCase() : "";
+      picked = (audioLang && list.find(function (t) {
+        return String((t && t.languageCode) || "").replace(/-asr$/i, "").split("-")[0].toLowerCase() === audioLang;
+      })) || list[0];
+    } else {
+      var exact = list.find(function (t) {
+        return t.code === sourceLang || t.languageCode === sourceLang;
+      });
+      var prefix = list.find(function (t) {
+        return String(t.languageCode || "").split("-")[0] === String(sourceLang).split("-")[0];
+      });
+      picked = exact || prefix || null;
+    }
+    return preferManualTrack(list, picked);
+  }
+
   function buildSystemPrompt(targetLang, customPrompt) {
     var tpl = customPrompt && String(customPrompt).trim() ? customPrompt : DEFAULT_SYSTEM_PROMPT;
     return tpl.replace(/\{TARGET_LANG\}/g, targetLang || "简体中文");
@@ -4782,9 +4821,9 @@
       var identity = [code, languageCode, kind].join("\x1f");
       if (identities[identity]) return null;
       identities[identity] = true;
-      // isOriginal 由采集侧按 vss_id 前缀判定（原语言轨为 ".en" 形式）。auto 选轨靠它
-      // 定位视频原语言，不能退回「取数组首条」—— 轨顺序不保证原语言在前。
-      files.push({ name: name, code: code, languageCode: languageCode, kind: kind, isOriginal: raw.isOriginal === true, url: parsed.toString() });
+      // kind 必须保留：auto 选轨靠 kind="asr" 那条轨的 languageCode 判定音轨语言
+      // （轨顺序不保证原语言在前，其他元数据无法区分原语言轨和人工翻译轨）。
+      files.push({ name: name, code: code, languageCode: languageCode, kind: kind, url: parsed.toString() });
     }
     return { videoId: videoId, files: files };
   }
@@ -5225,6 +5264,7 @@
     SOURCE_DISPLAY_MAX_WIDTH: SOURCE_DISPLAY_MAX_WIDTH,
     READING_MS_PER_CHAR: READING_MS_PER_CHAR,
     mergeUnreadableUnits: mergeUnreadableUnits,
+    pickTrack: pickTrack,
     TRANSLATION_DISPLAY_MAX_WIDTH: TRANSLATION_DISPLAY_MAX_WIDTH,
     PREFETCH_AHEAD: PREFETCH_AHEAD,
     planSemanticInterval: planSemanticInterval,

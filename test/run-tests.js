@@ -2280,26 +2280,58 @@ test("resegmentCues 上限单位是视觉宽度：逐字文字不得被「12 词
     "拉丁轨内容不得因这次改动发生变化");
 });
 
-test("validateTrackManifest 保留 isOriginal —— auto 选轨定位视频原语言的唯一判据", () => {
-  // 真实形态（E4HGfagANiQ）：音轨 en-US，但西语人工轨排在 files[0]。
-  // 原语言标记若在校验层被丢弃，auto 只能退回取首条，就会给英文视频配西语源字幕。
+test("auto 选轨跟音轨语言，不取轨道数组首条", () => {
+  // 真实缺陷（3teflb1QNN4，Vsauce「Is Anything Obvious?」）：音轨英语，另有西语人工
+  // 翻译轨。YouTube 返回的 captionTracks 实测形态（curl watch 页抓取）：
+  //   vssId ".en"      languageCode en      kind null   isTranslatable true
+  //   vssId "a.en"     languageCode en      kind "asr"  isTranslatable true
+  //   vssId ".es-419"  languageCode es-419  kind null   isTranslatable true
+  // v0.8.5 曾用 `/^\./.test(vss) || isTranslatable` 判原语言 —— 三条轨全部命中，
+  // find 仍返回首条，整片按西语翻译（用户第二次报同一问题）。
+  // 唯一可靠信号是 ASR 轨的语言：YouTube 只对音轨实际语言做语音识别。
+  const vsauce = [
+    { name: "Spanish (Latin America)", code: "es-419", languageCode: "es-419", kind: "", url: "u1" },
+    { name: "English", code: "en", languageCode: "en", kind: "", url: "u2" },
+    { name: "English (auto)", code: "en-asr", languageCode: "en", kind: "asr", url: "u3" },
+  ];
+  const picked = Core.pickTrack(vsauce, "auto");
+  assert.strictEqual(picked.languageCode, "en", "音轨是英语，必须选英语轨而非排在首位的西语轨");
+  assert.strictEqual(picked.kind, "", "同语言内应优先人工轨，不用 ASR");
+
+  // 日语轨（Dw43jxWZvPg）：只有 ASR 轨时就用它
+  const ja = [
+    { name: "日本語 (auto)", code: "ja-asr", languageCode: "ja", kind: "asr", url: "u1" },
+  ];
+  assert.strictEqual(Core.pickTrack(ja, "auto").languageCode, "ja");
+
+  // 无 ASR 轨时无从判断音轨语言，保留 YouTube 顺序（不猜）
+  const noAsr = [
+    { name: "English", code: "en", languageCode: "en", kind: "", url: "u1" },
+    { name: "Français", code: "fr", languageCode: "fr", kind: "", url: "u2" },
+  ];
+  assert.strictEqual(Core.pickTrack(noAsr, "auto").languageCode, "en");
+
+  // 用户显式指定的语言优先于音轨语言
+  assert.strictEqual(Core.pickTrack(vsauce, "es-419").languageCode, "es-419",
+    "显式 sourceLang 必须被尊重");
+  // 显式指定也走人工优先
+  assert.strictEqual(Core.pickTrack(vsauce, "en").kind, "", "显式指定英语时也应选人工轨");
+});
+
+test("validateTrackManifest 必须保留 kind —— auto 选轨靠 ASR 轨判定音轨语言", () => {
+  // kind="asr" 是判定音轨语言的唯一信号（YouTube 只对音轨实际语言做语音识别）。
+  // 若校验层丢掉 kind，auto 只能退回取首条，英文视频就会被配上西语源字幕。
   const u = (lang) => "https://www.youtube.com/api/timedtext?v=vid&lang=" + lang + "&pot=signed";
   const out = Core.validateTrackManifest({
     videoId: "vid",
     files: [
-      { name: "Spanish (Latin America)", code: "es-419", languageCode: "es-419", kind: "", isOriginal: false, url: u("es-419") },
-      { name: "English", code: "en", languageCode: "en", kind: "", isOriginal: true, url: u("en") },
+      { name: "English", code: "en", languageCode: "en", kind: "", url: u("en") },
+      { name: "English (auto)", code: "en-asr", languageCode: "en", kind: "asr", url: u("en") + "&kind=asr" },
     ],
   }, { expectedVideoId: "vid" });
   assert.ok(out, "合法 manifest 应通过");
-  assert.strictEqual(out.files.length, 2);
-  assert.strictEqual(out.files[0].isOriginal, false, "非原语言轨必须保留 false");
-  assert.strictEqual(out.files[1].isOriginal, true, "原语言轨标记不得被过滤掉");
-  // 负向：缺失字段不得被伪造成 true（宁可退化为取首条，也不能猜错语言）
-  const noFlag = Core.validateTrackManifest({
-    videoId: "vid", files: [{ code: "en", languageCode: "en", url: u("en") }],
-  }, { expectedVideoId: "vid" });
-  assert.strictEqual(noFlag.files[0].isOriginal, false, "未声明时必须为 false，不得默认 true");
+  assert.strictEqual(out.files[0].kind, "", "人工轨的 kind 必须保留为空");
+  assert.strictEqual(out.files[1].kind, "asr", "ASR 轨的 kind 不得被过滤掉");
 });
 
 asyncTest("chatCompletion 透传外部 AbortSignal 并区分主动取消", async () => {
@@ -3749,13 +3781,12 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     assert.doesNotMatch(core, /isChineseLangCode|shouldSkipChineseSource|skipChineseSource\s*:/);
     assert.match(core, /delete c\.skipChineseSource/, "迁移时应清除旧废字段");
     assert.doesNotMatch(popup, /skipChineseSource/);
-    const pick = src.slice(src.indexOf("function pickTrack"), src.indexOf("/* =====================================================", src.indexOf("function pickTrack")));
-    // auto 必须跟视频原语言（isOriginal），不得退回「取轨道数组第一条」。
-    // 负向：实测 E4HGfagANiQ 音轨 en-US 但西语人工轨排 list[0]，取首条会配错语言。
-    assert.match(pick, /sourceLang === "auto"[\s\S]*?isOriginal/);
-    assert.doesNotMatch(pick, /sourceLang === "auto"[\s\S]*?picked = list\[0\];[\s\S]*?\} else/,
-      "auto 分支不得无条件取 list[0]");
-    assert.match(pick, /Core\.preferManualTrack\(list, picked\)/);
+    // 选轨逻辑本身由「auto 选轨跟音轨语言」用例做行为断言（Core.pickTrack）。
+    // 这里只确认 isolated 侧没有第二份实现 —— 它必须委托给 core，不得自己判断。
+    assert.match(src, /function pickTrack\([\s\S]{0,200}?Core\.pickTrack\(/,
+      "isolated.pickTrack 必须委托 Core.pickTrack，不得存在平行实现");
+    assert.doesNotMatch(src, /sourceLang === "auto"/,
+      "isolated 不得自己判断 auto 选轨");
     // 中止的 clip 必须回到可重翻状态，且 inflight 无条件复位。
     // 回归防护：曾经 `if (stale || aborted) return;` 让 clipState 停在 "pending"、
     // clipInflight 停在 true —— retryTick 只捡 "error"，于是该 clip 永久无人重翻。
@@ -3769,8 +3800,13 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     const fin = tc.slice(tc.indexOf("} finally {"));
     assert.ok(fin.indexOf("state.clipInflight[idx] = false;") < fin.indexOf("!== state.requestGeneration"),
       "clipInflight 复位必须早于世代 return，不得被跳过");
-    assert.doesNotMatch(pick, /picked = exact \|\| prefix \|\| list\[0\]/, "显式源语言不存在时不得偷偷换成其它语言");
-    assert.doesNotMatch(pick, /["'](?:en|zh|ja|ar|th|pl)["']/);
+    // 显式源语言不存在时返回 null，不得偷偷换成其它语言；实现里不得有语言名单。
+    assert.strictEqual(Core.pickTrack([
+      { code: "en", languageCode: "en", kind: "", url: "u1" },
+    ], "ko"), null, "显式指定的语言不存在时必须返回 null");
+    const pickSrc = core.slice(core.indexOf("function pickTrack"), core.indexOf("function buildSystemPrompt"));
+    assert.doesNotMatch(pickSrc.replace(/\/\/[^\n]*/g, ""), /["'](?:en|zh|ja|ar|th|pl)["']/,
+      "选轨实现不得维护语言名单");
   });
 
   console.log("\n[token-span coverage 1:1 对齐]");
