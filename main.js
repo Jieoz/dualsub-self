@@ -122,16 +122,24 @@
         var url = normalizeUrl(rawUrl);
         if (!url) continue;
 
-        var lang = t.languageCode || (t.vss_id || "").replace(/^[.]/, "") || "und";
+        var vss = t.vss_id || t.vssId || "";
+        var lang = t.languageCode || vss.replace(/^[.a]*[.]/, "") || "und";
         // kind=asr 是自动生成字幕，code 标记 -asr 以便区分
-        var isAsr = t.kind === "asr" || /(^|\.)asr/.test(t.vss_id || "");
+        var isAsr = t.kind === "asr" || /(^|\.)asr/.test(vss);
         var code = isAsr ? lang + "-asr" : lang;
+
+        // 视频原语言判据：YouTube 给原语言轨的 vss_id 以 "." 开头（".en"），
+        // 译制/机翻轨是 "a.en" 或带 tlang。这是唯一可靠的判据 —— 轨道数组顺序
+        // 不保证原语言在首位（实测 E4HGfagANiQ 音轨是 en-US，但西语人工轨排在
+        // list[0]，auto 取首条就选中了西语）。isTranslatable 也是原轨特征之一。
+        var isOriginal = /^\./.test(vss) || t.isTranslatable === true;
 
         files.push({
           name: trackName(t),
           code: code,
           languageCode: lang,
           kind: t.kind || (isAsr ? "asr" : ""),
+          isOriginal: isOriginal,
           url: url,
         });
       }

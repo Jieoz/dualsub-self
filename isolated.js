@@ -441,7 +441,11 @@
     var list = tracks;
     var picked;
     if (!sourceLang || sourceLang === "auto") {
-      picked = list[0];
+      // auto = 跟视频原语言，而不是「轨道数组第一条」。
+      // YouTube 的轨顺序不保证原语言在首位：实测 E4HGfagANiQ 音轨是 en-US，但西语
+      // 人工轨排在 list[0]，取首条就会给英文视频配上西语源字幕。原语言由采集侧按
+      // vss_id 前缀（".en"）标成 isOriginal。
+      picked = list.find(function (t) { return t.isOriginal; }) || list[0];
     } else {
       var exact = list.find(function (t) {
         return t.code === sourceLang || t.languageCode === sourceLang;
@@ -520,7 +524,14 @@
       }
       // 先立即建立稳定 fallback 原文时间轴；技术 cue 不翻译。语义恢复是整轨模型工作，不能阻塞首字幕。
       var sourceTimeline = Core.buildCanonicalTokenTimeline(cues);
-      var fallbackCues = Core.resegmentCues(cues, { tailTrimMs: config.tailTrimMs, maxWords: Core.DISPLAY_UNIT_MAX_WORDS, continuationMaxWords: Core.SOURCE_UNIT_MAX_WORDS });
+      // maxVisualWidth 让词数上限按文本实际宽度折算：拉丁轨维持既有行为，逐字文字
+      // （日/中/韩/泰）不再被 12 个"词"=12 字符切成碎屏。
+      var fallbackCues = Core.resegmentCues(cues, {
+        tailTrimMs: config.tailTrimMs,
+        maxWords: Core.DISPLAY_UNIT_MAX_WORDS,
+        maxVisualWidth: Core.SOURCE_DISPLAY_MAX_WIDTH,
+        continuationMaxWords: Core.SOURCE_UNIT_MAX_WORDS,
+      });
       if (!installCueTimeline(fallbackCues, "block", { sourceTimeline: sourceTimeline })) {
         retryLater("解析后无有效字幕");
         return;
@@ -867,7 +878,19 @@
     } catch (e) {
       var stale = requestGeneration !== state.requestGeneration || timelineEpoch !== state.timelineEpoch || segmentationModeAtStart !== state.segmentationMode;
       var aborted = e && (e.name === "AbortError" || /aborted|superseded/i.test(String(e.message || "")));
-      if (stale || aborted) return;
+      // stale：整轨/身份已换代，这个 clip 的状态属于旧世代，交给 resetTrackState 处理，
+      // 这里不写状态（写了会污染新世代）。
+      if (stale) return;
+      // abort：当代请求被中止（seek/配置变更打断在途请求）。此前直接 return，clipState
+      // 停在 "pending"、clipInflight 停在 true —— 重试调度器只捡 "error"，预取窗口只向前
+      // 不回头，于是这个 clip 永久没人再碰。真实后果：西语轨 E4HGfagANiQ 块3 全空而块4
+      // 已译（144.1s→208.1s 无译文），中间留洞。中止不是失败，不计入 maxFails，但必须
+      // 回到可重翻状态。
+      if (aborted) {
+        state.clipState[idx] = "error";
+        ensureRetryScheduler();
+        return;
+      }
       if (/configuration missing/i.test(String(e && e.message || ""))) {
         state.clipState[idx] = "error";
         return;
@@ -878,8 +901,10 @@
       backoff.fail();
       ensureRetryScheduler();
     } finally {
-      if (requestGeneration !== state.requestGeneration || timelineEpoch !== state.timelineEpoch || segmentationModeAtStart !== state.segmentationMode) return;
+      // 无论是否换代，inflight 都必须复位：它是「本次调用是否在跑」的互斥标记，不是世代状态。
+      // 旧代残留 true 会让 translateClip 开头的守卫永久拒绝该 clip（僵尸态的另一半）。
       state.clipInflight[idx] = false;
+      if (requestGeneration !== state.requestGeneration || timelineEpoch !== state.timelineEpoch || segmentationModeAtStart !== state.segmentationMode) return;
       if (state.clipState[idx] === "pending") {
         state.clipState[idx] = "error";
         getBackoff(idx).fail();

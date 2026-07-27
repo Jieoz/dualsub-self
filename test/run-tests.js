@@ -2191,6 +2191,117 @@ test("validateTrackManifest 只接受受信 YouTube HTTPS 字幕 URL", () => {
   assert.strictEqual(Core.validateTrackManifest({ videoId: "x", files: new Array(65).fill({ code: "en", url: "https://www.youtube.com/api/timedtext?v=x" }) }), null, "轨道数量必须有上限");
 });
 
+test("读不完的屏必须合并相邻屏借时间，且不碰 startMs / 不越过后屏 end", () => {
+  // 真实缺陷（E4HGfagANiQ 西语轨）：源 cue「y por moda」只有 820ms，中文「也为了时尚，
+  // 展现个性」9 字按 Netflix 9 字/秒需 1000ms → 91ms/字读不完。红线禁止前推 startMs
+  // 或侵入下一屏，唯一合法解是与相邻屏合并，让时间窗与字数一起相加。
+  const mk = (id, s, e, t) => ({ blockSegmentId: id, srcStart: 1, srcEnd: 2, originalText: "src", translation: t, startMs: s, endMs: e });
+  const merged = Core.mergeUnreadableUnits([
+    mk("b0", 9280, 10100, "也为了时尚，展现个性"),  // 820ms / 10字需1110ms → 91ms/字读不完
+    mk("b0", 10220, 13200, "但没有别的动物"),      // 2980ms / 7字 → 够
+  ], { maxVisualWidth: 48 });
+  assert.strictEqual(merged.length, 1, "读不完的屏应与相邻屏合并");
+  assert.strictEqual(merged[0].startMs, 9280, "startMs 必须取前屏，绝不前推");
+  assert.strictEqual(merged[0].endMs, 13200, "endMs 必须取后屏，绝不越过它");
+  assert.match(merged[0].translation, /也为了时尚，展现个性/, "合并不得丢失前屏译文");
+  assert.match(merged[0].translation, /但没有别的动物/, "合并不得丢失后屏译文");
+
+  // 硬约束 1：不跨 segment（segment 边界=750ms 长停顿，真实语音结构）
+  const acrossSeg = Core.mergeUnreadableUnits([
+    mk("b0", 0, 500, "读不完的一屏文字"), mk("b1", 2000, 5000, "下一段"),
+  ], { maxVisualWidth: 48 });
+  assert.strictEqual(acrossSeg.length, 2, "不得跨长停顿边界合并");
+
+  // 硬约束 2：不把两个完整句子并到一屏
+  const twoSentences = Core.mergeUnreadableUnits([
+    mk("b0", 0, 500, "这是第一句。"), mk("b0", 600, 4000, "这是第二句"),
+  ], { maxVisualWidth: 48 });
+  assert.strictEqual(twoSentences.length, 2, "句末标点是硬边界，不得并两个完整句");
+
+  // 硬约束 3：不制造超宽屏
+  const wide = Core.mergeUnreadableUnits([
+    mk("b0", 0, 300, "一二三四五六七八九十一二"), mk("b0", 400, 5000, "十三十四十五十六十七十八十九二十"),
+  ], { maxVisualWidth: 20 });
+  assert.strictEqual(wide.length, 2, "合并后超过宽度上限则不合并");
+
+  // 集成：合并必须真的接在 materializeBlockTranslation 的管线里。
+  // 负向验证发现过：只测函数本身时，把管线里的调用整个删掉仍然全绿。
+  const srcCues = [
+    { start: 9280, end: 10100, content: "y por moda" },
+    { start: 10220, end: 13200, content: "pero ningun otro animal" },
+  ];
+  const piped = Core.materializeBlockTranslation([
+    { segmentId: "b0", sourceFrom: 0, sourceTo: 1, lines: ["也为了时尚，展现个性", "但没有别的动物"] },
+  ], srcCues, { maxVisualWidth: 48 });
+  assert.strictEqual(piped.length, 1, "materializeBlockTranslation 必须调用合并：读不完的屏要被并掉");
+  assert.strictEqual(piped[0].startMs, 9280, "管线合并后 startMs 仍取前屏");
+  assert.strictEqual(piped[0].endMs, 13200, "管线合并后 endMs 仍取后屏");
+
+  // 已够读的屏不得被无故合并（模型的语义断点必须保留）
+  const fine = Core.mergeUnreadableUnits([
+    mk("b0", 0, 5000, "短句"), mk("b0", 5000, 10000, "另一短句"),
+  ], { maxVisualWidth: 48 });
+  assert.strictEqual(fine.length, 2, "时间足够时必须原样保留模型断点");
+});
+
+test("resegmentCues 上限单位是视觉宽度：逐字文字不得被「12 词=12 字符」切成碎屏", () => {
+  // 真实缺陷（Dw43jxWZvPg 日语轨）：源轨每 cue 仅 ~9 个日文字符，1146 单元中 97% ≤12
+  // 字符。splitDisplayWords 把连写文字逐字切成 token，于是 maxWords=12 对日文只允许
+  // 12 字符宽，源轨的破碎边界被原样透传。修法是把上限单位统一成视觉宽度。
+  const mk = (i, text) => ({ start: i * 1500, end: i * 1500 + 1400, content: text });
+  const ja = [
+    "このようになってい", "るんだというのを", "この動画で見ていた", "だければと思います",
+    "今回分解をするエア", "コンはこちらです", "Comfeeというブランド", "のエアコンです",
+  ].map((t, i) => mk(i, t));
+  const byWidth = Core.resegmentCues(ja, { maxWords: Core.DISPLAY_UNIT_MAX_WORDS, maxVisualWidth: Core.SOURCE_DISPLAY_MAX_WIDTH });
+  const byWords = Core.resegmentCues(ja, { maxWords: Core.DISPLAY_UNIT_MAX_WORDS });
+  assert.ok(byWidth.length < byWords.length,
+    "宽度口径必须比词数口径产出更少更宽的屏，实测 " + byWidth.length + " vs " + byWords.length);
+  const widthOf = (s) => { let w = 0; for (const ch of String(s)) w += /[\u2E80-\uA4CF\uAC00-\uD7A3\uFF00-\uFF60]/.test(ch) ? 2 : 1; return w; };
+  for (const cue of byWidth) {
+    assert.ok(widthOf(cue.content) <= Core.SOURCE_DISPLAY_MAX_WIDTH + 8,
+      "宽度不得越过上限太多: " + cue.content + " (w=" + widthOf(cue.content) + ")");
+  }
+  // 内容与时间不变量：不丢字、不倒挂、不重叠
+  const join = (list) => list.map((c) => c.content).join("").replace(/\s+/g, "");
+  assert.strictEqual(join(byWidth), join(ja), "重分句不得丢失或改写任何原文字符");
+  for (let i = 1; i < byWidth.length; i++) {
+    assert.ok(byWidth[i].start >= byWidth[i - 1].start, "start 必须单调不减");
+    assert.ok(byWidth[i].end >= byWidth[i].start, "end 不得早于 start");
+  }
+  // 拉丁轨：12 词本来就约 60 视觉宽，折算后上限不该反而变紧把英文切碎。
+  const en = ["is boil water.", "One of those things", "you will do today"].map((t, i) => mk(i, t));
+  const enWords = Core.resegmentCues(en, { maxWords: Core.DISPLAY_UNIT_MAX_WORDS });
+  const enWidth = Core.resegmentCues(en, { maxWords: Core.DISPLAY_UNIT_MAX_WORDS, maxVisualWidth: Core.SOURCE_DISPLAY_MAX_WIDTH });
+  assert.ok(enWidth.length <= enWords.length + 1,
+    "拉丁轨不得因宽度折算被切得更碎，实测 " + enWidth.length + " vs " + enWords.length);
+  assert.strictEqual(enWidth.map((c) => c.content).join(" ").replace(/\s+/g, " "),
+    enWords.map((c) => c.content).join(" ").replace(/\s+/g, " "),
+    "拉丁轨内容不得因这次改动发生变化");
+});
+
+test("validateTrackManifest 保留 isOriginal —— auto 选轨定位视频原语言的唯一判据", () => {
+  // 真实形态（E4HGfagANiQ）：音轨 en-US，但西语人工轨排在 files[0]。
+  // 原语言标记若在校验层被丢弃，auto 只能退回取首条，就会给英文视频配西语源字幕。
+  const u = (lang) => "https://www.youtube.com/api/timedtext?v=vid&lang=" + lang + "&pot=signed";
+  const out = Core.validateTrackManifest({
+    videoId: "vid",
+    files: [
+      { name: "Spanish (Latin America)", code: "es-419", languageCode: "es-419", kind: "", isOriginal: false, url: u("es-419") },
+      { name: "English", code: "en", languageCode: "en", kind: "", isOriginal: true, url: u("en") },
+    ],
+  }, { expectedVideoId: "vid" });
+  assert.ok(out, "合法 manifest 应通过");
+  assert.strictEqual(out.files.length, 2);
+  assert.strictEqual(out.files[0].isOriginal, false, "非原语言轨必须保留 false");
+  assert.strictEqual(out.files[1].isOriginal, true, "原语言轨标记不得被过滤掉");
+  // 负向：缺失字段不得被伪造成 true（宁可退化为取首条，也不能猜错语言）
+  const noFlag = Core.validateTrackManifest({
+    videoId: "vid", files: [{ code: "en", languageCode: "en", url: u("en") }],
+  }, { expectedVideoId: "vid" });
+  assert.strictEqual(noFlag.files[0].isOriginal, false, "未声明时必须为 false，不得默认 true");
+});
+
 asyncTest("chatCompletion 透传外部 AbortSignal 并区分主动取消", async () => {
   const controller = new AbortController();
   controller.abort();
@@ -3639,8 +3750,25 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     assert.match(core, /delete c\.skipChineseSource/, "迁移时应清除旧废字段");
     assert.doesNotMatch(popup, /skipChineseSource/);
     const pick = src.slice(src.indexOf("function pickTrack"), src.indexOf("/* =====================================================", src.indexOf("function pickTrack")));
-    assert.match(pick, /sourceLang === "auto"[\s\S]*?picked = list\[0\]/);
+    // auto 必须跟视频原语言（isOriginal），不得退回「取轨道数组第一条」。
+    // 负向：实测 E4HGfagANiQ 音轨 en-US 但西语人工轨排 list[0]，取首条会配错语言。
+    assert.match(pick, /sourceLang === "auto"[\s\S]*?isOriginal/);
+    assert.doesNotMatch(pick, /sourceLang === "auto"[\s\S]*?picked = list\[0\];[\s\S]*?\} else/,
+      "auto 分支不得无条件取 list[0]");
     assert.match(pick, /Core\.preferManualTrack\(list, picked\)/);
+    // 中止的 clip 必须回到可重翻状态，且 inflight 无条件复位。
+    // 回归防护：曾经 `if (stale || aborted) return;` 让 clipState 停在 "pending"、
+    // clipInflight 停在 true —— retryTick 只捡 "error"，于是该 clip 永久无人重翻。
+    // 真实后果：E4HGfagANiQ 144.1s→208.1s 整块无译文，而其后的块已译完（中间留洞）。
+    const tcStart = src.indexOf("async function translateClip");
+    const tc = src.slice(tcStart, src.indexOf("\n  function ", tcStart));
+    assert.ok(tc.length > 200, "未定位到 translateClip 源码");
+    assert.doesNotMatch(tc, /if \(stale \|\| aborted\) return;/, "中止不得静默丢弃状态");
+    assert.match(tc, /if \(aborted\)[\s\S]*?clipState\[idx\] = "error"/, "中止后必须标为可重翻");
+    // inflight 复位必须在世代检查之前（否则旧代残留 true 永久阻塞该 clip）
+    const fin = tc.slice(tc.indexOf("} finally {"));
+    assert.ok(fin.indexOf("state.clipInflight[idx] = false;") < fin.indexOf("!== state.requestGeneration"),
+      "clipInflight 复位必须早于世代 return，不得被跳过");
     assert.doesNotMatch(pick, /picked = exact \|\| prefix \|\| list\[0\]/, "显式源语言不存在时不得偷偷换成其它语言");
     assert.doesNotMatch(pick, /["'](?:en|zh|ja|ar|th|pl)["']/);
   });

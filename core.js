@@ -1476,6 +1476,30 @@
     var maxDur = opts.maxDurationMs != null ? opts.maxDurationMs : 6000;
     var hasExplicitMaxWords = opts.maxWords != null;
     var maxWords = hasExplicitMaxWords ? opts.maxWords : 12;
+    // 「词数」对逐字文字（中日韩泰…）不是宽度的等价物：splitDisplayWords 把连写文字
+    // 逐字切成 token，于是 maxWords=12 对拉丁文约 60-70 视觉宽度（舒适），对日文只有
+    // 12 —— 实测 Dw43jxWZvPg 日语轨 1146 屏中 97% ≤12 字符，中位 9 字符，疯狂分屏。
+    // 修法不是给 CJK 加特例分支，而是把上限的单位统一成视觉宽度：宽度是屏能装多少的
+    // 唯一真实约束，词数只是它在等宽拉丁文下的近似。口径复用 semanticTokenBudgets，
+    // 与语义模式同源，不另算一套（语义轨本来就不碎，正因为它走的是宽度口径）。
+    var visualWidthCap = opts.maxVisualWidth != null
+      ? Math.max(12, Math.floor(Number(opts.maxVisualWidth))) : null;
+    // 把宽度上限折算成这批词的 token 数上限。
+    //
+    // 关键：只**放宽**，永不收紧。宽度折算的用途是「逐字文字里 1 token = 1 字，词数上限
+    // 严重低估了屏能装的内容」，所以取 max(词数上限, 宽度折算出的上限)。
+    // 若写成直接采用折算值，拉丁轨会被收紧：`unit0 has four words` 平均宽 5.25，
+    // 52/5.25≈9 < 12，于是 12 词的既有行为被压到 9 词，还会把一个 cue 劈成两半分到
+    // 相邻单元（实测 browser-replay full-srt 因此失败）。词数上限对拉丁文本来就合适，
+    // 折算值只该在它明显偏小时接管。
+    function tokenCapFor(words, wordCap) {
+      if (visualWidthCap == null) return wordCap;
+      var list = (words || []).filter(function (w) { return String(w || "").trim(); });
+      if (!list.length) return wordCap;
+      var average = semanticDisplayWidth(collapseWhitespace(joinRestoredWords(list))) / list.length;
+      if (!(average > 0)) return wordCap;
+      return Math.max(wordCap, Math.floor(visualWidthCap / average));
+    }
     var hasExplicitContinuationMaxWords = opts.continuationMaxWords != null;
     var continuationMaxWords = hasExplicitContinuationMaxWords
       ? Math.max(maxWords, Math.floor(Number(opts.continuationMaxWords) || maxWords)) : null;
@@ -1621,7 +1645,8 @@
       //    整 clip 变 [未翻译]。所以按「合并逻辑自己允许的最大宽度」兜底拆，
       //    上限口径复用 mergeHardCap（与 orphanCap / continuationCap 同源，
       //    不在这里另算一套，否则两处漂移就是下一个 bug）。
-      var chunks = splitWordsToCap(cur.words, cur.merged ? (cur.mergeHardCap || maxWords) : maxWords);
+      var wordCap = cur.merged ? (cur.mergeHardCap || maxWords) : maxWords;
+      var chunks = splitWordsToCap(cur.words, tokenCapFor(cur.words, wordCap));
       var span = Math.max(0, cur.end - cur.start);
       var weights = chunks.map(function (ws) {
         return Math.max(1, collapseWhitespace(joinRestoredWords(ws)).length);
@@ -1667,16 +1692,19 @@
         var ended = SENTENCE_END_RE.test(cur.words.join(" "));
         var wouldWords = cur.words.length + added.length;
         var wouldDur = c.end - cur.start;
+        // 合并判据里的所有词数上限都必须走同一折算口径，否则逐字文字永远达不到
+        // maxWords，碎片既不被合并也不被拆分，原样停留在源轨的破碎边界上。
+        var effMaxWords = tokenCapFor(cur.words.concat(added), maxWords);
         var orphanCap = hasExplicitContinuationMaxWords
-          ? continuationMaxWords : maxWords + (hasExplicitMaxWords ? 8 : 2);
+          ? continuationMaxWords : effMaxWords + (hasExplicitMaxWords ? 8 : 2);
         var orphanPrepMerge = ended && startsOrphanPrepositionalPhrase(words) &&
           gap < grammarContinuationMaxGapMs && wouldWords <= orphanCap &&
           wouldDur <= grammarContinuationMaxDurationMs;
         var canMerge = !ended || cur.words.length < minWords || orphanPrepMerge;
-        var normalMerge = gap < longPauseMs && wouldWords <= maxWords && wouldDur <= maxDur;
+        var normalMerge = gap < longPauseMs && wouldWords <= effMaxWords && wouldDur <= maxDur;
         var continuationCap = hasExplicitContinuationMaxWords
           ? continuationMaxWords
-          : (hasExplicitMaxWords ? maxWords + Math.max(4, Math.ceil(maxWords * 0.75)) : maxWords + 2);
+          : (hasExplicitMaxWords ? effMaxWords + Math.max(4, Math.ceil(effMaxWords * 0.75)) : effMaxWords + 2);
         // 下一 cue 若在内部很快出现句号，只需把第一个完整句并入；其后的新句已由
         // splitCueAtSentenceEnds 拆成独立 piece，不应计入这次续接的词数预算。
         var addedEndsSentence = SENTENCE_END_RE.test(added.join(" "));
@@ -1697,7 +1725,7 @@
           cur.merged = true;
           // 记下"本次合并被允许到多宽"。flush 的超长兜底拆分复用这个值，
           // 而不是另算一套上限 —— 上限只有一个来源，两处各算必然漂移。
-          var allowedCap = normalMerge ? maxWords : 0;
+          var allowedCap = normalMerge ? effMaxWords : 0;
           if (orphanPrepMerge && orphanCap > allowedCap) allowedCap = orphanCap;
           if (grammarMerge && effectiveContinuationCap > allowedCap) allowedCap = effectiveContinuationCap;
           if (!(cur.mergeHardCap > allowedCap)) cur.mergeHardCap = allowedCap;
@@ -1712,7 +1740,7 @@
       if (endedNow && curWords >= minWords) {
         flush();
       } else if (!cur.fragmentChain && !hasEnglishContinuationTail(cur.words) &&
-        (curWords >= maxWords || cur.end - cur.start >= maxDur)) {
+        (curWords >= tokenCapFor(cur.words, maxWords) || cur.end - cur.start >= maxDur)) {
         flush();
       }
     }
@@ -2973,6 +3001,12 @@
     "译文完整性是第一要求：原文每个意思都要译出，不省略、不概括、不压缩。\n" +
     "专有名词（品牌、人名、型号如 AA/AAA）保留原文写法，不要音译。\n" +
     "只返回严格 JSON：{\"segments\":[{\"sourceFrom\":\"c0\",\"sourceTo\":\"c3\",\"screens\":[\"第一屏\",\"第二屏\"]}]}。\n" +
+    "字幕要在语音结束前读完：观众阅读速度约每秒 5 个汉字，而每屏能显示多久由 sourceCues " +
+    "的 startMs/endMs 决定。所以译文要精炼上屏 —— 用更短的说法表达同一个意思，" +
+    "去掉可省的连接词、冗余修饰和不影响理解的重复，不追求与原文逐词对应。\n" +
+    "但精炼不等于删减：原文的每个信息点都必须还在，只是说法更紧凑。" +
+    "「毫无疑问，我们需要衣服来抵御自然环境」→「我们需要衣服御寒」是精炼（信息全在，更短）；" +
+    "删掉「御寒」这个原因就是删减，不允许。两者冲突时保留信息，宁可该屏偏长。\n" +
     "screens 是把该段完整译文按语义切好的字幕屏：每屏是一个读完整、通顺的意思单元；" +
     "目标 12-24 个汉字，但这是排版目标而非删减理由 —— 意思单元超长也要完整写出，宁可该屏偏长，绝不省略；" +
     "分开后某半太短读起来断气就不分，分开后各自更清楚就分；不切开词语、专名、数字+单位；" +
@@ -3021,10 +3055,17 @@
   // v6：契约由「模型交整段 text、程序独立分屏」改为「模型交语义分好的 screens、程序只做
   // 宽度兜底」。旧缓存里存的是程序按纯字数规则分出的屏（含焊句：「…记得这个与其另用电池
   // 测试器」），其 integrity 自洽会通过校验，不升版就会继续命中那批坏分屏。
-  var BLOCK_CONTRACT_VERSION = "block-v6";
+  // v7：prompt 增加「按可显示时长精炼措辞」的要求（输出结构不变，但译文形态变了，
+  // 旧缓存里是不受时长约束的长译文，不升版会继续命中那批读不完的屏）。
+  var BLOCK_CONTRACT_VERSION = "block-v7";
 
   var BLOCK_SEGMENT_MAX_GAP_MS = 750;
   var BLOCK_MIN_DISPLAY_MS = 300;
+  // 阅读速度上限，来自 Netflix Timed Text Style Guide（简体中文，成人节目 9 字/秒）。
+  // https://partnerhelp.netflixstudios.com/hc/en-us/articles/215986007
+  // 换算成每字最少显示毫秒数：1000/9 ≈ 111ms。此前代码里用过 180ms/字（5.5 字/秒）
+  // 的自拟值，把合格的屏也算成读不完（实测同一批数据 17 屏 vs 4 屏），故以行业标准为准。
+  var READING_MS_PER_CHAR = Math.ceil(1000 / 9);
   var BLOCK_MAX_LINES_PER_SEGMENT = 64;
 
   function maxBlockDisplayLines(activeMs) {
@@ -3835,7 +3876,90 @@
       });
     });
     if (coverageCursor !== source.length) throw new Error("block translation cached coverage incomplete");
-    return enforceDisplayMonotonicity(units, minDisplayMs);
+    // 顺序固定：先合并读不完的屏（会改变相邻关系），再去重叠。反过来则合并后又产生
+    // 新的重叠没人处理。
+    return enforceDisplayMonotonicity(
+      mergeUnreadableUnits(units, { maxVisualWidth: maxWidth }), minDisplayMs);
+  }
+
+  /**
+   * 合并「时间窗不够读完」的相邻屏。
+   *
+   * 为什么需要：屏的时间严格来自它覆盖的源 cue（红线：startMs 不许动、不许侵入下一屏），
+   * 所以当源 cue 本身很短时，无论译文怎么精炼都读不完 —— 实测西语 c4「y por moda」只有
+   * 820ms，中文「也为了时尚，展现个性」9 字按 9 字/秒需要 1000ms，91ms/字。
+   * 合并相邻两屏则时间窗相加、字数相加，人均阅读时间被摊平（91ms/字 → 156ms/字），
+   * 且 start 取前屏、end 取后屏，两个红线都不碰。
+   *
+   * 为什么由程序做而不是模型：这是算术不是语感。「够不够读」由字数和毫秒数唯一确定，
+   * 不存在两种合理答案；交给模型反而引入不确定性（弱模型心算 startMs/endMs 更不可靠），
+   * 还要多花 prompt token。语感判断（该不该在这里断句）仍归模型 —— 本函数只在
+   * 模型的断点确实读不完时才撤销它，且受下列硬约束限制。
+   *
+   * 硬约束（全部复用既有不变量，不新增规则）：
+   *  - 不跨 segment 合并：segment 边界就是 750ms 长停顿，是真实语音结构边界。
+   *  - 不把两个完整句子并到一屏：句末标点是既有硬边界（splitAtSentenceEnd 的判据）。
+   *  - 合并后不得超过最大显示宽度：否则渲染层还得再切，白合并。
+   *  - 只有「合并后确实改善」才合并：避免把两个都不够的屏合成一个仍不够的长屏。
+   */
+  function mergeUnreadableUnits(units, opts) {
+    opts = opts || {};
+    var maxWidth = Math.max(8, Math.floor(Number(opts.maxVisualWidth) || TRANSLATION_DISPLAY_MAX_WIDTH));
+    var msPerChar = Math.max(1, Math.floor(Number(opts.readingMsPerChar) || READING_MS_PER_CHAR));
+    // 需要多久才读得完这段译文。宽字符（汉字/假名）与窄字符（拉丁字母、数字）都算
+    // 一个阅读单位：Netflix 的 9 字/秒针对的是汉字，拉丁词整体读得更快，按字符计
+    // 反而高估，所以这里用 semanticDisplayWidth/2 折算成"汉字等价数"。
+    function readMsNeeded(text) {
+      var chars = Math.ceil(semanticDisplayWidth(text) / 2);
+      return chars * msPerChar;
+    }
+    function shortfall(unit) {
+      return readMsNeeded(unit.translation) - (unit.endMs - unit.startMs);
+    }
+    var out = [];
+    for (var i = 0; i < units.length; i++) {
+      var cur = units[i];
+      // 反复尝试把后继屏并进来，直到读得完或撞上任一硬约束。
+      while (shortfall(cur) > 0 && i + 1 < units.length) {
+        var next = units[i + 1];
+        if (next.blockSegmentId !== cur.blockSegmentId) break; // 不跨长停顿
+        if (endsWithSentenceFinal(cur.translation)) break;     // 不并两个完整句
+        var mergedText = joinDisplayScreens(cur.translation, next.translation);
+        if (semanticDisplayWidth(mergedText) > maxWidth) break; // 不制造超宽屏
+        var mergedUnit = {
+          blockSegmentId: cur.blockSegmentId,
+          srcStart: cur.srcStart,
+          srcEnd: next.srcEnd,
+          originalText: joinDisplayScreens(cur.originalText, next.originalText),
+          translation: mergedText,
+          startMs: cur.startMs,   // 红线：出现时刻取前屏，绝不前推
+          endMs: next.endMs,      // 红线：结束取后屏，绝不越过它
+        };
+        // 只在确实改善时接受：合并后每字可用时间必须变多，否则原样保留模型的断点。
+        var before = shortfall(cur);
+        var after = shortfall(mergedUnit);
+        if (!(after < before)) break;
+        cur = mergedUnit;
+        i++;
+      }
+      out.push(cur);
+    }
+    return out;
+  }
+
+  function endsWithSentenceFinal(text) {
+    var s = collapseWhitespace(String(text || ""));
+    if (!s) return false;
+    return SENTENCE_FINAL_PUNCT.test(s.slice(-1));
+  }
+
+  function joinDisplayScreens(a, b) {
+    var left = collapseWhitespace(String(a == null ? "" : a));
+    var right = collapseWhitespace(String(b == null ? "" : b));
+    if (!left) return right;
+    if (!right) return left;
+    // 中日韩之间不加空格，拉丁字符之间加 —— 复用 joinRestoredWords 的既有口径。
+    return joinRestoredWords([left, right]);
   }
 
   /**
@@ -4658,7 +4782,9 @@
       var identity = [code, languageCode, kind].join("\x1f");
       if (identities[identity]) return null;
       identities[identity] = true;
-      files.push({ name: name, code: code, languageCode: languageCode, kind: kind, url: parsed.toString() });
+      // isOriginal 由采集侧按 vss_id 前缀判定（原语言轨为 ".en" 形式）。auto 选轨靠它
+      // 定位视频原语言，不能退回「取数组首条」—— 轨顺序不保证原语言在前。
+      files.push({ name: name, code: code, languageCode: languageCode, kind: kind, isOriginal: raw.isOriginal === true, url: parsed.toString() });
     }
     return { videoId: videoId, files: files };
   }
@@ -5097,6 +5223,8 @@
     SEMANTIC_MAX_TOKENS: SEMANTIC_MAX_TOKENS,
     SOURCE_DISPLAY_PREFERRED_WIDTH: SOURCE_DISPLAY_PREFERRED_WIDTH,
     SOURCE_DISPLAY_MAX_WIDTH: SOURCE_DISPLAY_MAX_WIDTH,
+    READING_MS_PER_CHAR: READING_MS_PER_CHAR,
+    mergeUnreadableUnits: mergeUnreadableUnits,
     TRANSLATION_DISPLAY_MAX_WIDTH: TRANSLATION_DISPLAY_MAX_WIDTH,
     PREFETCH_AHEAD: PREFETCH_AHEAD,
     planSemanticInterval: planSemanticInterval,
