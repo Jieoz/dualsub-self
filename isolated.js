@@ -307,7 +307,7 @@
       systemPrompt: identity.systemPrompt || "",
       reasoningEffort: identity.reasoningEffort,
       maxLineChars: identity.maxLineChars,
-      contractVersion: "block-v1",
+      contractVersion: Core.BLOCK_CONTRACT_VERSION,
       segmentationMode: segmentationMode || state.segmentationMode,
       clipStartMs: clip.startMs,
       cueFingerprint: clipCueFingerprint(clip),

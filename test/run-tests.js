@@ -812,6 +812,50 @@ test("block translation 允许自由重组译文行，并按源范围粗粒度�
   assert.ok(units.every((unit) => unit.endMs > unit.startMs));
 });
 
+test("block translation 把悬挂的定语标记与被修饰成分合并回同一屏", () => {
+  const cues = [
+    { start: 0, end: 2000, content: "The phoenix emblem is everywhere" },
+    { start: 2000, end: 4000, content: "and the woodwork is real timber" },
+  ];
+  const linesOf = (raw) => Core.parseBlockTranslationResponse(raw, cues, { maxVisualWidth: 48 })[0].lines;
+
+  // 真实缺陷样本：模型把「的」留在屏尾，被修饰名词甩到下一屏。
+  // 实测发生率约 10%（日语人工轨 300s 内 5 处）。
+  // 修法是合并而非拒绝：纯拒绝实测导致 1/17 块重试 6 次耗尽后整块无字幕，
+  // 丢字幕比断句难看严重得多。
+  assert.deepStrictEqual(
+    linesOf(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", lines: ["各处都饰有凤凰的", "徽章"] }] })),
+    ["各处都饰有凤凰的徽章"], "悬挂的「的」必须与被修饰名词合并");
+
+  assert.deepStrictEqual(
+    linesOf(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", lines: ["车窗部分是类似铝材的", "材质"] }] })),
+    ["车窗部分是类似铝材的材质"], "这是纯拒绝策略下连续 6 次失败的真实样本");
+
+  for (const bad of ["外面的", "带有日式木纹的", "慢慢地", "跑得"]) {
+    const got = linesOf(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", lines: [bad, "后续内容"] }] }));
+    assert.deepStrictEqual(got, [bad + "后续内容"], `应合并以「${bad.slice(-1)}」结尾的非末行: ${bad}`);
+  }
+
+  // 连续多行悬挂时应持续吸收，不能只修一层。
+  assert.deepStrictEqual(
+    linesOf(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", lines: ["非常精致的", "手工雕刻的", "徽章"] }] })),
+    ["非常精致的手工雕刻的徽章"], "连续悬挂必须一路合并");
+
+  // 必须放过的合法情况：句末语气「的」——这是最初检测器 4/9 假阳性的来源。
+  assert.deepStrictEqual(
+    linesOf(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", lines: ["据说就是这样完成的"] }] })),
+    ["据说就是这样完成的"], "末行以「的」结尾是合法句末语气，不得改动");
+
+  assert.deepStrictEqual(
+    linesOf(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", lines: ["它是用多达七层工序", "完成的"] }] })),
+    ["它是用多达七层工序", "完成的"], "多行中最后一行以「的」结尾同样合法，不得合并");
+
+  // 标点收尾说明该屏是完整小句，不算悬挂。
+  assert.deepStrictEqual(
+    linesOf(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", lines: ["这就是我要说的，", "接着看下一处"] }] })),
+    ["这就是我要说的，", "接着看下一处"], "「的」后带标点表示小句结束，不得合并");
+});
+
 test("block translation 锁定连续源范围，并只在目标词法边界兜底分屏", () => {
   const cues = [{ start: 0, end: 1000, content: "one" }, { start: 1000, end: 2000, content: "two" }];
   const invalid = [
@@ -1856,7 +1900,9 @@ test("真实轨重新解析后语义缓存 key 不变（第二次观看必须秒
 test("makeCacheKey 隔离旧逐 cue 协议与 block 重构缓存", () => {
   const block = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", segmentationMode: "block", clipStartMs: 0 });
   const legacy = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", contractVersion: "cue-v1", segmentationMode: "semantic", clipStartMs: 0 });
-  assert.ok(block.startsWith("dsc-v90|block-v1|block|"), "block 重构必须使用独立缓存 namespace 与 contract");
+  // 跟随 core 的权威版本号，不硬编码：升版是"改变译文形态"时的必要动作，
+  // 断言应验证 namespace 结构与隔离性，而不是把版本号钉死在测试里。
+  assert.ok(block.startsWith(`dsc-v90|${Core.BLOCK_CONTRACT_VERSION}|block|`), "block 重构必须使用独立缓存 namespace 与 contract");
   assert.notStrictEqual(block, legacy, "block 译文不得复用旧逐 cue coverage 缓存");
   const before = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", segmentationMode: "block", clipStartMs: 0, cueFingerprint: "0:1000:a~1000:2000:b" });
   const after = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", segmentationMode: "block", clipStartMs: 0, cueFingerprint: "0:2000:a b" });
@@ -2765,11 +2811,15 @@ async function main() {
     assert.match(src, /var blockSeconds = Math\.max\(30/);
   })
 
-  test("运行时缓存身份与请求统一使用 block-v1 协议", () => {
+  test("运行时缓存身份与请求统一使用同一 block 契约版本", () => {
     const iso = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
     const core = fs.readFileSync(path.join(ROOT, "core.js"), "utf8");
-    assert.match(core, /"dsc-v90"[\s\S]*?parts\.contractVersion \|\| "block-v1"/);
-    assert.match(iso, /contractVersion:\s*"block-v1"/);
+    // 版本号只有一个权威来源（core 的 BLOCK_CONTRACT_VERSION）。
+    // 运行时不得再写字面量，否则两侧会各自漂移。
+    assert.match(core, /var BLOCK_CONTRACT_VERSION = "block-v\d+"/, "core 必须持有唯一权威版本号");
+    assert.match(core, /"dsc-v90"[\s\S]*?parts\.contractVersion \|\| BLOCK_CONTRACT_VERSION/);
+    assert.match(iso, /contractVersion:\s*Core\.BLOCK_CONTRACT_VERSION/, "isolated 必须引用 core 的版本号而非字面量");
+    assert.doesNotMatch(iso, /contractVersion:\s*"block-v\d+"/, "运行时不得硬编码契约版本字面量");
     assert.doesNotMatch(iso, /contractVersion:\s*"coverage-v1"/);
     assert.match(iso, /writeCache\(key, \{ segments: out\.segments \}, generation\)/);
     assert.match(iso, /Core\.materializeBlockTranslation\(cached\.segments, clip\.cues, \{ maxVisualWidth: identity\.maxLineChars, requireIntegrity: true \}\)/);
