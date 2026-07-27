@@ -2963,7 +2963,7 @@
   var DEFAULT_BLOCK_TRANSLATION_PROMPT =
     "翻译连续字幕块时先理解完整上下文，再用目标语言自然重组。允许合并或重新划分源 cue，绝不要求源译逐行对应。\n" +
     "只返回严格 JSON：{\"segments\":[{\"sourceFrom\":\"c0\",\"sourceTo\":\"c3\",\"lines\":[\"目标语言字幕第一屏\",\"第二屏\"]}]}。\n" +
-    "segments 必须按源 cue 顺序连续且恰好覆盖全部输入；相邻源 cue 若有 750ms 或更长停顿，必须成为两个 segment 的边界。每个目标字幕屏必须至少有约 300ms 可显示时间，不得为短源范围生成大量碎屏。每个 lines 项必须是自然、可直接显示的目标语言字幕。优先按目标语言标点断句；复杂长句只在完整词或完整短语之间换屏，坚决不得把词、词组、数字与单位、专名或固定表达拆到两屏。不得返回 Markdown、解释或其它字段。";
+    "segments 必须按源 cue 顺序连续且恰好覆盖全部输入；相邻源 cue 若有 750ms 或更长停顿，必须成为两个 segment 的边界。每个目标字幕屏必须至少有约 300ms 可显示时间，不得为短源范围生成大量碎屏。每个 lines 项必须是自然、可直接显示的目标语言字幕。优先按目标语言标点断句；复杂长句只在完整词或完整短语之间换屏，坚决不得把词、词组、数字与单位、专名或固定表达拆到两屏。换屏时前一屏不得以结构助词或介词收尾（如「的」「地」「得」「把」「在」「和」），修饰语必须与被修饰成分同屏；句子真正结束时以「的」收尾是允许的。不得返回 Markdown、解释或其它字段。";
 
   var BLOCK_SEGMENT_MAX_GAP_MS = 750;
   var BLOCK_MIN_DISPLAY_MS = 300;
@@ -2973,6 +2973,50 @@
     var byTime = Math.floor(Math.max(0, Number(activeMs) || 0) / BLOCK_MIN_DISPLAY_MS);
     if (byTime < 1) throw new Error("block translation source duration too short for one display line");
     return Math.min(BLOCK_MAX_LINES_PER_SEGMENT, byTime);
+  }
+
+  /**
+   * 中文定语/状态标记不得留在屏尾而把被修饰成分甩到下一屏。
+   *
+   * 真实缺陷样本（日语人工轨 300s 内 5 处，约 10% 相邻屏对）：
+   *   「各处都饰有凤凰的」→「徽章」
+   *   「关上车门后，外面的」→「声音就会被隔绝」
+   * 这类断法在中文里明确是错的：读到屏尾时修饰语悬空，观众必须等下一屏才能成句。
+   *
+   * 判据是目标语言（中文输出）特性，不是源语言特性 —— 与既有设计一致：
+   * 只允许对目标语言和 Unicode 书写系统属性做处理，绝不引入源语言名单。
+   *
+   * 只对**非末行**生效。末行以「的」结尾通常是合法句末语气（「据说就是这样完成的」），
+   * 同理「的」后紧跟标点说明该屏已是完整小句。早先一版检测器没区分这两种情况，
+   * 在真实产出上产生了 4/9 的假阳性，因此这里的边界条件本身就是回归测试的一部分。
+   *
+   * prompt 里已写明"不得把词、词组拆到两屏"并额外点明助词不得收尾，实测把英语首次
+   * 通过率提到 10/10，但**不能只靠 prompt**：日语真实轨上仍有块连续 6 次都这样断
+   * （「车窗部分是类似铝材的」→ 名词甩到下一屏）。
+   *
+   * 因此这里不抛错拒绝，而是确定性修正：把悬挂行与下一行合并。两行都在手上，
+   * 合并是无损的，且宽度由后续 splitTargetDisplayLine 兜底。
+   * 早先一版实现选择抛错交给重试，实测导致 1/17 块耗尽 6 次后**整块无字幕** ——
+   * 丢字幕比断句难看严重得多，纯拒绝策略在这里是错的。
+   */
+  var DANGLING_MODIFIER_TAIL = /[的地得把将和与在从对向给为][\s"'”’)）]*$/u;
+
+  function mergeDanglingModifierLines(lines, maxWidth) {
+    var merged = [];
+    for (var i = 0; i < lines.length; i++) {
+      var current = String(lines[i] || "");
+      // 只要当前行以助词收尾且还有后继行，就吸收后继行；连续悬挂会持续吸收。
+      // 末行以「的」收尾不进入循环，因为那是合法句末语气。
+      while (DANGLING_MODIFIER_TAIL.test(current) && i + 1 < lines.length) {
+        current += String(lines[i + 1] || "");
+        i++;
+      }
+      merged.push(current);
+    }
+    // 合并后可能超宽，交回既有词法边界分屏；它按原子选择切点，不会再切在助词后。
+    var out = [];
+    merged.forEach(function (line) { out = out.concat(splitTargetDisplayLine(line, maxWidth)); });
+    return out;
   }
 
   function blockSegmentIntegrity(segment) {
@@ -3105,8 +3149,10 @@
       if (segment.lines.length > maxLines) throw new Error("block translation has too many lines for source duration");
       // 长停顿是毫秒级时间事实，模型看不见也不该负责：这里不拒绝跨停顿的语义段，
       // 由 materializeBlockTranslation 在装载时把每屏钳到停顿的某一侧，保证静音处没有字幕。
+      // 先按词法边界分屏，再把助词悬挂的屏与后继屏合并（合并函数内部会重新分屏兜底宽度）。
       var lines = [];
       segment.lines.forEach(function (line) { lines = lines.concat(splitTargetDisplayLine(line, maxWidth)); });
+      lines = mergeDanglingModifierLines(lines, maxWidth);
       if (lines.length > maxLines) throw new Error("block translation has too many display lines for source duration");
       cursor = to + 1;
       var normalized = { segmentId: "b" + segmentIndex, sourceFrom: from, sourceTo: to, lines: lines };

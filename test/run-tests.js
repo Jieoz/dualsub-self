@@ -812,6 +812,50 @@ test("block translation 允许自由重组译文行，并按源范围粗粒度�
   assert.ok(units.every((unit) => unit.endMs > unit.startMs));
 });
 
+test("block translation 把悬挂的定语标记与被修饰成分合并回同一屏", () => {
+  const cues = [
+    { start: 0, end: 2000, content: "The phoenix emblem is everywhere" },
+    { start: 2000, end: 4000, content: "and the woodwork is real timber" },
+  ];
+  const linesOf = (raw) => Core.parseBlockTranslationResponse(raw, cues, { maxVisualWidth: 48 })[0].lines;
+
+  // 真实缺陷样本：模型把「的」留在屏尾，被修饰名词甩到下一屏。
+  // 实测发生率约 10%（日语人工轨 300s 内 5 处）。
+  // 修法是合并而非拒绝：纯拒绝实测导致 1/17 块重试 6 次耗尽后整块无字幕，
+  // 丢字幕比断句难看严重得多。
+  assert.deepStrictEqual(
+    linesOf(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", lines: ["各处都饰有凤凰的", "徽章"] }] })),
+    ["各处都饰有凤凰的徽章"], "悬挂的「的」必须与被修饰名词合并");
+
+  assert.deepStrictEqual(
+    linesOf(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", lines: ["车窗部分是类似铝材的", "材质"] }] })),
+    ["车窗部分是类似铝材的材质"], "这是纯拒绝策略下连续 6 次失败的真实样本");
+
+  for (const bad of ["外面的", "带有日式木纹的", "慢慢地", "跑得"]) {
+    const got = linesOf(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", lines: [bad, "后续内容"] }] }));
+    assert.deepStrictEqual(got, [bad + "后续内容"], `应合并以「${bad.slice(-1)}」结尾的非末行: ${bad}`);
+  }
+
+  // 连续多行悬挂时应持续吸收，不能只修一层。
+  assert.deepStrictEqual(
+    linesOf(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", lines: ["非常精致的", "手工雕刻的", "徽章"] }] })),
+    ["非常精致的手工雕刻的徽章"], "连续悬挂必须一路合并");
+
+  // 必须放过的合法情况：句末语气「的」——这是最初检测器 4/9 假阳性的来源。
+  assert.deepStrictEqual(
+    linesOf(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", lines: ["据说就是这样完成的"] }] })),
+    ["据说就是这样完成的"], "末行以「的」结尾是合法句末语气，不得改动");
+
+  assert.deepStrictEqual(
+    linesOf(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", lines: ["它是用多达七层工序", "完成的"] }] })),
+    ["它是用多达七层工序", "完成的"], "多行中最后一行以「的」结尾同样合法，不得合并");
+
+  // 标点收尾说明该屏是完整小句，不算悬挂。
+  assert.deepStrictEqual(
+    linesOf(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", lines: ["这就是我要说的，", "接着看下一处"] }] })),
+    ["这就是我要说的，", "接着看下一处"], "「的」后带标点表示小句结束，不得合并");
+});
+
 test("block translation 锁定连续源范围，并只在目标词法边界兜底分屏", () => {
   const cues = [{ start: 0, end: 1000, content: "one" }, { start: 1000, end: 2000, content: "two" }];
   const invalid = [
