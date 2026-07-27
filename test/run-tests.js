@@ -1900,7 +1900,9 @@ test("真实轨重新解析后语义缓存 key 不变（第二次观看必须秒
 test("makeCacheKey 隔离旧逐 cue 协议与 block 重构缓存", () => {
   const block = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", segmentationMode: "block", clipStartMs: 0 });
   const legacy = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", contractVersion: "cue-v1", segmentationMode: "semantic", clipStartMs: 0 });
-  assert.ok(block.startsWith("dsc-v90|block-v1|block|"), "block 重构必须使用独立缓存 namespace 与 contract");
+  // 跟随 core 的权威版本号，不硬编码：升版是"改变译文形态"时的必要动作，
+  // 断言应验证 namespace 结构与隔离性，而不是把版本号钉死在测试里。
+  assert.ok(block.startsWith(`dsc-v90|${Core.BLOCK_CONTRACT_VERSION}|block|`), "block 重构必须使用独立缓存 namespace 与 contract");
   assert.notStrictEqual(block, legacy, "block 译文不得复用旧逐 cue coverage 缓存");
   const before = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", segmentationMode: "block", clipStartMs: 0, cueFingerprint: "0:1000:a~1000:2000:b" });
   const after = Core.makeCacheKey({ videoId: "v", trackCode: "en", targetLang: "zh-Hans", apiModel: "m", segmentationMode: "block", clipStartMs: 0, cueFingerprint: "0:2000:a b" });
@@ -2809,11 +2811,15 @@ async function main() {
     assert.match(src, /var blockSeconds = Math\.max\(30/);
   })
 
-  test("运行时缓存身份与请求统一使用 block-v1 协议", () => {
+  test("运行时缓存身份与请求统一使用同一 block 契约版本", () => {
     const iso = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
     const core = fs.readFileSync(path.join(ROOT, "core.js"), "utf8");
-    assert.match(core, /"dsc-v90"[\s\S]*?parts\.contractVersion \|\| "block-v1"/);
-    assert.match(iso, /contractVersion:\s*"block-v1"/);
+    // 版本号只有一个权威来源（core 的 BLOCK_CONTRACT_VERSION）。
+    // 运行时不得再写字面量，否则两侧会各自漂移。
+    assert.match(core, /var BLOCK_CONTRACT_VERSION = "block-v\d+"/, "core 必须持有唯一权威版本号");
+    assert.match(core, /"dsc-v90"[\s\S]*?parts\.contractVersion \|\| BLOCK_CONTRACT_VERSION/);
+    assert.match(iso, /contractVersion:\s*Core\.BLOCK_CONTRACT_VERSION/, "isolated 必须引用 core 的版本号而非字面量");
+    assert.doesNotMatch(iso, /contractVersion:\s*"block-v\d+"/, "运行时不得硬编码契约版本字面量");
     assert.doesNotMatch(iso, /contractVersion:\s*"coverage-v1"/);
     assert.match(iso, /writeCache\(key, \{ segments: out\.segments \}, generation\)/);
     assert.match(iso, /Core\.materializeBlockTranslation\(cached\.segments, clip\.cues, \{ maxVisualWidth: identity\.maxLineChars, requireIntegrity: true \}\)/);

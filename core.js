@@ -2965,6 +2965,15 @@
     "只返回严格 JSON：{\"segments\":[{\"sourceFrom\":\"c0\",\"sourceTo\":\"c3\",\"lines\":[\"目标语言字幕第一屏\",\"第二屏\"]}]}。\n" +
     "segments 必须按源 cue 顺序连续且恰好覆盖全部输入；相邻源 cue 若有 750ms 或更长停顿，必须成为两个 segment 的边界。每个目标字幕屏必须至少有约 300ms 可显示时间，不得为短源范围生成大量碎屏。每个 lines 项必须是自然、可直接显示的目标语言字幕。优先按目标语言标点断句；复杂长句只在完整词或完整短语之间换屏，坚决不得把词、词组、数字与单位、专名或固定表达拆到两屏。换屏时前一屏不得以结构助词或介词收尾（如「的」「地」「得」「把」「在」「和」），修饰语必须与被修饰成分同屏；句子真正结束时以「的」收尾是允许的。不得返回 Markdown、解释或其它字段。";
 
+  /**
+   * block 译文缓存契约版本 —— 单一权威来源。
+   *
+   * 任何改变译文最终形态的修复都必须升版，否则旧缓存里存的是修复前的 lines，
+   * 且 integrity 校验会因内容自洽而通过，导致缓存命中时完全绕过修复。
+   * v2: 悬挂定语标记合并（「…的」+「徽章」→「…的徽章」）。
+   */
+  var BLOCK_CONTRACT_VERSION = "block-v2";
+
   var BLOCK_SEGMENT_MAX_GAP_MS = 750;
   var BLOCK_MIN_DISPLAY_MS = 300;
   var BLOCK_MAX_LINES_PER_SEGMENT = 64;
@@ -4023,7 +4032,7 @@
     var normalizedBase = normalizeEndpointIdentity(parts.apiBaseUrl);
     return [
       "dsc-v90",
-      parts.contractVersion || "block-v1",
+      parts.contractVersion || BLOCK_CONTRACT_VERSION,
       parts.segmentationMode || "fallback",
       parts.videoId || "",
       parts.trackCode || "",
@@ -4493,6 +4502,7 @@
     enforceVisualDisplayMarks: enforceVisualDisplayMarks,
     restoredWords: restoredWords,
     TRANSLATE_TIMEOUT_MS: TRANSLATE_TIMEOUT_MS,
+    BLOCK_CONTRACT_VERSION: BLOCK_CONTRACT_VERSION,
     joinRestoredWords: joinRestoredWords,
     sameRestoredWords: sameRestoredWords,
     restoredBoundaryMarks: restoredBoundaryMarks,
