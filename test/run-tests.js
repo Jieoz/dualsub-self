@@ -798,8 +798,8 @@ test("block translation 允许自由重组译文行，并按源范围粗粒度�
     { start: 3800, end: 5000, content: "for many ordinary tasks" },
   ];
   const raw = JSON.stringify({ segments: [
-    { sourceFrom: "c0", sourceTo: "c1", lines: ["尽管这里的电热水壶更慢，", "它们仍值得使用。"] },
-    { sourceFrom: "c2", sourceTo: "c3", lines: ["它们在许多日常任务中依然很实用。"] },
+    { sourceFrom: "c0", sourceTo: "c1", text: "尽管这里的电热水壶更慢，它们仍值得使用。" },
+    { sourceFrom: "c2", sourceTo: "c3", text: "它们在许多日常任务中依然很实用。" },
   ] });
   const parsed = Core.parseBlockTranslationResponse(raw, cues, { maxVisualWidth: 48 });
   const units = Core.materializeBlockTranslation(parsed, cues);
@@ -834,36 +834,36 @@ test("block translation 把悬挂的定语标记与被修饰成分合并回同�
   // 修法是合并而非拒绝：纯拒绝实测导致 1/17 块重试 6 次耗尽后整块无字幕，
   // 丢字幕比断句难看严重得多。
   assert.deepStrictEqual(
-    linesOf(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", lines: ["各处都饰有凤凰的", "徽章"] }] })),
+    linesOf(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", text: "各处都饰有凤凰的徽章" }] })),
     ["各处都饰有凤凰的徽章"], "悬挂的「的」必须与被修饰名词合并");
 
   assert.deepStrictEqual(
-    linesOf(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", lines: ["车窗部分是类似铝材的", "材质"] }] })),
+    linesOf(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", text: "车窗部分是类似铝材的材质" }] })),
     ["车窗部分是类似铝材的材质"], "这是纯拒绝策略下连续 6 次失败的真实样本");
 
   for (const bad of ["外面的", "带有日式木纹的", "慢慢地", "跑得"]) {
-    const got = linesOf(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", lines: [bad, "后续内容"] }] }));
+    const got = linesOf(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", text: bad + "后续内容" }] }));
     assert.deepStrictEqual(got, [bad + "后续内容"], `应合并以「${bad.slice(-1)}」结尾的非末行: ${bad}`);
   }
 
   // 连续多行悬挂时应持续吸收，不能只修一层。
   assert.deepStrictEqual(
-    linesOf(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", lines: ["非常精致的", "手工雕刻的", "徽章"] }] })),
+    linesOf(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", text: "非常精致的手工雕刻的徽章" }] })),
     ["非常精致的手工雕刻的徽章"], "连续悬挂必须一路合并");
 
   // 必须放过的合法情况：句末语气「的」——这是最初检测器 4/9 假阳性的来源。
   assert.deepStrictEqual(
-    linesOf(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", lines: ["据说就是这样完成的"] }] })),
+    linesOf(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", text: "据说就是这样完成的" }] })),
     ["据说就是这样完成的"], "末行以「的」结尾是合法句末语气，不得改动");
 
   assert.deepStrictEqual(
-    linesOf(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", lines: ["它是用多达七层工序", "完成的"] }] })),
+    linesOf(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", text: "它是用多达七层工序完成的" }] })),
     ["它是用多达七层工序完成的"],
     "模型换行作废：接回整段后 24 宽度未超容量，本就是一屏，「完成的」不该独立成屏");
 
   // 标点收尾说明该屏是完整小句，不算悬挂。
   assert.deepStrictEqual(
-    linesOf(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", lines: ["这就是我要说的，", "接着看下一处"] }] })),
+    linesOf(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", text: "这就是我要说的，接着看下一处" }] })),
     ["这就是我要说的，接着看下一处"],
     "接回整段后未超容量即一屏；句内逗号保留，只有落在屏尾的标点才移除");
 });
@@ -875,7 +875,7 @@ test("block translation 屏尾不得残留标点，且断点不落在词内部",
     { start: 3000, end: 6000, content: "source cue two text here" },
   ];
   const linesOf = (line) => Core.parseBlockTranslationResponse(
-    JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", lines: [line] }] }),
+    JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", text: line }] }),
     cues, { maxVisualWidth: 48 }
   )[0].lines;
 
@@ -901,6 +901,120 @@ test("block translation 屏尾不得残留标点，且断点不落在词内部",
   );
 });
 
+
+
+// 契约 block-v6 起，分屏由模型按语义完成，splitTargetDisplayLine 只在模型某一屏超宽时
+// 兜底。因此门禁不再锁「程序对某句该切成几屏」——那批期望本身互相矛盾（38 单位要一屏、
+// 46 单位要两屏、52 单位又要一屏），判据是语感而非任何程序可见特征，锁死只会逼出参数拧
+// 来拧去。改为锁两条真正的契约不变量：
+//   1. 模型给的屏边界必须原样保留（不合并、不重切）
+//   2. 模型某屏超宽时，程序必须切到不超宽，且不切开词
+test("block-v6：模型给的语义屏边界必须原样保留", () => {
+  const cues = [
+    { start: 0, end: 3000, content: "the idea was that rather than need to use" },
+    { start: 3000, end: 6000, content: "some sort of battery tester to see if a battery still had charge" },
+  ];
+  // 模型给了 3 个语义屏，每个都在宽度内 —— 程序一个都不许动。
+  const screens = ["当时的想法是", "与其还得用某种电池测试器来检查电池是否还有电", "不如直接把测试器做进电池本身"];
+  const parsed = Core.parseBlockTranslationResponse(
+    JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", screens: screens }] }),
+    cues,
+    { maxVisualWidth: 48 }
+  );
+  const got = parsed.flatMap((seg) => seg.lines);
+  assert.deepEqual(got, screens, `模型断点被改动: ${JSON.stringify(got)}`);
+});
+
+test("block-v6：模型某屏超宽时程序必须兜底切分且不切开词", () => {
+  const cues = [
+    { start: 0, end: 4000, content: "ninety nine percent of the time the battery tester was built in" },
+    { start: 4000, end: 8000, content: "and Duracell and some of their competitors did just that" },
+  ];
+  // 第 2 屏 88 单位远超 cap，程序必须把它切开；第 1、3 屏在宽度内，必须原样。
+  const wide = "这个想法是，与其还得另外用某种电池测试器来判断电池里到底还有没有电，不如直接把测试器做进电池本身";
+  const parsed = Core.parseBlockTranslationResponse(
+    JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", screens: ["90年代你大概还记得这些", wide, "Duracell 就这么做了"] }] }),
+    cues,
+    { maxVisualWidth: 48 }
+  );
+  const lines = parsed.flatMap((seg) => seg.lines);
+  lines.forEach((line) => {
+    assert.ok(Core.semanticDisplayWidth(line) <= 48, `兜底后仍超宽 ${Core.semanticDisplayWidth(line)}: ${line}`);
+  });
+  // 未超宽的两屏必须原样保留。
+  assert.ok(lines.includes("90年代你大概还记得这些"), `窄屏被改动: ${JSON.stringify(lines)}`);
+  assert.ok(lines.includes("Duracell 就这么做了"), `窄屏被改动: ${JSON.stringify(lines)}`);
+  // 拼回去必须与原译文一致（去掉屏尾标点后）—— 兜底切分不得丢字。
+  const joined = lines.join("").replace(/[，。！？、；：]/g, "");
+  const source = ("90年代你大概还记得这些" + wide + "Duracell 就这么做了").replace(/[，。！？、；：]/g, "");
+  assert.equal(joined, source, "兜底切分丢字或改写了译文");
+});
+
+test("block-v6：三种译文载荷形态都能解析（不挑模型）", () => {
+  const cues = [{ start: 0, end: 3000, content: "the idea was simple enough" }];
+  const variants = [
+    { name: "screens (v6 首选)", seg: { sourceFrom: "c0", sourceTo: "c0", screens: ["想法很简单", "就这么回事"] } },
+    { name: "text (退化单屏)", seg: { sourceFrom: "c0", sourceTo: "c0", text: "想法很简单，就这么回事" } },
+    { name: "lines (旧字段名)", seg: { sourceFrom: "c0", sourceTo: "c0", lines: ["想法很简单", "就这么回事"] } },
+  ];
+  variants.forEach((v) => {
+    const parsed = Core.parseBlockTranslationResponse(
+      JSON.stringify({ segments: [v.seg] }), cues, { maxVisualWidth: 48 }
+    );
+    const lines = parsed.flatMap((seg) => seg.lines);
+    assert.ok(lines.length >= 1, `${v.name} 解析出 0 屏`);
+    assert.ok(lines.join("").includes("想法很简单"), `${v.name} 译文丢失: ${JSON.stringify(lines)}`);
+  });
+});
+
+test("block-v6：模型把两个完整句子塞进一屏时程序必须在句末标点断开", () => {
+  // 实测 gpt-5.5 交回「确实就是这么做的事实上，这个版本的想法」——上句尾和下句头焊在
+  // 一屏且句号丢失。句末标点是无争议的硬边界，程序必须拆开，不能因为「尊重模型断点」
+  // 而放行。这是 v6 里唯一由程序推翻模型断点的情形。
+  const cues = [
+    { start: 0, end: 4000, content: "competitors did just that in fact this" },
+    { start: 4000, end: 8000, content: "version of the idea came from Kodak" },
+  ];
+  const parsed = Core.parseBlockTranslationResponse(
+    JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", screens: ["确实就是这么做的。事实上，这个版本的想法来自 Kodak"] }] }),
+    cues, { maxVisualWidth: 48 }
+  );
+  const lines = parsed.flatMap((seg) => seg.lines);
+  assert.ok(lines.length >= 2, `两个完整句子未被拆开: ${JSON.stringify(lines)}`);
+  assert.ok(
+    lines.some((l) => /^确实就是这么做的$/.test(l)),
+    `第一句未独立成屏: ${JSON.stringify(lines)}`
+  );
+  lines.forEach((l) => {
+    assert.ok(!/。.+/.test(l), `句号后仍有内容同屏: ${l}`);
+  });
+});
+
+test("block-v6：句末标点断开不得丢字，连续标点算单一边界", () => {
+  const cues = [{ start: 0, end: 6000, content: "really he asked and then paused" }];
+  const parsed = Core.parseBlockTranslationResponse(
+    JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c0", screens: ["真的吗？！他问道。然后停住了"] }] }),
+    cues, { maxVisualWidth: 48 }
+  );
+  const lines = parsed.flatMap((seg) => seg.lines);
+  // 「？！」是一个边界，不该拆成两屏空标点
+  assert.ok(lines.every((l) => l.trim()), `产生空屏: ${JSON.stringify(lines)}`);
+  const joined = lines.join("").replace(/[。！？、；：，]/g, "");
+  assert.equal(joined, "真的吗他问道然后停住了", `断开时丢字: ${JSON.stringify(lines)}`);
+});
+
+test("block-v6：混入未知字段仍必须拒绝（负向）", () => {
+  const cues = [{ start: 0, end: 3000, content: "the idea was simple" }];
+  assert.throws(
+    () => Core.parseBlockTranslationResponse(
+      JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c0", screens: ["想法很简单"], note: "额外解释" }] }),
+      cues, { maxVisualWidth: 48 }
+    ),
+    /segment fields invalid/,
+    "未知字段应被拒绝"
+  );
+});
+
 test("block translation 长停顿之后的语音必须仍有字幕覆盖", () => {
   // 一屏不得跨越长停顿。跨越时该屏的 end 会被钳到停顿起点，于是停顿**之后**的语音
   // 完全没有字幕单元 —— 实测 browser-replay seek-race：seek 到 7.4s 后画面一直吊着
@@ -912,7 +1026,7 @@ test("block translation 长停顿之后的语音必须仍有字幕覆盖", () =>
     { start: 7211, end: 10858, content: "from cooking to cleaning and disinfecting" },
   ];
   const parsed = Core.parseBlockTranslationResponse(JSON.stringify({ segments: [
-    { sourceFrom: "c0", sourceTo: "c3", lines: ["如果你是人类，有件事你会经常想做就是烧水，我们烧水有很多理由，从做饭到清洁和消毒"] },
+    { sourceFrom: "c0", sourceTo: "c3", text: "如果你是人类，有件事你会经常想做就是烧水，我们烧水有很多理由，从做饭到清洁和消毒" },
   ] }), gapped, { maxVisualWidth: 48 });
   const units = Core.materializeBlockTranslation(parsed, gapped, { maxVisualWidth: 48 });
   // 停顿之后那段语音（7211-10858）必须被至少一屏覆盖。
@@ -938,7 +1052,7 @@ test("block translation 在重叠源轨上仍不得让相邻屏时间倒挂", ()
     { start: 26599, end: 32639, content: "engineer out there decides that a thing which could fit" },
   ];
   const parsed = Core.parseBlockTranslationResponse(JSON.stringify({ segments: [
-    { sourceFrom: "c0", sourceTo: "c3", lines: ["经典的AA电池，或者如果设计师想故意添堵就是AAA电池看看两者尺寸差不了多少而且每节价格通常一样"] },
+    { sourceFrom: "c0", sourceTo: "c3", text: "经典的AA电池，或者如果设计师想故意添堵就是AAA电池看看两者尺寸差不了多少而且每节价格通常一样" },
   ] }), rolling, { maxVisualWidth: 24 });
   const units = Core.materializeBlockTranslation(parsed, rolling, { maxVisualWidth: 24 });
   assert.ok(units.length > 1, "需要多屏才能检验相邻屏时间关系");
@@ -958,25 +1072,25 @@ test("block translation 在重叠源轨上仍不得让相邻屏时间倒挂", ()
 test("block translation 锁定连续源范围，并只在目标词法边界兜底分屏", () => {
   const cues = [{ start: 0, end: 1000, content: "one" }, { start: 1000, end: 2000, content: "two" }];
   const invalid = [
-    { segments: [{ sourceFrom: "c1", sourceTo: "c1", lines: ["第二句"] }] },
-    { segments: [{ sourceFrom: "c0", sourceTo: "c0", lines: ["第一句"] }] },
-    { segments: [{ sourceFrom: "c0", sourceTo: "c1", lines: ["完整译文"], unitId: "forged" }] },
+    { segments: [{ sourceFrom: "c1", sourceTo: "c1", text: "第二句" }] },
+    { segments: [{ sourceFrom: "c0", sourceTo: "c0", text: "第一句" }] },
+    { segments: [{ sourceFrom: "c0", sourceTo: "c1", text: "完整译文", unitId: "forged" }] },
 
   ];
   assert.throws(() => Core.parseBlockTranslationResponse(JSON.stringify(invalid[0]), cues), /coverage/i);
   assert.throws(() => Core.parseBlockTranslationResponse(JSON.stringify(invalid[1]), cues), /incomplete/i);
   assert.throws(() => Core.parseBlockTranslationResponse(JSON.stringify(invalid[2]), cues), /fields/i);
   const overwide = Core.parseBlockTranslationResponse(JSON.stringify({ segments: [
-    { sourceFrom: "c0", sourceTo: "c1", lines: ["这是一条明显超过视觉硬上限的目标语言字幕"] },
+    { sourceFrom: "c0", sourceTo: "c1", text: "这是一条明显超过视觉硬上限的目标语言字幕" },
   ] }), cues, { maxVisualWidth: 12 });
   // 容量是硬上限。软超宽（DISPLAY_SOFT_OVERFLOW）只在「一屏仅装得下一个原子、再压就得
   // 拆词」时动用，正常分屏不该触发 —— 这里 4 屏全部落在 12 以内。
   assert.ok(overwide[0].lines.length > 1 && overwide[0].lines.every((line) => Core.semanticDisplayWidth(line) <= 12));
   assert.throws(() => Core.parseBlockTranslationResponse(JSON.stringify({ segments: [
-    { sourceFrom: "c0", sourceTo: "c1", lines: ["https://example.com/a-single-indivisible-very-long-url"] },
+    { sourceFrom: "c0", sourceTo: "c1", text: "https://example.com/a-single-indivisible-very-long-url" },
   ] }), cues, { maxVisualWidth: 12 }), /indivisible overwide/);
   const numberUnit = Core.parseBlockTranslationResponse(JSON.stringify({ segments: [
-    { sourceFrom: "c0", sourceTo: "c1", lines: ["偏差0.1 mm时车门就打不开"] },
+    { sourceFrom: "c0", sourceTo: "c1", text: "偏差0.1 mm时车门就打不开" },
   ] }), cues, { maxVisualWidth: 10 })[0].lines;
   assert.ok(!numberUnit.some((line, i) => /0\.1\s*$/.test(line) && /^mm\b/.test(numberUnit[i + 1] || "")), "数字与紧邻单位不得拆屏");
 
@@ -986,7 +1100,7 @@ test("block translation 锁定连续源范围，并只在目标词法边界兜�
   // 分屏由容量决定（模型换行作废），因此这里给足够长的译文以确实产生多屏，
   // 才能验证「每屏都被钳到停顿的某一侧」这条时间约束。
   const crossed = Core.parseBlockTranslationResponse(JSON.stringify({ segments: [
-    { sourceFrom: "c0", sourceTo: "c1", lines: ["这是停顿之前说的那一整句话，", "而这是停顿之后接着说的另一整句话"] },
+    { sourceFrom: "c0", sourceTo: "c1", text: "这是停顿之前说的那一整句话，而这是停顿之后接着说的另一整句话" },
   ] }), paused);
   const crossedUnits = Core.materializeBlockTranslation(crossed, paused);
   assert.ok(crossedUnits.length >= 2, "超宽译文必须产生多屏，才能检验停顿钳制");
@@ -995,8 +1109,8 @@ test("block translation 锁定连续源范围，并只在目标词法边界兜�
     assert.ok(!(u.endMs > 500 && u.endMs < 1500), `unit end ${u.endMs} 落在静音里`);
   });
   const split = Core.parseBlockTranslationResponse(JSON.stringify({ segments: [
-    { sourceFrom: "c0", sourceTo: "c0", lines: ["停顿前"] },
-    { sourceFrom: "c1", sourceTo: "c1", lines: ["停顿后"] },
+    { sourceFrom: "c0", sourceTo: "c0", text: "停顿前" },
+    { sourceFrom: "c1", sourceTo: "c1", text: "停顿后" },
   ] }), paused);
   // 模型的 segment 边界不构成显示分组，但**长停顿**构成：paused 两条 cue 之间有 1 秒静音，
   // 因此归一后仍是 2 组。一屏不得跨越静音 —— 跨越会让停顿另一侧的语音没有字幕。
@@ -1009,7 +1123,7 @@ test("block translation 锁定连续源范围，并只在目标词法边界兜�
   // 「甲乙丙丁」四行合起来只有 4 个字，接回整段后就是一屏，不该报错。
   assert.deepStrictEqual(
     Core.parseBlockTranslationResponse(JSON.stringify({ segments: [
-      { sourceFrom: "c0", sourceTo: "c0", lines: ["甲", "乙", "丙", "丁"] },
+      { sourceFrom: "c0", sourceTo: "c0", text: "甲乙丙丁" },
     ] }), [{ start: 0, end: 1000, content: "short source" }])[0].lines,
     ["甲乙丙丁"],
     "模型行数不决定屏数：短译文接回整段后是一屏"
@@ -1017,13 +1131,13 @@ test("block translation 锁定连续源范围，并只在目标词法边界兜�
   // 真正超出「源时长装得下的屏数」时才 fail-closed：1 秒源配几十字译文，
   // 分屏后屏数远超可读上限。
   assert.throws(() => Core.parseBlockTranslationResponse(JSON.stringify({ segments: [
-    { sourceFrom: "c0", sourceTo: "c0", lines: ["这是一段被刻意写得非常长的译文它会被程序分成很多屏远远超过一秒源语音装得下的屏数因此必须直接拒绝而不是硬塞给观众"] },
+    { sourceFrom: "c0", sourceTo: "c0", text: "这是一段被刻意写得非常长的译文它会被程序分成很多屏远远超过一秒源语音装得下的屏数因此必须直接拒绝而不是硬塞给观众" },
   ] }), [{ start: 0, end: 1000, content: "short source" }], { maxVisualWidth: 12 }), /too many display lines/);
   assert.throws(() => Core.parseBlockTranslationResponse(JSON.stringify({ segments: [
-    { sourceFrom: "c0", sourceTo: "c0", lines: ["甲"] },
+    { sourceFrom: "c0", sourceTo: "c0", text: "甲" },
   ] }), [{ start: 0, end: 299, content: "too short" }]), /duration too short/);
   const exactly300 = Core.parseBlockTranslationResponse(JSON.stringify({ segments: [
-    { sourceFrom: "c0", sourceTo: "c0", lines: ["甲"] },
+    { sourceFrom: "c0", sourceTo: "c0", text: "甲" },
   ] }), [{ start: 0, end: 300, content: "just enough" }]);
   assert.equal(Core.materializeBlockTranslation(exactly300, [{ start: 0, end: 300, content: "just enough" }])[0].endMs, 300);
 });
@@ -1032,10 +1146,10 @@ test("block 缓存必须复验 64 屏容量和 parser 完整性指纹", () => {
   const longCue = [{ start: 0, end: 19500, content: "source" }];
   assert.throws(() => Core.materializeBlockTranslation([{ segmentId: "b0", sourceFrom: 0, sourceTo: 0, lines: Array(65).fill("甲") }], longCue), /duration capacity/);
   const source = [{ start: 0, end: 5000, content: "source" }];
-  const parsedUrl = Core.parseBlockTranslationResponse(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c0", lines: ["访问 https://example.com/very-long-path"] }] }), source, { maxVisualWidth: 48 });
+  const parsedUrl = Core.parseBlockTranslationResponse(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c0", text: "访问 https://example.com/very-long-path" }] }), source, { maxVisualWidth: 48 });
   const splitUrl = JSON.parse(JSON.stringify(parsedUrl)); splitUrl[0].lines = ["访问 https://example.com/", "very-long-path"];
   assert.throws(() => Core.materializeBlockTranslation(splitUrl, source, { requireIntegrity: true }), /integrity/);
-  const parsedUnit = Core.parseBlockTranslationResponse(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c0", lines: ["偏差0.1 mm时失败"] }] }), source);
+  const parsedUnit = Core.parseBlockTranslationResponse(JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c0", text: "偏差0.1 mm时失败" }] }), source);
   const splitUnit = JSON.parse(JSON.stringify(parsedUnit)); splitUnit[0].lines = ["偏差0.1", "mm时失败"];
   assert.throws(() => Core.materializeBlockTranslation(splitUnit, source, { requireIntegrity: true }), /integrity/);
   const missing = JSON.parse(JSON.stringify(parsedUnit)); delete missing[0].integrity;
@@ -1060,7 +1174,7 @@ test("translateContextBlock 发送连续 cue 上下文并接受非 1:1 目标分
     cues, apiBaseUrl: "https://example.test", ["api" + "Key"]: String.fromCharCode(107), apiModel: "m", targetLang: "zh-Hans", maxVisualWidth: 48,
     fetchImpl: async (_url, req) => {
       const body = JSON.parse(req.body); sent = JSON.parse(body.messages[1].content);
-      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", lines: ["合并后的自然译文。"] }] }) } }] }) };
+      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ segments: [{ sourceFrom: "c0", sourceTo: "c1", text: "合并后的自然译文。" }] }) } }] }) };
     },
   });
   assert.deepStrictEqual(sent.sourceCues.map((cue) => cue.id), ["c0", "c1"]);
@@ -1088,11 +1202,17 @@ test("block-v1 对多书写系统使用同一请求、parser 与时间物化路�
       fetchImpl: async (_url, req) => {
         sent = JSON.parse(JSON.parse(req.body).messages[1].content);
         return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ segments: [
-          { sourceFrom: "c0", sourceTo: "c1", lines: ["统一协议的自然译文"] },
+          { sourceFrom: "c0", sourceTo: "c1", text: "统一协议的自然译文" },
         ] }) } }] }) };
       },
     });
-    assert.deepStrictEqual(sent.sourceCues.map((c) => c.text), pair);
+    // v6 起原文只在 sourceText 里发一遍（整段连续），sourceCues 只带 id + 首词用于
+    // 标注 segment 区间 —— 全文重发一遍是纯 token 浪费（实测占 user payload 55%）。
+    pair.forEach((content) => {
+      assert.ok(sent.sourceText.includes(content), `sourceText 缺原文: ${content}`);
+    });
+    assert.deepStrictEqual(sent.sourceCues.map((c) => c.id), ["c0", "c1"]);
+    assert.ok(sent.sourceCues.every((c) => !c.text), "sourceCues 不得重复携带全文");
     assert.deepStrictEqual(out.units.map((u) => u.translation), ["统一协议的自然译文"]);
   }
   const coreSrc = fs.readFileSync(path.join(ROOT, "core.js"), "utf8");
@@ -1108,10 +1228,15 @@ test("block 缓存命中重新验证字段、清洗句号、宽度与最短显�
   assert.deepStrictEqual(units.map((u) => u.translation), ["缓存译文"], "缓存也必须走最终无句号清洗");
   assert.throws(() => Core.materializeBlockTranslation([{ ...valid[0], forged: true }], cues), /cached coverage invalid/);
   assert.throws(() => Core.materializeBlockTranslation([{ ...valid[0], lines: ["。"] }], cues), /cached line empty/);
-  assert.throws(() => Core.materializeBlockTranslation([{ ...valid[0], lines: ["这是一条超过缓存视觉门禁的字幕"] }], cues, { maxVisualWidth: 8 }), /visual width/);
+  // 缓存层的宽度门禁校验的是「缓存里存的这一屏本身超宽」，所以夹具必须是**单屏**内容。
+  // 用不可再分的原子（URL）才测得到：普通中文长句会被分屏器自行拆开而不再超宽。
+  assert.throws(() => Core.materializeBlockTranslation([{ ...valid[0], lines: ["https://example.com/one-indivisible-token"] }], cues, { maxVisualWidth: 8 }), /visual width/);
+  // 屏数超过源时长可承载的下限时必须 fail-closed。
+  // v6 起屏边界来自模型且被原样保留，所以夹具要直接给多屏 —— 旧夹具给单屏「甲乙丙」靠
+  // 程序过度分屏才触发，那本身是 v5 分屏器的缺陷而非该测的契约。
   assert.throws(() => Core.materializeBlockTranslation([
     { segmentId: "b0", sourceFrom: 0, sourceTo: 0, lines: ["甲", "乙", "丙"] },
-  ], [{ start: 0, end: 600, content: "too many screens" }]), /duration capacity|duration too short/);
+  ], [{ start: 0, end: 600, content: "too many screens" }]), /duration capacity|duration too short|too many display lines/);
   // 一屏文字整体横跨停顿（start 在停顿前、end 在停顿后）时，只钳边界不够：
   // 边界都在停顿外，字幕会硬挺过整段静音。必须把 end 收到静音起点。
   const spanning = Core.materializeBlockTranslation([
@@ -2277,7 +2402,7 @@ test("makeSemanticCacheKey 只复用同一视频轨道、模型、网关与严�
 });
 
 test("pruneCache LRU 淘汰最旧条目", () => {
-  const cache = { k1: { t: 100, lines: ["a"] }, k2: { t: 200, lines: ["b"] }, k3: { t: 300, lines: ["c"] } };
+  const cache = { k1: { t: 100, text: "a" }, k2: { t: 200, text: "b" }, k3: { t: 300, text: "c" } };
   const pruned = Core.pruneCache(cache, 2);
   assert.strictEqual(Object.keys(pruned).length, 2);
   assert.ok(!pruned.k1, "最旧的 k1 应被淘汰");

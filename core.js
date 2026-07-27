@@ -2969,13 +2969,37 @@
   }
 
   var DEFAULT_BLOCK_TRANSLATION_PROMPT =
-    "翻译连续字幕块时先理解完整上下文，再用目标语言自然重组。允许合并或重新划分源 cue，绝不要求源译逐行对应。\n" +
-    "只返回严格 JSON：{\"segments\":[{\"sourceFrom\":\"c0\",\"sourceTo\":\"c3\",\"lines\":[\"目标语言字幕第一屏\",\"第二屏\"]}]}。\n" +
-    "segments 必须按源 cue 顺序连续且恰好覆盖全部输入；相邻源 cue 若有 750ms 或更长停顿，必须成为两个 segment 的边界。每个目标字幕屏必须至少有约 300ms 可显示时间，不得为短源范围生成大量碎屏。每个 lines 项必须是自然、可直接显示的目标语言字幕。不得返回 Markdown、解释或其它字段。";
-  // 分屏与断句规则刻意不写进 prompt：那是确定性排版工作，由 splitTargetDisplayLine
-  // 在词法原子上做 DP 得出，程序保证「断在标点 > 断在词组之间」「屏尾不留标点」
-  // 「不拆词/数字+单位/专名/URL」。写进 prompt 既不可靠（模型不一定遵守，还要靠
-  // 真机回放反复验证），又白占 token —— 模型只负责提供译文。
+    "输入是一段连续语音的完整原文。先通读整段，再译成通顺连贯的目标语言。\n" +
+    "译文完整性是第一要求：原文每个意思都要译出，不省略、不概括、不压缩。\n" +
+    "专有名词（品牌、人名、型号如 AA/AAA）保留原文写法，不要音译。\n" +
+    "只返回严格 JSON：{\"segments\":[{\"sourceFrom\":\"c0\",\"sourceTo\":\"c3\",\"screens\":[\"第一屏\",\"第二屏\"]}]}。\n" +
+    "screens 是把该段完整译文按语义切好的字幕屏：每屏是一个读完整、通顺的意思单元；" +
+    "目标 12-24 个汉字，但这是排版目标而非删减理由 —— 意思单元超长也要完整写出，宁可该屏偏长，绝不省略；" +
+    "分开后某半太短读起来断气就不分，分开后各自更清楚就分；不切开词语、专名、数字+单位；" +
+    "一句话说完必须写句号（或问号、感叹号），不得省略 —— 这是屏边界的判据；" +
+    "一屏里不要放两个完整句子。\n" +
+    "segments 必须按源 cue 顺序连续且恰好覆盖全部输入；相邻源 cue 若有 750ms 或更长停顿，必须成为两个 segment 的边界。不得返回 Markdown、解释或其它字段。\n" +
+    "输入里 sourceText 是完整原文，据它翻译；sourceCues 只用于标注每个 segment 覆盖的 cue 区间；contextBefore/contextAfter 只供理解上下文，不得进入输出覆盖范围。";
+  // 分工：模型负责**语义**（译文完整 + 断点自然），程序负责**宽度**（超宽屏内部再切，
+  // 但绝不撤销模型给的断点）。
+  //
+  // 这个分工是三次真实实测（gpt-5.4-mini）逼出来的，两个目标压给任一单方都失败：
+  //   - 只让程序分屏（v5）：程序只能看字数和标点，会把独立句子焊在一起
+  //     （「90年代你可能记得这个与其另用电池测试器」），且 Jay 的 11 组样例里存在
+  //     宽度不单调的矛盾（38 一屏 / 46 两屏），说明判据本质是语感，程序无法表达。
+  //   - 只让模型分屏且给硬宽度上限：模型为守上限而压缩译文，丢内容
+  //     （「判断电池还有没有电」整句消失）—— 违反完整性第一。
+  //   - 让模型分屏但不提长度：模型给回 118/143 单位的巨块，等于没分屏。
+  // 现在给目标长度但明确「宁可超也不许删」，实测完整性 15/15 + 超宽 0。
+  //
+  // 早先 v4 的 `lines` 也是「模型分屏」，但那时输入是逐 cue 碎片，模型没见过完整语流，
+  // 输出 100% 句内无标点 + 切词 + 错译。病根是输入碎，不是「模型分屏」本身。
+  //
+  // 已知残留限制（不再追，追不动）：源是无标点 ASR 流，`in fact`/`actually` 这类衔接词
+  // 前面本来就没有任何句子边界信号，模型有时写句号有时不写。写了的由 splitAtSentenceEnd
+  // 拆开；没写的会出现「…就是这么做的事实上，这个版本的想法」两句同屏。gpt-5.4-mini 与
+  // gpt-5.5 都会偶发，在 prompt 里显式要求「说完必须写句号」实测无效（三次跨模型验证）。
+  // 程序侧无从判断 —— 无标点时句子边界不可见，这与中文分词的困难同源。
 
   /**
    * block 译文缓存契约版本 —— 单一权威来源。
@@ -2991,7 +3015,13 @@
   // v4：分屏与时间派生规则整体改变（句号保留到分屏后、长停顿分组、时间由源词范围
   // 派生、汉字原子黏合）。旧缓存存的是按旧规则分好的 lines，其 integrity 自洽会通过
   // 校验，不升版就会绕过本次修复继续命中坏分屏。
-  var BLOCK_CONTRACT_VERSION = "block-v4";
+  // v5：模型契约由「输出分好屏的 lines」改为「输出整段带标点的 text」，输入也由逐条
+  // sourceCues 改为整段 sourceText。旧缓存里存的是模型自行切碎、句内无标点的短行，
+  // 其 integrity 自洽会通过校验，不升版就会继续命中那批坏分屏。
+  // v6：契约由「模型交整段 text、程序独立分屏」改为「模型交语义分好的 screens、程序只做
+  // 宽度兜底」。旧缓存里存的是程序按纯字数规则分出的屏（含焊句：「…记得这个与其另用电池
+  // 测试器」），其 integrity 自洽会通过校验，不升版就会继续命中那批坏分屏。
+  var BLOCK_CONTRACT_VERSION = "block-v6";
 
   var BLOCK_SEGMENT_MAX_GAP_MS = 750;
   var BLOCK_MIN_DISPLAY_MS = 300;
@@ -3141,8 +3171,54 @@
    * 惩罚量级与宽度项（(width-target)^2，量级可达数百）刻意可比 —— 让 DP 愿意为
    * 一个好断点牺牲一些宽度均匀性，但不至于为此产出极端窄行。
    */
-  var SENTENCE_FINAL_PUNCT = /[。！？!?…]$/u;
-  var CLAUSE_PUNCT = /[，、；：,;:]$/u;
+  /**
+   * 可断标点 —— 单一权威定义。
+   *
+   * Jay 明确：「逗号句号分号没有优先级，都一视同仁处理」。因此不再区分句末/句内两档，
+   * 只有「这里可以断」一个概念。字符集在此定义一次，splitIntoClauses（找断点）与
+   * stripTrailingBreakPunct（屏尾去标点）共用，避免两处字面量各自漂移。
+   */
+  // 顿号「、」刻意不在此列：它分隔并列项，不是小句边界。把它当断点会把型号列表劈开
+  // （实测「标准的 AA、AAA」/「C 和 D 电池…」）。Jay 说的「一视同仁」指句号逗号分号。
+  var BREAKABLE_PUNCT_CHARS = "。！？!?…，；：,;:";
+  var BREAKABLE_PUNCT = new RegExp("[" + BREAKABLE_PUNCT_CHARS + "]", "u");
+  // 句末标点 —— 断点强弱上与逗号同级（Jay：「一视同仁」），但它额外是**硬边界**：
+  // 一件事说完了，下一件不得挤进同一屏。装填时用它强制换屏。
+  var SENTENCE_FINAL_PUNCT = /[。！？!?…]\s*$/u;
+
+  /**
+   * 在句末标点后断开一屏。
+   *
+   * 句末标点（。！？…）是无争议的硬边界 —— 两个完整句子不得同屏，这不需要语感判断，
+   * 所以放在程序侧执行。其余断点（逗号、分句）一律尊重模型给的语义分屏。
+   * 语言中立：只看标点，不看内容。
+   */
+  function splitAtSentenceEnd(screen) {
+    var text = String(screen == null ? "" : screen);
+    var parts = [];
+    var buf = "";
+    for (var i = 0; i < text.length; i++) {
+      buf += text[i];
+      if (!/[。！？!?…]/u.test(text[i])) continue;
+      // 连续的句末标点（「？！」「……」）算同一个边界，全部吞掉再断。
+      while (i + 1 < text.length && /[。！？!?…]/u.test(text[i + 1])) { buf += text[++i]; }
+      parts.push(buf);
+      buf = "";
+    }
+    if (buf.trim()) parts.push(buf);
+    return parts.length ? parts : [text];
+  }
+  // 屏尾去标点的字符集比断点集多一个顿号：顿号不是断点，但它若恰好落在屏尾（被词组
+  // 间断切出来）同样是视觉噪音，要去掉。
+  var TRAILING_BREAKABLE_PUNCT = new RegExp("[" + BREAKABLE_PUNCT_CHARS + "、]+$", "u");
+
+  /**
+   * 这一屏实际会显示多宽 —— 屏尾标点与句号都不显示，判「装不装得下」必须按显示后的
+   * 宽度算。用带标点的宽度判会误断（样例 8 带标点 52、实显 48）。
+   */
+  function displayedWidth(text) {
+    return semanticDisplayWidth(stripTrailingBreakPunct(text));
+  }
 
   /**
    * 为保住词组允许的极小超宽（半角单位）—— 单一权威常量。
@@ -3153,20 +3229,33 @@
    */
   var DISPLAY_SOFT_OVERFLOW = 2;
 
-  function breakPointPenalty(atoms, j) {
-    // 末尾断点不构成换屏，无需惩罚。
-    if (j + 1 >= atoms.length) return 0;
-    var tail = String(atoms[j] || "").trim();
-    if (!tail) return 0;
-    // 规则 1：断在标点处 —— 句读边界，读起来完整。
-    // 句末标点优于句内标点：句子结束是最强的停顿，一屏一句最好读。两者若同代价，
-    // DP 会取先遇到的断点，实测把「…使用。它们在…」焊成一屏而在逗号处断开。
-    if (SENTENCE_FINAL_PUNCT.test(tail)) return 0;
-    if (CLAUSE_PUNCT.test(tail)) return 1;
-    // 规则 2：标点断不开时，断在词组之间 —— atoms 已是不可再分的词法原子，
-    // 在原子之间断即「词组与词组之间」，不会拆开词、数字+单位、专名或 URL。
-    return 1;
-  }
+  /**
+   * 一屏最少要有多少显示宽度才不算「碎」（半角单位，10 ≈ 5 个汉字）。
+   *
+   * 不足此宽度的小句不单独成屏 —— Jay 确认的样例 3「没错。」4 单位、样例 4
+   * 「麻烦的是，」8 单位、样例 8「可能到 1.6 伏」都必须与相邻屏合并。
+   */
+  var DISPLAY_MIN_SCREEN_WIDTH = 10;
+
+  /**
+   * 无标点长句多长才对半断（半角单位，40 ≈ 20 汉字）。
+   *
+   * 这个阈值**只**作用于整句没有任何可断标点的情形，不影响有标点的句子 —— 后者由
+   * 「一屏最多两个小句」决定，与字数无关。Jay 2026-07-27 反对追一条字数分界线
+   * （「21 假如我说要分开的话 22 呢」），两条路径分开后就不存在「为了断开无标点长句
+   * 而连累有标点句子」的牵制，这个数取 40 还是 44 都不改变后者的观感。
+   *
+   * 取 40：「你还得知道电压下降到什么程度之前电池都还算能用」(46) 对半断成
+   * 「你还得知道电压下降到」/「什么程度之前电池都还算能用」（样例 6）；
+   * 「所以它已经快没电了」(18) 远在阈值内保持一屏（样例 11）。
+   */
+  var PUNCTUATIONLESS_SPLIT_WIDTH = 40;
+
+  
+
+  
+
+  
 
   /**
    * 规则 3：屏尾不留标点符号。
@@ -3177,24 +3266,7 @@
    * 实现在下方 stripTrailingBreakPunct。
    */
 
-  /**
-   * 把模型返回的多行译文接回整段 —— 原样相接，不添加也不删除任何字符。
-   *
-   * 模型换行处若已有标点则直接相连；没有标点说明它把一句话断开了（「却偏要换」+
-   * 「成同样贵」），此时更不能补标点 —— 那会在词内部制造新的断裂。拉丁文字之间
-   * 补一个空格保持分词，CJK 等无空格书写系统直接相连。语言无关：只用 Unicode 属性。
-   */
-  function joinTargetLines(lines) {
-    var out = "";
-    (lines || []).forEach(function (line) {
-      var part = String(line == null ? "" : line).trim();
-      if (!part) return;
-      if (!out) { out = part; return; }
-      var needsSpace = /[A-Za-z\p{N}]$/u.test(out) && /^[A-Za-z\p{N}]/u.test(part);
-      out += (needsSpace ? " " : "") + part;
-    });
-    return out;
-  }
+  
 
   /**
    * 显示末端统一处理标点 —— 分屏之后、交付之前的最后一步。
@@ -3207,7 +3279,7 @@
    * 问号、感叹号是语义标点，保留在屏内；只有落在屏尾时才由第 1 条移除。
    */
   function stripTrailingBreakPunct(text) {
-    var s = String(text).trim().replace(/[。！？!?…，、；：,;:]+$/u, "").trim();
+    var s = String(text).trim().replace(TRAILING_BREAKABLE_PUNCT, "").trim();
     // 屏内句号：删掉后左右若都是文字会粘连，用空格隔开；CJK 之间的空格随后压掉。
     s = s.replace(/。+/gu, " ");
     s = s.replace(/([\p{scx=Han}\p{scx=Hiragana}\p{scx=Katakana}])\s+(?=[\p{scx=Han}\p{scx=Hiragana}\p{scx=Katakana}])/gu, "$1");
@@ -3218,43 +3290,139 @@
     var clean = sanitizeSubtitleLine(String(line == null ? "" : line));
     if (!clean.trim()) throw new Error("block translation line empty");
     var cap = Math.max(8, Math.floor(Number(maxVisualWidth) || TRANSLATION_DISPLAY_MAX_WIDTH));
-    if (semanticDisplayWidth(clean) <= cap) return [clean];
+    // 「装得下就不断」按**去掉标点后**的实际显示宽度判 —— 屏尾标点不显示，用带标点的
+    // 宽度判会把本可一屏的内容误断（样例 8「…1.5 伏，可能到 1.6 伏」带标点 52、
+    // 实显 48）。
+    //
+    // 无标点长句不走这条早退：它有自己更低的阈值（PUNCTUATIONLESS_SPLIT_WIDTH），
+    // 在 cap 之内也可能需要对半断（样例 6，46 单位 < cap 48 但仍要两屏）。
+    if (displayedWidth(clean) <= cap && BREAKABLE_PUNCT.test(clean)) return [clean];
     var atoms = targetDisplayAtoms(clean);
     // 原子不可再分。若单个原子本身就超过容量+软超宽，无解 —— 例如一条超长 URL。
     // 汉字黏合后的原子可能略超 cap，此时软超宽正是为它准备的。
     if (!atoms.length || atoms.some(function (atom) { return semanticDisplayWidth(atom) > cap + DISPLAY_SOFT_OVERFLOW; })) {
       throw new Error("block translation line contains an indivisible overwide target phrase");
     }
-    var n = atoms.length;
-    var dp = new Array(n + 1); dp[n] = { count: 0, cost: 0, lines: [] };
-    for (var i = n - 1; i >= 0; i--) {
-      var joined = "";
-      for (var j = i; j < n; j++) {
-        joined += atoms[j];
-        var width = semanticDisplayWidth(joined.trim());
-        // 容量是硬上限；软超宽只用于「这一屏只装了一个原子」的情形 —— 那时再压缩
-        // 就只能把原子（词）本身切开，而拆词比多两个字符难看得多。
-        var limit = (j === i) ? cap + DISPLAY_SOFT_OVERFLOW : cap;
-        if (width > limit) break;
-        if (!dp[j + 1]) continue;
-        // 断点选择只有三条规则，按优先级：
-        //   1. 有标点就断在标点处；
-        //   2. 标点断不开时，断在词组与词组之间；
-        //   3. 屏尾不留标点符号（逗号/句号/分号等在断屏时移除）。
-        // 屏宽只是硬上限 cap，不作为优化目标 —— 早先引入的「屏间均衡度」是多余的
-        // 发明，它与规则 1 争夺同一个代价预算，调参只能在「畸形短屏」和「断在词
-        // 中间」之间平移，两个目标永远无法同时满足。去掉均衡项后规则 1 独占决策，
-        // 不再有妥协。
-        var candidate = {
-          count: 1 + dp[j + 1].count,
-          cost: breakPointPenalty(atoms, j) + dp[j + 1].cost,
-          lines: [joined.trim()].concat(dp[j + 1].lines),
-        };
-        if (!dp[i] || candidate.count < dp[i].count || (candidate.count === dp[i].count && candidate.cost < dp[i].cost)) dp[i] = candidate;
+    // 一趟贪心填满，两个断点优先级，无回溯、无合并、无特判。
+    //
+    // 此前的实现把「按小句装屏」「短引子往哪并」「超宽后均分」拆成五个互相撤销的函数，
+    // 每加一条规则就要给别处加例外，Jay 明确反对这种堆法。改成单趟后规则只有两条：
+    //   1. 累到 minFill 且遇标点 → 断（标点是最自然的边界）
+    //   2. 超 cap → 回退到本屏最后一个标点；没有标点就退一个原子
+    // 均分改填满是关键：均分把断点强推到中点，正好落在词里（「电池|测试器」）；填满让
+    // 断点尽量靠后，落在自然边界上。Jay 给的排法「思路是，与其另外用某种电池测试器来
+    // 判断电池 / 还有没有电不如…」正是填满的结果。
+    // minFill 取 cap 的 5/8，实测 30/34/38 输出完全一致 —— 这个参数不敏感，无需调。
+    var minFill = Math.floor(cap * 5 / 8);
+    var screens = [];
+    var cur = [];
+    var lastPunct = -1;
+    var curWidth = function () { return displayedWidth(cur.join("")); };
+
+    atoms.forEach(function (atom) {
+      cur.push(atom);
+      if (BREAKABLE_PUNCT.test(atom)) {
+        if (curWidth() >= minFill) {
+          screens.push(cur.join(""));
+          cur = [];
+          lastPunct = -1;
+          return;
+        }
+        lastPunct = cur.length - 1;
       }
+      if (curWidth() > cap) {
+        if (lastPunct >= 0) {
+          var rest = cur.slice(lastPunct + 1);
+          screens.push(cur.slice(0, lastPunct + 1).join(""));
+          cur = rest;
+        } else {
+          var last = cur.pop();
+          screens.push(cur.join(""));
+          cur = [last];
+        }
+        lastPunct = -1;
+      }
+    });
+    if (cur.length) screens.push(cur.join(""));
+
+    var out = screens.map(stripTrailingBreakPunct)
+      .map(function (s) { return s.trim(); })
+      .filter(Boolean);
+    if (!out.length) throw new Error("block translation line cannot be split at target lexical boundaries");
+    return out;
+  }
+
+  
+
+  /**
+   * 无标点可断的长句：断在词法原子之间，两屏长度尽量接近，虚词不留屏尾。
+   *
+   * 只有这条路径才考虑宽度均衡 —— Jay 确认样例 6「你还得知道电压下降到 / 什么程度
+   * 之前电池都还算能用」而非「你还得知道 / 电压下降到什么程度之前电池都还算能用」。
+   * 均衡与「断在标点」不共用代价：有标点时根本走不到这里，因此均衡永远压不过标点。
+   * 这是 v0.8.3 的教训 —— 那时两者共用一个 cost 标量，屏数/宽度悄悄压过了断句规则。
+   */
+  function splitClauseByAtoms(text, cap) {
+    var atoms = targetDisplayAtoms(text);
+    if (atoms.length < 2) return [text];
+    var total = semanticDisplayWidth(text);
+    var screenCount = Math.max(2, Math.ceil(total / cap));
+
+    // 断点只能落在原子边界上 —— 先枚举所有合法边界及其累计宽度，再挑离理想切点最近的
+    // 那个。这个顺序很关键：先定目标宽度再找最近原子，会把「什么|程度」这类词组切开
+    // （实测），因为宽度目标压过了原子边界。反过来，边界是硬约束、宽度是软偏好。
+    var boundaries = [];
+    var acc = "";
+    for (var i = 0; i < atoms.length - 1; i++) {
+      acc += atoms[i];
+      boundaries.push({ index: i + 1, width: semanticDisplayWidth(acc), text: acc });
     }
-    if (!dp[0] || !dp[0].lines.length) throw new Error("block translation line cannot be split at target lexical boundaries");
-    return dp[0].lines;
+    if (!boundaries.length) return [text];
+
+    var out = [];
+    var startAtom = 0;
+    var consumedWidth = 0;
+    for (var seg = 1; seg < screenCount; seg++) {
+      // 本屏理想终点：把剩余内容均分给剩余屏数。
+      var remainingScreens = screenCount - seg + 1;
+      var ideal = consumedWidth + (total - consumedWidth) / remainingScreens;
+      var best = null;
+      boundaries.forEach(function (b) {
+        if (b.index <= startAtom) return;
+        var width = b.width - consumedWidth;
+        if (width <= 0 || width > cap) return;
+        // 虚词不许留在屏尾（样例 7）：断点右边第一个原子若是连词/助词，说明这个断点
+        // 会把它吊在上一屏末尾 —— 该虚词应当起下一行。
+        var penalty = leadsNextScreen(atoms[b.index - 1]) ? cap : 0;
+        var score = Math.abs(b.width - ideal) + penalty;
+        if (!best || score < best.score) best = { boundary: b, score: score };
+      });
+      if (!best) break;
+      // 按原子下标切片取本屏文本，不用字符串长度反推偏移（那样容易错位）。
+      out.push(atoms.slice(startAtom, best.boundary.index).join(""));
+      startAtom = best.boundary.index;
+      consumedWidth = best.boundary.width;
+    }
+    // 收尾：剩下的原子构成最后一屏。
+    var tail = atoms.slice(startAtom).join("");
+    if (tail) out.push(tail);
+    return out.filter(function (s) { return s && s.trim(); });
+  }
+
+  /**
+   * 这个原子该起一行，而不是吊在上一屏屏尾。
+   *
+   * Jay：「虚词留在下一句观感更好」—— 样例 7「改用同样贵 / 却寿命更短的 AAA」，
+   * 「却」若留在屏尾会让上一屏读起来断在半空。这些是**闭合的语法功能词**（连词与
+   * 结构助词），不是内容词表：它们数量固定、不随题材增长，与「不引入语言名单」的
+   * 约束不冲突 —— 该约束禁止的是靠逐样本扩充字表来打补丁。
+   */
+  var LEADING_FUNCTION_WORDS = ["却", "但", "而", "不过", "然而", "所以", "因为", "并且", "或者", "以及", "如果", "虽然", "尽管"];
+
+  function leadsNextScreen(atom) {
+    var s = String(atom || "").trim();
+    if (!s) return false;
+    return LEADING_FUNCTION_WORDS.indexOf(s) >= 0;
   }
 
   function joinLexicalAtoms(atoms) {
@@ -3299,34 +3467,61 @@
     var targetParts = [];
     payload.segments.forEach(function (segment) {
       if (!segment || typeof segment !== "object" || Array.isArray(segment)) throw new Error("block translation segment invalid");
-      if (Object.keys(segment).sort().join("|") !== "lines|sourceFrom|sourceTo") throw new Error("block translation segment fields invalid");
+      // 契约 block-v6：segment 带 `screens`（模型按语义切好的屏）。
+      //
+      // 译文载荷接受三种形态，不挑模型 —— 能力弱、不支持 JSON schema、或干脆忽略数组
+      // 要求的模型都能落地，而不是整块判失败后重试烧 token：
+      //   screens: ["…","…"]  v6 首选，模型给了语义断点
+      //   text:    "…"        退化为单屏，程序按宽度切（等于 v5 行为）
+      //   lines:   ["…","…"]  旧式字段名，语义等同 screens
+      // 三者归一到 screens 数组后，下游只有一条路径，不存在并行分支。
+      var keys = Object.keys(segment).sort().join("|");
+      if (keys !== "screens|sourceFrom|sourceTo"
+          && keys !== "sourceFrom|sourceTo|text"
+          && keys !== "lines|sourceFrom|sourceTo") {
+        throw new Error("block translation segment fields invalid");
+      }
       var from = source.findIndex(function (cue) { return cue.id === String(segment.sourceFrom || ""); });
       var to = source.findIndex(function (cue) { return cue.id === String(segment.sourceTo || ""); });
       if (from !== cursor || to < from) throw new Error("block translation source coverage gap, overlap, or reorder");
-      if (!Array.isArray(segment.lines) || !segment.lines.length) throw new Error("block translation lines empty");
-      segment.lines.forEach(function (line) { targetParts.push(line); });
+      var rawScreens = segment.screens || segment.lines
+        || (segment.text == null ? [] : [segment.text]);
+      if (!Array.isArray(rawScreens)) rawScreens = [rawScreens];
+      var segScreens = rawScreens
+        .map(function (s) { return collapseWhitespace(String(s == null ? "" : s)); })
+        .filter(Boolean);
+      if (!segScreens.length) throw new Error("block translation segment text empty");
+      segScreens.forEach(function (s) { targetParts.push(s); });
       cursor = to + 1;
     });
     if (cursor !== source.length) throw new Error("block translation source coverage incomplete");
 
-    // 模型的 segment 边界和换行位置一律作废：把译文接回完整文本，由程序统一分屏。
+    // 源轨里的长停顿是真实的语音结构边界，一屏字幕不得跨越它。实测 browser-replay 的
+    // 4 条源 cue 中间有 5303→7211 的静音，若整块接成一段只分出 2 屏，第 2 屏的 end 被
+    // 停顿钳到 5303，7211–10858 这段语音就完全没有字幕。
     //
-    // 模型只负责提供译文，分屏是确定性排版工作。只作废段内换行不够：实测
-    // gpt-5.4-mini 把「同样贵」切在两个 segment 之间，段内分屏无法修复。
+    // 因此先按长停顿分组，每组各自处理；组之间的边界就是静音。
     //
-    // 但整块也不能无条件接成一段：源轨里的长停顿是真实的语音结构边界。实测
-    // browser-replay 的 4 条源 cue 中间有 5303→7211 的静音，接成一段后只分出 2 屏，
-    // 第 2 屏的 end 被停顿钳到 5303，于是 7211–10858 这段语音完全没有字幕 ——
-    // seek 到 7.4s 时画面一直吊着第一句的源回退帧。
-    //
-    // 因此先按长停顿把源切成若干组，每组各自接整段再分屏：组内断点由
-    // splitTargetDisplayLine 在词法原子上决定（标点 > 词组间，屏尾去标点），
-    // 组之间的边界就是静音，屏永远不跨越静音。
+    // 组内**保留模型给的屏边界**（v6 分工：语义归模型）。程序只做两件事：
+    //   1. 把模型的屏按时长比例分配到各组
+    //   2. 超宽的屏在内部再切（splitTargetDisplayLine）
+    // 绝不把模型的屏接回整段重切 —— 那会撤销语义断点，退回 v5 的焊句问题。
     var groups = groupSourceByLongPause(source, maxInternalGapMs);
-    var targetGroups = allocateTargetToGroups(joinTargetLines(targetParts), groups, maxWidth);
+    var targetGroups = allocateScreensToGroups(targetParts, groups);
     var out = [];
     groups.forEach(function (group, groupIndex) {
-      var lines = mergeDanglingModifierLines(splitTargetDisplayLine(targetGroups[groupIndex], maxWidth), maxWidth);
+      var lines = [];
+      targetGroups[groupIndex].forEach(function (screen) {
+        // 句末标点是无争议的硬边界：两个完整句子不得同屏。实测 gpt-5.5 会交回
+        // 「确实就是这么做的事实上，这个版本的想法」——把上句尾和下句头焊在一屏。
+        // 这一条不需要语感判断，因此由程序执行；其余断点一律尊重模型。
+        splitAtSentenceEnd(screen).forEach(function (part) {
+          if (displayedWidth(part) <= maxWidth) { lines.push(part); return; }
+          // 只有超宽时才继续在内部切。
+          splitTargetDisplayLine(part, maxWidth).forEach(function (p) { lines.push(p); });
+        });
+      });
+      lines = mergeDanglingModifierLines(lines, maxWidth);
       // 屏尾去标点必须是最后一步。
       //
       // 标点是悬挂检测的判据：「这就是我要说的，」的逗号说明该屏已是完整小句，
@@ -3372,25 +3567,44 @@
    * 按各组的语音时长比例切分：译文的推进速度大致跟随语音。只有一组时直接整块返回
    * （最常见情形，不做任何切分）。切点吸附到最近的原子边界，绝不切在词内部。
    */
-  function allocateTargetToGroups(joinedTarget, groups, maxWidth) {
-    if (groups.length === 1) return [joinedTarget];
-    var atoms = targetDisplayAtoms(joinedTarget);
+  /**
+   * 把模型给的屏按各组语音时长比例分配到长停顿分组。
+   *
+   * 屏是不可分单位 —— 模型的语义断点必须保留，所以只在屏之间分界，不切开屏内文本。
+   * 每组至少拿一屏（组是真实语音段，无字幕会导致该段画面吊着上一句）。
+   * 复杂度 O(屏数)，无原子级遍历。
+   */
+  function allocateScreensToGroups(screens, groups) {
+    if (groups.length === 1) return [screens.slice()];
+    // 屏数少于组数时无法每组分一屏 —— 把最宽的屏在标点处拆开补足。
+    // 不这样做后面的组会拿到空数组，那一段语音就没有字幕。
+    while (screens.length < groups.length) {
+      var widest = 0;
+      for (var w = 1; w < screens.length; w++) {
+        if (displayedWidth(screens[w]) > displayedWidth(screens[widest])) widest = w;
+      }
+      var halves = splitTargetDisplayLine(screens[widest], Math.max(8, Math.ceil(displayedWidth(screens[widest]) / 2)));
+      if (halves.length < 2) break; // 无可拆之处，接受组数不足
+      screens = screens.slice(0, widest).concat(halves, screens.slice(widest + 1));
+    }
     var durations = groups.map(function (g) { return Math.max(1, g.activeMs || 1); });
-    var totalWidth = atoms.reduce(function (sum, atom) { return sum + semanticDisplayWidth(atom); }, 0);
     var totalDuration = durations.reduce(function (a, b) { return a + b; }, 0);
+    var totalWidth = screens.reduce(function (sum, s) { return sum + displayedWidth(s); }, 0);
     var out = [];
     var cursor = 0;
     for (var g = 0; g < groups.length; g++) {
-      if (g + 1 === groups.length) { out.push(atoms.slice(cursor).join("")); break; }
+      var remainingGroups = groups.length - g - 1;
+      if (!remainingGroups) { out.push(screens.slice(cursor)); break; }
       var target = totalWidth * durations[g] / totalDuration;
       var acc = 0;
       var take = cursor;
-      while (take < atoms.length - (groups.length - g - 1) && acc < target) {
-        acc += semanticDisplayWidth(atoms[take]);
+      // 每组至少留一屏给后面每个组，否则后面的组会拿到空数组。
+      while (take < screens.length - remainingGroups && acc < target) {
+        acc += displayedWidth(screens[take]);
         take++;
       }
-      take = Math.max(cursor + 1, take);
-      out.push(atoms.slice(cursor, take).join(""));
+      take = Math.max(cursor + 1, Math.min(take, screens.length - remainingGroups));
+      out.push(screens.slice(cursor, take));
       cursor = take;
     }
     return out;
@@ -3665,11 +3879,19 @@
       reasoningEffort: opts.reasoningEffort,
       systemContent: sys,
       userContent: JSON.stringify({
-        maxVisualWidth: maxWidth,
+        // 整段连续原文 —— 模型翻译时看到的是完整语流，不是一条条碎 cue。逐 cue 投喂会
+        // 让模型逐条译成半句，译文里落不进标点（实测 100% 无句内标点）。
+        sourceText: source.map(function (c) { return c.text; }).join(" "),
+        // cue 边界仍要给：segment 的 sourceFrom/sourceTo 靠 id 定位，750ms 长停顿边界靠
+        // 时间判断。但**不重发全文** —— 全文已在 sourceText 里，再发一遍是纯浪费
+        // （实测占 user payload 55%，总 token -18%）。
+        sourceCues: source.map(function (c) {
+          return { id: c.id, startMs: c.startMs, endMs: c.endMs };
+        }),
         contextBefore: contextList(opts.contextBefore, "p"),
-        sourceCues: source,
         contextAfter: contextList(opts.contextAfter, "n"),
-        instruction: "contextBefore/contextAfter 只供理解，不得出现在输出覆盖范围；segments 只能覆盖 sourceCues。",
+        // instruction 已移入 system prompt：它每块都一样，放在 user 里等于每次重发，
+        // 还会破坏 prompt 前缀缓存（system 稳定则前缀可复用）。
       }),
       timeoutMs: opts.timeoutMs,
       fetchImpl: opts.fetchImpl,
@@ -4896,6 +5118,10 @@
     // 中文显示契约的收口点（屏尾去标点 + 句号不显示）。与 sanitizeSubtitleLine 同级：
     // 都是对外可见的产品契约，不是内部辅助，因此可直接断言。
     stripTrailingBreakPunct: stripTrailingBreakPunct,
+    // 中文分屏契约的唯一实现者。Jay 逐条确认过 11 组「输入 → 期望分屏」样例，那些
+    // 样例就是本函数的产品规格，必须能直接断言 —— 经公开入口测会被时间层与屏数
+    // 上限干扰，测不到排版本身。同 stripTrailingBreakPunct：契约点，不是内部辅助。
+    splitTargetDisplayLine: splitTargetDisplayLine,
     validateChineseDisplayUnit: validateChineseDisplayUnit,
     buildClipUnits: buildClipUnits,
     preferManualTrack: preferManualTrack,
