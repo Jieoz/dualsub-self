@@ -3421,6 +3421,16 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     const m = JSON.parse(raw);
     assert.strictEqual(m.manifest_version, 3);
     assert.match(m.version, /^\d+\.\d+\.\d+$/, "manifest 版本必须是 semver（发版时同步 bump，不再硬编码单一版本）");
+    // README 是项目唯一权威说明，不能落后于 manifest：曾出现只 bump 一处的漂移。
+    // 门禁只锁"README 声明的当前版本 == manifest 版本"，不锁具体号。
+    const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
+    const declared = readme.match(/当前版本：\*\*v(\d+\.\d+\.\d+)\*\*/);
+    assert.ok(declared, "README 必须声明当前版本");
+    assert.strictEqual(declared[1], m.version, "README 当前版本必须与 manifest.json 一致");
+    assert.ok(
+      readme.includes(`/releases/tag/v${m.version}`),
+      "README 的 Releases 链接必须指向当前版本的 tag",
+    );
     assert.ok(Array.isArray(m.content_scripts) && m.content_scripts.length === 2);
     const worlds = m.content_scripts.map((c) => c.world).sort();
     assert.deepStrictEqual(worlds, ["ISOLATED", "MAIN"]);
