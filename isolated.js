@@ -740,6 +740,45 @@
   function clearWaitTimer() {
     if (state.waitTimer != null) { clearTimeout(state.waitTimer); state.waitTimer = null; }
   }
+
+  function releaseWaitPause() {
+    state.waitTimer = null;
+    state.firstClipReady = true;
+    if (state.waitPausedByUs) {
+      state.waitPausedByUs = false;
+      var v = videoEl();
+      if (v && v.paused) { var p = v.play(); if (p && p.catch) p.catch(function () {}); }
+    }
+    requestRender();
+  }
+
+  /**
+   * 「等首块译文」的兜底解锁，不是等待上限。
+   *
+   * 曾经这里是固定 8000ms 死超时：到点无条件恢复播放。但首块真实耗时实测
+   * 12.7s / 18.0s / 23.6s（gpt-5.4-mini，DGdsIrAjp3k 首块 7 条 cue）—— 三次全部超过
+   * 8s，于是自动暂停几乎每次都在译文到达前就放行了，等于这个功能没生效。
+   *
+   * 固定时长猜不中：网关快慢、块大小、模型都在变。所以改成等真实完成信号 ——
+   * 首块 done 时 maybeResumeAfterFirstTranslation 立即恢复播放（那才是正常路径）；
+   * 这个定时器只负责「翻译已经不在跑了」时别把视频永久卡住。到点仍在翻译中就继续等。
+   */
+  function scheduleWaitDeadline() {
+    var ms = Number(config.waitForFirstTranslationCheckMs);
+    if (!Number.isFinite(ms) || ms <= 0) ms = 2000;
+    state.waitTimer = setTimeout(function () {
+      state.waitTimer = null;
+      if (state.firstClipReady) return;
+      // 首块仍在正常翻译中（排队/在飞/等重试）→ 继续等，不放行。
+      var st = state.clipState[0];
+      var stillWorking = state.clipInflight[0] === true || st === "pending" || st === "error";
+      if (stillWorking) {
+        scheduleWaitDeadline();
+        return;
+      }
+      releaseWaitPause();
+    }, ms);
+  }
   function maybePauseForFirstTranslation(clipIdx) {
     if (!config.waitForFirstTranslation) return;
     if (state.firstClipReady) return;
@@ -751,18 +790,7 @@
       state.waitPausedByUs = true;
       setRendererText((state.renderUnits[0] && state.renderUnits[0].originalText) || "", "", true, false);
       clearWaitTimer();
-      var ms = Number(config.waitForFirstTranslationMs);
-      if (!Number.isFinite(ms) || ms <= 0) ms = 8000;
-      state.waitTimer = setTimeout(function () {
-        state.waitTimer = null;
-        state.firstClipReady = true;
-        if (state.waitPausedByUs) {
-          state.waitPausedByUs = false;
-          var vv = videoEl();
-          if (vv && vv.paused) { var p = vv.play(); if (p && p.catch) p.catch(function () {}); }
-        }
-        requestRender();
-      }, ms);
+      scheduleWaitDeadline();
     } catch (e) {}
   }
   function maybeResumeAfterFirstTranslation(clipIdx) {
@@ -1129,6 +1157,17 @@
       }
     }
     render.sort(function (a, b) { return a.start - b.start || a.end - b.end; });
+    // 去重叠必须在这里做 —— 整条时间线只有汇合后才完整。
+    //
+    // materializeBlockTranslation 里的去重叠只看得见**单个块**，块与块之间没人管；
+    // 而滚动窗口 ASR 轨（YouTube 自动字幕）相邻 cue 天然大幅交叉（实测 DGdsIrAjp3k
+    // 188/202 条重叠），块边界两侧的屏于是重叠上屏，播放器同时命中两屏 —— 用户看到
+    // 的现象是「译文和原文错位、串行」。
+    //
+    // 只截 end、不动 start：出现时刻是唯一必须精确贴合音轨的量（红线）。
+    Core.enforceDisplayMonotonicity(render, Core.BLOCK_MIN_DISPLAY_MS, {
+      startKey: "start", endKey: "end",
+    });
     state.renderUnits = render;
     updateNativeCaptionVisibility();
     state.lastHitCueIdx = -1;

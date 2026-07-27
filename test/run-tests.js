@@ -2280,6 +2280,65 @@ test("resegmentCues 上限单位是视觉宽度：逐字文字不得被「12 词
     "拉丁轨内容不得因这次改动发生变化");
 });
 
+test("跨块汇合后必须去重叠 —— 块内去重叠看不见块边界", () => {
+  // 真实缺陷（DGdsIrAjp3k，LockPickingLawyer，滚动窗口 ASR 轨 188/202 条 cue 重叠）：
+  // materializeBlockTranslation 的去重叠只作用于单个块，块与块之间无人处理。实测拼接
+  // 后出现「屏5 end=15280 > 屏6 start=13440」，两屏同时命中 → 用户看到译文与原文错位。
+  // 修复点在 rebuildRenderTimeline：整条时间线只有汇合排序后才完整。
+  const render = [
+    { start: 11440, end: 15280, translation: "但即便如此，它们仍比" },   // 块1 末屏
+    { start: 13440, end: 18000, translation: "Quickset 过去做过的任何产品" }, // 块2 首屏
+    { start: 42360, end: 45280, translation: "所以我要把这个画面传到我的" },
+    { start: 44160, end: 50719, translation: "旧手机，然后看看钥匙长什么样" },
+  ];
+  const before = render.map((u) => u.start);
+  Core.enforceDisplayMonotonicity(render, Core.BLOCK_MIN_DISPLAY_MS, {
+    startKey: "start", endKey: "end",
+  });
+  for (let i = 1; i < render.length; i++) {
+    assert.ok(render[i].start >= render[i - 1].end,
+      `屏 ${i} 与前屏仍重叠：${render[i - 1].end} > ${render[i].start}`);
+  }
+  assert.deepStrictEqual(render.map((u) => u.start), before,
+    "startMs 是红线：去重叠只能截 end，不得改出现时刻");
+  assert.strictEqual(render[0].end, 13440, "前屏 end 应截到后屏 start");
+
+  // 接线断言：渲染时间线汇合处必须真的调用去重叠，否则块边界重叠会漏到显示层。
+  const iso = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
+  const rebuildAt = iso.indexOf("function rebuildRenderTimeline");
+  // 函数体到下一个顶层函数声明为止（早返回分支里也有 lastHitCueIdx / 原生字幕调用，
+  // 不能拿它们当边界 —— 那样切出来的片段不含排序与去重叠）。
+  const body = iso.slice(rebuildAt, iso.indexOf("\n  function ", rebuildAt + 10));
+  const sortAt = body.indexOf("render.sort(");
+  const dedupeAt = body.indexOf("Core.enforceDisplayMonotonicity(render");
+  assert.ok(dedupeAt > sortAt && sortAt >= 0,
+    "rebuildRenderTimeline 必须在排序后对整条时间线去重叠");
+  assert.match(body.slice(dedupeAt, dedupeAt + 200), /startKey:\s*"start"[\s\S]*?endKey:\s*"end"/,
+    "渲染时间线用 start/end 字段名，须显式传入");
+});
+
+test("等首块译文不得用固定超时上限放行", () => {
+  // 真实缺陷：曾是固定 8000ms 死超时，到点无条件恢复播放。但首块实测耗时
+  // 12.7s / 18.0s / 23.6s（gpt-5.4-mini）—— 三次全超，自动暂停几乎每次都在译文
+  // 到达前就放行，功能等于没生效。任何固定上限都猜不中（网关/块大小/模型都在变）。
+  const iso = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
+  const sched = iso.slice(iso.indexOf("function scheduleWaitDeadline"));
+  const body = sched.slice(0, sched.indexOf("\n  }"));
+  // 到点必须检查首块是否仍在翻译中，在跑就继续等
+  assert.match(body, /clipInflight\[0\]|clipState\[0\]/,
+    "到点必须检查首块实际状态，不能无条件放行");
+  assert.match(body, /stillWorking[\s\S]*?scheduleWaitDeadline\(\)/,
+    "仍在翻译中时必须继续等待（重新排期）");
+  // 旧的固定上限键必须从默认配置里消失，并在迁移时清除
+  assert.ok(!("waitForFirstTranslationMs" in Core.DEFAULT_CONFIG),
+    "旧的固定超时上限键不得留在默认配置");
+  assert.strictEqual(Core.DEFAULT_CONFIG.waitForFirstTranslationCheckMs, 2000);
+  const migrated = Core.migrateConfig({ waitForFirstTranslationMs: 8000 });
+  assert.ok(!("waitForFirstTranslationMs" in migrated), "迁移必须清除旧键");
+  // failed 是终态，不得被当成「仍在翻译中」而永久卡住视频
+  assert.doesNotMatch(body, /"failed"/, "failed 终态不得计入 stillWorking");
+});
+
 test("auto 选轨跟音轨语言，不取轨道数组首条", () => {
   // 真实缺陷（3teflb1QNN4，Vsauce「Is Anything Obvious?」）：音轨英语，另有西语人工
   // 翻译轨。YouTube 返回的 captionTracks 实测形态（curl watch 页抓取）：
@@ -3828,7 +3887,9 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     assert.ok(Core.DEFAULT_CONFIG.minLineChars >= 10);
     assert.strictEqual(Core.DEFAULT_CONFIG.maxLineChars, 0, "双语对照模式不得在中文 cue 内插入换行");
     assert.strictEqual(Core.DEFAULT_CONFIG.waitForFirstTranslation, true);
-    assert.ok(Core.DEFAULT_CONFIG.waitForFirstTranslationMs >= 1000 && Core.DEFAULT_CONFIG.waitForFirstTranslationMs <= 15000);
+    // 兜底检查间隔（不是等待上限 —— 见「等首块译文不得用固定超时上限放行」）。
+    assert.ok(Core.DEFAULT_CONFIG.waitForFirstTranslationCheckMs >= 500
+      && Core.DEFAULT_CONFIG.waitForFirstTranslationCheckMs <= 5000);
   });
 
   /* ============ 7. 交付物校验 ============ */

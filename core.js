@@ -1766,7 +1766,9 @@
     systemPrompt: "", // 空 = 使用语言/供应商无关的连续 block 翻译角色
     sentencePrompt: "", // 已废弃；保留键仅为兼容旧导出配置，不再使用
     waitForFirstTranslation: true,
-    waitForFirstTranslationMs: 8000,
+    // 「等首块译文」的兜底检查间隔（不是等待上限）。每次到点检查首块是否仍在翻译中：
+    // 在跑就继续等，已停就放行。首块实测 12.7~23.6s，任何固定上限都会提前放行。
+    waitForFirstTranslationCheckMs: 2000,
     // 显示样式
     fontSize: 22, // px —— 语义为"基准高度(FONT_BASE_HEIGHT=480，常规非全屏)下的字号"；
     //               实际渲染字号随播放器高度由 computeFontPx 同比缩放（全屏放大、退出缩小）。
@@ -1860,6 +1862,9 @@
   function migrateConfig(config) {
     var c = Object.assign({}, config || {});
     delete c.skipChineseSource;
+    // 旧「等首块译文」是固定超时上限（8s），语义已改成兜底检查间隔并换键名。
+    // 直接丢弃旧值：把 8000 当检查间隔用会白等一轮，而它作为上限本就是错的。
+    delete c.waitForFirstTranslationMs;
     c.targetLang = normalizeTargetLang(c.targetLang) || DEFAULT_CONFIG.targetLang;
     if (c.strokeWidth == null) {
       // 旧 stroke 显式 false → 无描边(0)；否则用默认粗细
@@ -4011,12 +4016,18 @@
    * 修法只截 endMs，绝不动 startMs：出现时刻是唯一必须精确贴合音轨的量，前推会让
    * 整轨累积漂移。若截断后不足最短显示时长，就保留 minDisplayMs 并让下一屏的
    * startMs 成为硬边界（宁可短暂重叠 <minDisplayMs，也不让字幕早于语音出现）。
+   *
+   * 要求 units 已按 start 升序。字段名可配：块内 units 用 startMs/endMs，渲染时间线
+   * 用 start/end —— 后者是跨块汇合后的唯一去重叠点，块内那次看不见块边界。
    */
-  function enforceDisplayMonotonicity(units, minDisplayMs) {
+  function enforceDisplayMonotonicity(units, minDisplayMs, opts) {
+    opts = opts || {};
+    var sKey = opts.startKey || "startMs";
+    var eKey = opts.endKey || "endMs";
     for (var i = 0; i + 1 < units.length; i++) {
-      var nextStart = units[i + 1].startMs;
-      if (units[i].endMs > nextStart) {
-        units[i].endMs = Math.max(nextStart, units[i].startMs + minDisplayMs);
+      var nextStart = units[i + 1][sKey];
+      if (units[i][eKey] > nextStart) {
+        units[i][eKey] = Math.max(nextStart, units[i][sKey] + minDisplayMs);
       }
     }
     return units;
@@ -5264,6 +5275,8 @@
     SOURCE_DISPLAY_MAX_WIDTH: SOURCE_DISPLAY_MAX_WIDTH,
     READING_MS_PER_CHAR: READING_MS_PER_CHAR,
     mergeUnreadableUnits: mergeUnreadableUnits,
+    enforceDisplayMonotonicity: enforceDisplayMonotonicity,
+    BLOCK_MIN_DISPLAY_MS: BLOCK_MIN_DISPLAY_MS,
     pickTrack: pickTrack,
     TRANSLATION_DISPLAY_MAX_WIDTH: TRANSLATION_DISPLAY_MAX_WIDTH,
     PREFETCH_AHEAD: PREFETCH_AHEAD,
