@@ -513,6 +513,7 @@
         maxVisualWidth: Core.SOURCE_DISPLAY_MAX_WIDTH,
         continuationMaxWords: Core.SOURCE_UNIT_MAX_WORDS,
       });
+
       if (!installCueTimeline(fallbackCues, "block", { sourceTimeline: sourceTimeline })) {
         retryLater("解析后无有效字幕");
         return;
@@ -683,6 +684,28 @@
     }
     var nextClips = sliceTimelineClips(canonicalCues);
     var nextCueMap = Core.cueClipIndexMap(nextClips);
+    // 原文侧去重叠 —— 必须在分块之后。
+    //
+    // canonicalCues 是「译文未到 / 翻译失败时只显示原文」实际上屏的数据，也就是视频
+    // 刚开始那几秒用户看到的东西。滚动窗口 ASR 轨上实测 51/56 个单元互相重叠、最大
+    // 7920ms，两屏原文同时上屏。缺陷自 v0.8.2 起一直存在：历次验证只测译文侧
+    // renderUnits，没测过原文侧。
+    //
+    // 位置有两个约束：
+    //   · 不能放在 resegmentCues 产物上 —— 单元时间取自 token 跨度，上游改 end 会被
+    //     buildCueTokenSpanUnits 按 token 重算覆盖（实测改前改后同为 51/56）。
+    //   · 必须在 sliceTimelineClips 之后 —— sliceClipsByCue 按 cue.end - startMs 算
+    //     跨度，先去重叠会连带改变翻译分块（实测块内 cue 数 3,8,9,6,9,7,9,6 →
+    //     4,10,8,7,10,3,10,5）。去重叠是显示层的事，不该动翻译分块。
+    //
+    // 同一条红线：只截 end，不动 start。
+    //
+    // 已知例外（不是漏修）：当前屏 end 已被截到 BLOCK_MIN_DISPLAY_MS=300ms 下限、而
+    // 后屏 start 仍更早时，两条约束冲突 —— 宁可留 19~527ms 重叠，也不把屏压到不可读
+    // 或挪动 start。22 条真实轨里仅一条日语轨出现 5 处（625 单元中的 5 个）。
+    Core.enforceDisplayMonotonicity(canonicalCues, Core.BLOCK_MIN_DISPLAY_MS, {
+      startKey: "start", endKey: "end",
+    });
     var nextClipUnits = {};
     var nextClipState = {};
 

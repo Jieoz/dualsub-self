@@ -2339,6 +2339,68 @@ test("等首块译文不得用固定超时上限放行", () => {
   assert.doesNotMatch(body, /"failed"/, "failed 终态不得计入 stillWorking");
 });
 
+test("音效标记不进翻译管线，歌词不受影响", () => {
+  // 22 条真实轨统计：括号包裹的 cue 共 8 种形态，其中 117 条是音效/说话人标记
+  // （[Applause]×23 [Music]×19 [笑い]×69 [拍手]×2 [鼻息]×2 [叫び声]×2 [Vsauce]×2），
+  // 1 种是歌词 (Up, up, up; up, up)。DGdsIrAjp3k 有 9 条音效覆盖 158s（视频约 330s），
+  // 其中两个整块里一句人话都没有却各发了一次完整翻译请求。
+  //
+  // 判据是形态不是词表：方括号完整包裹 + 内部无句内标点。音效词随语言无限延伸，
+  // 词表必然漏且违反语言中立。
+  ["[Applause]", "[Music]", "[笑い]", "[拍手]", "[鼻息]", "[叫び声]", "[Vsauce]", "【笑】"]
+    .forEach((t) => assert.equal(Core.isNonSpeechMarker(t), true, "应判为非语音标记: " + t));
+  // 歌词用圆括号且带真实语流标点 —— 必须保留
+  assert.equal(Core.isNonSpeechMarker("(Up, up, up; up, up)"), false);
+  // 方括号但含句内标点 = 真内容，不是标记
+  assert.equal(Core.isNonSpeechMarker("[so, it is]"), false);
+  assert.equal(Core.isNonSpeechMarker("hello world"), false);
+  // 过长的不当标记处理（避免把整句误判成标记）
+  assert.equal(Core.isNonSpeechMarker("[a very long marker text that goes on beyond the limit]"), false);
+
+  // 解析层真过滤：三条 json3 event，中间那条是音效
+  const parsed = Core.parseJson3({
+    events: [
+      { tStartMs: 0, dDurationMs: 1000, segs: [{ utf8: "hello there", tOffsetMs: 0 }] },
+      { tStartMs: 1000, dDurationMs: 3000, segs: [{ utf8: "[Applause]", tOffsetMs: 0 }] },
+      { tStartMs: 4000, dDurationMs: 1000, segs: [{ utf8: "we are back", tOffsetMs: 0 }] },
+    ],
+  });
+  assert.equal(parsed.length, 2, "音效 cue 必须在解析层被剔除");
+  assert.ok(!parsed.some((c) => /Applause/.test(c.content)));
+});
+
+test("原文侧（fallback）时间线必须去重叠 —— 译文未到时用户看到的就是它", () => {
+  // 真实缺陷（自 v0.8.2 起未被发现）：滚动窗口 ASR 轨上 fallback 原文单元 51/56 互相
+  // 重叠、最大 7920ms，两屏原文同时上屏。历次验证只测译文侧 renderUnits。
+  //
+  // 这里断言 isolated.js 的接线顺序：去重叠必须在 sliceTimelineClips 之后 ——
+  // sliceClipsByCue 按 cue.end - startMs 算跨度，先去重叠会连带改变翻译分块
+  // （实测 3,8,9,6,9,7,9,6 → 4,10,8,7,10,3,10,5）。
+  const iso = fs.readFileSync(path.join(__dirname, "..", "isolated.js"), "utf8");
+  const installAt = iso.indexOf("function installCueTimeline");
+  assert.ok(installAt >= 0);
+  const body = iso.slice(installAt, iso.indexOf("\n  function ", installAt + 10));
+  const sliceAt = body.indexOf("sliceTimelineClips(canonicalCues)");
+  const dedupeAt = body.indexOf("Core.enforceDisplayMonotonicity(canonicalCues");
+  assert.ok(sliceAt >= 0, "installCueTimeline 必须对 canonicalCues 分块");
+  assert.ok(dedupeAt > sliceAt,
+    "原文侧去重叠必须在 sliceTimelineClips 之后，否则会连带改变翻译分块");
+
+  // 行为断言：重叠的原文单元经去重叠后不再重叠，且 start 一个都不许动
+  const units = [
+    { start: 480, end: 6240, content: "a" },
+    { start: 4319, end: 9920, content: "b" },
+    { start: 7759, end: 13440, content: "c" },
+  ];
+  const starts = units.map((u) => u.start);
+  Core.enforceDisplayMonotonicity(units, Core.BLOCK_MIN_DISPLAY_MS, { startKey: "start", endKey: "end" });
+  assert.deepEqual(units.map((u) => u.start), starts, "startMs 是红线，一个都不许动");
+  for (let i = 1; i < units.length; i++) {
+    assert.ok(units[i].start >= units[i - 1].end,
+      `原文单元 ${i - 1}/${i} 仍重叠: ${units[i - 1].end} > ${units[i].start}`);
+  }
+});
+
 test("auto 选轨跟音轨语言，不取轨道数组首条", () => {
   // 真实缺陷（3teflb1QNN4，Vsauce「Is Anything Obvious?」）：音轨英语，另有西语人工
   // 翻译轨。YouTube 返回的 captionTracks 实测形态（curl watch 页抓取）：

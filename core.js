@@ -109,6 +109,27 @@
   }
 
   /**
+   * 非语音标记 —— 方括号完整包裹、内部无句内标点的 cue。
+   *
+   * ASR 轨会把音效写成独立 cue：[Applause] [Music] [笑い] [拍手] [鼻息] [叫び声]，
+   * 也包括来源/说话人标签 [Vsauce]。这些都不是语音，翻译成"掌声/音乐"既占屏又白烧
+   * token —— 实测 DGdsIrAjp3k 有 9 条共覆盖 158s（视频总长约 330s），其中两个整块
+   * 里一句人话都没有，却各发了一次完整翻译请求。
+   *
+   * 判据是形态，不是词表：
+   *   方括号 [] 或【】完整包裹  +  内部不含句内标点
+   * 语言中立（22 条真实轨里日语英语音效全部命中），且不误伤歌词 —— 歌词用圆括号且
+   * 带真实语流标点，如 "(Up, up, up; up, up)" 会被保留。
+   *
+   * 不用词表的理由：音效词随语言无限延伸，维护名单必然漏，且违反语言中立。
+   */
+  var NON_SPEECH_MARKER_RE = /^[\[【]\s*[^\[\]【】,;，；。．!?！？…]{1,30}\s*[\]】]$/;
+
+  function isNonSpeechMarker(text) {
+    return NON_SPEECH_MARKER_RE.test(String(text || "").trim());
+  }
+
+  /**
    * 解析 YouTube json3 字幕格式。
    * 除 event 的粗粒度时间外，保留 seg.tOffsetMs 推导出的 token 时间。后续语义
    * 重分段可以自由跨 ASR event 重组，仍准确落回原音频区间。
@@ -126,6 +147,8 @@
       // ["hello", " ", "world"] 会被误拼成 "helloworld"。collapseWhitespace 只用于显示。
       const content = collapseWhitespace(rawSegs.map((seg) => seg.utf8).join(""));
       if (!content) continue;
+      // 音效/说话人标记不是语音：不进翻译管线，也不占屏。
+      if (isNonSpeechMarker(content)) continue;
       const tokens = timedJson3EventTokens(rawSegs, start, eventEnd);
       out.push({ start: start, end: eventEnd, duration: duration, content: content, tokens: tokens });
     }
@@ -164,6 +187,7 @@
           .replace(/<[^>]+>/g, "") // 去掉 vtt 内联标签
       );
       if (!content) continue;
+      if (isNonSpeechMarker(content)) continue;
       out.push({ start: start, end: end, duration: Math.max(0, end - start), content: content });
     }
     return out;
@@ -5276,6 +5300,7 @@
     READING_MS_PER_CHAR: READING_MS_PER_CHAR,
     mergeUnreadableUnits: mergeUnreadableUnits,
     enforceDisplayMonotonicity: enforceDisplayMonotonicity,
+    isNonSpeechMarker: isNonSpeechMarker,
     BLOCK_MIN_DISPLAY_MS: BLOCK_MIN_DISPLAY_MS,
     pickTrack: pickTrack,
     TRANSLATION_DISPLAY_MAX_WIDTH: TRANSLATION_DISPLAY_MAX_WIDTH,
