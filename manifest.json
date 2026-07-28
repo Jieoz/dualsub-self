@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "MyDualsub - 双语字幕 (自带翻译API)",
-  "description": "在 YouTube 上显示双语字幕，使用你自己的 OpenAI 兼容翻译 API。翻译不经过任何第三方服务端，密钥仅存本地。",
-  "version": "0.9.2",
+  "description": "在 YouTube 和 Netflix 上显示双语字幕，使用你自己的 OpenAI 兼容翻译 API。翻译不经过任何第三方服务端，密钥仅存本地。",
+  "version": "0.9.3",
   "icons": {
     "16": "icons/16.png",
     "48": "icons/48.png",
@@ -14,6 +14,7 @@
   "host_permissions": [
     "https://www.youtube.com/*",
     "https://m.youtube.com/*",
+    "https://www.netflix.com/*",
     "<all_urls>"
   ],
   "action": {
@@ -33,10 +34,21 @@
       "run_at": "document_start"
     },
     {
+      "world": "MAIN",
+      "matches": [
+        "https://www.netflix.com/*"
+      ],
+      "js": [
+        "netflix-main.js"
+      ],
+      "run_at": "document_start"
+    },
+    {
       "world": "ISOLATED",
       "matches": [
         "https://www.youtube.com/*",
-        "https://m.youtube.com/*"
+        "https://m.youtube.com/*",
+        "https://www.netflix.com/*"
       ],
       "js": [
         "core.js",

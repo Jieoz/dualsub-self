@@ -1,6 +1,6 @@
 # MyDualsub · 双语字幕（自带翻译 API）
 
-在 **YouTube** 上叠加显示**双语字幕**（英文原文一行 + 中文译文一行）的 Manifest V3 浏览器扩展。
+在 **YouTube** 和 **Netflix** 上叠加显示**双语字幕**（原文一行 + 中文译文一行）的 Manifest V3 浏览器扩展。
 
 它仿照商业扩展 **Dualsub** 的架构，但有一个关键区别：
 
@@ -14,14 +14,22 @@
 
 - `https://www.youtube.com/*`（桌面网页版）
 - `https://m.youtube.com/*`（移动网页版，尽力支持）
+- `https://www.netflix.com/*`（桌面网页版）
 
-> 目前只做 YouTube。架构上 main.js 负责站点适配，后续可扩展其它站点。
+> 站点差异全部收敛在 `core.js` 的 **`SITE_ADAPTERS`** 一张表里：播放器/视频元素选择器、要隐藏的原生字幕容器、可信字幕主机与 URL 校验规则、字幕格式、以及**该轨是否滚动重发**。取轨脚本每站一份（`main.js` / `netflix-main.js`），产出同一种 `update-manifest` 消息；解析、时间轴、语义分屏、翻译、覆盖率账本全部站点无关地复用。加站点=加一行适配器 + 一份取轨脚本，不改下游。有门禁强制 `manifest.json` 与适配表同步。
 
 ---
 
 ## 安装（加载已解压的扩展程序）
 
-当前版本：**v0.9.2**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.9.2) 下载 Chrome MV3 安装包。
+当前版本：**v0.9.3**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.9.3) 下载 Chrome MV3 安装包。
+
+v0.9.3 **新增 Netflix 支持**，并修掉一个由此暴露出来的、同样影响用户上传字幕轨的丢词缺陷。
+
+- **人工成品字幕轨的合法重复台词不再被吞。** `stripOverlap` 原先只按纯文本判「重复即滚动重发」——这是给 YouTube 滚动 ASR 设计的（同一次发声在连续时间片里反复出现）。但人工轨里重复文本是真台词：实测 Netflix 英文轨 352 条 cue **丢 12 个词**，`"It works. It works like crazy!"` 被删成病句 `"It works. like crazy!"`，`Tobes!` 五连变四连。这条路径同样服务**用户上传的 srt/vtt 人工轨**，所以不是 Netflix 独有问题。
+- **判据从「猜时间」改成「声明来源」。** 中间试过按 cue 间隙阈值判定，被真轨证伪：cue #334 `He almost...` 与 #335 `Almost what?` 间隙仅 **83ms** 却是合法重复，任何间隙阈值都会误判。也试过按 `rollingEnd` 字段自动推断轨类型，同样不完备——真实 YouTube VTT 自动轨没有 token 却确实滚动重发。最终改为 `resegmentCues(cues, { rollingSource })` 由站点适配器**显式声明**，一次判定、全轨一致。同源 cue 切出的相邻片段永不视为重发。
+- **门禁是双向的**：正向断言人工轨重复台词必须保留（取自真轨样本），负向断言滚动轨的重发**仍必须被去掉**——防止把开关做成「无条件关闭去重」的假修复。
+- **Netflix 是句级轨，没有词级时间。** 实测 415 条 `<p>` 内联时间戳 **0 个**（YouTube json3 词级覆盖率 85.3%），所以时间层的词级收益吃不到；语义分屏、覆盖率账本、可读性时长照常生效。新增 `parseTtml`（IMSC1）按声明的 `tickRate` 换算、保留 `<br/>` 硬换行、剥离纯音效与说话人标签（`[Jim]`、`♪`），并修掉「剥掉音效行后残留孤立 `-` 分隔符」的坑——真轨 12 条踩中。
 
 v0.9.2 修掉一个**只在无词间空格语言（日/中/泰）上触发**的整块丢字幕缺陷。
 

@@ -165,7 +165,9 @@
       if (signature === lastSignature) return;
       lastSignature = signature;
 
-      send("update-manifest", { videoId: videoId, files: files });
+      // site 必须显式声明：isolated.js 靠它选站点适配器做 URL 校验，
+      // 不靠猜。缺省回落到 youtube 只是为了兼容旧包，新代码一律显式发。
+      send("update-manifest", { site: "youtube", videoId: videoId, files: files });
     } catch (e) {
       // 播放器内部对象偶发抛错，吞掉继续下轮
     }

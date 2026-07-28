@@ -5,9 +5,33 @@ const ROOT=path.resolve(__dirname,"../..");
 const FIX=__dirname;
 const endpoint=process.env.DUALSUB_CDP_URL||"http://172.19.0.33:9222";
 const publicHost=process.env.DUALSUB_REPLAY_HOST||Object.values(os.networkInterfaces()).flat().find(x=>x&&x.family==="IPv4"&&!x.internal&&/^172\./.test(x.address))?.address||"127.0.0.1";
-const scenarios=(process.env.DUALSUB_REPLAY_SCENARIOS||"happy,empty-track-retry,empty-track-exhaust,block-long-fallback,block-failure,seek-race,block-cache,config-race,disable-inflight,track-switch-race,full-srt,full-srt-cancel,priority-overtake").split(",");
+const scenarios=(process.env.DUALSUB_REPLAY_SCENARIOS||"happy,empty-track-retry,empty-track-exhaust,block-long-fallback,block-failure,seek-race,block-cache,config-race,disable-inflight,track-switch-race,full-srt,full-srt-cancel,priority-overtake,netflix-happy").split(",");
 for(const name of ["index.html","track.json","semantic.json"])assert.ok(fs.existsSync(path.join(FIX,name)),`missing fixture: ${name}`);
-class CDP{constructor(ws){this.ws=ws;this.id=0;this.pending=new Map();ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.id&&this.pending.has(m.id)){const {resolve,reject}=this.pending.get(m.id);this.pending.delete(m.id);m.error?reject(new Error(m.error.message)):resolve(m.result)}}}send(method,params={},sessionId){return new Promise((resolve,reject)=>{const id=++this.id;this.pending.set(id,{resolve,reject});this.ws.send(JSON.stringify({id,method,params,...(sessionId?{sessionId}:{})}))})}}
+class CDP{constructor(ws){this.ws=ws;this.id=0;this.pending=new Map();this.onEvent=null;ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.id&&this.pending.has(m.id)){const {resolve,reject}=this.pending.get(m.id);this.pending.delete(m.id);m.error?reject(new Error(m.error.message)):resolve(m.result)}else if(m.method&&this.onEvent){this.onEvent(m)}}}send(method,params={},sessionId){return new Promise((resolve,reject)=>{const id=++this.id;this.pending.set(id,{resolve,reject});this.ws.send(JSON.stringify({id,method,params,...(sessionId?{sessionId}:{})}))})}}
+/* 生产 isolated.js 按 location.hostname 选站点适配器，未支持的站点直接退出。
+ * 所以回放必须跑在**真实站点 origin** 上，不能用 IP —— 否则测的就不是
+ * 真实注入条件了。这里用 CDP 请求拦截把 https://www.youtube.com/* 的响应
+ * 换成本地 fixture，页面看到的 origin 与真机一致，且不产生任何外网请求。
+ * 不为测试在生产代码里留 host 白名单后门。 */
+/* 场景名决定站点 origin：netflix-* 跑 Netflix，其余跑 YouTube。
+ * 不用环境变量，否则跑全量时只能测到一个站点。 */
+function originFor(name){return /^netflix-/.test(name)?"https://www.netflix.com":"https://www.youtube.com"}
+async function installOriginShim(cdp,sessionId,origin){
+  await cdp.send("Fetch.enable",{patterns:[{urlPattern:origin+"/*"}]},sessionId);
+}
+function fulfillFromDisk(cdp,sessionId,ev){
+  const {requestId,request}=ev.params;
+  const p=new URL(request.url).pathname;
+  // /api/timedtext 由页面内的 fetch 桩接管，这里放行让它自己失败/被桩拦下
+  const f=fileFor(p==="/watch"||p==="/"?"/":p);
+  if(!f.startsWith(ROOT)||!fs.existsSync(f)){
+    return cdp.send("Fetch.fulfillRequest",{requestId,responseCode:404,body:Buffer.from("not found").toString("base64")},sessionId).catch(()=>{});
+  }
+  const body=fs.readFileSync(f);
+  return cdp.send("Fetch.fulfillRequest",{requestId,responseCode:200,
+    responseHeaders:[{name:"content-type",value:mime[path.extname(f)]||"application/octet-stream"}],
+    body:body.toString("base64")},sessionId).catch(()=>{});
+}
 const mime={".html":"text/html; charset=utf-8",".js":"text/javascript; charset=utf-8",".json":"application/json; charset=utf-8"};
 function fileFor(url){const p=new URL(url,"http://x").pathname;if(p==="/core.js"||p==="/isolated.js")return path.join(ROOT,p.slice(1));return path.join(FIX,p==="/"?"index.html":p.slice(1))}
 function serve(){return new Promise(resolve=>{const s=http.createServer((req,res)=>{const f=fileFor(req.url);if(!f.startsWith(ROOT)||!fs.existsSync(f)){res.writeHead(404);return res.end("not found")}res.setHeader("content-type",mime[path.extname(f)]||"application/octet-stream");fs.createReadStream(f).pipe(res)});s.listen(0,"0.0.0",()=>resolve(s))})}
@@ -23,5 +47,33 @@ function check(name,r){assert.equal(r.finished,true,`${name}: replay did not fin
  if(name==="disable-inflight"){const disabled=r.events.find(x=>x.type==="disable-send");assert.ok(disabled,"disable was not exercised");assert.ok(r.events.some(x=>x.type==="translation-aborted"),"disable did not actively abort translation");assert.equal(r.apiUsage&&r.apiUsage.requests,0,"aborted response polluted usage");assert.ok(!r.events.some(x=>x.type==="cache-write-after-disable"),"aborted response wrote cache after disable");assert.ok(!r.paints.some(x=>x.t>disabled.t&&x.trans&&x.trans!=="翻译中…"),"late translation painted after disable");assert.ok(r.nativeRestored,"disable did not restore native captions")}
  if(name==="full-srt"){assert.equal(r.fullSrtStatus&&r.fullSrtStatus.status,"completed","full SRT did not complete");assert.ok(r.exportSrt&&r.exportSrt.ok,"full SRT export is incomplete");const counts=r.events.filter(e=>e.type==="translation-start").map(e=>e.count);assert.ok(r.events.some(e=>e.type==="translation-start"&&/unit0[\s\S]*unit1[\s\S]*unit2/.test(e.first||"")),"full SRT did not send a context-rich source block");assert.ok(counts.every(n=>n<=20),"full SRT emitted a request above the block cue cap")}
 if(name==="full-srt-cancel"){assert.equal(r.fullSrtStatus&&r.fullSrtStatus.status,"cancelled","full SRT cancellation did not settle");assert.ok(r.fullSrtStatus.completedUnits<r.fullSrtStatus.totalUnits,"cancelled full SRT unexpectedly completed");assert.equal(r.exportSrt&&r.exportSrt.ok,false,"cancelled incomplete SRT was exportable");const cancelled=r.events.find(e=>e.type==="full-srt-cancelled");assert.ok(cancelled,"cancel event missing");const startsBySource=new Map();for(const e of r.events.filter(e=>e.type==="translation-start")){const k=e.first||"";startsBySource.set(k,(startsBySource.get(k)||0)+1)}assert.ok([...startsBySource.values()].every(n=>n===1),"full-SRT and foreground issued duplicate requests for the same block");assert.ok(!r.events.some(e=>e.type==="translation-aborted"&&e.t>=cancelled.t),"cancelling full-SRT aborted a request potentially shared with foreground")}
+if(name==="netflix-happy"){
+  // Netflix 是句级人工成品字幕轨（TTML/IMSC1，无词级时间），与 YouTube ASR 的
+  // 形态完全不同，下面每条都断言真实行为，不是"没报错就算过"。
+  const fetched=r.events.filter(e=>e.type==="ttml-fetch").length;
+  assert.equal(fetched,1,"Netflix 轨没被下载或被重复下载: "+fetched);
+  // ① 注入活性：原生字幕真的被隐藏过（不是只加了 class 不生效）
+  assert.ok(r.paints.some(p=>p.nativeHidden&&p.nativeDisplay==="none"),"Netflix 原生字幕容器没被真正隐藏");
+  // ② 渲染活性：原文与译文都真上过屏
+  const painted=r.paints.filter(p=>p.orig&&p.trans&&p.trans!=="翻译中…");
+  assert.ok(painted.length,"Netflix 双语没上屏");
+  // ③ 标点必须保留。句级人工字幕自带标点，而句号是最强分屏信号；
+  //    canonical token 流曾用剥标点的 restoredWords 切词，导致整轨标点全灭。
+  assert.ok(painted.some(p=>/[.!?]/.test(p.orig)),"Netflix 原文标点被吃掉了: "+JSON.stringify(painted[0].orig));
+  // ④ 合法重复台词一个都不能少。注意：渲染与导出的文本来自 canonical token 流，
+  //    它本身不做重发去重，所以这条断言不能用来验 rollingSource 开关（实测把
+  //    rollingSource 强设成 true，这里仍然全绿）。rollingSource 的承重门禁在
+  //    test/run-tests.js 的 resegmentCues 用例里，带负向验证。这里守的是
+  //    「整条链路端到端没吞词」。
+  const srt=(r.exportSrt&&r.exportSrt.units||[]).map(u=>u.originalText).join(" ");
+  assert.ok(/It works\. It works like crazy!/.test(srt),"合法重复台词被当滚动重发删了: "+srt);
+  assert.equal((srt.match(/Tobes/g)||[]).length,3,"Tobes 重复次数不对: "+srt);
+  assert.ok(/He almost\.\.\. Almost what\?/.test(srt),"83ms 间隙的相邻台词被误删: "+srt);
+  // ⑤ 双说话人分隔符 "-" 必须还在（剥音效不能顺手吃掉它）
+  assert.ok(/- Tobes!/.test(srt),"说话人分隔符丢了: "+srt);
+  // ⑥ startMs 红线：导出单元的起点必须来自源轨，一个都不许改
+  const first=(r.exportSrt&&r.exportSrt.units||[])[0];
+  assert.equal(first&&first.startMs,300,"首单元起点偏离源轨 300ms");
+}
 if(name==="priority-overtake"){assert.equal(r.fullSrtStatus&&r.fullSrtStatus.status,"completed","priority fixture did not finish full SRT");const seek=r.events.find(e=>e.type==="priority-seek");assert.ok(seek,"priority seek missing");const startsForTarget=r.events.filter(e=>e.type==="translation-start"&&/^unit1[2-9]\b|^unit2[0-3]\b/.test(e.first||""));assert.equal(startsForTarget.length,1,"seek duplicated a block already being translated by full-SRT");const abortAfterSeek=r.events.filter(e=>e.type==="translation-aborted"&&e.t>=seek.t);assert.equal(abortAfterSeek.length,0,"seek aborted shared in-flight block");assert.ok(r.events.some(e=>e.type==="translation-ready"&&e.t>seek.t),"shared block never completed after seek") }if(name==="track-switch-race"){assert.ok(r.events.some(x=>x.type==="track-fetch-aborted"&&x.track==="slowA"),"old source-track fetch was not actively aborted");assert.ok(!r.paints.some(x=>String(x.orig||"").includes("stale first track")),"stale source track reached DOM");assert.ok(r.paints.some(x=>String(x.orig||"").includes("fresh second track wins")),"new source track never painted");assert.ok((r.exportSrt.units||[]).some(x=>String(x.originalText||"").includes("fresh second track wins")),"SRT snapshot did not belong to new source track")}}
-(async()=>{const server=await serve(),port=server.address().port,cdp=await connect();try{for(const name of scenarios){const {targetId}=await cdp.send("Target.createTarget",{url:"about:blank"});const {sessionId}=await cdp.send("Target.attachToTarget",{targetId,flatten:true});await cdp.send("Runtime.enable",{},sessionId);await cdp.send("Page.navigate",{url:`http://${publicHost}:${port}/?scenario=${name}`},sessionId);const deadline=Date.now()+(name==="empty-track-exhaust"?14000:6000);let report;while(Date.now()<deadline){await new Promise(r=>setTimeout(r,100));const out=await cdp.send("Runtime.evaluate",{expression:"window.__report||null",returnByValue:true},sessionId);report=out.result.value;if(report&&report.finished)break}if(process.env.DUALSUB_REPLAY_DEBUG)console.log(JSON.stringify(report));check(name,report||{});await cdp.send("Target.closeTarget",{targetId});console.log(`PASS ${name}`)}console.log(`browser replay: ${scenarios.length}/${scenarios.length} scenarios passed`)}finally{server.close();if(typeof server.closeAllConnections==="function")server.closeAllConnections();cdp.ws.close()}})().catch(e=>{console.error(e.stack||e);process.exit(1)});
+(async()=>{const server=await serve(),port=server.address().port,cdp=await connect();try{for(const name of scenarios){const {targetId}=await cdp.send("Target.createTarget",{url:"about:blank"});const {sessionId}=await cdp.send("Target.attachToTarget",{targetId,flatten:true});await cdp.send("Runtime.enable",{},sessionId);cdp.onEvent=m=>{if(m.method==="Fetch.requestPaused"&&m.sessionId===sessionId)fulfillFromDisk(cdp,sessionId,m)};const origin=originFor(name);await installOriginShim(cdp,sessionId,origin);await cdp.send("Page.navigate",{url:`${origin}/watch?scenario=${name}`},sessionId);const deadline=Date.now()+(name==="empty-track-exhaust"?14000:6000);let report;while(Date.now()<deadline){await new Promise(r=>setTimeout(r,100));const out=await cdp.send("Runtime.evaluate",{expression:"window.__report||null",returnByValue:true},sessionId);report=out.result.value;if(report&&report.finished)break}if(process.env.DUALSUB_REPLAY_DEBUG)console.log(JSON.stringify(report));check(name,report||{});await cdp.send("Target.closeTarget",{targetId});console.log(`PASS ${name}`)}console.log(`browser replay: ${scenarios.length}/${scenarios.length} scenarios passed`)}finally{server.close();if(typeof server.closeAllConnections==="function")server.closeAllConnections();cdp.ws.close()}})().catch(e=>{console.error(e.stack||e);process.exit(1)});

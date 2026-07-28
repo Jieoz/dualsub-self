@@ -215,6 +215,145 @@
     return out;
   }
 
+  /* ---------------------------------------------------------------
+   * TTML / IMSC1 解析（Netflix 等人工成品字幕轨）
+   *
+   * 与 json3 的本质区别：**没有词级时间**。实测 Netflix 英文轨 415 条 <p>，
+   * 内联时间戳 0 个（YouTube json3 词级覆盖 85.3%）。所以这里产出的 cue
+   * 不带 tokens，下游 nativeTiming 分支自然走 else —— 不需要任何站点分支。
+   * ------------------------------------------------------------- */
+
+  function decodeXmlEntities(s) {
+    return String(s)
+      .replace(/&#(\d+);/g, function (_, d) { return String.fromCharCode(Number(d)); })
+      .replace(/&#x([0-9a-f]+);/gi, function (_, h) { return String.fromCharCode(parseInt(h, 16)); })
+      .replace(/&quot;/g, '"')
+      .replace(/&apos;/g, "'")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&nbsp;/g, " ")
+      // &amp; 必须最后解码，否则 "&amp;quot;" 会被二次解码成引号
+      .replace(/&amp;/g, "&");
+  }
+
+  /**
+   * TTML 时间值 → 毫秒。Netflix 用 tick（"13277430832t"），必须按声明的
+   * ttp:tickRate 换算，不能硬编码；同时兼容 TTML 合法的时钟与秒表示。
+   */
+  function ttmlTimeToMs(v, tickRate) {
+    if (!v) return null;
+    var s = String(v).trim();
+    if (/^\d+t$/.test(s)) {
+      var rate = tickRate > 0 ? tickRate : 10000000;
+      return Math.round((parseInt(s, 10) / rate) * 1000);
+    }
+    var c = s.match(/^(\d+):(\d\d):(\d\d)(?:[.,](\d+))?$/);
+    if (c) {
+      var frac = c[4] ? Number("0." + c[4]) : 0;
+      return Math.round((Number(c[1]) * 3600 + Number(c[2]) * 60 + Number(c[3]) + frac) * 1000);
+    }
+    if (/^[\d.]+s$/.test(s)) return Math.round(parseFloat(s) * 1000);
+    if (/^[\d.]+ms$/.test(s)) return Math.round(parseFloat(s));
+    return null;
+  }
+
+  /**
+   * 剥离音效与说话人标记，返回可翻译的台词文本。
+   *
+   * 为什么必须剥：实测英文轨 415 条里 56 条（13%）是纯音效
+   * "[soothing music playing]"，另有 51 条音效与台词混排。原样送翻译既烧
+   * token，也只会得到「[舒缓的音乐播放]」这种没人要看的字幕。
+   *
+   * 行首 "-" 是**分隔符**，不是台词的一部分 —— 它只在同一条 cue 里有两个以上
+   * 说话人时才有意义。所以它的保留条件是「剥离后仍剩 ≥2 行」，而不是「原文有
+   * 没有写」。真轨里 12 条踩了这个坑，典型的一条：
+   *   源：  "-[soothing music playing]<br/>-Don't go in there, he's with a patient."
+   *   剥后：只剩一行台词，那个 "-" 已经不分隔任何东西
+   *   错的："- Don't go in there, ..."（凭空多出个破折号）
+   *   对的："Don't go in there, ..."
+   */
+  function stripSubtitleAnnotations(text) {
+    var lines = String(text == null ? "" : text).split("\n");
+    var kept = [];
+    var hadAnnotation = false;
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i];
+      var dash = /^\s*-\s*/.test(line);
+      var body = line.replace(/^\s*-\s*/, "");
+      // 方括号标记：音效 [music playing] 与说话人 [Jim]
+      var stripped = body.replace(/\[[^\]]*\]/g, "");
+      // 圆括号在部分轨里也用于音效标注，但只在整段成对且独占时才剥，
+      // 避免吃掉台词里的正常插入语。
+      stripped = stripped.replace(/^\s*\([^)]*\)\s*$/g, "");
+      stripped = stripped.replace(/\s{2}/g, " ").trim();
+      if (stripped !== body.trim()) hadAnnotation = true;
+      if (stripped) kept.push({ dash: dash, text: stripped });
+    }
+    // 分隔符只在真的需要分隔（≥2 行存活）时才写回
+    var useDash = kept.length > 1;
+    var speech = kept.map(function (k) {
+      return (useDash && k.dash ? "- " : "") + k.text;
+    }).join("\n");
+    return { speech: speech, hadAnnotation: hadAnnotation, annotationOnly: speech === "" };
+  }
+
+  /**
+   * 解析 TTML / IMSC1 字幕轨为与 parseJson3 同构的 cue 流。
+   *
+   * 产出 cue：{ start, end, content, position }
+   *   - content 已剥离音效/说话人标记，<br/> 保留为 "\n"（人工换行是排版
+   *     信息，抹成空格会把两个说话人的话连读）
+   *   - position 来自 region 的 tts:displayAlign（Netflix 避让画面文字时会
+   *     把字幕切到上方，实测 415 条里 19 条在上方）
+   *   - 不带 tokens：这类轨没有词级时间
+   * 纯音效 cue 整条丢弃（不送翻译、不占屏）。
+   */
+  function parseTtml(text) {
+    var out = [];
+    if (typeof text !== "string" || text.indexOf("<") < 0) return out;
+    var tickRate = Number((text.match(/ttp:tickRate="(\d+)"/) || [])[1] || 10000000);
+
+    // region 的 displayAlign 决定字幕在上方还是下方
+    var regionAlign = {};
+    var regionRe = /<region\b([^>]*)>/g;
+    var rm;
+    while ((rm = regionRe.exec(text))) {
+      var rid = (rm[1].match(/xml:id="([^"]+)"/) || [])[1];
+      var align = (rm[1].match(/tts:displayAlign="([^"]+)"/) || [])[1];
+      if (rid) regionAlign[rid] = align === "before" ? "top" : "bottom";
+    }
+
+    var pRe = /<p\b([^>]*)>([\s\S]*?)<\/p>/g;
+    var m;
+    while ((m = pRe.exec(text))) {
+      var attrs = m[1];
+      var inner = m[2];
+      var start = ttmlTimeToMs((attrs.match(/\bbegin="([^"]+)"/) || [])[1], tickRate);
+      var end = ttmlTimeToMs((attrs.match(/\bend="([^"]+)"/) || [])[1], tickRate);
+      if (start == null || end == null || !(end > start) || start < 0) continue;
+      var region = (attrs.match(/\bregion="([^"]+)"/) || [])[1] || null;
+
+      // <br/> → 硬换行；span（斜体/外语）只影响样式，文本要留下
+      inner = inner.replace(/<br\s*\/?>/gi, "\n");
+      inner = inner.replace(/<\/?span[^>]*>/gi, "");
+      var raw = decodeXmlEntities(inner.replace(/<[^>]*>/g, ""))
+        .replace(/[ \t]+/g, " ")
+        .replace(/ *\n */g, "\n")
+        .trim();
+      if (!raw) continue;
+      var ann = stripSubtitleAnnotations(raw);
+      if (ann.annotationOnly) continue; // 纯音效：不翻译也不显示
+      out.push({
+        start: start,
+        end: end,
+        duration: end - start,
+        content: ann.speech,
+        position: regionAlign[region] || "bottom",
+      });
+    }
+    return out;
+  }
+
   /**
    * 通用 WebVTT 解析器（备用：部分轨道只给 vtt）。
    * 返回同样的 cue 结构（毫秒）。
@@ -326,8 +465,21 @@
     for (var i = cut; i < next.length; i++) out.push(next[i]);
   }
 
+  // 无原生词级时间的轨（人工成品字幕：Netflix TTML、用户上传 SRT/VTT）在这里按
+  // cue 时长均摊出 token 时间。
+  //
+  // 切词必须用 splitDisplayWords 而不是 restoredWords：两者词边界完全一致（前者
+  // 就是按后者的 match span 切的），差别只在标点——restoredWords 按设计剥掉标点，
+  // 而 canonical token 流是下游渲染与 SRT 导出重建文本的**唯一**来源，用它切词
+  // 会把源文标点永久丢掉：真轨 "It works. It works like crazy!" 上屏成
+  // "It works It works like crazy"。
+  //
+  // YouTube ASR 自带词级时间、走不到这个分支，且本身无标点，所以这个缺陷此前
+  // 一直不可见；Netflix 句级轨 100% 走这里，全轨标点全灭。
+  //
+  // 标点不只是观感：句号是最强的分屏信号，语义分屏 prompt 依赖它判句末。
   function fallbackCueTokens(cue) {
-    var words = restoredWords(cue && cue.content || "");
+    var words = splitDisplayWords(cue && cue.content || "");
     if (!words.length) return [];
     var start = Number(cue && cue.start);
     var end = Number(cue && cue.end);
@@ -1130,6 +1282,7 @@
   //   “0.1mmず” → [“0.1”, “mm”, “ず”]，不会再变成 [“0.”,“1mm”,“ず”]。
   function splitDisplayWords(text) {
     var out = [];
+    var pendingPrefix = "";
     var rawWords = collapseWhitespace(text).split(" ").filter(Boolean);
     for (var i = 0; i < rawWords.length; i++) {
       var raw = rawWords[i];
@@ -1140,13 +1293,27 @@
         if (!match[0]) { re.lastIndex++; continue; }
         matches.push({ text: match[0], start: match.index, end: match.index + match[0].length });
       }
-      if (!matches.length) { out.push(raw); continue; }
+      // 整块都不含字母/数字（人工字幕的说话人分隔符 "-"、破折号、省略号…）：
+      // 它不是词，不能单独成 token —— canonical token 流与显示词流必须逐词一一对应，
+      // 而显示侧的权威 restoredWords 按定义不会产出这种块。放行会让游标错位一格，
+      // 整轨抛 "display cue does not align to canonical timeline"（Netflix 双说话人
+      // 行 13% 命中，实测整轨字幕失效）。附到下一个真实词的前缀上，字形一个不丢。
+      if (!matches.length) {
+        pendingPrefix += raw + " ";
+        continue;
+      }
       for (var p = 0; p < matches.length; p++) {
         var current = matches[p];
         var nextStart = p + 1 < matches.length ? matches[p + 1].start : raw.length;
-        var prefix = p === 0 ? raw.slice(0, current.start) : "";
+        var prefix = p === 0 ? pendingPrefix + raw.slice(0, current.start) : "";
+        if (p === 0) pendingPrefix = "";
         out.push(prefix + current.text + raw.slice(current.end, nextStart));
       }
+    }
+    // 收尾：若全文只剩纯标点块（无任何真实词），挂到最后一个词后面，绝不丢字形。
+    if (pendingPrefix) {
+      if (out.length) out[out.length - 1] += " " + pendingPrefix.trim();
+      else out.push(pendingPrefix.trim());
     }
     return out;
   }
@@ -5133,14 +5300,143 @@
     ].join("|");
   }
 
+  /* ---------------------------------------------------------------
+   * 站点适配层
+   *
+   * 唯一权威：每个受支持站点的所有差异都收敛在这张表里 —— 播放器/视频元素
+   * 选择器、要隐藏的原生字幕容器、可信的字幕主机与 URL 形态、字幕格式、
+   * 轨是否滚动重发。渲染、时间轴、语义分屏、翻译、ledger 全部与站点无关。
+   *
+   * 加新站点只允许往这张表里加一项 + 写它的取轨脚本，禁止在下游任何地方
+   * 出现 if (site === "...") 分支 —— 那就是平行实现的开端。
+   * ------------------------------------------------------------- */
+
+  var SITE_ADAPTERS = {
+    youtube: {
+      id: "youtube",
+      // 匹配 host（判定当前页属于哪个站点）
+      hostRe: /(^|\.)youtube\.com$/,
+      playerSelector: ".html5-video-player",
+      videoSelector: ".html5-main-video, video",
+      // 原生字幕容器：注入双语字幕后要隐藏它，否则和我们的叠加层重影
+      nativeCaptionSelector: ".ytp-caption-window-container",
+      // 字幕轨格式：json3 带词级时间（tOffsetMs）
+      trackFormat: "json3",
+      // 滚动 ASR 轨：同一句话在连续时间片里重发，重复文本要去重
+      rollingSource: true,
+      trustedHostRe: /^(?:youtube\.com|.*\.youtube\.com)$/,
+      pathRe: /^\/api\/timedtext\/?$/,
+      /* YouTube 的 timedtext URL 自带可交叉校验的参数：v/lang/kind 必须与轨道
+       * 元数据一致，pot 签名必须在，tlang（YouTube 机翻）必须不在。 */
+      checkTrackUrl: function (parsed, meta) {
+        var urlVideo = parsed.searchParams.getAll("v");
+        var urlLang = parsed.searchParams.getAll("lang");
+        var urlKind = parsed.searchParams.getAll("kind");
+        var pot = parsed.searchParams.get("pot");
+        if (urlVideo.length !== 1 || urlVideo[0] !== meta.videoId) return false;
+        if (urlLang.length !== 1 || urlLang[0] !== meta.languageCode) return false;
+        if (!pot || parsed.searchParams.has("tlang")) return false;
+        if (meta.kind === "asr") {
+          return urlKind.length === 1 && urlKind[0] === "asr" &&
+            meta.code === meta.languageCode + "-asr";
+        }
+        return urlKind.length === 0 && meta.code === meta.languageCode;
+      },
+      /* 观看页 URL → 视频 id：?v=xxx，以及 /shorts|live|embed/xxx */
+      videoIdFrom: function (url) {
+        var q = url.searchParams.get("v");
+        if (q) return q;
+        var m = url.pathname.match(/^\/(?:shorts|live|embed)\/([A-Za-z0-9_-]{1,128})(?:\/|$)/);
+        return m ? m[1] : "";
+      },
+    },
+    netflix: {
+      id: "netflix",
+      hostRe: /(^|\.)netflix\.com$/,
+      // Netflix 没有 .html5-video-player 之类的语义 class。实测 DOM：
+      //   div.watch-video--player-view (absolute, 856x685) → div.watch-video → video
+      // 注意 default-ltr-iqcdef-cache-* 是编译期生成的 CSS class，会随构建变化，
+      // 绝不能当选择器用。
+      playerSelector: ".watch-video--player-view, .watch-video",
+      videoSelector: "video",
+      // 实测容器：.player-timedtext (856x481) > .player-timedtext-text-container
+      nativeCaptionSelector: ".player-timedtext",
+      // IMSC1 / TTML：句级时间，无内联词级时间戳（实测词级 0%）
+      trackFormat: "ttml",
+      // 人工成品轨：重复文本是真台词，不得当滚动重发删除
+      rollingSource: false,
+      // 字幕走签名 CDN 直链，形如 https://ipv4-cxxx-....oca.nflxvideo.net/range/...
+      trustedHostRe: /^(?:[a-z0-9.-]+\.)?nflxvideo\.net$/,
+      pathRe: /^\/[\w./-]*$/,
+      /* Netflix 的 CDN 直链没有可交叉校验的语言参数（语言只存在于轨道元数据），
+       * 所以只能校验元数据自身一致性：code 必须等于 languageCode，且不接受
+       * asr —— Netflix 只有人工轨，出现 asr 说明数据被污染。 */
+      checkTrackUrl: function (parsed, meta) {
+        return meta.kind === "" && meta.code === meta.languageCode;
+      },
+      /* 观看页 URL 形如 /watch/80075919（可带 ?trackId=...） */
+      videoIdFrom: function (url) {
+        var m = url.pathname.match(/^\/watch\/(\d{1,32})(?:\/|$)/);
+        return m ? m[1] : "";
+      },
+    },
+  };
+
+  /**
+   * 按字幕文档的**实际内容**选解析器。
+   *
+   * 为什么不按站点的 trackFormat 直接派发：格式是数据的属性，不是站点的属性。
+   * 同一站点可能给不同格式（Netflix 有 imsc1 与 webvtt 两种 profile），
+   * 按内容嗅探既覆盖得全，也不会在站点改格式时静默产出空轨。
+   * trackFormat 只作为「预期格式」用于诊断日志，不参与派发。
+   */
+  function parseSubtitleText(text) {
+    if (typeof text !== "string") return [];
+    var head = text.slice(0, 2048).replace(/^\uFEFF/, "").trim();
+    if (head.charAt(0) === "{") {
+      try { return parseJson3(JSON.parse(text)); } catch (e) { return []; }
+    }
+    if (/^WEBVTT/m.test(head)) return parseVtt(text);
+    if (/<tt\b|<tt:tt\b|xmlns[^>]*ttml/i.test(head)) return parseTtml(text);
+    // 未知形态：按 vtt 尽力而为（历史行为），失败就是空轨，由上游重试。
+    return parseVtt(text);
+  }
+
+  /** 按 host 判定站点适配器；未支持的站点返回 null（不猜、不回落）。 */
+  function siteAdapterFor(hostname) {
+    var host = String(hostname == null ? "" : hostname).toLowerCase();
+    var keys = Object.keys(SITE_ADAPTERS);
+    for (var i = 0; i < keys.length; i++) {
+      var a = SITE_ADAPTERS[keys[i]];
+      if (a.hostRe.test(host)) return a;
+    }
+    return null;
+  }
+
+  /**
+   * 当前页的视频 id。规则由站点适配器给出，这里只负责选适配器 ——
+   * 加站点不需要改这个函数。
+   */
+  function pageVideoId(href) {
+    var url;
+    try { url = new URL(String(href)); } catch (e) { return ""; }
+    var adapter = siteAdapterFor(url.hostname);
+    if (!adapter) return "";
+    return adapter.videoIdFrom(url) || "";
+  }
+
   /**
    * 校验 MAIN world 送来的字幕轨道清单。DOM CustomEvent 是不可信边界：
-   * 这里只允许 YouTube HTTPS timedtext URL，并限制所有字段和数组大小。
+   * 只允许目标站点的 HTTPS 字幕 URL，并限制所有字段和数组大小。
    * 返回去除未知字段的新对象；任一轨道非法时整包拒绝。
+   *
+   * site 决定用哪套 URL 形态校验。缺省 youtube 以保持既有行为。
    */
   function validateTrackManifest(content, options) {
     options = options || {};
     if (!content || typeof content !== "object" || !Array.isArray(content.files)) return null;
+    var adapter = SITE_ADAPTERS[String(content.site || options.site || "youtube")];
+    if (!adapter) return null;
     var videoId = String(content.videoId == null ? "" : content.videoId);
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(videoId)) return null;
     if (options.expectedVideoId != null && String(options.expectedVideoId) !== videoId) return null;
@@ -5155,24 +5451,17 @@
       var parsed;
       try { parsed = new URL(rawUrl); } catch (e) { return null; }
       var host = String(parsed.hostname || "").toLowerCase();
-      var trustedHost = host === "youtube.com" || /\.youtube\.com$/.test(host);
-      if (parsed.protocol !== "https:" || !trustedHost || !/^\/api\/timedtext\/?$/.test(parsed.pathname)) return null;
+      if (parsed.protocol !== "https:" || !adapter.trustedHostRe.test(host) ||
+        !adapter.pathRe.test(parsed.pathname)) return null;
       var code = String(raw.code == null ? "" : raw.code);
       var languageCode = String(raw.languageCode == null ? "" : raw.languageCode);
       var name = String(raw.name == null ? code : raw.name);
       var kind = String(raw.kind == null ? "" : raw.kind);
       if (!/^[A-Za-z0-9_.-]{1,64}$/.test(languageCode) || name.length > 256 || (kind !== "" && kind !== "asr")) return null;
-      var urlVideo = parsed.searchParams.getAll("v");
-      var urlLang = parsed.searchParams.getAll("lang");
-      var urlKind = parsed.searchParams.getAll("kind");
-      var pot = parsed.searchParams.get("pot");
-      if (urlVideo.length !== 1 || urlVideo[0] !== videoId || urlLang.length !== 1 || urlLang[0] !== languageCode) return null;
-      if (!pot || parsed.searchParams.has("tlang")) return null;
-      if (kind === "asr") {
-        if (urlKind.length !== 1 || urlKind[0] !== "asr" || code !== languageCode + "-asr") return null;
-      } else if (urlKind.length !== 0 || code !== languageCode) {
-        return null;
-      }
+      // URL 与元数据的交叉校验规则由适配器自己给出，不在这里按站点分支。
+      if (!adapter.checkTrackUrl(parsed, {
+        videoId: videoId, code: code, languageCode: languageCode, kind: kind,
+      })) return null;
       var identity = [code, languageCode, kind].join("\x1f");
       if (identities[identity]) return null;
       identities[identity] = true;
@@ -5180,7 +5469,7 @@
       // （轨顺序不保证原语言在前，其他元数据无法区分原语言轨和人工翻译轨）。
       files.push({ name: name, code: code, languageCode: languageCode, kind: kind, url: parsed.toString() });
     }
-    return { videoId: videoId, files: files };
+    return { site: adapter.id, videoId: videoId, files: files };
   }
 
   /**
@@ -5572,6 +5861,10 @@
   var EXPORTS = {
     parseJson3: parseJson3,
     parseVtt: parseVtt,
+    parseTtml: parseTtml,
+    parseSubtitleText: parseSubtitleText,
+    stripSubtitleAnnotations: stripSubtitleAnnotations,
+    ttmlTimeToMs: ttmlTimeToMs,
     cleanupCues: cleanupCues,
     applyTailTrim: applyTailTrim,
     resegmentCues: resegmentCues,
@@ -5674,6 +5967,9 @@
     makeCacheKey: makeCacheKey,
     makeSemanticCacheKey: makeSemanticCacheKey,
     validateTrackManifest: validateTrackManifest,
+    SITE_ADAPTERS: SITE_ADAPTERS,
+    siteAdapterFor: siteAdapterFor,
+    pageVideoId: pageVideoId,
     pruneCache: pruneCache,
     makeBackoff: makeBackoff,
     joinUrl: joinUrl,

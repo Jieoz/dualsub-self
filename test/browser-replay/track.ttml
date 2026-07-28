@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 取自 Jay 的 Netflix Trollhunters 英文真轨形态（时间压缩到回放窗口内）：
+     ①纯音效 + 台词混排的双说话人行  ②合法重复台词 "It works." / "It works like crazy!"
+     ③Tobes! 连续重复  ④He almost... / Almost what? 间隙 83ms（任何间隙阈值都会误判）
+     这些正是旧实现按纯文本去重时丢词的真实样本。 -->
+<tt xmlns="http://www.w3.org/ns/ttml"
+    xmlns:tts="http://www.w3.org/ns/ttml#styling"
+    xmlns:ttp="http://www.w3.org/ns/ttml#parameter"
+    ttp:tickRate="10000000" ttp:timeBase="media" xml:lang="en">
+  <head>
+    <layout>
+      <region xml:id="region0" tts:displayAlign="before"/>
+      <region xml:id="region1" tts:displayAlign="after"/>
+    </layout>
+  </head>
+  <body>
+    <div>
+      <p begin="3000000t" end="9000000t" region="region1">-[soothing music playing]<br/>-It works.</p>
+      <p begin="10000000t" end="16000000t" region="region1">It works like crazy!</p>
+      <p begin="17000000t" end="23000000t" region="region1">-Tobes!<br/>-Tobes, Tobes!</p>
+      <p begin="24000000t" end="27000000t" region="region1">He almost...</p>
+      <p begin="27830000t" end="34000000t" region="region1">Almost what? Speak, Master Jim.</p>
+    </div>
+  </body>
+</tt>

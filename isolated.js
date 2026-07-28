@@ -26,6 +26,17 @@
   var SENDER = "isolated";
   var RPC_PEER = "main";
 
+  /* ---- 站点适配器 ----
+   * 当前页属于哪个站点，全靠这一个查询。播放器/视频选择器、要隐藏的原生
+   * 字幕容器、字幕格式、轨是否滚动重发都从这里取，下游不出现站点分支。
+   * 未支持站点 → null，脚本本不该被注入，这里只做防御。
+   */
+  var SITE = Core.siteAdapterFor(location.hostname);
+  if (!SITE) {
+    console.warn("[dualsub] 未支持的站点，isolated.js 退出:", location.hostname);
+    return;
+  }
+
   // ---- 配置 ----
   var STORAGE_KEY = "dualsub:" + location.origin; // 按 origin 存
   // 每个缓存 entry 使用独立 storage key；不同标签页写不同 entry 不再共享对象 RMW 覆盖。
@@ -334,11 +345,7 @@
 
   function currentPageVideoId() {
     try {
-      var url = new URL(location.href);
-      var queryId = url.searchParams.get("v");
-      if (queryId) return queryId;
-      var match = url.pathname.match(/^\/(?:shorts|live|embed)\/([A-Za-z0-9_-]{1,128})(?:\/|$)/);
-      return match ? match[1] : "";
+      return Core.pageVideoId(location.href) || "";
     } catch (e) { return ""; }
   }
 
@@ -490,15 +497,8 @@
       if (!trackRequestCurrent(requestContext)) return;
       endRuntimeRequest(requestContext);
       requestContext = null;
-      var cues;
-      // 优先按 json3 解析，失败再试 vtt
-      var trimmed = text.trim();
-      if (trimmed.startsWith("{")) {
-        var json = JSON.parse(text);
-        cues = Core.parseJson3(json);
-      } else {
-        cues = Core.parseVtt(text);
-      }
+      // 解析器按文档实际内容选（json3 / vtt / ttml），不按站点硬派发
+      var cues = Core.parseSubtitleText(text);
       cues = Core.cleanupCues(cues);
       if (!cues.length) {
         // 200 + 合法 JSON 但没有任何字幕内容 —— 典型的限流/降级响应,重试通常能拿到真轨
@@ -514,6 +514,9 @@
         maxWords: Core.DISPLAY_UNIT_MAX_WORDS,
         maxVisualWidth: Core.SOURCE_DISPLAY_MAX_WIDTH,
         continuationMaxWords: Core.SOURCE_UNIT_MAX_WORDS,
+        // 这条轨会不会滚动重发，由站点适配器声明。人工成品轨（Netflix）里
+        // 重复台词是真内容，按滚动去重会吞词。
+        rollingSource: SITE ? SITE.rollingSource : true,
       });
 
       if (!installCueTimeline(fallbackCues, "block", { sourceTimeline: sourceTimeline })) {
@@ -1226,11 +1229,11 @@
    * ===================================================== */
 
   function playerEl() {
-    return document.querySelector(".html5-video-player");
+    return document.querySelector(SITE.playerSelector);
   }
 
   function videoEl() {
-    return document.querySelector(".html5-main-video, video");
+    return document.querySelector(SITE.videoSelector);
   }
 
   function currentTimeMs() {
@@ -1317,7 +1320,8 @@
       ".dualsub-trans.dualsub-pending{ opacity:0.55; font-style:italic; }",
       ".dualsub-trans.dualsub-failed{ opacity:0.6; font-style:italic; color:#ff8a8a; }",
       ".dualsub-hidden{ display:none !important; }",
-      ".dualsub-hide-native-captions .ytp-caption-window-container{ display:none !important; }",
+      // 原生字幕容器的选择器来自站点适配器（YouTube 与 Netflix 结构不同）
+      ".dualsub-hide-native-captions " + SITE.nativeCaptionSelector + "{ display:none !important; }",
     ].join("\n");
     var styleEl = document.createElement("style");
     styleEl.id = STYLE_ID;

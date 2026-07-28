@@ -1966,6 +1966,118 @@ test("resegment 去 ASR 滚动重叠词（不出现 work work）", () => {
   assert.ok(!/work work/.test(seg[0].content), "重叠词 work 应只出现一次");
 });
 
+/* =====================================================================
+ * TTML / IMSC1 解析（Netflix 等人工成品轨）
+ * 所有样本取自 Jay 的 Netflix Trollhunters 英文真轨。
+ * ===================================================================== */
+
+const TTML_HEAD =
+  '<?xml version="1.0" encoding="UTF-8"?>' +
+  '<tt xmlns="http://www.w3.org/ns/ttml" xmlns:tts="http://www.w3.org/ns/ttml#styling"' +
+  ' xmlns:ttp="http://www.w3.org/ns/ttml#parameter" ttp:tickRate="10000000"' +
+  ' ttp:timeBase="media" xml:lang="en">' +
+  '<head><layout>' +
+  '<region xml:id="region0" tts:displayAlign="before"/>' +
+  '<region xml:id="region1" tts:displayAlign="after"/>' +
+  '</layout></head><body><div>';
+const TTML_TAIL = "</div></body></tt>";
+const ttml = (body) => TTML_HEAD + body + TTML_TAIL;
+
+test("TTML: tick 按声明的 tickRate 换算，不硬编码", () => {
+  // 真轨末条 end="13277430832t" @ tickRate 1e7 → 1327.743s
+  const cues = Core.parseTtml(ttml(
+    '<p begin="571821250t" end="607273332t" region="region1">Hello.</p>'
+  ));
+  assert.strictEqual(cues.length, 1);
+  assert.strictEqual(cues[0].start, 57182);
+  assert.strictEqual(cues[0].end, 60727);
+  // tickRate 变一半 → 时间翻倍，证明真的读了声明值
+  const halved = Core.parseTtml(
+    ttml('<p begin="571821250t" end="607273332t">Hello.</p>').replace('ttp:tickRate="10000000"', 'ttp:tickRate="5000000"')
+  );
+  assert.strictEqual(halved[0].start, 114364);
+});
+
+test("TTML: 时间格式兼容 clock / s / ms，非法值整条丢弃", () => {
+  assert.strictEqual(Core.ttmlTimeToMs("00:00:12.345", 1e7), 12345);
+  assert.strictEqual(Core.ttmlTimeToMs("1.5s", 1e7), 1500);
+  assert.strictEqual(Core.ttmlTimeToMs("250ms", 1e7), 250);
+  assert.strictEqual(Core.ttmlTimeToMs("garbage", 1e7), null);
+  // end <= start 或缺时间 → 整条丢弃，不产出坏 cue
+  const bad = Core.parseTtml(ttml(
+    '<p begin="100t" end="50t">倒退</p><p begin="x" end="y">非法</p><p>无时间</p>'
+  ));
+  assert.strictEqual(bad.length, 0);
+});
+
+test("TTML: <br/> 保留为硬换行，span 只脱标签保文本，XML 实体正确解码", () => {
+  const cues = Core.parseTtml(ttml(
+    '<p begin="0t" end="10000000t">-Yeah.<br/>-The &quot;GummGumms&quot; are coming.</p>' +
+    '<p begin="20000000t" end="30000000t">He said <span style="style2">arrivederci</span>.</p>' +
+    '<p begin="40000000t" end="50000000t">A &amp;amp; B &#39;quoted&#39;</p>'
+  ));
+  assert.strictEqual(cues[0].content, '- Yeah.\n- The "GummGumms" are coming.');
+  assert.strictEqual(cues[1].content, "He said arrivederci.");
+  // &amp;amp; 只能解码一层，否则 &amp; 会被二次解码
+  assert.strictEqual(cues[2].content, "A &amp; B 'quoted'");
+});
+
+test("TTML: region 的 displayAlign 决定上下位（Netflix 避让画面文字）", () => {
+  const cues = Core.parseTtml(ttml(
+    '<p begin="0t" end="10000000t" region="region0">上方</p>' +
+    '<p begin="20000000t" end="30000000t" region="region1">下方</p>' +
+    '<p begin="40000000t" end="50000000t">无 region</p>'
+  ));
+  assert.strictEqual(cues[0].position, "top");
+  assert.strictEqual(cues[1].position, "bottom");
+  assert.strictEqual(cues[2].position, "bottom", "缺 region 默认下方");
+});
+
+test("TTML: 纯音效整条丢弃，混排只留台词", () => {
+  const cues = Core.parseTtml(ttml(
+    '<p begin="0t" end="10000000t">[soothing music playing]</p>' +
+    '<p begin="20000000t" end="30000000t">[Jim] Hey, Toby.</p>' +
+    '<p begin="40000000t" end="50000000t">It works [chuckles] fine.</p>'
+  ));
+  assert.strictEqual(cues.length, 2, "纯音效条必须整条不产出");
+  assert.strictEqual(cues[0].content, "Hey, Toby.");
+  assert.strictEqual(cues[1].content, "It works fine.");
+});
+
+test("TTML: 行首 - 是分隔符，剥离后只剩一行时必须去掉（真轨 12 条）", () => {
+  // 真轨 subtitle1 原样
+  const cues = Core.parseTtml(ttml(
+    '<p begin="571821250t" end="607273332t" region="region0">' +
+    "-[soothing music playing]<br/>-Don't go in there, he's with a patient.</p>" +
+    '<p begin="608110000t" end="621870000t">-Tobes.<br/>-Hey, Jim.</p>'
+  ));
+  assert.strictEqual(cues[0].content, "Don't go in there, he's with a patient.",
+    "只剩一个说话人时不该凭空多出破折号");
+  assert.strictEqual(cues[1].content, "- Tobes.\n- Hey, Jim.",
+    "两个说话人都在时分隔符必须保留");
+});
+
+test("负向：stripSubtitleAnnotations 不吃台词里的正常内容", () => {
+  // 括号只在整行独占时才剥，插入语不能被吃
+  const inline = Core.stripSubtitleAnnotations("I said (quietly) no.");
+  assert.strictEqual(inline.speech, "I said (quietly) no.");
+  const whole = Core.stripSubtitleAnnotations("(door creaks)");
+  assert.strictEqual(whole.annotationOnly, true);
+  // 数学/连字符不能当说话人分隔
+  const math = Core.stripSubtitleAnnotations("well-known problem");
+  assert.strictEqual(math.speech, "well-known problem");
+  // 没有标记时 hadAnnotation 必须为 false（否则该标志无意义）
+  assert.strictEqual(Core.stripSubtitleAnnotations("plain line").hadAnnotation, false);
+});
+
+test("TTML 轨不带 tokens：下游词级时间分支自然走 else，不需站点分支", () => {
+  const cues = Core.parseTtml(ttml('<p begin="0t" end="10000000t">Hello world.</p>'));
+  assert.ok(!cues[0].tokens, "TTML 无词级时间，不得伪造 tokens");
+  // 能被 canonical 时间线接受（派生词级时间），不抛错
+  const timeline = Core.buildCanonicalTokenTimeline(Core.cleanupCues(cues));
+  assert.ok(timeline && timeline.tokens.length === 2, "应派生出 2 个词");
+});
+
 test("人工成品轨的合法重复台词不得被当成滚动重发删除（Netflix 真轨回归）", () => {
   // 全部取自 Jay 的 Netflix Trollhunters 英文真轨。旧实现按纯文本去重，
   // 实测 352 cue 丢 12 个词，其中 "It works." 那条被删成病句。
@@ -2573,6 +2685,123 @@ test("validateTrackManifest 只接受受信 YouTube HTTPS 字幕 URL", () => {
     assert.strictEqual(Core.validateTrackManifest({ videoId: "x", files: [{ code: "en", url }] }), null, "不受信 URL 必须整包拒绝: " + url);
   }
   assert.strictEqual(Core.validateTrackManifest({ videoId: "x", files: new Array(65).fill({ code: "en", url: "https://www.youtube.com/api/timedtext?v=x" }) }), null, "轨道数量必须有上限");
+});
+
+test("站点适配表：按 host 判定，未支持站点不猜不回落", () => {
+  assert.strictEqual(Core.siteAdapterFor("www.youtube.com").id, "youtube");
+  assert.strictEqual(Core.siteAdapterFor("m.youtube.com").id, "youtube");
+  assert.strictEqual(Core.siteAdapterFor("www.netflix.com").id, "netflix");
+  assert.strictEqual(Core.siteAdapterFor("netflix.com").id, "netflix");
+  // 未支持 / 仿冒域名必须返回 null，而不是回落到某个站点
+  for (const host of ["example.com", "notnetflix.com", "youtube.com.evil.net", "", null]) {
+    assert.strictEqual(Core.siteAdapterFor(host), null, "不得匹配: " + host);
+  }
+  // 每个适配器都必须给全下游依赖的字段，缺一个就是接错线
+  for (const key of Object.keys(Core.SITE_ADAPTERS)) {
+    const a = Core.SITE_ADAPTERS[key];
+    for (const f of ["id", "playerSelector", "videoSelector", "nativeCaptionSelector",
+      "trackFormat", "trustedHostRe", "pathRe", "checkTrackUrl"]) {
+      assert.ok(a[f] != null, key + " 缺字段 " + f);
+    }
+    assert.strictEqual(typeof a.rollingSource, "boolean", key + " 必须显式声明 rollingSource");
+  }
+});
+
+test("人工成品轨的重复台词：rollingSource=false 保台词，=true 会串行（真轨样本）", () => {
+  // 取自 Jay 的 Netflix Trollhunters 英文真轨（352 cue）。这里断言的是**显示单元**
+  // 层：canonical token 流不做重发去重，所以词数在两种设置下都是 2412；差别体现在
+  // resegmentCues 的分屏内容上——误当滚动轨会把上一句替换成下一位说话人的台词。
+  const cues = [
+    { start: 300, end: 900, content: "Was felled." },
+    { start: 1000, end: 1600, content: "- Felled?" },
+    { start: 1700, end: 2300, content: "- Means killed." },
+    { start: 2400, end: 3000, content: "Turned to stone and smashed." },
+  ];
+  const opts = { maxWords: 12, maxVisualWidth: 52, continuationMaxWords: 14 };
+  const good = Core.resegmentCues(cues, Object.assign({ rollingSource: false }, opts));
+  const bad = Core.resegmentCues(cues, Object.assign({ rollingSource: true }, opts));
+  const goodText = good.map((c) => c.content).join(" | ");
+  const badText = bad.map((c) => c.content).join(" | ");
+  // 正向：人工轨必须保住 "Felled?" 这句独立台词
+  assert.ok(/Felled\?/.test(goodText), "人工轨丢了台词: " + goodText);
+  // 负向：滚动设置下该台词会被吞掉 —— 证明这个开关确实是承重的，不是装饰
+  assert.ok(!/Felled\?/.test(badText), "负向用例失效：滚动设置没有吞词，门禁不再承重");
+  assert.notStrictEqual(goodText, badText);
+});
+
+test("manifest.json 与站点适配表必须同步：每个适配器都有注入配置", () => {
+  const mf = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "manifest.json"), "utf8"));
+  const isolated = mf.content_scripts.filter((c) => c.world === "ISOLATED");
+  assert.strictEqual(isolated.length, 1, "ISOLATED 注入应只有一份（core+isolated）");
+  const isoMatches = isolated[0].matches.join(" ");
+  const mainScripts = mf.content_scripts.filter((c) => c.world === "MAIN");
+  const hostPerms = mf.host_permissions.join(" ");
+
+  for (const key of Object.keys(Core.SITE_ADAPTERS)) {
+    const adapter = Core.SITE_ADAPTERS[key];
+    // 造一个该站点的代表 host，确认 manifest 里真的注入了它
+    const sample = { youtube: "www.youtube.com", netflix: "www.netflix.com" }[key];
+    assert.ok(sample, "新站点 " + key + " 需要在本门禁里补一个代表 host");
+    assert.strictEqual(Core.siteAdapterFor(sample).id, adapter.id);
+    assert.ok(isoMatches.includes(sample), key + " 未注入 ISOLATED（core.js/isolated.js）");
+    assert.ok(hostPerms.includes(sample), key + " 缺 host_permissions");
+    // 每个站点必须有自己的 MAIN world 取轨脚本，且脚本文件真的存在
+    const own = mainScripts.filter((c) => c.matches.join(" ").includes(sample));
+    assert.strictEqual(own.length, 1, key + " 应恰好有一份 MAIN 取轨脚本");
+    for (const js of own[0].js) {
+      assert.ok(fs.existsSync(path.join(__dirname, "..", js)), "缺文件: " + js);
+    }
+  }
+  // 反向：manifest 注入的站点都必须能被适配表识别，否则注了没人管
+  for (const c of mf.content_scripts) {
+    for (const m of c.matches) {
+      const host = m.replace(/^https:\/\//, "").replace(/\/\*$/, "");
+      assert.ok(Core.siteAdapterFor(host), "manifest 注入了适配表不认识的站点: " + host);
+    }
+  }
+});
+
+test("validateTrackManifest 按站点校验 Netflix CDN 直链", () => {
+  const nfUrl = "https://ipv4-c001-abc001-example-isp.1.oca.nflxvideo.net/range/0-9999?o=1&v=2&e=3&t=sig";
+  const ok = Core.validateTrackManifest({
+    site: "netflix", videoId: "80075919",
+    files: [{ name: "English", code: "en", languageCode: "en", kind: "", url: nfUrl }],
+  });
+  assert.ok(ok, "合法 Netflix 轨应通过");
+  assert.strictEqual(ok.site, "netflix");
+  assert.strictEqual(ok.files[0].languageCode, "en");
+
+  // 负向：非 nflxvideo.net 主机、明文、以及仿冒后缀
+  for (const url of [
+    "https://evil.example/range/0-99",
+    "http://a.oca.nflxvideo.net/range/0-99",
+    "https://nflxvideo.net.evil.com/range/0-99",
+    "https://www.netflix.com/range/0-99",
+  ]) {
+    assert.strictEqual(Core.validateTrackManifest({
+      site: "netflix", videoId: "80075919",
+      files: [{ code: "en", languageCode: "en", kind: "", url }],
+    }), null, "必须拒绝: " + url);
+  }
+  // 负向：Netflix 只有人工轨，出现 asr 说明数据被污染
+  assert.strictEqual(Core.validateTrackManifest({
+    site: "netflix", videoId: "80075919",
+    files: [{ code: "en-asr", languageCode: "en", kind: "asr", url: nfUrl }],
+  }), null, "Netflix 不该出现 asr 轨");
+  // 负向：站点不能混用 —— YouTube URL 不得以 netflix 身份通过，反之亦然
+  assert.strictEqual(Core.validateTrackManifest({
+    site: "netflix", videoId: "dQw4w9WgXcQ",
+    files: [{ code: "en", languageCode: "en", kind: "",
+      url: "https://www.youtube.com/api/timedtext?v=dQw4w9WgXcQ&lang=en&pot=s" }],
+  }), null, "YouTube URL 不得当 Netflix 轨通过");
+  assert.strictEqual(Core.validateTrackManifest({
+    site: "youtube", videoId: "80075919",
+    files: [{ code: "en", languageCode: "en", kind: "", url: nfUrl }],
+  }), null, "Netflix URL 不得当 YouTube 轨通过");
+  // 未知站点整包拒绝
+  assert.strictEqual(Core.validateTrackManifest({
+    site: "bilibili", videoId: "x", files: [{ code: "en", languageCode: "en", url: nfUrl }],
+  }), null, "未知站点必须拒绝");
 });
 
 test("读不完的屏必须合并相邻屏借时间，且不碰 startMs / 不越过后屏 end", () => {
@@ -4532,9 +4761,18 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
       readme.includes(`/releases/tag/v${m.version}`),
       "README 的 Releases 链接必须指向当前版本的 tag",
     );
-    assert.ok(Array.isArray(m.content_scripts) && m.content_scripts.length === 2);
-    const worlds = m.content_scripts.map((c) => c.world).sort();
-    assert.deepStrictEqual(worlds, ["ISOLATED", "MAIN"]);
+    // 不锁脚本条数（加站点会加 MAIN 取轨脚本），锁结构不变量：
+    // 两个 world 都在、ISOLATED 只有一份、且每条都 document_start 注入。
+    assert.ok(Array.isArray(m.content_scripts) && m.content_scripts.length >= 2);
+    const worlds = new Set(m.content_scripts.map((c) => c.world));
+    assert.deepStrictEqual([...worlds].sort(), ["ISOLATED", "MAIN"]);
+    assert.strictEqual(
+      m.content_scripts.filter((c) => c.world === "ISOLATED").length, 1,
+      "ISOLATED 注入必须只有一份，多份会重复加载 core.js",
+    );
+    for (const c of m.content_scripts) {
+      assert.strictEqual(c.run_at, "document_start", "取轨脚本必须在 document_start 注入");
+    }
     assert.ok(m.host_permissions.includes("<all_urls>"), "需 <all_urls> 才能跨域翻译");
     assert.strictEqual(m.action.default_popup, "popup.html");
   });
