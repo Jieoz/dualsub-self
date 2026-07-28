@@ -4121,8 +4121,13 @@
       // 「本 cue 终点」→ start > end → 抛错丢掉整块 32 秒字幕并退避重试重烧 token。
       // restoredWords 对连写文字一字一词（见 RESTORE_WORD_RE），源词数与屏数量级
       // 匹配，零词屏在真实轨上不再出现；同时消灭了这里自写的第 4 份分词实现。
+      // 必须用 splitDisplayWords 而不是 restoredWords：这里切出来的词要原样拼回**显示
+      // 用原文**，标点不能丢。restoredWords 走的是纯词边界（canonical 对齐用），会把
+      // "person," 变成 "person" —— 我第一版用了它，e2e coverage ledger 立刻 FAIL，
+      // 相当于把原文标点全吃掉。splitDisplayWords 同样以唯一权威 newWordRe() 定边界，
+      // 只是额外把标点附着回相邻 token，正是显示路径要的语义。
       var cueWordLists = cues.map(function (cue) {
-        return restoredWords(collapseWhitespace(cue.content || ""));
+        return splitDisplayWords(cue.content || "");
       });
       var cueBoundaries = [];
       var boundaryAcc = 0;
