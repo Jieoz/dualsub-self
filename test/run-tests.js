@@ -2339,6 +2339,85 @@ test("等首块译文不得用固定超时上限放行", () => {
   assert.doesNotMatch(body, /"failed"/, "failed 终态不得计入 stillWorking");
 });
 
+test("每条上屏路径都必须去重叠 —— 结构性锁死，不靠人记得测", () => {
+  // 这条门禁是为了根治一个反复犯的错：我测了译文侧就以为测完了。
+  // 同一类缺陷（去重叠漏了某条路径）连续出现两次 —— v0.8.7 修跨块译文侧，
+  // v0.8.8 才发现 fallback 原文侧从 v0.8.2 起一直有 51/56 重叠、六个版本零覆盖。
+  //
+  // 与其每轮靠自觉排查，不如锁死结构：上屏数据只有三条产出路径，每条都得去重叠。
+  // 新增第四条路径时这条门禁会红，逼着一起接线。
+  const iso = fs.readFileSync(path.join(__dirname, "..", "isolated.js"), "utf8");
+  const core = fs.readFileSync(path.join(__dirname, "..", "core.js"), "utf8");
+
+  // 1) 原文侧（fallback，译文未到时用户看到的）
+  const srcAt = iso.indexOf("sliceTimelineClips(canonicalCues)");
+  const srcGuard = iso.indexOf("enforceDisplayMonotonicity(canonicalCues");
+  assert.ok(srcAt > 0 && srcGuard > srcAt,
+    "原文侧必须去重叠，且必须在分块之后（否则连带改变翻译分块）");
+
+  // 2) 译文侧（rebuildRenderTimeline）
+  const rebuildAt = iso.indexOf("function rebuildRenderTimeline");
+  assert.ok(rebuildAt > 0);
+  const rebuildBody = iso.slice(rebuildAt, iso.indexOf("\n  function ", rebuildAt + 10));
+  assert.match(rebuildBody, /enforceDisplayMonotonicity\(/,
+    "译文侧渲染时间线必须去重叠");
+  assert.ok(rebuildBody.indexOf("state.renderUnits = render") > rebuildBody.indexOf("enforceDisplayMonotonicity("),
+    "必须先去重叠再写入 renderUnits");
+
+  // 3) 块内（materializeBlockTranslation）：先合并读不完的屏，再去重叠
+  const matAt = core.indexOf("function materializeBlockTranslation");
+  assert.ok(matAt > 0);
+  const matBody = core.slice(matAt, matAt + 6000);
+  const mergeAt = matBody.indexOf("mergeUnreadableUnits(");
+  const monoAt = matBody.indexOf("enforceDisplayMonotonicity(");
+  assert.ok(mergeAt > 0 && monoAt > 0, "块内必须既合并读不完的屏也去重叠");
+  assert.ok(monoAt < mergeAt,
+    "顺序固定：enforceDisplayMonotonicity 包在外层，先合并（改变相邻关系）再去重叠");
+
+  // 4) 写 renderUnits 的地方只允许是清空或那唯一一处赋值 —— 防止新增旁路
+  const writes = iso.split("state.renderUnits =").length - 1;
+  const clears = iso.split("state.renderUnits = []").length - 1;
+  assert.equal(writes - clears, 1,
+    `写 renderUnits 的非清空路径应恰好 1 处（当前 ${writes - clears}）—— 新增路径必须一并接去重叠`);
+});
+
+test("时间派生异常产生的过短屏由合并层兜住，不会上屏", () => {
+  // 真实案例 DGdsIrAjp3k：源 cue `locks in the u.s` 时长 3680ms，但 ASR 把 u.s 拆成
+  // 两个 token 且时间戳跨 1.5s（u@6799 / s@8360）。渲染单元时间取自 token 跨度，
+  // 于是译文「家用锁之一」只拿到 300ms 窗口 —— 按 111ms/字 需要 560ms，读不完。
+  //
+  // 结论不是「要修时间派生层」（全量统计这类 token 间隔异常仅 0.47%，多数是真实停顿
+  // 与慢速歌词，加规则会误伤）。而是 mergeUnreadableUnits 本就该兜住它。
+  //
+  // 这条门禁存在的真正原因：我曾用绕过合并层的诊断脚本观察到那个 300ms 屏，据此把
+  // 「已被机制兜住」误判成「缺陷会上屏」。诊断脚本可以绕过生产管线，门禁不能。
+  const units = [
+    { startMs: 0, endMs: 3000, translation: "这张卡就能帮你解读", originalText: "this card", srcStart: 0, srcEnd: 1 },
+    { startMs: 3000, endMs: 3300, translation: "家用锁之一", originalText: "in the u s", srcStart: 1, srcEnd: 2 },
+    { startMs: 3300, endMs: 7000, translation: "先看钥匙的切痕有多深", originalText: "deep the cuts", srcStart: 2, srcEnd: 3 },
+  ];
+  const R = Core.READING_MS_PER_CHAR;
+  // 与生产同一口径（core.js:3981）：宽度 /2 取整 = 字数，再 × 每字毫秒
+  const needMs = (t) => Math.ceil(Core.semanticDisplayWidth(t) / 2) * R;
+
+  // 前提：中间那屏确实读不完（否则这条门禁测的不是它该测的东西）
+  assert.ok(needMs(units[1].translation) > units[1].endMs - units[1].startMs,
+    "样本前提失效：中间屏应当读不完");
+
+  const merged = Core.mergeUnreadableUnits(units, { maxVisualWidth: 48 });
+  assert.ok(merged.length < units.length, "读不完的屏必须被合并掉");
+
+  // 合并后不得再有读不完的屏，且 startMs 红线不动
+  merged.forEach((u) => {
+    const span = u.endMs - u.startMs;
+    assert.ok(needMs(u.translation) <= span,
+      `合并后仍读不完: ${u.translation} 窗口 ${span}ms 需 ${Math.round(needMs(u.translation))}ms`);
+  });
+  assert.equal(merged[0].startMs, units[0].startMs, "合并不得改动首屏 startMs");
+  assert.ok(merged.every((u) => units.some((s) => s.startMs === u.startMs)),
+    "合并后每屏 startMs 必须来自某个原始屏（红线：start 不许新造）");
+});
+
 test("failed 块在用户播到时可复活一次，且只有一次", () => {
   // 退避预算 maxFails=6 / base 2s / max 30s：6 次全超时要 10.5 分钟才耗尽（合理），
   // 但 6 次快速失败（网关 429 立即返回、网络瞬断）只要 90 秒就把整块打成 failed。

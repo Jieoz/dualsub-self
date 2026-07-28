@@ -1,7 +1,8 @@
 /*
  * test/e2e-harness.js — 真·E2E 调试 harness（node 直接跑，零外部依赖除 fetch）
  * =============================================================================
- * block-v1 架构：连续源 cue block 整体翻译，目标语言可自然合并和重新分屏。
+ * block 架构（当前契约版本见 core.js BLOCK_CONTRACT_VERSION）：连续源 cue block 整体
+ * 翻译，目标语言可自然合并和重新分屏。
  *   本 harness 跑完整主链路：cleanupCues → resegmentCues → sliceClipsByCue
  *     → translateContextBlock(严格 segments JSON)
  *     → materializeBlockTranslation(粗粒度时间映射 + 缓存 round-trip) → buildSrt
@@ -157,7 +158,8 @@ async function run() {
     a.apiKey = "mock-key";
     a.base = "http://mock.local/v1";
     fetchImpl = makeMockFetch(stats, {});
-    mode = "MOCK (offline block-v1 non-1:1)";
+    // 契约版本跟随常量，别写字面量 —— 曾滞留 block-v1 直到 block-v7 才被发现。
+    mode = "MOCK (offline " + Core.BLOCK_CONTRACT_VERSION + " non-1:1)";
   }
 
   console.log("\n=== dualsub E2E harness (v" + EXT_VERSION + ") ===");
@@ -239,6 +241,18 @@ function writeOutputs(renderUnits, stats, a, mode) {
   // 1) SRT — 双语（原文在上，译文在下），走 core.buildSrt（与线上同一产出路径）。
   const srt = Core.buildSrt(renderUnits, { mode: "bilingual_orig_top" });
   fs.writeFileSync(path.join(OUT_DIR, "subtitles.srt"), srt, "utf8");
+
+  // 1b) units.json — 渲染单元原始数组，供 audit-units.js 零成本反复复核。
+  //
+  // 为什么必须落盘：真实模式（--real）每轨要烧 8 个块 × 12-23s 的真实翻译。此前只写
+  // SRT/HTML/stats，想复核可读性、重叠、宽度口径就得重跑整轨。SRT 是展示格式，解析
+  // 回来会丢 srcStart/srcEnd 等字段；stats 是聚合量，看不到单屏。
+  fs.writeFileSync(path.join(OUT_DIR, "units.json"), JSON.stringify({
+    savedAt: new Date().toISOString(),
+    mode: mode,
+    contract: Core.BLOCK_CONTRACT_VERSION,
+    units: renderUnits,
+  }, null, 1), "utf8");
 
   // 2) review.html — 三列：时间轴 | 原文 | 译文。
   const rows = renderUnits.map((u, i) => {
