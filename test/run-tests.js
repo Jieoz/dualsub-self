@@ -1787,9 +1787,12 @@ test("双向去重对齐：canonical 保留、display 删除的 gap 重复词仍
     const per = dur / words.length;
     return { tStartMs: tStart, dDurationMs: dur, segs: words.map((w, i) => ({ utf8: (i ? " " : "") + w, tOffsetMs: Math.round(per * i) })) };
   }
+  // 这是 json3 滚动 ASR 轨（token 带 rollingEnd），所以 stripOverlap 会删重复。
+  // gap 让 canonical 的词级时间不重叠 → canonical 保留重复、display 删除重复，
+  // 正是本测试要覆盖的 display<canonical 落差方向。
   const json = { events: [
     ev(0,    2000, ["boil", "water", "on", "the", "stove"]),
-    ev(2600, 2400, ["on", "the", "stove", "top", "and", "cook"]), // gap：无时间重叠
+    ev(2600, 2400, ["on", "the", "stove", "top", "and", "cook"]), // gap：无词级时间重叠
   ] };
   const cues = Core.cleanupCues(Core.parseJson3(json));
   const timeline = Core.buildCanonicalTokenTimeline(cues);
@@ -1961,6 +1964,57 @@ test("resegment 去 ASR 滚动重叠词（不出现 work work）", () => {
   assert.strictEqual(seg.length, 1);
   assert.strictEqual(seg[0].content, "how transformers work under the hood.");
   assert.ok(!/work work/.test(seg[0].content), "重叠词 work 应只出现一次");
+});
+
+test("人工成品轨的合法重复台词不得被当成滚动重发删除（Netflix 真轨回归）", () => {
+  // 全部取自 Jay 的 Netflix Trollhunters 英文真轨。旧实现按纯文本去重，
+  // 实测 352 cue 丢 12 个词，其中 "It works." 那条被删成病句。
+  const cases = [
+    {
+      cues: [{ start: 77077, end: 79579, content: "It works. It works like crazy!" }],
+      mustContain: "It works. It works like crazy!",
+      words: 6,
+    },
+    {
+      cues: [{ start: 62271, end: 65691, content: "Tobes! Tobes, Tobes, Tobes, Tobes! I have got to talk to you." }],
+      words: 12,
+    },
+    {
+      // 跨 cue 的合法重复：间隙只有 83ms，任何间隙阈值都会误判成重发
+      cues: [
+        { start: 1268893, end: 1272271, content: "He nearly... We nearly... He almost..." },
+        { start: 1272354, end: 1273898, content: "Almost what? Speak, Master Jim." },
+      ],
+      words: 11,
+    },
+  ];
+  cases.forEach((tc) => {
+    const seg = Core.resegmentCues(Core.cleanupCues(tc.cues), { rollingSource: false });
+    const inWords = tc.cues.reduce((n, c) => n + Core.restoredWords(c.content).length, 0);
+    const outWords = seg.reduce((n, c) => n + Core.restoredWords(c.content).length, 0);
+    assert.strictEqual(inWords, tc.words, "样本词数应与实测一致");
+    assert.strictEqual(outWords, inWords,
+      "人工轨重复台词被删：" + JSON.stringify(seg.map((s) => s.content)));
+    if (tc.mustContain) {
+      assert.ok(seg.some((s) => s.content === tc.mustContain),
+        "应原样保留：" + JSON.stringify(seg.map((s) => s.content)));
+    }
+  });
+});
+
+test("负向：滚动轨仍必须去重发，rollingSource 不是无条件关闭去重", () => {
+  const frags = Core.cleanupCues([
+    { start: 0, end: 1500, content: "how transformers work" },
+    { start: 1500, end: 3000, content: "work under the hood." },
+  ]);
+  // 默认（滚动轨）必须去重
+  const rolling = Core.resegmentCues(frags, { maxWords: 50, maxDurationMs: 30000 });
+  assert.ok(!/work work/.test(rolling.map((s) => s.content).join(" ")),
+    "滚动轨的重发必须仍被删除");
+  // 显式声明人工轨则保留 —— 证明这个开关真的在起作用，不是死参数
+  const manual = Core.resegmentCues(frags, { maxWords: 50, maxDurationMs: 30000, rollingSource: false });
+  assert.ok(/work work/.test(manual.map((s) => s.content).join(" ")),
+    "人工轨应保留重复，否则开关是死代码");
 });
 
 test("resegment 真实长句在 with 后允许一次受限续接", () => {

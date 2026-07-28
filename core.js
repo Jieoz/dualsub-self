@@ -1547,7 +1547,26 @@
    *     → next 去掉开头的 "work" → ["under","the","hood"]。
    * 只在词级别比对（CJK 无空格的语言此重叠少见，按整体词处理即可）。
    */
-  function stripOverlap(prevWords, nextWords) {
+  /**
+   * 去掉「滚动 ASR 重发」造成的重复前缀。
+   *
+   * 关键约束：重复文本本身**不是**重发的充分证据。滚动重发的定义是
+   * “同一次发声被上一条 cue 和这一条 cue 各写了一遍”，它必须有时间证据 ——
+   * 源轨的两条 cue 在时间上重叠（YouTube json3 滚动窗口正是如此）。
+   *
+   * 人工成品字幕轨（Netflix TTML，实测相邻重叠 0 处）里重复文本是**真台词**：
+   *   "It works. It works like crazy!"        → 曾被删成 "It works. like crazy!"（病句）
+   *   "Tobes! Tobes, Tobes, Tobes, Tobes!"    → 曾被删掉一个 Tobes
+   *   "He almost..." / "Almost what?"         → 跨 cue 的合法重复，曾被删掉 Almost
+   * 实测 Netflix 英文轨 352 cue 因此丢 12 个词，全是这类合法重复。
+   *
+   * 判据不能是「间隙有多大」：上面最后一例的两条 cue 只隔 83ms，任何间隙阈值都
+   * 会误判。判据是「这条轨会不会滚动重发」，由 resegmentCues 的调用方按轨来源
+   * 声明（opts.rollingSource），一次判定、全轨一致，不逐对猜时间。
+   */
+  function stripOverlap(prevWords, nextWords, rollingSource) {
+    // 源轨不是滚动轨 → 不存在重发，重复即真实内容，原样保留。
+    if (rollingSource === false) return nextWords;
     var maxK = Math.min(prevWords.length, nextWords.length, 8);
     for (var k = maxK; k >= 1; k--) {
       var match = true;
@@ -1633,13 +1652,27 @@
       return out;
     }
 
+    // 「这条轨会不会滚动重发」由调用方按轨来源显式声明，默认 true 保持既有行为。
+    //
+    // 不能靠推断：token 上的 rollingEnd 只有 parseJson3 会产生，而真实 YouTube
+    // VTT 自动轨同样滚动重发却没有 tokens —— 用 rollingEnd 推断会漏掉它们。
+    // 反过来 Netflix TTML 是人工成品轨（实测相邻重叠 0 处），重复即真台词。
+    // 唯一可靠的信息在调用方：它知道这份 cue 是哪个解析器出来的。
+    var rollingSourceTrack = opts.rollingSource !== false;
+
     var list = [];
     // 这里**不做**时间修复:resegment 只决定「切在哪里」,它的 cue 时间下游
     // 会被丢弃(最终显示时间一律来自 canonical token)。在这里改时间只会
     // 干扰长停顿/碎句黏合等分屏判定 —— 那是另一套已被测试锁定的行为。
-    (cues || []).filter(function (c) { return c && c.content; }).forEach(function (c) {
+    // 每个 piece 记住它来自**哪条源 cue**：同一条源 cue 内切出的两段绝不可能是
+    // 滚动重发（"It works." / "It works like crazy!" 来自同一条），stripOverlap
+    // 必须能区分「跨源 cue 的重复」和「同源 cue 内的重复」。
+    (cues || []).filter(function (c) { return c && c.content; }).forEach(function (c, srcIdx) {
       var pieces = splitCueAtSentenceEnds(c);
-      for (var i = 0; i < pieces.length; i++) list.push(pieces[i]);
+      for (var i = 0; i < pieces.length; i++) {
+        pieces[i].srcIdx = srcIdx;
+        list.push(pieces[i]);
+      }
     });
     if (!list.length) return [];
 
@@ -1776,10 +1809,16 @@
       if (!words.length) continue;
 
       if (!cur) {
-        cur = { start: c.start, end: c.end, words: words.slice(), fragmentChain: startsSyntacticFragmentChain(words) };
+        cur = { start: c.start, end: c.end, words: words.slice(), fragmentChain: startsSyntacticFragmentChain(words), srcIdx: c.srcIdx };
       } else {
         var gap = c.start - cur.end;
-        var added = stripOverlap(cur.words, words);
+        // 滚动重发的时间证据：两条 piece 必须来自**不同**源 cue，且这两条源 cue
+        // 在时间上真实重叠。同一源 cue 内切出的两段（"It works." / "It works
+        // like crazy!"）不可能是重发，源轨零重叠时（人工成品字幕）同理。
+        // 同一源 cue 内切出的两段绝不可能是重发（"It works." / "It works like
+        // crazy!"）；跨 cue 时才看轨形态。两个条件都不依赖间隙大小。
+        var sameSource = cur.srcIdx != null && cur.srcIdx === c.srcIdx;
+        var added = stripOverlap(cur.words, words, !sameSource && rollingSourceTrack);
         var ended = SENTENCE_END_RE.test(cur.words.join(" "));
         var wouldWords = cur.words.length + added.length;
         var wouldDur = c.end - cur.start;
@@ -1813,6 +1852,9 @@
         if (canMerge && (normalMerge || grammarMerge || orphanPrepMerge)) {
           for (var w = 0; w < added.length; w++) cur.words.push(added[w]);
           cur.end = Math.max(cur.end, c.end);
+          // 源标识跟着推进到最后并入的那条 piece：下一轮判重发时，对照的必须是
+          // 「cur 目前吃到哪条源 cue」，而不是它最初来自哪条。
+          cur.srcIdx = c.srcIdx;
           cur.merged = true;
           // 记下"本次合并被允许到多宽"。flush 的超长兜底拆分复用这个值，
           // 而不是另算一套上限 —— 上限只有一个来源，两处各算必然漂移。
@@ -1822,7 +1864,7 @@
           if (!(cur.mergeHardCap > allowedCap)) cur.mergeHardCap = allowedCap;
         } else {
           flush();
-          cur = { start: c.start, end: c.end, words: words.slice(), fragmentChain: startsSyntacticFragmentChain(words) };
+          cur = { start: c.start, end: c.end, words: words.slice(), fragmentChain: startsSyntacticFragmentChain(words), srcIdx: c.srcIdx };
         }
       }
 
