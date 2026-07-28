@@ -76,6 +76,7 @@
     renderUnits: [], // 全局渲染时间轴（各 clip 的渲染单元按 start 升序拼接）。findCueIndexAt 在此上查当前行
     clipState: {}, // clipIndex -> 'pending'|'done'|'error'|'failed'（error=可重试；failed=达 maxFails 终态）
     clipBackoff: {}, // clipIndex -> backoff 控制器（失败退避）
+    clipRevived: {}, // clipIndex -> 已用掉「用户播到此处」的那一次复活机会（见 translateClip）
     clipInflight: {}, // clipIndex -> bool：translateClip 进行中（重入互斥，防同 clip 并发）
     retryTimer: null, // 后台失败重试调度器 id（第2层；只在有 error clip 时活跃）
     renderer: null, // 叠加层 DOM
@@ -404,6 +405,7 @@
     state.renderUnits = [];
     state.clipState = {};
     state.clipBackoff = {};
+    state.clipRevived = {};
     state.clipInflight = {};
     state.lastHitCueIdx = -1;
     clearRenderer();
@@ -723,6 +725,7 @@
     state.renderUnits = [];
     state.clipState = nextClipState;
     state.clipBackoff = {};
+    state.clipRevived = {};
     state.clipInflight = {};
     state.lastHitCueIdx = -1;
     rebuildRenderTimeline();
@@ -896,7 +899,29 @@
     var segmentationModeAtStart = state.segmentationMode;
     var requestGeneration = state.requestGeneration;
     var clip = state.clips[idx];
-    if (!clip || state.clipState[idx] === "done" || state.clipState[idx] === "failed" || state.clipInflight[idx]) return;
+    if (!clip || state.clipState[idx] === "done" || state.clipInflight[idx]) return;
+
+    // failed 是「后台调度器放弃」，不该是「永久拒绝」。
+    //
+    // 退避预算 maxFails=6 / 2s→30s：6 次全超时要 10.5 分钟才耗尽（合理），但 6 次
+    // 快速失败（网关 429 立即返回、网络瞬断）只要 90 秒就把整块打成 failed 终态。
+    // 原先 failed 在入口直接 return，那 32 秒字幕就永久没了 —— 用户重新播到那里也
+    // 不会重试，只能改配置（config 变更处会清 error/failed 态）才恢复。
+    //
+    // priority 100 = prefetchAround 里的 plan[0]，即用户当前播放位置。用户人在这一段
+    // 上，就是最明确的「再试一次」信号。后台预取（优先级 10/60）仍然尊重 failed 终态，
+    // 不会拿失败块反复冲击网关。
+    //
+    // 但机会必须限次：预取循环每 1.5s 就跑一轮，plan[0] 一直是当前块，无条件重置会
+    // 变成不受退避约束的无限重试 —— 正是「更深的窗口必须配合并发上限，否则 429 →
+    // 退避 → 更卡」要避免的。所以每块只给一次复活，用 clipRevived 记账。
+    if (state.clipState[idx] === "failed") {
+      if (priority !== 100) return;
+      if (state.clipRevived[idx]) return;
+      state.clipRevived[idx] = true;
+      getBackoff(idx).reset();
+      state.clipState[idx] = undefined;
+    }
 
     var backoff = getBackoff(idx);
     if (!backoff.shouldTry()) return;
@@ -1838,6 +1863,9 @@
       if (apiChanged) {
         invalidateRuntimeRequests();
         state.clipBackoff = {};
+        // 配置变了（换 key/base/model 等）就是一次全新尝试：复活记账一并清掉，
+        // 否则上一轮用掉机会的块在新配置下也拿不到重试。
+        state.clipRevived = {};
         state.clipInflight = {};
         // model/语言变了，旧译文已不适用 → 丢内存缓存重翻（持久缓存按新 key 自然不命中）
         if (translationIdentityChanged) {

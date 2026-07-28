@@ -2339,6 +2339,42 @@ test("等首块译文不得用固定超时上限放行", () => {
   assert.doesNotMatch(body, /"failed"/, "failed 终态不得计入 stillWorking");
 });
 
+test("failed 块在用户播到时可复活一次，且只有一次", () => {
+  // 退避预算 maxFails=6 / base 2s / max 30s：6 次全超时要 10.5 分钟才耗尽（合理），
+  // 但 6 次快速失败（网关 429 立即返回、网络瞬断）只要 90 秒就把整块打成 failed。
+  // 原先 failed 在 translateClip 入口无条件 return —— 那 32 秒字幕永久没了，用户
+  // 重新播到那里也不重试，只能改配置才恢复。
+  //
+  // 复活必须限次：预取循环每 1.5s 一轮、plan[0] 恒为当前块，无条件重置会变成不受
+  // 退避约束的无限重试（正是「更深窗口必须配合并发上限，否则 429 → 退避 → 更卡」
+  // 要避免的）。所以只有 priority===100（用户当前播放位置）能复活，且每块一次。
+  const iso = fs.readFileSync(path.join(__dirname, "..", "isolated.js"), "utf8");
+  const at = iso.indexOf("async function translateClip");
+  assert.ok(at >= 0);
+  const body = iso.slice(at, iso.indexOf("\n  function ", at + 10));
+
+  // failed 不得再出现在入口的早退条件里
+  const guardLine = body.slice(0, body.indexOf("\n\n"));
+  assert.doesNotMatch(guardLine, /"failed"/,
+    "failed 不该在入口无条件早退 —— 用户播到时应有一次复活机会");
+
+  // 复活受两道限制：priority 100 + 每块一次
+  const revivalAt = body.indexOf('state.clipState[idx] === "failed"');
+  assert.ok(revivalAt > 0, "必须显式处理 failed 复活");
+  const revival = body.slice(revivalAt, revivalAt + 400);
+  assert.match(revival, /priority !== 100/, "只有用户当前播放位置能触发复活");
+  assert.match(revival, /clipRevived\[idx\]/, "复活必须限次，否则变无限重试");
+  assert.ok(revival.indexOf("clipRevived[idx] = true") > 0, "必须记账已用掉的机会");
+  assert.match(revival, /\.reset\(\)/, "复活要重置退避预算");
+
+  // clipRevived 的生命周期必须与 clipBackoff 一一对应，否则换轨/换配置后记账残留
+  const backoffResets = iso.split("state.clipBackoff = {}").length - 1;
+  const revivedResets = iso.split("state.clipRevived = {}").length - 1;
+  assert.equal(revivedResets, backoffResets,
+    `clipRevived 重置点(${revivedResets}) 必须与 clipBackoff(${backoffResets}) 一致`);
+  assert.match(iso, /clipRevived: \{\}/, "clipRevived 必须在 state 里声明");
+});
+
 test("音效标记不进翻译管线，歌词不受影响", () => {
   // 22 条真实轨统计：括号包裹的 cue 共 8 种形态，其中 117 条是音效/说话人标记
   // （[Applause]×23 [Music]×19 [笑い]×69 [拍手]×2 [鼻息]×2 [叫び声]×2 [Vsauce]×2），
