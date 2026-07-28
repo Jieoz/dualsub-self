@@ -4025,7 +4025,9 @@
     if (lineIndex + 1 === lineCount) {
       var tail = words.slice(cursor.index);
       cursor.index = words.length;
-      return tail.join(" ");
+      // 必须用权威 joinRestoredWords：words 现在由 restoredWords() 切出，连写文字
+      // 一字一词，无脑 join(" ") 会把 45 字日文撑成 89 字散字（见其函数注释）。
+      return joinRestoredWords(tail);
     }
     var linesLeftAfter = lineCount - lineIndex - 1;
     // 按整段总量算 share，不要"改成剩余量占比"。
@@ -4047,7 +4049,7 @@
     }
     var slice = words.slice(cursor.index, cursor.index + best);
     cursor.index += best;
-    return slice.join(" ");
+    return joinRestoredWords(slice);
   }
 
   function materializeBlockTranslation(parsedSegments, sourceCues, opts) {
@@ -4111,18 +4113,28 @@
       //
       // 但"不严格"不等于"误差可以累积"：取词量必须按剩余量占比算，让每屏吸收前面
       // 的偏差（见 takeForwardSourceWords）。否则松对齐不闭环，会漂出几屏的错位。
-      var cueTexts = cues.map(function (cue) {
-        return collapseWhitespace(cue.content || "");
-      }).filter(Boolean);
+      // 分词必须走全系统唯一权威 restoredWords()，不能用 /\s+/ 自己切。
+      //
+      // 真机故障（日语轨 pczh.ja，两个模型同现，clip 5/6/10）：/\s+/ 对无词间空格的
+      // 语言（日/中/泰）每个 cue 只得到 1 个"词"。一旦模型给的译文屏数多于源词数，
+      // 末尾屏取到 0 词 → 游标停在 cue 分界 → start 取「下一 cue 起点」、end 取
+      // 「本 cue 终点」→ start > end → 抛错丢掉整块 32 秒字幕并退避重试重烧 token。
+      // restoredWords 对连写文字一字一词（见 RESTORE_WORD_RE），源词数与屏数量级
+      // 匹配，零词屏在真实轨上不再出现；同时消灭了这里自写的第 4 份分词实现。
+      var cueWordLists = cues.map(function (cue) {
+        return restoredWords(collapseWhitespace(cue.content || ""));
+      });
       var cueBoundaries = [];
       var boundaryAcc = 0;
-      cueTexts.forEach(function (text) {
-        boundaryAcc += text.split(/\s+/).filter(Boolean).length;
+      var allWords = [];
+      cueWordLists.forEach(function (list) {
+        boundaryAcc += list.length;
         cueBoundaries.push(boundaryAcc);
+        for (var wi = 0; wi < list.length; wi++) allWords.push(list[wi]);
       });
       var sourceCursor = {
         index: 0,
-        words: cueTexts.join(" ").split(/\s+/).filter(Boolean),
+        words: allWords,
         cueBoundaries: cueBoundaries,
         weights: weights,
         totalWeight: totalWeight,
@@ -4137,10 +4149,16 @@
         var fromOffset = sourceCursor.index;
         var original = takeForwardSourceWords(sourceCursor, lineIndex, cleanLines.length);
         var toOffset = sourceCursor.index;
+        // 零词屏必须两侧同向取时间，否则跨 cue 分界时 start 取「下一 cue 起点」、
+        // end 取「本 cue 终点」→ start > end。根因已在上游修掉（分词改走权威
+        // restoredWords，连写文字一字一词，源词数与屏数量级匹配），这里只保留同向
+        // 求值这一条不变式，不再靠它兜整块字幕。
         var startMs = clampToPauseSide(pauses, wordOffsetToTime(cues, sourceCursor, fromOffset, true), true);
-        var endMs = clampToPauseSide(pauses, wordOffsetToTime(cues, sourceCursor, toOffset, false), false);
+        var endMs = toOffset === fromOffset
+          ? startMs
+          : clampToPauseSide(pauses, wordOffsetToTime(cues, sourceCursor, toOffset, false), false);
         endMs = trimSpannedPause(pauses, startMs, endMs, minDisplayMs);
-        if (!(endMs > startMs)) throw new Error("block translation materialized timing invalid");
+        if (endMs < startMs) throw new Error("block translation materialized timing invalid");
         var roundedStart = Math.round(startMs);
         var roundedEnd = Math.round(endMs);
         // 短于最小显示时长不是协议违规，而是源 cue 本身就短（真实 ASR 轨常见）。

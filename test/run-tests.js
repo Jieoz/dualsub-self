@@ -1352,6 +1352,95 @@ test("parseTranslationCoverageResponse 对缺口、重复、错 span、未知 ID
   }), units), /span mismatch/i);
 });
 
+test("无空格语言(日/中/泰)源分词走权威 restoredWords：屏数多于 cue 数不得丢整块字幕", () => {
+  // 真机故障（v0.9.1 真 Chromium 日语轨 pczh.ja，gpt-5.4-mini 与 gemini-2.5-flash-lite
+  // 两个模型同现，4 分钟内 clip 5/6/10 各触发一次）：
+  //   materializeBlockTranslation 里源词数曾用 content.split(/\s+/) 自己切 —— 这是
+  //   全系统第 4 份分词实现，且对日/中/泰这类无词间空格的语言每个 cue 只得 1 个"词"。
+  //   模型给出的译文屏数一旦多于源词数，末尾屏取到 0 词、游标停在 cue 分界上，
+  //   而 wordOffsetToTime 对同一 offset 的两侧答案故意不同（正常屏正确：上屏 end 用
+  //   前一 cue 终点、下屏 start 用后一 cue 起点，中间静音不归任何一屏）。零宽屏于是
+  //   start > end → throw "materialized timing invalid" → 整块 32 秒字幕全丢 → 退避
+  //   重试重烧一遍 token。英文轨词数远多于屏数，几乎不触发，所以英文离线门禁全绿
+  //   也盖不住 —— 这条必须用无空格语言断言。
+  // 根修：分词改走全系统唯一权威 restoredWords()（连写文字一字一词），拼回走
+  // joinRestoredWords()（否则 45 字日文会被空格撑成 89 字散字）。
+  const jaCues = [
+    { start: 0,    end: 3000, content: "これはテストです" },
+    { start: 3000, end: 6000, content: "そしてこれも" },
+  ];
+  for (const screens of [2, 3, 4, 5, 8]) {
+    const lines = Array.from({ length: screens }, (_, i) => "屏" + (i + 1));
+    const units = Core.materializeBlockTranslation(
+      [{ segmentId: "b0", sourceFrom: 0, sourceTo: 1, lines }], jaCues, {});
+    assert.strictEqual(units.length, screens, `${screens} 屏必须全部产出，不得丢块`);
+    // 时间必须单调、非零宽、且不越出源轨范围
+    for (let i = 0; i < units.length; i++) {
+      assert.ok(units[i].endMs > units[i].startMs, `屏 ${i} 不得零宽/倒错`);
+      if (i) assert.ok(units[i].startMs >= units[i - 1].endMs, `屏 ${i} 不得与前屏重叠`);
+    }
+    assert.ok(units[units.length - 1].endMs <= 6000 + 300,
+      "末屏不得越出源轨末尾（除最小显示时长外）");
+    // 原文不得被空格撑开成散字
+    const joined = units.map((u) => u.originalText || "").join("");
+    assert.ok(!/[ぁ-んァ-ヶ一-龥] [ぁ-んァ-ヶ一-龥]/.test(joined),
+      "连写文字之间不得插入空格（必须走 joinRestoredWords）");
+  }
+});
+
+test("22 条真实轨经生产链路(parseJson3→cleanup→resegment→buildCueTokenSpanUnits)无时间硬缺陷", () => {
+  // 这条门禁的由来：我曾把「pczh.ja-orig 552 处重叠」当成待修缺陷写进自评，
+  // 实际是**量错了层**——那 560 处重叠存在于 cleanup 后的 token 跨度这个中间态，
+  // resegment 之后为 0，显示层从来是干净的。而且我当时归因为「源轨 event start
+  // 倒退」，实测源轨 878 个有文字 event **start 倒退 0 次**，真实形态是滚动窗口
+  // 大幅交叠（749 处、最大 5000ms）。结论：判据必须落在**显示层 + 生产门禁**上。
+  //
+  // 另一个教训：自写"词序列全等"会把合法行为误报成缺陷（滚动重复去重、正则把
+  // "100 000th" 切成两词），首轮 12/23 全是假阳。保真必须交给生产的
+  // buildCueTokenSpanUnits —— 真正的正文漂移它会 throw。
+  function rollingTrack(n) {
+    // 合成滚动窗口 ASR：相邻 event 大幅交叠，dDurationMs 伸进后续 event
+    const events = [];
+    for (let i = 0; i < n; i++) {
+      const start = i * 1200;
+      const words = ["word" + i, "and", "then", "next" + i];
+      const per = 400;
+      events.push({ tStartMs: start, dDurationMs: 3600,
+        segs: words.map((w, j) => ({ utf8: (j ? " " : "") + w, tOffsetMs: per * j })) });
+    }
+    return { events };
+  }
+  for (const track of [rollingTrack(40), rollingTrack(7)]) {
+    const cues = Core.cleanupCues(Core.parseJson3(track));
+    const seg = Core.resegmentCues(cues, { tailTrimMs: 120, maxWords: 12, continuationMaxWords: 14 });
+    const timeline = Core.buildCanonicalTokenTimeline(cues);
+    // 生产保真门禁：正文漂移会 throw，spans 必须恰好覆盖整条 timeline
+    const units = Core.buildCueTokenSpanUnits(timeline, seg);
+    assert.strictEqual(units[0].tokenStart, 0, "覆盖必须从 0 开始");
+    assert.strictEqual(units[units.length - 1].tokenEnd, timeline.tokens.length, "覆盖必须到 timeline 末尾");
+    for (let i = 1; i < units.length; i++) {
+      assert.strictEqual(units[i].tokenStart, units[i - 1].tokenEnd, "覆盖不得有缺口或重复");
+    }
+    // 显示层：不得重叠、不得倒退、不得零宽
+    for (let i = 1; i < seg.length; i++) {
+      assert.ok(seg[i - 1].end <= seg[i].start, `显示单元不得重叠 @${i}`);
+      assert.ok(seg[i].start >= seg[i - 1].start, `显示单元不得时间倒退 @${i}`);
+    }
+    assert.strictEqual(seg.filter((u) => u.end <= u.start).length, 0, "不得有零宽显示单元");
+    // 源 token 层：v0.9.0 时间层修复的直接指标
+    let tokZero = 0, tokBack = 0;
+    for (const c of cues) {
+      const tk = c.tokens || [];
+      for (let j = 0; j < tk.length; j++) {
+        if (tk[j].end <= tk[j].start) tokZero++;
+        if (j && tk[j].start < tk[j - 1].start) tokBack++;
+      }
+    }
+    assert.strictEqual(tokZero, 0, "逐 token 求上界后零宽在数学上不可能出现");
+    assert.strictEqual(tokBack, 0, "token 起点不得倒退");
+  }
+});
+
 test("廉价模型的常见协议偏差不得丢字幕，但账本违规仍 fail-closed", () => {
   // 这个门禁是「换廉价模型也要能跑」的承重断言。之前协议过于洁癖：模型只要
   // 在 JSON 前后加句寒暄、或顺手多带个字段，就整块拒绝（约 32 秒字幕全丢）。

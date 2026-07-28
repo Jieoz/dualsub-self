@@ -21,7 +21,13 @@
 
 ## 安装（加载已解压的扩展程序）
 
-当前版本：**v0.9.1**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.9.1) 下载 Chrome MV3 安装包。
+当前版本：**v0.9.2**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.9.2) 下载 Chrome MV3 安装包。
+
+v0.9.2 修掉一个**只在无词间空格语言（日/中/泰）上触发**的整块丢字幕缺陷。
+
+- **源分词统一到全系统唯一权威 `restoredWords()`。** `materializeBlockTranslation` 此前用 `content.split(/\s+/)` 自己切词——这是第 4 份平行分词实现，且对日/中/泰每个 cue 只得到 1 个"词"。当模型给出的译文屏数多于源词数时，末尾屏取到 0 词、游标停在 cue 分界上，而边界两侧的时间答案故意不同（对正常屏是对的：上屏 end 取前一 cue 终点、下屏 start 取后一 cue 起点，中间静音不归任何一屏）。零宽屏于是 `start > end` → 抛错丢弃整块约 32 秒字幕 → 退避重试重烧一遍 token。
+- **真机实测收益（日语轨 4 分钟，真 Chromium + 真模型）：** API 失败 **33 → 0**，请求次数 **16 → 8**（重试风暴消失，token 直接省一半），有原文时译文覆盖 **82% → 100%**。
+- 英文轨词数远多于屏数，几乎不触发——所以全套英文离线门禁 + 英文真机 live 全绿也盖不住它。新增门禁改用无空格语言断言，并做了负向验证：把分词换回 `/\s+/` 该测试立即失败。
 
 v0.9.1 在 v0.9.0 的架构根修之上做了一轮 **token 审计与弱模型兼容**，契约升到 `block-v9`（旧缓存整体失效）。
 
@@ -40,7 +46,7 @@ v0.9.0 是一次架构根修，改掉三个互相纠缠的病灶：**译文与�
 
 顺带清掉一处双实现漂移：`translateContextBlock` 曾自己复制一份分屏/宽度兜底/悬挂助词合并/屏尾去标点，与 `parseBlockTranslationResponse` 并行存在，漂移后 browser-replay 直接打红。现在只有一条权威路径，并加了门禁禁止再复制回来。
 
-真实验证：单测 285、browser-replay 13/13、语义语料 10/10、真实模型 e2e 两条轨（干净轨 + 滚动窗口 ASR 轨）clip 失败 0、重叠/超宽/未译/切词全 0，完整 373-cue 轨 508/508 单元有译文，真 Chromium + 真模型连续播放 5 分钟有原文时译文覆盖 100%、最长漏译空窗 0s、API 失败 0、JS 错误 0。
+真实验证：单测 287、browser-replay 13/13、语义语料 10/10、23 条真实字幕轨经生产链路（`parseJson3→cleanup→resegment→buildCueTokenSpanUnits`）显示层零硬缺陷、真实模型 e2e 两条轨（干净轨 + 滚动窗口 ASR 轨）clip 失败 0、重叠/超宽/未译/切词全 0，完整 373-cue 轨 508/508 单元有译文，真 Chromium + 真模型英日两条轨连续播放有原文时译文覆盖 100%、最长漏译空窗 0s、API 失败 0、JS 错误 0。廉价模型（`gemini-2.5-flash-lite`，会把 JSON 包在 markdown 围栏里）真实跑 clip 失败 0、30/30 单元有译文。
 
 已知残留（模型侧偶发，不是回归）：模型偶尔交回不合账本契约的条目（`coverage entry fields invalid` / `empty translation`），由退避重试兜住，live 跑里未影响覆盖率。
 
