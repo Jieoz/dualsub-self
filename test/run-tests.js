@@ -1247,14 +1247,17 @@ test("block-v1 对多书写系统使用同一请求、parser 与时间物化路�
       cues, apiBaseUrl: "https://example.test", ["api" + "Key"]: "k", apiModel: "m", targetLang: "zh-Hans",
       fetchImpl: async (_url, req) => {
         sent = JSON.parse(JSON.parse(req.body).messages[1].content);
-        const translations = sent.units.map((u, i) => ({ unitId: u.unitId, coverFrom: u.coverFrom, coverTo: u.coverTo, translation: i === 0 ? "第一句译文" : "第二句译文" }));
+        const translations = sent.units.map((u, i) => ({ unitId: u.unitId, translation: i === 0 ? "第一句译文" : "第二句译文" }));
         return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ translations }) } }] }) };
       },
     });
     pair.forEach((content) => {
       assert.ok(sent.units.some((unit) => unit.sourceText === content), `ledger 缺原文: ${content}`);
     });
-    assert.ok(sent.units.every((unit) => unit.unitId && Number.isInteger(unit.coverFrom) && Number.isInteger(unit.coverTo)), "units 必须携带 coverage ledger");
+    // 账本仍由程序侧唯一决定，但不再发给模型（unitId 已编码范围）。承重点是
+    // 「每单元有稳定 unitId 且译文按 unitId 原子归位」，不是「模型抄回 span」。
+    assert.ok(sent.units.every((unit) => unit.unitId), "units 必须携带稳定 unitId");
+    assert.ok(sent.units.every((unit) => unit.coverFrom === undefined && unit.coverTo === undefined), "不得把范围冗余发给模型");
     assert.deepStrictEqual(out.units.map((u) => u.translation), ["第一句译文", "第二句译文"]);
   }
   const coreSrc = fs.readFileSync(path.join(ROOT, "core.js"), "utf8");
@@ -1327,8 +1330,95 @@ test("parseTranslationCoverageResponse 对缺口、重复、错 span、未知 ID
     { translations:[entry("u0",0,3),entry("u1",2,4)] },
     { translations:[entry("u0",0,2),entry("other",2,4)] },
     { translations:[entry("u0",0,2," "),entry("u1",2,4)] },
-    { translations:[Object.assign(entry("u0",0,2),{source:"forged"}),entry("u1",2,4)] },
   ]) assert.throws(() => Core.parseTranslationCoverageResponse(JSON.stringify(payload), units), /translation coverage/i);
+  // 未知字段必须被忽略而不是整块拒绝：承重的是 unitId 能否对上程序侧账本。
+  // 此前白名单外字段直接抛错，模型顺手加个 notes 就丢掉整块约 32 秒字幕。
+  const withExtras = Core.parseTranslationCoverageResponse(JSON.stringify({
+    translations: [
+      Object.assign(entry("u0",0,2), { notes: "n", confidence: 0.9 }),
+      Object.assign(entry("u1",2,4), { source: "forged" }),
+    ],
+    usage: { total_tokens: 123 },
+  }), units);
+  assert.deepStrictEqual(withExtras.map(x => x.translation), ["完整译文","完整译文"], "未知字段应忽略");
+  // 不再要求模型回抄 coverFrom/coverTo：省输出 token，也消掉「抄错数字」这类整块失败。
+  const noSpan = Core.parseTranslationCoverageResponse(JSON.stringify({
+    translations: [{ unitId:"u0", translation:"甲译文" }, { unitId:"u1", translation:"乙译文" }],
+  }), units);
+  assert.deepStrictEqual(noSpan.map(x => [x.coverFrom, x.coverTo]), [[0,2],[2,4]], "范围由程序侧账本决定");
+  // 但模型主动给错范围仍须 fail-closed —— 那说明它在自行重划覆盖，正是 v0.9.0 的病灶。
+  assert.throws(() => Core.parseTranslationCoverageResponse(JSON.stringify({
+    translations: [entry("u0",0,3), entry("u1",2,4)],
+  }), units), /span mismatch/i);
+});
+
+test("廉价模型的常见协议偏差不得丢字幕，但账本违规仍 fail-closed", () => {
+  // 这个门禁是「换廉价模型也要能跑」的承重断言。之前协议过于洁癖：模型只要
+  // 在 JSON 前后加句寒暄、或顺手多带个字段，就整块拒绝（约 32 秒字幕全丢）。
+  // 内容完全可用却因洁癖丢弃，是拿用户的字幕换协议整齐。
+  const units = [
+    { unitId: "clip:u0:0-2", tokenStart: 0, tokenEnd: 2 },
+    { unitId: "clip:u1:2-4", tokenStart: 2, tokenEnd: 4 },
+  ];
+  const good = [
+    { unitId: "clip:u0:0-2", translation: "第一条译文" },
+    { unitId: "clip:u1:2-4", translation: "第二条译文" },
+  ];
+  const parse = (raw, opts) => Core.parseTranslationCoverageResponse(raw, units, opts);
+
+  // A. 必须容忍：形态噪声，不影响账本对齐。
+  const tolerated = {
+    "markdown 围栏": "```json\n" + JSON.stringify({ translations: good }) + "\n```",
+    "围栏无 json 标记": "```\n" + JSON.stringify({ translations: good }) + "\n```",
+    "前后加解释性文字": "好的，这是翻译结果：\n" + JSON.stringify({ translations: good }) + "\n希望有帮助！",
+    "JSON 尾逗号(非法语法)": '{"translations":[' + JSON.stringify(good[0]) + "," + JSON.stringify(good[1]) + ",]}",
+    "条目多带未知字段": JSON.stringify({ translations: good.map(x => ({ ...x, notes: "n", confidence: 0.9 })) }),
+    "顶层多带未知字段": JSON.stringify({ translations: good, usage: { total_tokens: 1 } }),
+    "嵌套对象在前": '{"meta":{"a":1},"translations":' + JSON.stringify(good) + "}",
+    "顺序打乱": JSON.stringify({ translations: [good[1], good[0]] }),
+    "字段名写成 text": JSON.stringify({ translations: good.map(x => ({ unitId: x.unitId, text: x.translation })) }),
+    "只给 coverTo(不成对)": JSON.stringify({ translations: good.map((x, i) => ({ ...x, coverTo: units[i].tokenEnd })) }),
+  };
+  for (const [name, raw] of Object.entries(tolerated)) {
+    const out = parse(raw);
+    assert.strictEqual(out.length, 2, `${name}: 应解析出全部单元`);
+    assert.ok(out.every(x => x.translation), `${name}: 不得丢译文`);
+    assert.deepStrictEqual(out.map(x => [x.coverFrom, x.coverTo]), [[0, 2], [2, 4]], `${name}: 范围仍由程序侧账本决定`);
+  }
+
+  // B. 修复器只动语法噪声，绝不动文字本身：译文里合法出现 } ] , 必须原样保留。
+  for (const text of ["用 {} 表示空集合", "数组写成 [1,2],", "先看这个，}然后那个"]) {
+    const out = parse(JSON.stringify({ translations: [{ unitId: good[0].unitId, translation: text }, good[1]] }));
+    assert.strictEqual(out[0].translation, text, "净化不得删改文字本身");
+  }
+
+  // C. 仍须 fail-closed：这些是账本违规/协议漂移，放行就是屏级错位复发。
+  const mustReject = {
+    "漏掉一条": JSON.stringify({ translations: [good[0]] }),
+    "多给一条": JSON.stringify({ translations: good.concat([{ unitId: "clip:u9:9-9", translation: "多的" }]) }),
+    "未知 unitId": JSON.stringify({ translations: [{ unitId: "other", translation: "甲" }, good[1]] }),
+    "重复 unitId": JSON.stringify({ translations: [good[0], good[0]] }),
+    "coverFrom 填错": JSON.stringify({ translations: [{ ...good[0], coverFrom: 1 }, good[1]] }),
+    "coverTo 填错": JSON.stringify({ translations: [{ ...good[0], coverTo: 3 }, good[1]] }),
+    "两套译文字段": JSON.stringify({ translations: [{ ...good[0], text: "另一套" }, good[1]] }),
+    "translations 不是数组": JSON.stringify({ translations: "nope" }),
+    "返回数组而非对象": JSON.stringify(good),
+    "非 JSON 纯文本": "第一条译文\n第二条译文",
+  };
+  for (const [name, raw] of Object.entries(mustReject)) {
+    assert.throws(() => parse(raw), /translation coverage/i, `${name}: 必须 fail-closed`);
+    assert.throws(() => parse(raw, { lenient: true }), /translation coverage/i, `${name}: lenient 也不得放行`);
+  }
+
+  // D. 内容问题（未翻译/空）在运行时降级为该句显原文，不连坐同块其余译文。
+  const contentBad = JSON.stringify({ translations: [
+    { unitId: good[0].unitId, translation: "still English here" },
+    good[1],
+  ] });
+  assert.throws(() => parse(contentBad), /translation coverage/i, "导出仍 fail-closed");
+  const lenient = parse(contentBad, { lenient: true });
+  assert.strictEqual(lenient[0].translation, "", "未翻译单元回退原文");
+  assert.strictEqual(lenient[1].translation, "第二条译文", "同块其余译文必须保留");
 });
 
 test("parseTranslationCoverageResponse lenient 运行时只把坏内容单元置空，保留同 clip 其余合规译文", () => {
@@ -1355,13 +1445,13 @@ test("parseTranslationCoverageResponse lenient 运行时只把坏内容单元置
 test("parseTranslationCoverageResponse lenient 仍对结构性违规 fail-closed（协议漂移不放行）", () => {
   const units = [{ unitId: "u0", tokenStart: 0, tokenEnd: 2 }, { unitId: "u1", tokenStart: 2, tokenEnd: 4 }];
   const entry = (id, from, to, translation="完整译文") => ({ unitId:id, coverFrom:from, coverTo:to, translation });
-  // 数量不足、重复、错 span、未知 ID、额外字段——这些是协议漂移，lenient 也必须 throw。
+  // 数量不足、重复、错 span、未知 ID——这些是协议漂移，lenient 也必须 throw。
+  // （未知**字段**不在此列：它不影响账本对齐，忽略即可，见上一个测试。）
   for (const payload of [
     { translations:[entry("u0",0,2)] },
     { translations:[entry("u0",0,2),entry("u0",0,2)] },
     { translations:[entry("u0",0,3),entry("u1",2,4)] },
     { translations:[entry("u0",0,2),entry("other",2,4)] },
-    { translations:[Object.assign(entry("u0",0,2),{source:"forged"}),entry("u1",2,4)] },
   ]) assert.throws(() => Core.parseTranslationCoverageResponse(JSON.stringify(payload), units, { lenient: true }), /translation coverage/i);
 });
 
@@ -1414,8 +1504,12 @@ asyncTest("translateClipLines 发送 token-span units，并按 unitId 对乱序�
   });
   assert.deepStrictEqual(lines,["第一声完整译文","返回完整译文"]);
   assert.deepStrictEqual(lines.coverage.map(x=>[x.unitId,x.coverFrom,x.coverTo]),[["u0",0,3],["u1",3,5]]);
-  assert.deepStrictEqual(requestPayload.units.map(x=>Object.keys(x).sort()),[["coverFrom","coverTo","maxVisualWidth","semanticGroupId","sourceText","unitId"],["coverFrom","coverTo","maxVisualWidth","semanticGroupId","sourceText","unitId"]]);
-  assert.deepStrictEqual(requestPayload.units.map(x=>x.semanticGroupId),["sg0","sg1"],"无显式 semanticGroupId 时每个单元独立，禁止意外跨句搬信息");
+  // 发出的每单元只有 unitId + sourceText。coverFrom/coverTo/maxVisualWidth/semanticGroupId
+  // 曾逐单元发送，实测占 user payload 45.9% 且全可由程序侧推导/恒定，纯浪费 token；
+  // 让模型回抄 span 还额外制造了「抄错数字→整块丢字幕」这一类失败。
+  assert.deepStrictEqual(requestPayload.units.map(x=>Object.keys(x).sort()),[["sourceText","unitId"],["sourceText","unitId"]]);
+  assert.ok(!/coverFrom|coverTo|semanticGroupId/.test(JSON.stringify(requestPayload.units)),"逐单元冗余字段不得回归");
+  assert.strictEqual(requestPayload.maxVisualWidth, 48, "宽度恒定值提到顶层发一次");
   assert.ok(!JSON.stringify(requestPayload).includes("1. "),"不得退回编号文本协议");
 });
 

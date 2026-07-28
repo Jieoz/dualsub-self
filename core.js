@@ -2985,16 +2985,99 @@
     });
   }
 
+  /**
+   * 从模型返回里取出第一个完整 JSON 对象。
+   *
+   * 廉价模型最高频的协议偏差不是内容错，而是「把正确的 JSON 包在废话里」：
+   *   好的，这是翻译结果：{"translations":[…]}  希望有帮助！
+   * 此前只剥 ```json 围栏、其余一律按 invalid JSON 整块拒绝（约 32 秒字幕全丢）。
+   * 那是在拿协议洁癖换用户的字幕 —— 内容完全可用，只是被寒暄包着。
+   *
+   * 做法：先试整体 parse（正常模型走这条，零开销）；失败则从第一个 '{' 起做
+   * 括号配平扫描，字符串内的括号与转义不计数，取第一个自洽的对象。
+   * 不用贪心正则 /\{[\s\S]*\}/ —— 译文里带 '}' 或后面跟第二个对象都会切错。
+   */
+  function extractJsonObject(raw, requiredKey) {
+    var text = String(raw == null ? "" : raw).trim();
+    if (!text) return null;
+
+    // 只在字符串外把 ",}" / ",]" 的多余逗号去掉 —— 小模型高频语法失误。
+    // 必须跳过字符串内容，否则译文里出现 ",}" 会被改坏（净化只删语法噪声，不动文字）。
+    function repairTrailingCommas(src) {
+      var out = "", inStr = false, esc = false;
+      for (var i = 0; i < src.length; i++) {
+        var ch = src[i];
+        if (esc) { out += ch; esc = false; continue; }
+        if (ch === "\\") { out += ch; if (inStr) esc = true; continue; }
+        if (ch === '"') { inStr = !inStr; out += ch; continue; }
+        if (!inStr && ch === ",") {
+          var j = i + 1;
+          while (j < src.length && /\s/.test(src[j])) j++;
+          if (src[j] === "}" || src[j] === "]") continue; // 丢掉这个逗号
+        }
+        out += ch;
+      }
+      return out;
+    }
+    function tryParse(s) {
+      try { return JSON.parse(s); } catch (_) {}
+      try { return JSON.parse(repairTrailingCommas(s)); } catch (_) {}
+      return null;
+    }
+    // 候选是否可用：要求带 requiredKey 的，就不能拿一个恰好配平的内层对象顶替。
+    // （实测：尾逗号 payload 会让括号扫描先命中内层 {"unitId":…}，若不校验就会
+    // 把「JSON 语法错」误报成「顶层字段不对」，把真实病因藏起来。）
+    function usable(v) {
+      if (!v || typeof v !== "object" || Array.isArray(v)) return v || null;
+      if (requiredKey && !(requiredKey in v)) return null;
+      return v;
+    }
+
+    var fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+    if (fenced) {
+      var f = usable(tryParse(fenced[1].trim()));
+      if (f) return f;
+      text = fenced[1].trim();
+    }
+    var whole = usable(tryParse(text));
+    if (whole) return whole;
+
+    var start = text.indexOf("{");
+    while (start >= 0) {
+      var depth = 0, inStr = false, esc = false;
+      for (var i = start; i < text.length; i++) {
+        var ch = text[i];
+        if (esc) { esc = false; continue; }
+        if (ch === "\\") { if (inStr) esc = true; continue; }
+        if (ch === '"') { inStr = !inStr; continue; }
+        if (inStr) continue;
+        if (ch === "{") depth++;
+        else if (ch === "}") {
+          depth--;
+          if (depth === 0) {
+            var cand = usable(tryParse(text.slice(start, i + 1)));
+            if (cand) return cand;
+            break;
+          }
+        }
+      }
+      start = text.indexOf("{", start + 1);
+    }
+    return null;
+  }
+
   function parseTranslationCoverageResponse(raw, expectedUnits, opts) {
     opts = opts || {};
-    var text = String(raw || "").trim();
-    var fenced = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
-    if (fenced) text = fenced[1].trim();
-    var payload;
-    try { payload = JSON.parse(text); } catch (_) { throw new Error("translation coverage invalid JSON"); }
-    if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error("translation coverage response must be an object");
-    var outerKeys = Object.keys(payload);
-    if (outerKeys.length !== 1 || outerKeys[0] !== "translations" || !Array.isArray(payload.translations)) {
+    var payload = extractJsonObject(raw, "translations");
+    if (!payload) throw new Error("translation coverage invalid JSON");
+    if (typeof payload !== "object" || Array.isArray(payload)) throw new Error("translation coverage response must be an object");
+    // 顶层只要求 translations 存在且是数组。
+    //
+    // 此前要求「顶层恰好只有 translations 一个键」，于是模型顺手带个 usage/notes
+    // 就整块拒绝（约 32 秒字幕全丢）。廉价模型加解释字段是高频行为，而多余的顶层
+    // 字段对承重的覆盖账本没有任何影响 —— 拒绝它纯属自伤。
+    // 真正承重的（数量、unitId 存在性、无重复、无缺口）在下面逐条 fail-closed。
+    if (!Array.isArray(payload.translations)) {
       throw new Error("translation coverage response must contain only translations");
     }
     var expected = (expectedUnits || []).map(function (unit) {
@@ -3025,18 +3108,26 @@
     var translatedById = {};
     payload.translations.forEach(function (item) {
       if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("translation coverage entry invalid");
-      var keys = Object.keys(item).sort();
-      var allowed = { unitId: true, coverFrom: true, coverTo: true, translation: true, text: true, content: true, translatedText: true };
-      for (var ki = 0; ki < keys.length; ki++) if (!allowed[keys[ki]]) throw new Error("translation coverage entry fields invalid");
+      // 未知字段忽略，不拒绝。
+      //
+      // 此前是白名单 + 「出现名单外字段就整块抛错」，于是模型加个 notes/confidence
+      // 就丢掉整块 32 秒字幕。承重的是 unitId 能否对上程序侧账本，多余字段无害。
+      // 弱模型还会把 translation 写成 text/content/translatedText（真实 gpt-5.4-mini
+      // 已见 text），所以译文字段名放宽为别名集合，但必须恰好给一个，避免两套文本。
       var textFields = ["translation", "text", "content", "translatedText"].filter(function (k) { return item[k] != null; });
-      // 弱模型会把字段名 translation 写成 text/content/translatedText（真实 gpt-5.4-mini 已见 text），
-      // 但 unitId 与 coverFrom/coverTo 才是承重 ledger。这里只放宽译文字段名；覆盖范围、数量、
-      // 重复、缺口仍 fail-closed。译文字段必须恰好一个，避免模型同时给两套文本。
-      if (textFields.length !== 1 || item.unitId == null || item.coverFrom == null || item.coverTo == null) throw new Error("translation coverage entry fields invalid");
+      if (textFields.length !== 1 || item.unitId == null) throw new Error("translation coverage entry fields invalid");
       var unitId = String(item.unitId || "");
       var source = expectedById[unitId];
       if (!source || translatedById[unitId]) throw new Error("translation coverage unknown or duplicate unit");
-      if (!Number.isInteger(item.coverFrom) || !Number.isInteger(item.coverTo) || item.coverFrom !== source.tokenStart || item.coverTo !== source.tokenEnd) {
+      // coverFrom/coverTo 不再要求模型回抄 —— 范围由程序侧账本唯一决定（unitId 已编码它）。
+      // 但只要模型主动给了，就必须与账本一致：给错说明它在按自己的理解重新划分覆盖，
+      // 那正是 v0.9.0 要根除的病灶，必须 fail-closed 而不是默默忽略。
+      // 逐字段独立校验：给了哪个就验哪个。不能要求「两个都给」——弱模型只给
+      // coverTo 时本无害（范围仍由账本决定），要求成对会把它误判成 span mismatch。
+      if (item.coverFrom != null && (!Number.isInteger(item.coverFrom) || item.coverFrom !== source.tokenStart)) {
+        throw new Error("translation coverage span mismatch");
+      }
+      if (item.coverTo != null && (!Number.isInteger(item.coverTo) || item.coverTo !== source.tokenEnd)) {
         throw new Error("translation coverage span mismatch");
       }
       // 结构性违规（JSON 形状 / 字段 / unitId / span / 数量 / 缺口重叠）永远 fail-closed——它们是协议漂移。
@@ -3094,12 +3185,25 @@
     var fingerprints = {};
     units.forEach(function (unit) { if (unit.sourceFingerprint) fingerprints[unit.sourceFingerprint] = true; });
     if (Object.keys(fingerprints).length > 1) throw new Error("translation coverage source fingerprint mismatch");
+    // 发给模型的字段只保留「它翻译时真正需要的信息」：哪个单元 + 原文。
+    //
+    // 此前还发了 coverFrom/coverTo、maxVisualWidth、semanticGroupId，实测占 user
+    // payload 的 45.9%，且三者全是冗余：
+    //  - coverFrom/coverTo 已编码在 unitId 尾部（"clip:u0:0-8" → 0-8），程序自己能推；
+    //    让模型回抄反而制造了一整类失败（弱模型抄 12 组数字必错 → span mismatch 整块丢）。
+    //  - maxVisualWidth 全单元恒定，且宽度是显示层职责，不该进翻译请求。
+    //  - semanticGroupId 与单元序号 1:1，不携带分组信息；parser 判断句子是否跨屏延续
+    //    读的是**程序侧** expectedUnits 的该字段，与发不发给模型无关。
+    //
+    // 覆盖账本的承重点是「程序定账本」，不是「模型抄账本」——校验一条不减。
     var sys = buildSystemPrompt(opts.targetLang, opts.systemPrompt) +
-      "\n协议硬约束：只返回 translations JSON；unitId、coverFrom、coverTo 必须逐项原样复制，所有输入单元必须恰好覆盖一次。";
+      "\n协议硬约束：只返回 {\"translations\":[{\"unitId\":\"…\",\"translation\":\"…\"}]}；" +
+      "unitId 必须原样复制，每个输入单元恰好一条，不多不少，不要输出其他字段。";
     var userContent = JSON.stringify({
       sourceFingerprint: Object.keys(fingerprints)[0] || "",
+      maxVisualWidth: units[0] && units[0].maxVisualWidth || TRANSLATION_DISPLAY_MAX_WIDTH,
       units: units.map(function (unit) {
-        return { unitId: unit.unitId, coverFrom: unit.tokenStart, coverTo: unit.tokenEnd, sourceText: unit.sourceText, maxVisualWidth: unit.maxVisualWidth, semanticGroupId: unit.semanticGroupId };
+        return { unitId: unit.unitId, sourceText: unit.sourceText };
       }),
     });
     var content = await chatCompletion({
@@ -3204,7 +3308,9 @@
   // 旧缓存里是不受时长约束的长译文，不升版会继续命中那批读不完的屏）。
   // v8：screens 从字符串改为 {sourceFrom,sourceTo,text} 对象。旧缓存/旧模型输出没有
   // 屏级覆盖范围，程序只能按比例猜配，正是整句重译和屏级错位的根因。
-  var BLOCK_CONTRACT_VERSION = "block-v8";
+  // v9：请求只发 unitId + sourceText（去掉 coverFrom/coverTo/maxVisualWidth/semanticGroupId
+  // 逐单元冗余），响应只要求 unitId + translation。输出形态变了必须升版本作废旧缓存。
+  var BLOCK_CONTRACT_VERSION = "block-v9";
 
   var BLOCK_SEGMENT_MAX_GAP_MS = 750;
   var BLOCK_MIN_DISPLAY_MS = 300;
@@ -5483,6 +5589,7 @@
     preferManualTrack: preferManualTrack,
     translationCoverageUnitsFromCues: translationCoverageUnitsFromCues,
     parseTranslationCoverageResponse: parseTranslationCoverageResponse,
+    extractJsonObject: extractJsonObject,
     DEFAULT_BLOCK_TRANSLATION_PROMPT: DEFAULT_BLOCK_TRANSLATION_PROMPT,
     blockSourceCues: blockSourceCues,
     parseBlockTranslationResponse: parseBlockTranslationResponse,
