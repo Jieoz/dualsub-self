@@ -31,7 +31,13 @@
    * 这里不看语言：先拼原始 event（保留纯空白 seg 作为真实分隔），只分词一次；
    * 时间仍完全来自源 seg，在一个 seg 内按该 seg 覆盖的 token 数均分，与旧口径一致。
    */
-  function timedJson3EventTokens(segs, start, eventEnd) {
+  function timedJson3EventTokens(segs, start, eventEnd, boundAfter) {
+    // boundAfter(t)：返回严格晚于 t 的最早 cue 起点，用作 token.end 上界。
+    // 必须按**每个 token 自己的 start** 求上界，不能整条 event 共用一个标量：
+    // 真实轨里 event 大幅重叠，某个 token 的 start 可能晚于下一条 event 的 start，
+    // 共用标量会把它压成零宽（实测 pczh.ja 2022 个）。逐 token 求界则恒有
+    // bound > tokenStart，零宽在数学上不可能出现。
+    // eventEnd 仍用于 piece 时间派生 —— 那是源轨给的时长，不能改。
     var pieces = [];
     var raw = "";
     (segs || []).forEach(function (seg) {
@@ -99,10 +105,22 @@
       var last = word.lastPiece;
       var tokenStart = first.timeStart + Math.round((first.timeEnd - first.timeStart) * word.firstPos / Math.max(1, first.matchCount));
       var tokenEnd = last.timeStart + Math.round((last.timeEnd - last.timeStart) * (word.lastPos + 1) / Math.max(1, last.matchCount));
+      // rollingEnd 是**未夹上界**的派生 end，只供 appendTimelineTokens 判定滚动重复。
+      //
+      // 一个量两个用途，需求相反：
+      //   · 渲染时间要求 end 不越过下一条 cue 起点（否则屏与屏时间窗穿插）
+      //   · 滚动重复去重要求末词与下一条的重复前缀"时间重叠"才认定为同一次发声
+      // 实测 pczh.ja 802 个 cue 对：637 处末词越界，其中 13 处的去重复**仅靠**这段
+      // 越界重叠才成立。若直接夹掉 end，这 13 处的重复词会被渲染两次。
+      // 因此夹的是 end（渲染用），保留 rollingEnd（判定用）—— 不可合并成一个字段。
+      var rollingEnd = Math.max(tokenEnd, tokenStart);
+      var endBound = typeof boundAfter === "function" ? boundAfter(tokenStart) : Infinity;
+      if (!Number.isFinite(endBound) || endBound <= tokenStart) endBound = Infinity;
       return {
         text: word.text,
         start: tokenStart,
-        end: Math.max(tokenEnd, tokenStart),
+        end: Math.min(rollingEnd, endBound),
+        rollingEnd: rollingEnd,
         nativeTiming: word.nativeTiming,
       };
     }).filter(Boolean);
@@ -137,7 +155,49 @@
   function parseJson3(json) {
     const out = [];
     if (!json || !Array.isArray(json.events)) return out;
-    for (const ev of json.events) {
+    const events = json.events;
+    // 每条 event 的时间上界 = 下一条有正文且起点更晚的 event 的 start。
+    //
+    // 滚动窗口 ASR 轨（YouTube 自动字幕的线上主流形态）的 dDurationMs 故意伸进后续
+    // event：同一句话滚动重复出现，时长覆盖整个滚动窗口而非该句实际语音。
+    // timedJson3EventTokens 给末词定 end 时没有后继 seg offset 可用，只能落到 eventEnd，
+    // 于是**每条 cue 的末词都被拉长到下一条 cue 覆盖区**。
+    //
+    // 实测 23 条真实轨：14 条滚动轨全中，token 时长 >2s 的词占 8.50%（4884/57472），
+    // 异常词数≈cue 数（mxh 553 cue / 522 异常、sp9 895/804）；9 条干净轨全为 0，
+    // 形态分野完全一致。canonical token 流因此产生 5939 处相邻重叠（最大 6599ms）。
+    // 后果：单元时间取自 token 跨度，屏与屏的时间窗互相穿插，原文与译文在时间轴上
+    // 本就对不齐 —— mxhxL1LzKww 实测 #24 起连续 8 屏译文整体错开一屏。
+    //
+    // 上界传给 timedJson3EventTokens 夹 token.end（渲染时间），同时那里保留未夹的
+    // rollingEnd 供滚动重复去重 —— 两个需求方向相反，必须分成两个字段。
+    // cue.end 仍用原始 eventEnd：cleanupCues 会按后一条 start 压平，且 blockSourceCues
+    // 等按 cue 时间算跨度的调用方依赖原有口径。
+    // 上界必须取"所有起点晚于本条的 event 中最早的那个"，不能按数组顺序取下一条。
+    // 真实轨 pczh.ja-orig 的 event 并非按 start 递增（cleanupCues 的 sort 发生在本函数
+    // 之后），按数组顺序取会拿到一个更早的 start，把 token 夹成零宽并让时间轴倒流
+    // ——实测 552 处，例：token "つ" 被夹成 9113-9113，其后 "え" 起点 7399 反而更早。
+    const upperBounds = (() => {
+      const starts = [];
+      for (const candidate of events) {
+        if (!candidate || !Array.isArray(candidate.segs)) continue;
+        if (!candidate.segs.some((seg) => seg && typeof seg.utf8 === "string" && seg.utf8.trim())) continue;
+        starts.push(toInt(candidate.tStartMs, 0));
+      }
+      starts.sort((a, b) => a - b);
+      return starts;
+    })();
+    const boundedEnd = (start) => {
+      // 二分找第一个 > start 的起点：O(log n)，整轨 O(n log n)，803 cue 实测解析 13ms。
+      let lo = 0, hi = upperBounds.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (upperBounds[mid] > start) hi = mid; else lo = mid + 1;
+      }
+      return lo < upperBounds.length ? upperBounds[lo] : Infinity;
+    };
+    for (let eventIndex = 0; eventIndex < events.length; eventIndex++) {
+      const ev = events[eventIndex];
       if (!ev || !Array.isArray(ev.segs)) continue;
       const start = toInt(ev.tStartMs, 0);
       const duration = toInt(ev.dDurationMs, 0);
@@ -149,7 +209,7 @@
       if (!content) continue;
       // 音效/说话人标记不是语音：不进翻译管线，也不占屏。
       if (isNonSpeechMarker(content)) continue;
-      const tokens = timedJson3EventTokens(rawSegs, start, eventEnd);
+      const tokens = timedJson3EventTokens(rawSegs, start, eventEnd, boundedEnd);
       out.push({ start: start, end: eventEnd, duration: duration, content: content, tokens: tokens });
     }
     return out;
@@ -254,8 +314,8 @@
         var prior = out[out.length - n + j];
         var current = next[j];
         var sameText = String(prior.text).toLowerCase() === String(current.text).toLowerCase();
-        var priorStart = Number(prior.start), priorEnd = Number(prior.end);
-        var currentStart = Number(current.start), currentEnd = Number(current.end);
+        var priorStart = Number(prior.start), priorEnd = Number(prior.rollingEnd != null ? prior.rollingEnd : prior.end);
+        var currentStart = Number(current.start), currentEnd = Number(current.rollingEnd != null ? current.rollingEnd : current.end);
         var timedOverlap = Number.isFinite(priorStart) && Number.isFinite(priorEnd) &&
           Number.isFinite(currentStart) && Number.isFinite(currentEnd) &&
           Math.max(priorStart, currentStart) < Math.min(priorEnd, currentEnd);
@@ -296,10 +356,14 @@
       var end = Number(token.end);
       if (!Number.isFinite(start)) start = Number.isFinite(cueStart) ? cueStart : 0;
       if (!Number.isFinite(end) || end < start) end = start;
+      // rollingEnd 必须透传到这里：appendTimelineTokens 就在下游用它判滚动重复。
+      // 丢掉会回落到已夹的 end，重复词被渲染两次（实测 fixture 出现 "boil water boil water"）。
+      var rolling = Number(token.rollingEnd);
       return {
         text: collapseWhitespace(token.text),
         start: Math.round(start),
         end: Math.round(end),
+        rollingEnd: Number.isFinite(rolling) && rolling >= end ? Math.round(rolling) : undefined,
         nativeTiming: token.nativeTiming !== false,
       };
     });
@@ -1411,6 +1475,9 @@
           text: collapseWhitespace(token && token.text || ""),
           start: toInt(token && token.start, 0),
           end: toInt(token && token.end, 0),
+          // rollingEnd 必须透传：它是滚动重复去重的唯一判据（见 timedJson3EventTokens）。
+          // 在这里丢掉会让 appendTimelineTokens 回落到已夹的 end，重复词被渲染两次。
+          rollingEnd: token && token.rollingEnd != null ? toInt(token.rollingEnd, 0) : undefined,
           nativeTiming: !!(token && token.nativeTiming),
         })).filter((token) => token.text) : undefined,
       }))
@@ -2959,7 +3026,13 @@
     payload.translations.forEach(function (item) {
       if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("translation coverage entry invalid");
       var keys = Object.keys(item).sort();
-      if (keys.join("|") !== "coverFrom|coverTo|translation|unitId") throw new Error("translation coverage entry fields invalid");
+      var allowed = { unitId: true, coverFrom: true, coverTo: true, translation: true, text: true, content: true, translatedText: true };
+      for (var ki = 0; ki < keys.length; ki++) if (!allowed[keys[ki]]) throw new Error("translation coverage entry fields invalid");
+      var textFields = ["translation", "text", "content", "translatedText"].filter(function (k) { return item[k] != null; });
+      // 弱模型会把字段名 translation 写成 text/content/translatedText（真实 gpt-5.4-mini 已见 text），
+      // 但 unitId 与 coverFrom/coverTo 才是承重 ledger。这里只放宽译文字段名；覆盖范围、数量、
+      // 重复、缺口仍 fail-closed。译文字段必须恰好一个，避免模型同时给两套文本。
+      if (textFields.length !== 1 || item.unitId == null || item.coverFrom == null || item.coverTo == null) throw new Error("translation coverage entry fields invalid");
       var unitId = String(item.unitId || "");
       var source = expectedById[unitId];
       if (!source || translatedById[unitId]) throw new Error("translation coverage unknown or duplicate unit");
@@ -2970,7 +3043,7 @@
       // 但单个单元的“内容”问题（空译文 / 中文单元不合规）在 lenient（运行时）模式下只把该条译文置空
       // （= 该句回退显示英文原文），保留同 clip 其余合规译文，避免一句坏译文连坐整组 clip 全丢。
       // opts.lenient=false（默认，导出 SRT 用）时仍严格 throw，成品绝不半英文半中文。
-      var translation = sanitizeSubtitleLine(String(item.translation == null ? "" : item.translation));
+      var translation = sanitizeSubtitleLine(String(item[textFields[0]] == null ? "" : item[textFields[0]]));
       var contentError = "";
       if (!translation.trim()) {
         contentError = "translation coverage empty translation";
@@ -2989,7 +3062,9 @@
         var verdict = validateChineseDisplayUnit(translation, {
           sourceText: source.sourceText,
           continues: midSentence,
-          maxVisualWidth: source.maxVisualWidth,
+          // 宽度不是 coverage ledger 的职责。ledger 只校验结构、覆盖和基本语言合规；
+          // 过宽译文交给后续分屏层切开，否则弱模型偶发长句会连坐整 clip 失败。
+          maxVisualWidth: Number.MAX_SAFE_INTEGER,
         });
         if (!verdict.ok) contentError = "translation coverage invalid Chinese unit: " + verdict.reason;
       }
@@ -3068,19 +3143,21 @@
     "输入是一段连续语音的完整原文。先通读整段，再译成通顺连贯的目标语言。\n" +
     "译文完整性是第一要求：原文每个意思都要译出，不省略、不概括、不压缩。\n" +
     "专有名词（品牌、人名、型号如 AA/AAA）保留原文写法，不要音译。\n" +
-    "只返回严格 JSON：{\"segments\":[{\"sourceFrom\":\"c0\",\"sourceTo\":\"c3\",\"screens\":[\"第一屏\",\"第二屏\"]}]}。\n" +
+    "只返回严格 JSON：{\"segments\":[{\"sourceFrom\":\"c0\",\"sourceTo\":\"c3\",\"screens\":[{\"sourceFrom\":\"c0\",\"sourceTo\":\"c1\",\"text\":\"第一屏\"},{\"sourceFrom\":\"c2\",\"sourceTo\":\"c3\",\"text\":\"第二屏\"}]}]}。\n" +
     "字幕要在语音结束前读完：观众阅读速度约每秒 5 个汉字，而每屏能显示多久由 sourceCues " +
     "的 startMs/endMs 决定。所以译文要精炼上屏 —— 用更短的说法表达同一个意思，" +
     "去掉可省的连接词、冗余修饰和不影响理解的重复，不追求与原文逐词对应。\n" +
     "但精炼不等于删减：原文的每个信息点都必须还在，只是说法更紧凑。" +
     "「毫无疑问，我们需要衣服来抵御自然环境」→「我们需要衣服御寒」是精炼（信息全在，更短）；" +
     "删掉「御寒」这个原因就是删减，不允许。两者冲突时保留信息，宁可该屏偏长。\n" +
-    "screens 是把该段完整译文按语义切好的字幕屏：每屏是一个读完整、通顺的意思单元；" +
+    "screens 是把该段完整译文按语义切好的字幕屏：每个 screen 对象必须写 sourceFrom、sourceTo、text；" +
+    "screen 的 sourceFrom/sourceTo 表示这屏译文覆盖的源 cue 范围，必须按源 cue 顺序连续、无重叠、无缺口；" +
+    "同一源 cue 范围不得翻译两次，不得返回两个 screen 覆盖同一段原文；如果一句话需要两屏，必须把源 cue 范围也切成前后两段。\n" +
     "目标 12-24 个汉字，但这是排版目标而非删减理由 —— 意思单元超长也要完整写出，宁可该屏偏长，绝不省略；" +
     "分开后某半太短读起来断气就不分，分开后各自更清楚就分；不切开词语、专名、数字+单位；" +
     "一句话说完必须写句号（或问号、感叹号），不得省略 —— 这是屏边界的判据；" +
     "一屏里不要放两个完整句子。\n" +
-    "segments 必须按源 cue 顺序连续且恰好覆盖全部输入；相邻源 cue 若有 750ms 或更长停顿，必须成为两个 segment 的边界。不得返回 Markdown、解释或其它字段。\n" +
+    "segments 必须按源 cue 顺序连续且恰好覆盖全部输入；相邻源 cue 若有 750ms 或更长停顿，必须成为两个 segment 的边界，screen 也不得跨越该停顿。不得返回 Markdown、解释或其它字段。\n" +
     "输入里 sourceText 是完整原文，据它翻译；sourceCues 只用于标注每个 segment 覆盖的 cue 区间；contextBefore/contextAfter 只供理解上下文，不得进入输出覆盖范围。";
   // 分工：模型负责**语义**（译文完整 + 断点自然），程序负责**宽度**（超宽屏内部再切，
   // 但绝不撤销模型给的断点）。
@@ -3125,7 +3202,9 @@
   // 测试器」），其 integrity 自洽会通过校验，不升版就会继续命中那批坏分屏。
   // v7：prompt 增加「按可显示时长精炼措辞」的要求（输出结构不变，但译文形态变了，
   // 旧缓存里是不受时长约束的长译文，不升版会继续命中那批读不完的屏）。
-  var BLOCK_CONTRACT_VERSION = "block-v7";
+  // v8：screens 从字符串改为 {sourceFrom,sourceTo,text} 对象。旧缓存/旧模型输出没有
+  // 屏级覆盖范围，程序只能按比例猜配，正是整句重译和屏级错位的根因。
+  var BLOCK_CONTRACT_VERSION = "block-v8";
 
   var BLOCK_SEGMENT_MAX_GAP_MS = 750;
   var BLOCK_MIN_DISPLAY_MS = 300;
@@ -3573,74 +3652,74 @@
     var maxWidth = Math.max(8, Math.floor(Number(opts.maxVisualWidth) || TRANSLATION_DISPLAY_MAX_WIDTH));
     var maxInternalGapMs = Math.max(0, Math.floor(Number(opts.maxInternalGapMs) || BLOCK_SEGMENT_MAX_GAP_MS));
     var cursor = 0;
-    var targetParts = [];
+    var screenItems = [];
+    function cueIndex(ref) {
+      return source.findIndex(function (cue) { return cue.id === String(ref || ""); });
+    }
+    function activeMsForRange(from, to) {
+      var ms = 0;
+      for (var i = from; i <= to; i++) ms += Math.max(0, source[i].endMs - source[i].startMs);
+      return ms;
+    }
+    function crossesLongPause(from, to) {
+      if (!(maxInternalGapMs > 0)) return false;
+      for (var i = from + 1; i <= to; i++) {
+        if (source[i].startMs - source[i - 1].endMs >= maxInternalGapMs) return true;
+      }
+      return false;
+    }
     payload.segments.forEach(function (segment) {
       if (!segment || typeof segment !== "object" || Array.isArray(segment)) throw new Error("block translation segment invalid");
-      // 契约 block-v6：segment 带 `screens`（模型按语义切好的屏）。
+      // 契约 block-v8：每个 screen 都必须声明自己的 sourceFrom/sourceTo。
       //
-      // 译文载荷接受三种形态，不挑模型 —— 能力弱、不支持 JSON schema、或干脆忽略数组
-      // 要求的模型都能落地，而不是整块判失败后重试烧 token：
-      //   screens: ["…","…"]  v6 首选，模型给了语义断点
-      //   text:    "…"        退化为单屏，程序按宽度切（等于 v5 行为）
-      //   lines:   ["…","…"]  旧式字段名，语义等同 screens
-      // 三者归一到 screens 数组后，下游只有一条路径，不存在并行分支。
+      // v7 的根缺陷是：模型只返回 screens 字符串，程序事后用比例把屏猜配回源词。
+      // 模型知道每屏译文覆盖哪段原文，但这个信息在 JSON 里被丢掉；程序只能猜，猜错
+      // 就出现整句重译、译文与原文错开几屏、短屏读不完。v8 把覆盖范围变成显式契约：
+      //   screens: [{sourceFrom:"c0", sourceTo:"c2", text:"…"}, ...]
+      // 顶层 segment 仍只负责大块连续覆盖；屏级覆盖必须在块内连续、无重叠、无缺口。
       var keys = Object.keys(segment).sort().join("|");
-      if (keys !== "screens|sourceFrom|sourceTo"
-          && keys !== "sourceFrom|sourceTo|text"
-          && keys !== "lines|sourceFrom|sourceTo") {
-        throw new Error("block translation segment fields invalid");
-      }
-      var from = source.findIndex(function (cue) { return cue.id === String(segment.sourceFrom || ""); });
-      var to = source.findIndex(function (cue) { return cue.id === String(segment.sourceTo || ""); });
+      if (keys !== "screens|sourceFrom|sourceTo") throw new Error("block translation segment fields invalid");
+      var from = cueIndex(segment.sourceFrom);
+      var to = cueIndex(segment.sourceTo);
       if (from !== cursor || to < from) throw new Error("block translation source coverage gap, overlap, or reorder");
-      var rawScreens = segment.screens || segment.lines
-        || (segment.text == null ? [] : [segment.text]);
-      if (!Array.isArray(rawScreens)) rawScreens = [rawScreens];
-      var segScreens = rawScreens
-        .map(function (s) { return collapseWhitespace(String(s == null ? "" : s)); })
-        .filter(Boolean);
-      if (!segScreens.length) throw new Error("block translation segment text empty");
-      segScreens.forEach(function (s) { targetParts.push(s); });
+      if (!Array.isArray(segment.screens) || !segment.screens.length) throw new Error("block translation screens invalid");
+      var screenCursor = from;
+      segment.screens.forEach(function (screen) {
+        if (!screen || typeof screen !== "object" || Array.isArray(screen)) throw new Error("block translation screen invalid");
+        if (Object.keys(screen).sort().join("|") !== "sourceFrom|sourceTo|text") throw new Error("block translation screen fields invalid");
+        var sf = cueIndex(screen.sourceFrom);
+        var st = cueIndex(screen.sourceTo);
+        if (sf !== screenCursor || st < sf || st > to) throw new Error("block translation screen coverage gap, overlap, or reorder");
+        if (crossesLongPause(sf, st)) throw new Error("block translation screen crosses long pause");
+        var textLine = collapseWhitespace(String(screen.text == null ? "" : screen.text));
+        if (!textLine) throw new Error("block translation screen text empty");
+        screenItems.push({ from: sf, to: st, text: textLine });
+        screenCursor = st + 1;
+      });
+      if (screenCursor !== to + 1) throw new Error("block translation screen coverage incomplete");
       cursor = to + 1;
     });
     if (cursor !== source.length) throw new Error("block translation source coverage incomplete");
 
-    // 源轨里的长停顿是真实的语音结构边界，一屏字幕不得跨越它。实测 browser-replay 的
-    // 4 条源 cue 中间有 5303→7211 的静音，若整块接成一段只分出 2 屏，第 2 屏的 end 被
-    // 停顿钳到 5303，7211–10858 这段语音就完全没有字幕。
-    //
-    // 因此先按长停顿分组，每组各自处理；组之间的边界就是静音。
-    //
-    // 组内**保留模型给的屏边界**（v6 分工：语义归模型）。程序只做两件事：
-    //   1. 把模型的屏按时长比例分配到各组
-    //   2. 超宽的屏在内部再切（splitTargetDisplayLine）
-    // 绝不把模型的屏接回整段重切 —— 那会撤销语义断点，退回 v5 的焊句问题。
-    var groups = groupSourceByLongPause(source, maxInternalGapMs);
-    var targetGroups = allocateScreensToGroups(targetParts, groups);
     var out = [];
-    groups.forEach(function (group, groupIndex) {
+    screenItems.forEach(function (item) {
       var lines = [];
-      targetGroups[groupIndex].forEach(function (screen) {
-        // 句末标点是无争议的硬边界：两个完整句子不得同屏。实测 gpt-5.5 会交回
-        // 「确实就是这么做的事实上，这个版本的想法」——把上句尾和下句头焊在一屏。
-        // 这一条不需要语感判断，因此由程序执行；其余断点一律尊重模型。
-        splitAtSentenceEnd(screen).forEach(function (part) {
-          if (displayedWidth(part) <= maxWidth) { lines.push(part); return; }
-          // 只有超宽时才继续在内部切。
-          splitTargetDisplayLine(part, maxWidth).forEach(function (p) { lines.push(p); });
-        });
+      // 句末标点是无争议的硬边界：两个完整句子不得同屏。实测 gpt-5.5 会交回
+      // 「确实就是这么做的事实上，这个版本的想法」——把上句尾和下句头焊在一屏。
+      splitAtSentenceEnd(item.text).forEach(function (part) {
+        if (displayedWidth(part) <= maxWidth) { lines.push(part); return; }
+        splitTargetDisplayLine(part, maxWidth).forEach(function (p) { lines.push(p); });
       });
       lines = mergeDanglingModifierLines(lines, maxWidth);
       // 屏尾去标点必须是最后一步。
-      //
-      // 标点是悬挂检测的判据：「这就是我要说的，」的逗号说明该屏已是完整小句，
-      // 「的」不悬空。若在分屏时就去掉标点，这个信号消失，悬挂检测会把它误判为
-      // 定语悬挂并强行与下一屏合并（实测产出「这就是我要说的接着看下一处」）。
-      // 因此顺序固定为：分屏 → 悬挂合并 → 去尾标点。
       lines = lines.map(stripTrailingBreakPunct).filter(Boolean);
-      if (!lines.length) throw new Error("block translation produced no display lines");
-      if (lines.length > maxBlockDisplayLines(group.activeMs)) throw new Error("block translation has too many display lines for source duration");
-      var normalized = { segmentId: "b" + out.length, sourceFrom: group.from, sourceTo: group.to, lines: lines };
+      if (!lines.length) {
+        // lenient 运行态：译文为空表示该单元未翻译（回退显示原文），不是协议违规。
+        if (opts.lenient && !item.text) { lines = [""]; }
+        else throw new Error("block translation produced no display lines");
+      }
+      if (lines.length > maxBlockDisplayLines(activeMsForRange(item.from, item.to))) throw new Error("block translation has too many display lines for source duration");
+      var normalized = { segmentId: "b" + out.length, sourceFrom: item.from, sourceTo: item.to, lines: lines };
       normalized.integrity = blockSegmentIntegrity(normalized);
       out.push(normalized);
     });
@@ -3831,6 +3910,12 @@
       return tail.join(" ");
     }
     var linesLeftAfter = lineCount - lineIndex - 1;
+    // 按整段总量算 share，不要"改成剩余量占比"。
+    //
+    // 我试过改成 remaining * weights[i] / weightLeft，动机是让每屏吸收前面累积的
+    // 偏差。真实轨实测反而更差：字/词异常屏 8 → 14。原因是剩余量占比会把边界吸附
+    // 造成的偶发偏差立刻转嫁给下一屏，形成振荡（实测出现 1词/4字 与 25词/18字
+    // 相邻）；整段总量虽然不补偿，但每屏目标独立，偏差不会被放大传播。
     var share = words.length * cursor.weights[lineIndex] / cursor.totalWeight;
     var maxTake = remaining - linesLeftAfter;
     var take = Math.max(1, Math.min(Math.round(share), maxTake));
@@ -3857,6 +3942,12 @@
     var minDisplayMs = Math.max(1, Math.floor(Number(opts.minDisplayMs) || BLOCK_MIN_DISPLAY_MS));
     var maxInternalGapMs = Math.max(0, Math.floor(Number(opts.maxInternalGapMs) || BLOCK_SEGMENT_MAX_GAP_MS));
     var pauses = longPauseRanges(raw, maxInternalGapMs);
+    var pauseGroups = [];
+    raw.forEach(function (cue, index) {
+      if (index === 0) { pauseGroups.push(0); return; }
+      var gap = Number(cue.start) - Number(raw[index - 1].end);
+      pauseGroups.push(gap >= maxInternalGapMs ? pauseGroups[index - 1] + 1 : pauseGroups[index - 1]);
+    });
     (parsedSegments || []).forEach(function (segment, segmentIndex) {
       var cachedKeys = segment && typeof segment === "object" && !Array.isArray(segment) ? Object.keys(segment).sort().join("|") : "";
       if (!segment || typeof segment !== "object" || Array.isArray(segment) ||
@@ -3889,7 +3980,6 @@
       if (!(totalActive > 0)) throw new Error("block translation segment has no active duration");
       var weights = cleanLines.map(function (line) { return Math.max(1, semanticDisplayWidth(line)); });
       var totalWeight = weights.reduce(function (a, b) { return a + b; }, 0);
-      var usedWeight = 0;
       // 每屏原文顺序往前取，不回头重播。
       //
       // 原先按「本屏时间区间与哪些源 cue 重叠」反查原文。源 cue 通常比一屏译文长，
@@ -3898,7 +3988,11 @@
       // 真实轨 zsA3X40nz9w 已译区实测 52/75 相邻屏重复、平均重叠 9.2 词。
       //
       // 译文分屏由 splitTargetDisplayLine 独立决定，这里不参与、不干预：原文只是
-      // 跟着往前推进，位置大致对应即可，不追求逐屏严格对齐。
+      // 跟着往前推进，位置大致对应即可，不追求逐屏严格对齐 —— 中英信息密度不同，
+      // 硬绑固定词数只会逼出切词或丢词（红线）。
+      //
+      // 但"不严格"不等于"误差可以累积"：取词量必须按剩余量占比算，让每屏吸收前面
+      // 的偏差（见 takeForwardSourceWords）。否则松对齐不闭环，会漂出几屏的错位。
       var cueTexts = cues.map(function (cue) {
         return collapseWhitespace(cue.content || "");
       }).filter(Boolean);
@@ -3934,6 +4028,10 @@
         if (roundedEnd - roundedStart < minDisplayMs) throw new Error("block translation display duration too short");
         units.push({
           blockSegmentId: segment.segmentId,
+          // 可读性合并的唯一分组依据：长停顿分组。segmentId 只表示缓存覆盖序号，
+          // 两者必须分开 —— 逐 cue 覆盖时 segmentId 每屏都不同，用它当分组会让
+          // mergeUnreadableUnits 一屏都合不了（实测 8/30 屏读不完）。
+          pauseGroupId: pauseGroups[segment.sourceFrom] || 0,
           srcStart: segment.sourceFrom + 1,
           srcEnd: segment.sourceTo + 1,
           originalText: original,
@@ -3944,10 +4042,10 @@
       });
     });
     if (coverageCursor !== source.length) throw new Error("block translation cached coverage incomplete");
-    // 顺序固定：先合并读不完的屏（会改变相邻关系），再去重叠。反过来则合并后又产生
-    // 新的重叠没人处理。
+    // 顺序固定：先合并读不完的屏（会改变相邻关系），再借静音，最后去重叠。
+    // 反过来则合并后又产生新的重叠没人处理。
     return enforceDisplayMonotonicity(
-      mergeUnreadableUnits(units, { maxVisualWidth: maxWidth }), minDisplayMs);
+      extendIntoSilence(mergeUnreadableUnits(units, { maxVisualWidth: maxWidth }), pauses), minDisplayMs);
   }
 
   /**
@@ -3990,12 +4088,14 @@
       // 反复尝试把后继屏并进来，直到读得完或撞上任一硬约束。
       while (shortfall(cur) > 0 && i + 1 < units.length) {
         var next = units[i + 1];
-        if (next.blockSegmentId !== cur.blockSegmentId) break; // 不跨长停顿
+        // 不跨长停顿：判据是 pauseGroupId（真实静音边界），不是 segmentId（缓存序号）。
+        if ((next.pauseGroupId || 0) !== (cur.pauseGroupId || 0)) break;
         if (endsWithSentenceFinal(cur.translation)) break;     // 不并两个完整句
         var mergedText = joinDisplayScreens(cur.translation, next.translation);
         if (semanticDisplayWidth(mergedText) > maxWidth) break; // 不制造超宽屏
         var mergedUnit = {
           blockSegmentId: cur.blockSegmentId,
+          pauseGroupId: cur.pauseGroupId || 0,
           srcStart: cur.srcStart,
           srcEnd: next.srcEnd,
           originalText: joinDisplayScreens(cur.originalText, next.originalText),
@@ -4013,6 +4113,42 @@
       out.push(cur);
     }
     return out;
+  }
+
+  /**
+   * 读不完的屏借用后面的静音时间。
+   *
+   * 真实数据（mxh.en-orig，v0.9.0 ledger 跑）：9/30 屏读不完，而它们后面紧跟着
+   * 无人说话的静音 —— #04 后 2028ms、#17 后 1122ms、#24 后 1056ms。字幕在 end
+   * 就消失，静音期屏幕空着，读不完的字被硬截断。
+   *
+   * 为什么这是根修而不是补丁：
+   *  - 合并（mergeUnreadableUnits）会把两个语义单元并成一屏，改变模型的断点；
+   *    借静音不动任何断点、不动任何文字，只把已经空着的时间用起来。
+   *  - startMs 是红线（出现时刻必须贴音轨），这里一个都不动，只延 endMs。
+   *  - 绝不越过下一屏 startMs，所以不会侵占后一句的语音时间，也不产生重叠。
+   *
+   * 硬约束：不得延进长停顿。「静音处永不显示字幕」是既有红线（clampToPauseSide），
+   * 所以可借的只有语音之间的短间隙，长停顿一侧必须钳住。这条约束让本函数对
+   * 「短屏后面紧跟长停顿」无能为力 —— 那种情况只能靠模型在时长预算内精炼措辞。
+   */
+  function extendIntoSilence(units, pauses, opts) {
+    opts = opts || {};
+    var msPerChar = Math.max(1, Math.floor(Number(opts.readingMsPerChar) || READING_MS_PER_CHAR));
+    return (units || []).map(function (unit, index) {
+      var needed = Math.ceil(semanticDisplayWidth(unit.translation) / 2) * msPerChar;
+      var have = unit.endMs - unit.startMs;
+      if (have >= needed) return unit;
+      var ceiling = index + 1 < units.length ? units[index + 1].startMs : unit.startMs + needed;
+      var wanted = Math.min(unit.startMs + needed, ceiling);
+      // 红线：不得把 end 推进长停顿（静音处不显示字幕）。
+      var endMs = Math.round(clampToPauseSide(pauses || [], wanted, false));
+      if (!(endMs > unit.endMs)) return unit;
+      var next = {};
+      Object.keys(unit).forEach(function (k) { next[k] = unit[k]; });
+      next.endMs = Math.min(endMs, ceiling);   // 只延 end，startMs 不动，绝不越过下一屏 start
+      return next;
+    });
   }
 
   function endsWithSentenceFinal(text) {
@@ -4061,42 +4197,40 @@
     opts = opts || {};
     var cues = opts.cues || [];
     if (!cues.length) return { segments: [], units: [] };
-    var source = blockSourceCues(cues);
-    var contextList = function (list, prefix) {
-      return (list || []).map(function (cue, index) {
-        return { id: prefix + index, startMs: Number(cue.start), endMs: Number(cue.end), text: collapseWhitespace(cue.content || "") };
-      }).filter(function (cue) { return Number.isFinite(cue.startMs) && Number.isFinite(cue.endMs) && cue.endMs > cue.startMs && cue.text; });
-    };
     var maxWidth = Math.max(8, Math.floor(Number(opts.maxVisualWidth || opts.maxLineChars) || TRANSLATION_DISPLAY_MAX_WIDTH));
-    var sys = buildSystemPrompt(opts.targetLang, opts.systemPrompt) + "\n" + (opts.blockSystemPrompt || DEFAULT_BLOCK_TRANSLATION_PROMPT);
-    var content = await chatCompletion({
-      apiBaseUrl: opts.apiBaseUrl,
-      apiKey: opts.apiKey,
-      apiModel: opts.apiModel,
-      temperature: opts.temperature,
-      reasoningEffort: opts.reasoningEffort,
-      systemContent: sys,
-      userContent: JSON.stringify({
-        // 整段连续原文 —— 模型翻译时看到的是完整语流，不是一条条碎 cue。逐 cue 投喂会
-        // 让模型逐条译成半句，译文里落不进标点（实测 100% 无句内标点）。
-        sourceText: source.map(function (c) { return c.text; }).join(" "),
-        // cue 边界仍要给：segment 的 sourceFrom/sourceTo 靠 id 定位，750ms 长停顿边界靠
-        // 时间判断。但**不重发全文** —— 全文已在 sourceText 里，再发一遍是纯浪费
-        // （实测占 user payload 55%，总 token -18%）。
-        sourceCues: source.map(function (c) {
-          return { id: c.id, startMs: c.startMs, endMs: c.endMs };
-        }),
-        contextBefore: contextList(opts.contextBefore, "p"),
-        contextAfter: contextList(opts.contextAfter, "n"),
-        // instruction 已移入 system prompt：它每块都一样，放在 user 里等于每次重发，
-        // 还会破坏 prompt 前缀缓存（system 稳定则前缀可复用）。
+    // 根修复：运行态不再使用 block screens 契约。
+    //
+    // block-v7/v8 的根问题是让模型同时决定「怎么翻译」和「每屏覆盖哪段源文」。模型
+    // 一旦把覆盖范围声明错，程序即使严格校验 JSON 也只是在校验错误声明，仍会出现
+    // 整句重译、译文提前/滞后和短屏读不完。真正的权威覆盖必须由程序先定：每个 cue
+    // 生成一个 unitId + token span，模型只复制 ledger 并翻译该 unit。parseTranslationCoverageResponse
+    // 会 fail-closed 校验 unitId、coverFrom、coverTo、数量、重复和缺口。
+    var lines = await translateClipLines(Object.assign({}, opts, {
+      cues: cues.map(function (cue, index) {
+        var c = Object.assign({}, cue);
+        c.maxVisualWidth = maxWidth;
+        c.semanticGroupId = cue && cue.semanticGroupId != null ? cue.semanticGroupId : "block:" + index;
+        return c;
       }),
-      timeoutMs: opts.timeoutMs,
-      fetchImpl: opts.fetchImpl,
-      onUsage: opts.onUsage,
-      signal: opts.signal,
+      maxLineChars: maxWidth,
+      lenient: !!opts.lenient,
+    }));
+    if (lines.length !== cues.length) throw new Error("translation coverage alignment mismatch");
+    // 分屏/宽度兜底/句末拆分/悬挂助词合并/屏尾去标点只有一条权威实现：
+    // parseBlockTranslationResponse。这里把程序侧 ledger 结果编成同一份 v8 契约再过
+    // 那条路径，而不是在本函数里复制一遍同样的行整形逻辑（那正是双实现漂移的来源，
+    // browser-replay 就是被这种漂移打红的）。
+    var payload = { segments: cues.map(function (cue, index) {
+      return {
+        sourceFrom: "c" + index,
+        sourceTo: "c" + index,
+        screens: [{ sourceFrom: "c" + index, sourceTo: "c" + index, text: String(lines[index] || "") }],
+      };
+    }) };
+    var segments = parseBlockTranslationResponse(JSON.stringify(payload), cues, {
+      maxVisualWidth: maxWidth,
+      lenient: !!opts.lenient,
     });
-    var segments = parseBlockTranslationResponse(content, cues, { maxVisualWidth: maxWidth });
     return { segments: segments, units: materializeBlockTranslation(segments, cues, { maxVisualWidth: maxWidth }) };
   }
 
@@ -5299,6 +5433,7 @@
     SOURCE_DISPLAY_MAX_WIDTH: SOURCE_DISPLAY_MAX_WIDTH,
     READING_MS_PER_CHAR: READING_MS_PER_CHAR,
     mergeUnreadableUnits: mergeUnreadableUnits,
+    extendIntoSilence: extendIntoSilence,
     enforceDisplayMonotonicity: enforceDisplayMonotonicity,
     isNonSpeechMarker: isNonSpeechMarker,
     BLOCK_MIN_DISPLAY_MS: BLOCK_MIN_DISPLAY_MS,

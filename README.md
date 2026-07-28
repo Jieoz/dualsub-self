@@ -21,7 +21,19 @@
 
 ## 安装（加载已解压的扩展程序）
 
-当前版本：**v0.8.9**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.8.9) 下载 Chrome MV3 安装包。
+当前版本：**v0.9.0**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.9.0) 下载 Chrome MV3 安装包。
+
+v0.9.0 是一次架构根修，改掉三个互相纠缠的病灶：**译文与原文的屏级错位**、**词级时间越界**、**读不完的屏**。契约升到 `block-v8`（旧缓存整体失效）。
+
+- **对齐不再让模型自报覆盖范围。** 病根是让模型同时负责「怎么翻译」和「每屏覆盖哪段原文」。`block-v7` 只返回译文字符串、程序按比例猜配，猜错就整句重译；改成让模型自报 `sourceFrom/sourceTo` 后（`block-v8` 解析层）真实跑仍然出错——模型会把范围本身填错（实测两屏都译成「至少目前如此」、某屏译文提前覆盖后文内容）。两种都是同一个错。现在覆盖账本由**程序**先定：每个源 cue 生成 `unitId + coverFrom/coverTo`，模型只复制账本并填译文，解析层 fail-closed 校验 unitId 存在、范围原样复制、数量完整、无重复、无缺口。真实跑重译归零。
+- **词级时间夹上界。** 渲染取的是 token 跨度而非 `cue.end`，所以只压 `cue.end` 对带原生 tokens 的 ASR 轨完全无效。修在逐 token 夹上界，`end`（夹后）与 `rollingEnd`（未夹）拆成独立字段。22 条真实轨：异常词 4884 → 166（-96.6%），日语零宽 token 2022 → 0，`startMs` 改动 0 处。
+- **读不完的屏借用后续静音。** 真实数据里那些读不完的屏后面紧跟着大段无人说话的间隙（实测某屏后 2028ms），字幕在 `end` 就消失、静音期屏幕空着白白浪费。现在只延 `endMs`，不动 `startMs`、不越过下一屏、不越进长停顿（静音处不显示字幕这条约束仍然守着）。这比合并干净：不撤销模型的任何断点，也不改一个字。滚动窗口 ASR 轨读不完的屏从 8/30 降到 1/44，且那一条只差 63ms。
+
+顺带清掉一处双实现漂移：`translateContextBlock` 曾自己复制一份分屏/宽度兜底/悬挂助词合并/屏尾去标点，与 `parseBlockTranslationResponse` 并行存在，漂移后 browser-replay 直接打红。现在只有一条权威路径，并加了门禁禁止再复制回来。
+
+真实验证：单测 284、browser-replay 13/13、语义语料 10/10、真实模型 e2e 两条轨（干净轨 + 滚动窗口 ASR 轨）重叠/超宽/未译/切词全 0，真 Chromium + 真模型连续播放 5 分钟有原文时译文覆盖 100%、最长漏译空窗 0s、API 失败 0、JS 错误 0。
+
+已知残留（模型侧偶发，不是回归）：模型偶尔交回不合账本契约的条目（`coverage entry fields invalid` / `empty translation`），由退避重试兜住，live 跑里未影响覆盖率。
 
 v0.8.9 修一个可靠性缺陷：**`failed` 块不再永久放弃**。
 

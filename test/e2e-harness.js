@@ -91,19 +91,15 @@ function loadOriginalCues(limit) {
   }));
 }
 
-/* ---------------- mock 模型：连续源范围返回非 1:1 block segments ---------------- */
+/* ---------------- mock 模型：逐 unit 复制 coverage ledger ---------------- */
 function structuralMockZh(index) { return "完整块译文" + String(index + 1); }
 function makeMockFetch(stats, opts) {
   opts=opts||{};const REASON_MS=opts.reasonMs!=null?opts.reasonMs:20,PER_CHAR_MS=opts.perCharMs!=null?opts.perCharMs:1;
   return function mockFetch(url,fetchOpts){
     const body=JSON.parse(fetchOpts.body),payload=JSON.parse((body.messages[1]&&body.messages[1].content)||"{}");
-    const source=payload.sourceCues||[],segments=[];let from=0;
-    for(let i=1;i<=source.length;i++){
-      const boundary=i===source.length||source[i].startMs-source[i-1].endMs>=750;
-      if(!boundary)continue;
-      segments.push({sourceFrom:source[from].id,sourceTo:source[i-1].id,lines:[structuralMockZh(segments.length)]});from=i;
-    }
-    const content=JSON.stringify({segments}),t0=Date.now(),thinkMs=REASON_MS+content.length*PER_CHAR_MS;
+    const units=payload.units||[];
+    const translations=units.map((u,i)=>({unitId:u.unitId,coverFrom:u.coverFrom,coverTo:u.coverTo,translation:structuralMockZh(i)}));
+    const content=JSON.stringify({translations}),t0=Date.now(),thinkMs=REASON_MS+content.length*PER_CHAR_MS;
     return new Promise(resolve=>setTimeout(()=>{stats.requestMs.push(Date.now()-t0);resolve({ok:true,status:200,json:async()=>({choices:[{message:{content}}]}),text:async()=>""})},thinkMs));
   };
 }
@@ -207,14 +203,20 @@ async function run() {
   const detectorOk = auditSelfTest();
   const audit = auditWordCuts(renderUnits);
   const timelineOk=renderUnits.every((u,i)=>u.originalText&&u.translation&&u.end>u.start&&(!i||u.start>=renderUnits[i-1].end));
-  const nonOneToOne=renderUnits.length!==reseg.length;
+  // coverage ledger 门禁：每个源词必须恰好出现一次、顺序不变。
+  // 不能用「渲染单元数 == 源 cue 数」来判 —— 可读性合并会合法减少屏数，
+  // 而重译/漏译才是要抓的缺陷，判据是原文词序列本身。
+  const wordsOf=(s)=>String(s||"").split(/\s+/).filter(Boolean);
+  const srcWords=reseg.flatMap(c=>wordsOf(c.content));
+  const gotWords=renderUnits.flatMap(u=>wordsOf(u.originalText));
+  const ledgerExact=srcWords.length===gotWords.length&&srcWords.every((w,i)=>w===gotWords[i]);
   const noChineseFullStop=renderUnits.every(u=>!(u.translation||"").includes("。"));
   const cacheOk=stats.cacheRoundTrips===clips.length;
-  console.log("block 非 1:1   :",nonOneToOne?"PASS":"FAIL");
+  console.log("coverage ledger :",ledgerExact?"PASS":"FAIL");
   console.log("时间轴/缓存往返:",timelineOk&&cacheOk?"PASS":"FAIL");
   console.log("中文字幕无句号:",noChineseFullStop?"PASS":"FAIL");
-  if(!detectorOk||!nonOneToOne||!timelineOk||!cacheOk||!noChineseFullStop||(a.real&&!audit.pass))process.exitCode=1;
-  if(!a.real)console.log("说明          : MOCK 验证 block JSON、非 1:1、时间轴与缓存往返；不冒充真实模型语言质量。" );
+  if(!detectorOk||!ledgerExact||!timelineOk||!cacheOk||!noChineseFullStop||(a.real&&!audit.pass))process.exitCode=1;
+  if(!a.real)console.log("说明          : MOCK 验证 coverage ledger、时间轴与缓存往返；不冒充真实模型语言质量。" );
 }
 
 /* ============================== 产物输出 ============================== */
