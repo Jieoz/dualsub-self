@@ -3215,10 +3215,22 @@
   var READING_MS_PER_CHAR = Math.ceil(1000 / 9);
   var BLOCK_MAX_LINES_PER_SEGMENT = 64;
 
+  /**
+   * 一段源时长最多装几屏。
+   *
+   * 这个上限的作用是拦「模型把几十屏塞进一秒语音」，那是协议违规。
+   * 但它一度还会在源时长不足一屏（<300ms）时抛错 —— 那是把**源数据事实**
+   * 当协议违规处理，代价极不对称：逐 cue 覆盖后一个 segment 只覆盖一条 cue，
+   * 于是任何一条 200ms 的短 cue 都会让整块（约 32 秒字幕）翻译失败。
+   * CI 全轨实测 7/50 块因此整块丢字幕，而短 cue 在真实 ASR 轨里完全正常。
+   *
+   * 所以下限恒为 1：短 cue 允许出一屏，读不完由时间层解决（借静音、
+   * 与相邻屏合并）—— 那才是可读性该待的地方。真正的越界（屏数多于时长
+   * 能装下的）仍然 fail-closed。
+   */
   function maxBlockDisplayLines(activeMs) {
     var byTime = Math.floor(Math.max(0, Number(activeMs) || 0) / BLOCK_MIN_DISPLAY_MS);
-    if (byTime < 1) throw new Error("block translation source duration too short for one display line");
-    return Math.min(BLOCK_MAX_LINES_PER_SEGMENT, byTime);
+    return Math.min(BLOCK_MAX_LINES_PER_SEGMENT, Math.max(1, byTime));
   }
 
   /**
@@ -4025,7 +4037,10 @@
         if (!(endMs > startMs)) throw new Error("block translation materialized timing invalid");
         var roundedStart = Math.round(startMs);
         var roundedEnd = Math.round(endMs);
-        if (roundedEnd - roundedStart < minDisplayMs) throw new Error("block translation display duration too short");
+        // 短于最小显示时长不是协议违规，而是源 cue 本身就短（真实 ASR 轨常见）。
+        // 抛错的代价是整块 32 秒字幕全丢（CI 全轨实测 7/50 块），而正确处理是
+        // 给它最小显示时长、后续由 enforceDisplayMonotonicity 保证不侵占下一屏。
+        if (roundedEnd - roundedStart < minDisplayMs) roundedEnd = roundedStart + minDisplayMs;
         units.push({
           blockSegmentId: segment.segmentId,
           // 可读性合并的唯一分组依据：长停顿分组。segmentId 只表示缓存覆盖序号，

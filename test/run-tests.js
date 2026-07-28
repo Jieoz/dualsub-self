@@ -1165,9 +1165,22 @@ test("block translation 锁定连续源范围，并只在目标词法边界兜�
   assert.throws(() => Core.parseBlockTranslationResponse(JSON.stringify({ segments: [
     v8Segment("c0", "c0", "这是一段被刻意写得非常长的译文它会被程序分成很多屏远远超过一秒源语音装得下的屏数因此必须直接拒绝而不是硬塞给观众"),
   ] }), [{ start: 0, end: 1000, content: "short source" }], { maxVisualWidth: 12 }), /too many display lines/);
-  assert.throws(() => Core.parseBlockTranslationResponse(JSON.stringify({ segments: [
+  // 源 cue 短于最小显示时长不是协议违规，而是真实 ASR 轨的常态。抛错的代价极不对称：
+  // 逐 cue 覆盖后一条 200ms 短 cue 会让整块（约 32 秒字幕）翻译失败 —— CI 全轨实测
+  // 7/50 块因此整块丢字幕。短 cue 必须允许出一屏，读不完交给时间层（借静音/合并）。
+  const shortCue = [{ start: 0, end: 299, content: "too short" }];
+  const shortParsed = Core.parseBlockTranslationResponse(JSON.stringify({ segments: [
     v8Segment("c0", "c0", "甲"),
-  ] }), [{ start: 0, end: 299, content: "too short" }]), /duration too short/);
+  ] }), shortCue);
+  assert.deepStrictEqual(shortParsed[0].lines, ["甲"], "短 cue 必须允许出一屏，不得整块失败");
+  const shortUnits = Core.materializeBlockTranslation(shortParsed, shortCue);
+  assert.equal(shortUnits.length, 1, "短 cue 必须物化出屏");
+  assert.equal(shortUnits[0].startMs, 0, "startMs 是红线，短 cue 也不许改");
+  assert.ok(shortUnits[0].endMs - shortUnits[0].startMs >= 300, "短屏必须补足最小显示时长");
+  // 真正的越界仍须 fail-closed：屏数多于源时长装得下的。
+  assert.throws(() => Core.parseBlockTranslationResponse(JSON.stringify({ segments: [
+    v8Segment("c0", "c0", "这是一段被刻意写得非常长的译文它会被程序分成很多屏远远超过这条极短源语音装得下的屏数因此必须拒绝"),
+  ] }), shortCue, { maxVisualWidth: 12 }), /too many display lines/);
   const exactly300 = Core.parseBlockTranslationResponse(JSON.stringify({ segments: [
     v8Segment("c0", "c0", "甲"),
   ] }), [{ start: 0, end: 300, content: "just enough" }]);
