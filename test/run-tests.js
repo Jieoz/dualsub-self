@@ -2084,7 +2084,10 @@ test("人工成品轨的合法重复台词不得被当成滚动重发删除（Ne
   const cases = [
     {
       cues: [{ start: 77077, end: 79579, content: "It works. It works like crazy!" }],
-      mustContain: "It works. It works like crazy!",
+      // 这条断言的承重点是「重复台词不得被删词」，不是「必须挤在同一屏」。
+      // 一屏不放两个完整句子（见 resegmentCues 的 canMerge），所以正解是
+      // 两屏各自完整；重复的 "It works" 两次都在，才是这条回归要守的事。
+      mustEqual: ["It works.", "It works like crazy!"],
       words: 6,
     },
     {
@@ -2107,9 +2110,9 @@ test("人工成品轨的合法重复台词不得被当成滚动重发删除（Ne
     assert.strictEqual(inWords, tc.words, "样本词数应与实测一致");
     assert.strictEqual(outWords, inWords,
       "人工轨重复台词被删：" + JSON.stringify(seg.map((s) => s.content)));
-    if (tc.mustContain) {
-      assert.ok(seg.some((s) => s.content === tc.mustContain),
-        "应原样保留：" + JSON.stringify(seg.map((s) => s.content)));
+    if (tc.mustEqual) {
+      assert.deepStrictEqual(seg.map((s) => s.content), tc.mustEqual,
+        "分屏形态应为逐句独立且不丢词：" + JSON.stringify(seg.map((s) => s.content)));
     }
   });
 });
@@ -2329,26 +2332,65 @@ test("resegment 超过最大词数强制切句", () => {
   assert.ok(seg[0].content.length > 0);
 });
 
-test("resegment minWords：短句(<minWords)后接短句、小间隙 → 黏合成一段", () => {
-  // "ok." 只有 1 词 (< minWords=3)，虽自然结束也不立即切，应与下一条小间隙的短句黏合
+test("短句说完就落屏：小间隙也不与下一句黏成一屏（一屏不放两个完整句）", () => {
+  // 这条曾断言相反行为（"ok." 太短 → 与下一句黏合成 "ok. let us continue."）。
+  // 那个规则是 Jay 报的分屏缺陷的根因：它作用在**已完成的句子**上，等于允许把
+  // 这句的尾巴焊到下一句开头。真实轨 aXTcYa7u12k 上 8/123 屏因此跨句，译文侧
+  // 出现「消失了今天我们要探究」这种谓语被劈开的读法。
+  // 过短屏的正确出口是显示层 mergeUnreadableUnits 向后借时间，不是分段层黏连。
   const frags = Core.cleanupCues([
     { start: 0, end: 800, content: "ok." },
-    { start: 900, end: 2000, content: "let us continue." }, // 间隙 100ms <= 300ms
+    { start: 900, end: 2000, content: "let us continue." }, // 间隙 100ms，仍不黏
   ]);
-  const seg = Core.resegmentCues(frags, { minWords: 3, tailTrimMs: 0 });
-  assert.strictEqual(seg.length, 1, "碎句应黏进相邻句，不单独成段");
-  assert.strictEqual(seg[0].content, "ok. let us continue.");
+  const seg = Core.resegmentCues(frags, { tailTrimMs: 0 });
+  assert.deepStrictEqual(seg.map((s) => s.content), ["ok.", "let us continue."],
+    "完整句必须各自成屏：" + JSON.stringify(seg.map((s) => s.content)));
+  // startMs 红线：分屏不得前移任何屏的起点
   assert.strictEqual(seg[0].start, 0);
-  assert.strictEqual(seg[0].end, 2000, "时间轴取并集");
+  assert.strictEqual(seg[1].start, 900);
 });
 
-test("resegment minWords：短句后接大间隙 → 无法合并，碎句单独成段", () => {
-  // "ok." 太短想黏合，但下一条间隙 4s >> maxGap(300ms)，确实无法再合并 → 各自成段
+test("真实 ASR 轨：一屏不得放两个完整句子（aXTcYa7u12k 分屏回归）", () => {
+  // Jay 报的分屏缺陷。真轨实测 8/123 屏出现「前句仅 1-2 词 + 下一句开头」焊在
+  // 一屏，译文侧读成「消失了今天我们要探究」。根因是 resegmentCues 的 canMerge
+  // 曾对已完成的短句破例放行合并。这里用真轨 fixture 断言该形态归零。
+  const raw = fs.readFileSync(
+    path.join(__dirname, "fixtures", "youtube-axt-sentence-split-raw.json"), "utf8");
+  const cues = Core.cleanupCues(Core.parseSubtitleText(raw));
+  assert.ok(cues.length >= 20, "fixture 应含足够 cue 才能复现，实得 " + cues.length);
+  const seg = Core.resegmentCues(cues, {
+    maxWords: Core.DISPLAY_UNIT_MAX_WORDS,
+    maxVisualWidth: Core.SOURCE_DISPLAY_MAX_WIDTH,
+    continuationMaxWords: Core.SOURCE_UNIT_MAX_WORDS,
+    rollingSource: true,
+  });
+  const crossed = seg.filter((c) => /[.!?]\s+\S/.test(String(c.content || "").trim()))
+    .map((c) => c.content);
+  assert.deepStrictEqual(crossed, [], "一屏放了两个完整句子：" + JSON.stringify(crossed));
+  // 同轨零丢词：分屏不得为了对齐边界吞词
+  const canon = Core.buildCanonicalTokenTimeline(cues).tokens.map((t) => t.text).join(" ");
+  assert.deepStrictEqual(
+    Core.restoredWords(seg.map((c) => c.content).join(" ")),
+    Core.restoredWords(canon), "分屏丢词或改词");
+});
+
+test("句末孤立介词短语必须并回上一屏（不是新句子，勿被分屏规则误切）", () => {
+  // 与上一条互为约束：拒绝「一屏两句」不等于「见句号就切」。这条防止把
+  // canMerge 的修法过度推广到 flush 层——那样会静默废掉这个语法续接。
+  const seg = Core.resegmentCues(Core.cleanupCues([
+    { start: 0, end: 1000, content: "It vanished." },
+    { start: 1100, end: 2200, content: "in the vacuum chamber." },
+  ]), { maxWords: 12, maxVisualWidth: 52, continuationMaxWords: 14, tailTrimMs: 0 });
+  assert.deepStrictEqual(seg.map((c) => c.content), ["It vanished. in the vacuum chamber."],
+    "句末孤立介词短语被切开：" + JSON.stringify(seg.map((c) => c.content)));
+});
+
+test("完整短句后接大间隙 → 各自成段（长停顿同样不得跨屏）", () => {
   const frags = Core.cleanupCues([
     { start: 0, end: 800, content: "ok." },
     { start: 5000, end: 6000, content: "much later text." },
   ]);
-  const seg = Core.resegmentCues(frags, { minWords: 3 });
+  const seg = Core.resegmentCues(frags, {});
   assert.strictEqual(seg.length, 2, "大间隙阻断黏合，碎句单独成段");
   assert.strictEqual(seg[0].content, "ok.");
   assert.strictEqual(seg[1].content, "much later text.");
@@ -2711,21 +2753,25 @@ test("人工成品轨的重复台词：rollingSource=false 保台词，=true 会
   // 取自 Jay 的 Netflix Trollhunters 英文真轨（352 cue）。这里断言的是**显示单元**
   // 层：canonical token 流不做重发去重，所以词数在两种设置下都是 2412；差别体现在
   // resegmentCues 的分屏内容上——误当滚动轨会把上一句替换成下一位说话人的台词。
+  // 去重发只发生在**合并**路径上：两条 piece 要先被判定成同一屏，stripOverlap 才有
+  // 机会删掉重复词。所以样本必须是「句子尚未结束 + 下一 cue 重发尾词」这种真实滚动
+  // 形态。早先的样本每条都自带句末标点，各自独立成屏后根本不进合并，两臂输出全等 ——
+  // 负向断言测不到东西（一屏不放两个完整句子后此缺陷立刻暴露）。
   const cues = [
-    { start: 300, end: 900, content: "Was felled." },
-    { start: 1000, end: 1600, content: "- Felled?" },
-    { start: 1700, end: 2300, content: "- Means killed." },
-    { start: 2400, end: 3000, content: "Turned to stone and smashed." },
+    { start: 300, end: 900, content: "Was felled" },
+    { start: 1000, end: 1600, content: "felled Felled?" },
   ];
   const opts = { maxWords: 12, maxVisualWidth: 52, continuationMaxWords: 14 };
   const good = Core.resegmentCues(cues, Object.assign({ rollingSource: false }, opts));
   const bad = Core.resegmentCues(cues, Object.assign({ rollingSource: true }, opts));
   const goodText = good.map((c) => c.content).join(" | ");
   const badText = bad.map((c) => c.content).join(" | ");
-  // 正向：人工轨必须保住 "Felled?" 这句独立台词
-  assert.ok(/Felled\?/.test(goodText), "人工轨丢了台词: " + goodText);
-  // 负向：滚动设置下该台词会被吞掉 —— 证明这个开关确实是承重的，不是装饰
-  assert.ok(!/Felled\?/.test(badText), "负向用例失效：滚动设置没有吞词，门禁不再承重");
+  // 正向：人工轨里重复的 "felled" 是两位说话人的真台词，一个都不能少
+  assert.strictEqual(good.reduce((n, c) => n + Core.restoredWords(c.content).length, 0), 4,
+    "人工轨丢了台词: " + goodText);
+  // 负向：误当滚动轨会把重发的那个词删掉 —— 证明这个开关确实承重，不是装饰
+  assert.strictEqual(bad.reduce((n, c) => n + Core.restoredWords(c.content).length, 0), 3,
+    "负向用例失效：滚动设置没有吞词，门禁不再承重: " + badText);
   assert.notStrictEqual(goodText, badText);
 });
 

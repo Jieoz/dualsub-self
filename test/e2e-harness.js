@@ -195,6 +195,15 @@ async function run() {
     stats.clipMs.push(Date.now()-ct0);
   }
   stats.cacheRoundTrips=cacheRoundTrips;
+  // 生产链路的最后一步：整条时间线汇合后统一去重叠（isolated.js rebuildRenderTimeline）。
+  // translateContextBlock 的去重叠只看得见**单个 clip**，跨 clip 边界没人管；一个句子
+  // 被分到两个 clip 时，两半各自按源 cue 跨度算时间，天然会交叉。少了这一步，harness
+  // 会把「生产层已经兜住的形态」报成缺陷 —— 比漏报更坏。
+  // 只截 end、不动 start（startMs 红线）。
+  renderUnits.sort((a,b)=>a.start-b.start||a.end-b.end);
+  Core.enforceDisplayMonotonicity(renderUnits, Core.BLOCK_MIN_DISPLAY_MS, {
+    startKey:"start", endKey:"end",
+  });
   stats.totalMs = Date.now() - t0;
 
   writeOutputs(renderUnits, stats, a, mode);

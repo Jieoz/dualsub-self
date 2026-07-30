@@ -1780,7 +1780,12 @@
     var hasExplicitContinuationMaxWords = opts.continuationMaxWords != null;
     var continuationMaxWords = hasExplicitContinuationMaxWords
       ? Math.max(maxWords, Math.floor(Number(opts.continuationMaxWords) || maxWords)) : null;
-    var minWords = opts.minWords != null ? opts.minWords : 3;
+    // 完整句短于这个词数时先不落屏，留一轮给 orphanPrepMerge 判断下一条是不是
+    // 「句末孤立介词短语」（It vanished. + in the vacuum chamber.）——那不是新句子。
+    // 它**只**推迟落屏时机，不授权跨句合并：一屏两句由 canMerge 单点拒绝。
+    // 取 3 而不是别的数：介词短语续接的语义前提是主句本身很短、信息不完整；
+    // 3 词以上的完整句已能独立成屏，不需要靠后续短语补足。
+    var SENTENCE_FLUSH_MIN_WORDS = opts.minWords != null ? opts.minWords : 3;
     var longPauseMs = opts.longPauseMs != null ? opts.longPauseMs : 700;
     var grammarContinuationMaxGapMs = opts.grammarContinuationMaxGapMs != null
       ? opts.grammarContinuationMaxGapMs : 2200;
@@ -1997,7 +2002,12 @@
         var orphanPrepMerge = ended && startsOrphanPrepositionalPhrase(words) &&
           gap < grammarContinuationMaxGapMs && wouldWords <= orphanCap &&
           wouldDur <= grammarContinuationMaxDurationMs;
-        var canMerge = !ended || cur.words.length < minWords || orphanPrepMerge;
+        // ended 的单元不会走到这里：完整句在上一轮循环末尾就被 flush 了（见下方
+        // `if (endedNow)`）。这里只剩「句子未结束」和 orphanPrepMerge（句号后紧跟
+        // 孤立介词短语，本身不是新句子）两种情况。
+        // 不要在这里再加一条「短句可破例合并」——那会与 flush 形成两套判据，正是
+        // Jay 报的跨句分屏缺陷的来源。
+        var canMerge = !ended || orphanPrepMerge;
         var normalMerge = gap < longPauseMs && wouldWords <= effMaxWords && wouldDur <= maxDur;
         var continuationCap = hasExplicitContinuationMaxWords
           ? continuationMaxWords
@@ -2037,7 +2047,12 @@
 
       var curWords = cur.words.length;
       var endedNow = SENTENCE_END_RE.test(cur.words.join(" "));
-      if (endedNow && curWords >= minWords) {
+      // 这里**不能**改成 `if (endedNow)` 无条件落屏。看着更干净，但会让下一轮的
+      // `ended` 恒为 false，从而静默废掉 orphanPrepMerge：「It vanished.」+
+      // 「in the vacuum chamber.」这种句末孤立介词短语再也并不回去（实测由
+      // 一屏变两屏）。那个短语不是新句子，属于同一屏的语法续接。
+      // 一屏不放两个完整句子这条规则由 canMerge 单点负责（见上），不在这里重复实现。
+      if (endedNow && curWords >= SENTENCE_FLUSH_MIN_WORDS) {
         flush();
       } else if (!cur.fragmentChain && !hasEnglishContinuationTail(cur.words) &&
         (curWords >= tokenCapFor(cur.words, maxWords) || cur.end - cur.start >= maxDur)) {
