@@ -22,7 +22,16 @@
 
 ## 安装（加载已解压的扩展程序）
 
-当前版本：**v0.9.3**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.9.3) 下载 Chrome MV3 安装包。
+当前版本：**v0.9.4**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.9.4) 下载 Chrome MV3 安装包。
+
+v0.9.4 修掉**一屏里塞进两个完整句子**的分屏缺陷——它让译文读起来是断裂的。
+
+- **根因：已结句的单元被「太短」这条例外放行合并。** `resegmentCues` 的合并判据写作 `!ended || cur.words.length < minWords || orphanPrepMerge`，其中 `ended` 表示这个单元已经说完一句话，却被 `< 3 词` 盖掉。于是只剩 1-2 词的句子尾巴被焊到下一句开头。真轨 `aXTcYa7u12k` 实测 **8/123 屏**跨句，形如 `the splash disappears. Today, we're going to`，译文侧读成 `消失了今天我们要探究`。删掉这条例外后：一屏两句 **8 → 0**，句中断屏 36.6% → 34.4%，词数 1136 → 1136（零丢词、词序逐词一致），`startMs` 一个未动。
+- **一屏两句只由一个地方负责。** 改法没有推广到 flush 层：把落屏条件改成「结句就落屏」看着更干净，但会让下一轮的 `ended` 恒为 false，**静默废掉 `orphanPrepMerge`** —— `It vanished.` + `in the vacuum chamber.` 这种句末孤立介词短语再也并不回去（实测由一屏变两屏），而那个短语不是新句子，属于同一屏的语法续接。所以 `canMerge` 是唯一判据，原 `minWords` 更名 `SENTENCE_FLUSH_MIN_WORDS` 并注明它只推迟落屏时机、不授权跨句合并。
+- **修掉一条已经失效的旧门禁。** `rollingSource` 的负向断言样本每条自带句末标点，各自独立成屏后根本进不了合并路径，两臂输出完全相同 —— 断言在空转。换成「句子未结束 + 下一条重发尾词」的真滚动形态后才真正承重。
+- **门禁双向验证**：回退 `canMerge` 修复 → 3 红（含真轨 fixture 断言）；把修法推广到 flush → 1 红（介词短语断言抓住）。
+
+- **e2e harness 补齐生产链路最后一步（诊断保真度）。** harness 把 `translateContextBlock` 的单元直接当渲染结果，漏了 `enforceDisplayMonotonicity`；而生产的 `rebuildRenderTimeline` 一定会调它，因为一个句子被切到两个 clip 时，两半各按自己的源 cue 跨度算时间，交叉是预期形态。少了这一步，harness 会把**生产层已经兜住的形态报成缺陷** —— 比漏报更危险。只截 `end`、不动 `start`。
 
 v0.9.3 **新增 Netflix 支持**，并修掉一个由此暴露出来的、同样影响用户上传字幕轨的丢词缺陷。
 
