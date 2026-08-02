@@ -1671,6 +1671,32 @@
    */
   function onRenderTick() {
     if (!config.enabled || !state.renderer || !state.renderUnits.length) return;
+
+    // SPA 换片自检：URL 的 videoId 一变，上一部片的渲染立刻作废。
+    //
+    // 不能等新 manifest 到达再清 —— manifest 由 main.js 3 秒轮询产出，且要过
+    // 「播放器就绪 / 已开播 / 轨道挂上 / pot 签名齐备」四道关，慢时远超一轮。
+    // 这段窗口里 renderUnits 还是上一部片的，字幕就挂在新片画面上。
+    // browser-replay 的 spa-switch-stale 场景复现了它：去掉本段后，切换 URL
+    // 900ms 之后仍有 9 帧上一部片的双语字幕留在新片上。
+    // main.js 的 checkRoute 只清它自己的 lastSignature，管不到本层渲染。
+    //
+    // 放在渲染 tick 里而不是另起定时器：这个 tick 本来就在跑（250ms 兜底 +
+    // 帧回调），且上面那行 `!state.renderUnits.length` 已经把「无字幕可残留」
+    // 的情况挡在门外 —— 正是不需要检查的时候它才不检查。另起 setInterval 会
+    // 在没有字幕、甚至没在看视频时也持续唤醒页面，低配设备上是白烧电。
+    // 判据取 location.href 而非 MAIN world 传来的值：换片这件事页面 URL 自己
+    // 就是权威信号。YouTube 与 Netflix 共用 Core.pageVideoId 的站点适配表。
+    var pageId = currentPageVideoId();
+    if (pageId && state.videoId && pageId !== state.videoId) {
+      // 清空 videoId 与轨道身份，让随后到达的 manifest 走 changedVideo 分支，
+      // 避免新旧 id 相同时（同片重进）漏掉轨道身份重锁。
+      state.videoId = null;
+      state.manifestIdentity = null;
+      resetForNewVideo();
+      return;
+    }
+
     if (state.seeking) return; // 拖动中不渲染，停稳后统一刷
     // 渲染器被播放器重建踢出 DOM（全屏/影院/SPA）→ 重挂（isConnected 是 O(1)）
     if (!state.renderer.isConnected) {
@@ -1905,7 +1931,20 @@
           if (track) {
             switchTrack(track); // 单一 transition：先取消旧轨，再加载新轨
           } else {
-            // 没轨道也要把循环按当前状态接起来
+            // 选不到轨（无此语言，或源轨是中文 → 本扩展不介入）。必须走
+            // 和 onManifest 无可用轨分支同一条清理路径：bindVideo() 只重绑
+            // 播放循环，不清 renderUnits、不摘 dualsub-hide-native-captions，
+            // 于是上一条轨的字幕会一直挂在画面上，同时原生字幕仍被隐藏 ——
+            // 用户从英文切到中文源就会两头都没有正确字幕。
+            // 顺序：先 reset 再 bindVideo。reset 里的 clearRenderer() 会把
+            // state.renderer 置 null，而 bindVideo 不依赖 renderer 存在 ——
+            // 它只绑 <video> 事件并 syncLoops()，其中 onRenderTick 首行
+            // `!state.renderer` 早返回、setRendererText 首行 `if (!r) return`。
+            // renderer 保持 null 正是本扩展「不介入」的状态：
+            // updateNativeCaptionVisibility 见 !state.renderer 就摘掉
+            // hide-native-captions，原生字幕因此可见。用户再切回外语源时，
+            // 本分支上游的 ensureRenderer() 会重新建好 renderer。
+            resetForNewVideo();
             bindVideo();
           }
         } else if (apiChanged || !prevEnabled) {

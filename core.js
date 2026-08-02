@@ -1257,6 +1257,10 @@
   // 缩成小字来塞下。
   var SOURCE_DISPLAY_PREFERRED_WIDTH = 48;
   var SOURCE_DISPLAY_MAX_WIDTH = 52;
+
+  // 词数上限允许突破视觉宽度上限的最大倍数。见 tokenCapFor 的说明：
+  // 拉丁轨确实需要按词数放宽，但放宽不能无上界，否则长词内容会堆到 173% 宽度。
+  var WIDTH_OVERSHOOT_LIMIT = 1.25;
   var TRANSLATION_DISPLAY_MAX_WIDTH = 48;
 
   var TRANSLATE_TIMEOUT_MS = 90000;
@@ -1692,6 +1696,55 @@
   // 句末标点（中英文）：命中则认为一句自然结束，适合断句
   var SENTENCE_END_RE = /[.!?。！？…]+["'”’)\]]*$/;
 
+  /**
+   * 非台词的音效/场景标记（字幕作者写给观众的旁注，不是有人在说话）。
+   *
+   * 三种包裹形态取自真实人工上传轨（_-mBeYC2KGc，Technology Connections）：
+   *   *awkward pause*
+   *   [sound level increases slightly as compressor kicks in]
+   *   ♫ icy smooth jazz ♫
+   *
+   * 必须单独占一屏。它们不带句末标点，所以 SENTENCE_END_RE 看不见边界，
+   * 分屏层会把它当成"还没说完的句子"继续吞下一条台词，实测产出：
+   *   "*awkward pause* But there's an increasingly popular variety of them..."
+   * 译文跟着黏成「尴尬停顿但有一种越来越受欢迎的款式」——旁注和台词混成一句。
+   *
+   * 判据只认「整条都是标记」，不匹配句中夹带的星号/括号：台词里出现
+   * (like this) 属于正常内容，拆开反而破句。
+   */
+  var SOUND_CUE_RE = /^\s*(?:\*[^*]+\*|\[[^\]]+\]|[♪♫][^♪♫]+[♪♫])\s*$/;
+
+  function isSoundCue(text) {
+    return SOUND_CUE_RE.test(String(text == null ? "" : text));
+  }
+
+  /**
+   * 音效标记被宽度拆成多屏后，给每片补齐包裹符。
+   *
+   * 拆分本身是对的（可读性优先，见 flush 处说明），但直接拆会留下断头：
+   *   ["[compressor kicks in, and a second, much louder", "fan spins up at the same time]"]
+   * 观众看到孤立的 "[" 或 "]" 会以为字幕出错。补齐后：
+   *   ["[compressor kicks in, and a second, much louder]", "[fan spins up at the same time]"]
+   * 每片都是自洽的旁注，读起来仍是"这是音效说明"而不是台词。
+   *
+   * 只动首尾字符，不碰词本身 —— 净化类操作绝不许删原文内容。
+   */
+  function rewrapSoundCueChunks(chunks) {
+    var first = joinRestoredWords(chunks[0]).trim();
+    var open = first.charAt(0);
+    var close = open === "[" ? "]" : (open === "*" ? "*" : (open === "♪" || open === "♫" ? open : ""));
+    if (!close) return chunks;
+    return chunks.map(function (ws, idx) {
+      var copy = ws.slice();
+      var lastIdx = copy.length - 1;
+      if (lastIdx < 0) return copy;
+      // 非首片补开符、非末片补闭符；词内容本身一个字符都不动。
+      if (idx > 0) copy[0] = open + String(copy[0] == null ? "" : copy[0]);
+      if (idx < chunks.length - 1) copy[lastIdx] = String(copy[lastIdx] == null ? "" : copy[lastIdx]) + close;
+      return copy;
+    });
+  }
+
   // 对齐用的词键：转小写、去掉词首尾的标点，保留内部的撇号/连字符。
   //
   // 字符类必须是 Unicode。曾用 [^0-9a-z一-鿿]，它只认 ASCII 字母、数字和 CJK，
@@ -1775,7 +1828,19 @@
       if (!list.length) return wordCap;
       var average = semanticDisplayWidth(collapseWhitespace(joinRestoredWords(list))) / list.length;
       if (!(average > 0)) return wordCap;
-      return Math.max(wordCap, Math.floor(visualWidthCap / average));
+      var widthCap = Math.floor(visualWidthCap / average);
+      // 词数上限仍是主判据（上面那段说明了为什么不能改成直接采用折算值），
+      // 但它不能无上界地压过宽度：英文技术内容里 12 个长词（Single-hose、
+      // air conditioners、figuratively）实测能堆到 90 字符 = 宽度上限 52 的 173%，
+      // 真实轨上 12% 的屏超宽、p99 达 82，尾部完全失控。那是可读性问题，
+      // 不是"宽度只是近似"能解释的量级。
+      //
+      // 所以给放宽留一个封顶：宽度可以被突破（拉丁轨确实需要），但不得超过
+      // WIDTH_OVERSHOOT_LIMIT 倍。取 1.25 —— p90 是 54（上限的 1.04 倍）属正常
+      // 波动必须放行，1.25 对应 65 字符，把 47 条 60~90 字符的失控屏收回来，
+      // 同时不触碰绝大多数只是轻微越界的正常屏。
+      var overshootCap = Math.floor(visualWidthCap * WIDTH_OVERSHOOT_LIMIT / average);
+      return Math.max(Math.min(wordCap, overshootCap), widthCap);
     }
     var hasExplicitContinuationMaxWords = opts.continuationMaxWords != null;
     var continuationMaxWords = hasExplicitContinuationMaxWords
@@ -1942,7 +2007,18 @@
       //    上限口径复用 mergeHardCap（与 orphanCap / continuationCap 同源，
       //    不在这里另算一套，否则两处漂移就是下一个 bug）。
       var wordCap = cur.merged ? (cur.mergeHardCap || maxWords) : maxWords;
+      // 音效/场景标记照常按宽度拆 —— 可读性优先于形式完整。
+      //
+      // 曾让它整条不拆以保住包裹符，结果 "[compressor kicks in, and a second,
+      // much louder fan spins up at the same time]" 78 字符挤一屏（maxVisualWidth=48
+      // 的 163%）且只给 3.5s，屏上糊成一坨。宽度上限本来就是可读性判据，
+      // 为了让方括号成对而突破它是本末倒置。
+      //
+      // 真正要守的是「不出现断头包裹符」，所以拆完给每片补上包裹（下面的
+      // rewrapSoundCueChunks），而不是拒绝拆分。
+      var isMark = isSoundCue(joinRestoredWords(cur.words));
       var chunks = splitWordsToCap(cur.words, tokenCapFor(cur.words, wordCap));
+      if (isMark && chunks.length > 1) chunks = rewrapSoundCueChunks(chunks);
       var span = Math.max(0, cur.end - cur.start);
       var weights = chunks.map(function (ws) {
         return Math.max(1, collapseWhitespace(joinRestoredWords(ws)).length);
@@ -2007,7 +2083,11 @@
         // 孤立介词短语，本身不是新句子）两种情况。
         // 不要在这里再加一条「短句可破例合并」——那会与 flush 形成两套判据，正是
         // Jay 报的跨句分屏缺陷的来源。
-        var canMerge = !ended || orphanPrepMerge;
+        // 音效/场景标记两侧都是硬边界：它自己不吞下一条台词，台词也不并进它。
+        // 判据放在 canMerge 这一个点上，和「一屏不放两个完整句」同源，
+        // 不在 flush 侧另开一套（两处各判必然漂移）。
+        var soundCueBoundary = isSoundCue(cur.words.join(" ")) || isSoundCue(c.content);
+        var canMerge = (!ended || orphanPrepMerge) && !soundCueBoundary;
         var normalMerge = gap < longPauseMs && wouldWords <= effMaxWords && wouldDur <= maxDur;
         var continuationCap = hasExplicitContinuationMaxWords
           ? continuationMaxWords
@@ -2292,6 +2372,31 @@
    * 选源字幕轨。先尊重用户显式 sourceLang；auto 跟音轨的实际语言。
    * 确定语言后在该语言内统一优先人工轨（preferManualTrack），不维护任何语言名单。
    */
+  /**
+   * 译文语言固定为 zh-Hans，所以源轨已经是中文时这个扩展没有存在意义：
+   * 不选轨、不请求翻译、不渲染、也不隐藏 YouTube 原生字幕，完全隐身。
+   *
+   * 返回 null 即可 —— 调用侧（isolated.js onManifest）本来就有「无可用轨」
+   * 分支走 resetForNewVideo()，其中 restoreNativeCaptions() 会摘掉
+   * dualsub-hide-native-captions，原生字幕照常显示。不新增第二条路径。
+   *
+   * yue（粤语）是例外，要翻译：书面粤语（唔、係、嘅、咁樣）和标准中文差异大，
+   * 那是真翻译不是繁简转码。它的语言码不带 zh 前缀，天然落在下面的判据之外。
+   *
+   * zh-Hant → zh-Hans 属于字形转换而不是翻译，不该花 API 的钱，一并跳过。
+   */
+  function isChineseTrackCode(code) {
+    var s = String(code == null ? "" : code).trim().toLowerCase();
+    if (!s) return false;
+    s = s.replace(/[-_]asr$/, "");        // 中文 ASR 轨同样跳过
+    // zh 前缀覆盖 zh / zh-Hans / zh-Hant / zh-CN / zh-TW / zh-HK / zh-Hans-CN…
+    // cmn 是官话的 ISO 639-3 码（cmn / cmn-Hans / cmn-Hant），同样是中文，
+    // 只按 zh 判会漏。分隔符同时接受 - 和 _，因为真实轨里两种都出现过。
+    // 仍用前缀而非整串匹配，才能覆盖任意 BCP47 子标签组合；yue/zhuang/zha
+    // 不以 zh 或 cmn 加分隔符开头，不会被误伤。
+    return /^(?:zh|cmn)(?:[-_]|$)/.test(s);
+  }
+
   function pickTrack(tracks, sourceLang) {
     if (!tracks || !tracks.length) return null;
     var list = tracks;
@@ -2324,7 +2429,13 @@
       });
       picked = exact || prefix || null;
     }
-    return preferManualTrack(list, picked);
+    picked = preferManualTrack(list, picked);
+    // 中文源轨：返回 null，让调用侧走「无可用轨」分支，本扩展完全不介入。
+    // 判据放在出口单点，auto 与显式 sourceLang 两条路都覆盖。
+    if (picked && (isChineseTrackCode(picked.languageCode) || isChineseTrackCode(picked.code))) {
+      return null;
+    }
+    return picked;
   }
 
   function buildSystemPrompt(targetLang, customPrompt) {

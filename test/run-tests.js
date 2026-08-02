@@ -5812,6 +5812,180 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     }
   });
 
+  // ── 音效/场景标记必须独立成屏（真实人工上传轨 _-mBeYC2KGc）──────────
+  // Jay 报的实际缺陷：`*awkward pause*` 被并进下一条台词，译文黏成
+  // 「尴尬停顿但有一种越来越受欢迎的款式」，旁注与台词混为一句。
+  test("音效标记独立成屏，不与台词合并", () => {
+    const SOUND_RE = /^\s*(?:\*[^*]+\*|\[[^\]]+\]|[♪♫][^♪♫]+[♪♫])\s*$/;
+    const raw = JSON.parse(fs.readFileSync(
+      path.join(__dirname, "fixtures/youtube-sound-cue-track.json"), "utf8"));
+    const cues = Core.cleanupCues(raw);
+
+    // fixture 形状自检：三种包裹形态都要在，否则这条门禁是空跑
+    const srcMarks = cues.filter((c) => SOUND_RE.test(String(c.content || "")));
+    assert.ok(srcMarks.length >= 3,
+      `fixture 应含至少 3 条音效标记，实测 ${srcMarks.length}（形状不对，门禁失效）`);
+    assert.ok(srcMarks.some((c) => /^\s*\*/.test(c.content)), "缺 *星号* 形态");
+    assert.ok(srcMarks.some((c) => /^\s*\[/.test(c.content)), "缺 [方括号] 形态");
+    assert.ok(srcMarks.some((c) => /^\s*[♪♫]/.test(c.content)), "缺 ♫音符♫ 形态");
+
+    const display = Core.resegmentCues(cues, { maxVisualWidth: 48, tailTrimMs: 120 });
+
+    // 正向：每条标记都必须整屏独占，屏内不得夹带台词
+    for (const u of display) {
+      const t = String(u.content || "");
+      const hasMark = /\*[^*]+\*|\[[^\]]+\]|[♪♫][^♪♫]+[♪♫]/.test(t);
+      if (!hasMark) continue;
+      assert.ok(SOUND_RE.test(t),
+        `音效标记与台词混在同一屏：${JSON.stringify(t)}`);
+    }
+    // 标记一条都不能少。这里只能断言「不少于」而不是「等于」：超宽标记会被按
+    // 宽度拆成多屏，那是刻意行为（可读性优先于形式完整，见 core.js flush 处），
+    // 实测 78 字符那条拆成 48 + 31 两屏，每屏都补齐包裹自洽。写成 === 就会把
+    // 这条正确行为判成缺陷 —— 曾经如此，4 → 5 报红。
+    //
+    // 「不能靠删掉标记来通过」由下面的零丢词断言承重，不靠数量相等来兜。
+    const outMarks = display.filter((u) => SOUND_RE.test(String(u.content || "")));
+    assert.ok(outMarks.length >= srcMarks.length,
+      `音效标记屏数 ${outMarks.length} < 源轨 ${srcMarks.length}，标记被吞`);
+    // 拆出来的每一片都必须包裹成对，不得留断头的 [ 或 ]
+    for (const u of outMarks) {
+      const t = String(u.content).trim();
+      const openCount = (t.match(/\[/g) || []).length;
+      const closeCount = (t.match(/\]/g) || []).length;
+      assert.strictEqual(openCount, closeCount,
+        `方括号不成对（断头包裹符）：${JSON.stringify(t)}`);
+      assert.ok((t.match(/\*/g) || []).length % 2 === 0,
+        `星号不成对：${JSON.stringify(t)}`);
+      assert.ok((t.match(/[♪♫]/g) || []).length % 2 === 0,
+        `音符不成对：${JSON.stringify(t)}`);
+    }
+
+    // 零丢词：按词键比对整条序列，顺序也不许变
+    const keyWords = (s) => String(s || "").toLowerCase()
+      .replace(/[^a-z0-9\u4e00-\u9fff]+/g, " ").trim().split(/\s+/).filter(Boolean);
+    const srcSeq = cues.flatMap((c) => keyWords(c.content));
+    const outSeq = display.flatMap((c) => keyWords(c.content));
+    assert.deepStrictEqual(outSeq, srcSeq, "音效标记分屏后词序列发生变化（丢词或错序）");
+
+    // 时间硬契约
+    for (let i = 0; i < display.length; i++) {
+      assert.ok(display[i].end > display[i].start, "单元时长非正");
+      if (i + 1 < display.length) {
+        assert.ok(display[i + 1].start >= display[i].end, "音效标记分屏后出现重叠");
+      }
+    }
+  });
+
+  // ── 音效标记边界必须自己承重，不能靠宽度封顶替它顶（消融实测发现）──────
+  //
+  // 上面那条用真实轨的门禁对 soundCueBoundary 是**空跑**的：消融时关掉该判据，
+  // 症状并未复现。原因是真实轨里 "*awkward pause* But there's an increasingly
+  // popular variety of them that figuratively" 有 86 字符，超过宽度封顶（65）
+  // 被拆开，第一刀正好落在标记边界上 —— 宽度层顺手把混屏消掉了。
+  //
+  // 所以那条测试只能证明「两个修复合起来有效」，删掉 soundCueBoundary 它照样绿。
+  // 这里用短台词把宽度层的作用排除掉：29 / 21 字符远在任何上限之内，宽度层没有
+  // 任何理由拆它，混不混屏完全取决于边界判据是否在位。
+  test("音效标记边界不依赖宽度封顶：短台词也不得与标记同屏", () => {
+    const SOUND_RE = /^\s*(?:\*[^*]+\*|\[[^\]]+\]|[♪♫][^♪♫]+[♪♫])\s*$/;
+    const cues = Core.cleanupCues([
+      { start: 0, end: 1200, content: "*awkward pause*" },
+      { start: 1200, end: 3000, content: "But it sucks." },
+      { start: 3200, end: 5000, content: "♫ jazz ♫" },
+      { start: 5000, end: 6800, content: "And cooling." },
+    ]);
+    const display = Core.resegmentCues(cues, { maxVisualWidth: 48, tailTrimMs: 120 });
+
+    // 形状自检：每屏都必须远小于宽度上限，否则本条又变成宽度层在承重
+    for (const u of display) {
+      const w = Core.semanticDisplayWidth(String(u.content || ""));
+      assert.ok(w < 48,
+        `用例失效：出现 ${w} 字符的屏，宽度层可能介入了拆分（本条要求纯边界判据承重）`);
+    }
+    // 四条各自独占一屏
+    assert.strictEqual(display.length, 4,
+      `期望 4 屏（标记与台词各自独立），实测 ${display.length} 屏：` +
+      JSON.stringify(display.map((u) => u.content)));
+    for (const u of display) {
+      const t = String(u.content || "");
+      if (!/\*|\[|\]|[♪♫]/.test(t)) continue;
+      assert.ok(SOUND_RE.test(t),
+        `短台词被并进音效标记（soundCueBoundary 未生效）：${JSON.stringify(t)}`);
+    }
+  });
+
+  // ── 词数上限的宽度封顶必须有门禁（消融实测发现它此前完全没被测到）──────
+  //
+  // 把 WIDTH_OVERSHOOT_LIMIT 从 1.25 抬到 999，全套测试仍然 306/0 全绿 ——
+  // 说明这条修复是活代码（overshootCap 参与 tokenCapFor 的返回值）却无人看守，
+  // 任何人顺手调大它都不会有任何测试报警。
+  //
+  // 用例形状很关键：必须是**无句末标点的长词续接片段**。有句末标点的整句各自
+  // 独立落屏，合并根本走不到词数上限，封顶自然不介入（我第一次的用例就是这样，
+  // 四条都 26~36 字符，无论封顶多少都一样）。下面这组一路合并到词数上限：
+  // 封顶在位 → 最宽 43 字符；封顶失效 → 单屏 108 字符，即宽度上限 52 的 208%。
+  test("长词续接不得突破宽度封顶：词数上限不能无上界压过宽度", () => {
+    const cues = Core.cleanupCues([
+      { start: 0,    end: 850,  content: "Single-hose air" },
+      { start: 900,  end: 1750, content: "conditioners compromise" },
+      { start: 1800, end: 2650, content: "efficiency significantly" },
+      { start: 2700, end: 3550, content: "because infiltration" },
+      { start: 3600, end: 4450, content: "overwhelms performance" },
+    ]);
+    const display = Core.resegmentCues(cues, { maxVisualWidth: 48, tailTrimMs: 120 });
+
+    // 用例自检：必须真的发生了合并，否则封顶没被走到，本条又是空跑
+    assert.ok(display.length < cues.length,
+      `用例失效：${cues.length} 条未发生任何合并，封顶逻辑未被触及`);
+
+    // 硬上限 52 × 1.25 = 65。留一点余量断在 70，避免把正常波动写成阈值测试。
+    const OVERSHOOT_HARD_LIMIT = 70;
+    for (const u of display) {
+      const t = String(u.content || "");
+      const w = Core.semanticDisplayWidth(t);
+      assert.ok(w <= OVERSHOOT_HARD_LIMIT,
+        `单屏 ${w} 字符突破宽度封顶（上限 52 的 ${Math.round(w / 52 * 100)}%）：` +
+        JSON.stringify(t));
+    }
+  });
+
+  // ── 中文源轨完全不介入（yue 例外要翻译）─────────────────────────────
+  // 译文固定 zh-Hans，源轨已是中文时本扩展没有存在意义：不选轨即不请求、
+  // 不渲染、不隐藏原生字幕。zh-Hant→zh-Hans 是字形转换不是翻译，一并跳过。
+  test("中文源轨返回 null，粤语与其他语言照常翻译", () => {
+    const T = (code) => ({ code, languageCode: code, kind: "", name: code });
+
+    // 该跳的必须跳
+    for (const code of ["zh", "zh-Hans", "zh-Hant", "zh-CN", "zh-TW", "zh-HK",
+      "zh-SG", "zh-Hans-CN", "zh-Hant-TW", "ZH-HANS", "zh-Hans-asr",
+      // cmn 是官话的 ISO 639-3 码，同样是中文；zh_CN 下划线形态真实出现过。
+      // 二者都曾漏判（只按 /^zh-/ 判时），补进来防回归。
+      "cmn", "cmn-Hans", "cmn-Hant", "cmn-CN", "zh_CN", "zh_Hant_TW", "cmn_Hans",
+      " zh-Hans ", "zh-Hans-ASR", "cmn-Hans-asr"]) {
+      assert.strictEqual(Core.pickTrack([T(code)], "auto"), null,
+        `中文轨 ${code} 仍被选中 —— 会白烧 token 且盖掉原生字幕`);
+      assert.strictEqual(Core.pickTrack([T(code)], code), null,
+        `显式指定 ${code} 仍被选中`);
+    }
+
+    // 该译的绝不能被误跳：yue 是书面粤语，与标准中文差异大，属真翻译
+    // cmn 前缀不能误伤：cmn 本身要跳，但 cmnX 这类不是官话的码不能被吞掉
+    for (const code of ["yue", "yue-HK", "en", "ja", "ko", "th", "vi", "zhuang", "zha",
+      "zhx", "cmnx", "zhoa", "nan", "hak", "wuu", "en-Hans"]) {
+      const picked = Core.pickTrack([T(code)], code);
+      assert.ok(picked && picked.code === code,
+        `${code} 被误判为中文轨而跳过（zh 前缀不能误伤 zhuang/zha/yue）`);
+    }
+
+    // 混合清单：英文视频挂机翻中文轨，选英文照常翻译
+    const mixed = Core.pickTrack([T("en"), T("zh-Hans")], "en");
+    assert.ok(mixed && mixed.code === "en", "混合轨中英文源被误跳");
+    // 中文视频挂英文轨，显式选中文 → 不介入
+    assert.strictEqual(Core.pickTrack([T("zh-Hans"), T("en")], "zh-Hans"), null,
+      "中文视频显式选中文源时仍介入");
+  });
+
   console.log("\n========================================");
   console.log("  通过: " + passed + "  失败: " + failed);
   console.log("========================================");
