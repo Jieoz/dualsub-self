@@ -3520,6 +3520,25 @@
     var fingerprints = {};
     units.forEach(function (unit) { if (unit.sourceFingerprint) fingerprints[unit.sourceFingerprint] = true; });
     if (Object.keys(fingerprints).length > 1) throw new Error("translation coverage source fingerprint mismatch");
+    // 发给模型的 unitId 用短别名（u0、u1…），程序侧再映射回真实 unitId。
+    //
+    // 真实 unitId 是 "<sourceFingerprint>:u3:41-52"（timeline 快照生成，见 buildRenderUnits），
+    // 每单元 20+ 字符且全是程序内部信息：指纹用于跨块一致性校验、token span 用于覆盖账本，
+    // 模型两者都不需要，它只需要"这条译文属于哪一条输入"。让模型原样复制长 id 还额外
+    // 制造了一类失败：弱模型抄 12 组 "指纹:u序号:起-止" 必错 → unknown unit → 整块丢字幕。
+    //
+    // 别名保持可读的 "u<序号>" 而不是纯数字或单字母键：协议硬约束里要按名字引用它，
+    // 语义清楚的短标识对弱模型最稳（这是"不挑模型"优先于极限压缩的取舍）。
+    // 承重校验一条不减 —— 数量、未知别名、重复、缺口仍在 parseTranslationCoverageResponse
+    // 里 fail-closed，只是比对的是别名而非长 id。
+    var aliasToUnitId = {};
+    var aliasUnits = units.map(function (unit, index) {
+      var alias = "u" + index;
+      aliasToUnitId[alias] = unit.unitId;
+      var aliased = Object.assign({}, unit);
+      aliased.unitId = alias;
+      return aliased;
+    });
     // 发给模型的字段只保留「它翻译时真正需要的信息」：哪个单元 + 原文。
     //
     // 此前还发了 coverFrom/coverTo、maxVisualWidth、semanticGroupId，实测占 user
@@ -3531,13 +3550,22 @@
     //    读的是**程序侧** expectedUnits 的该字段，与发不发给模型无关。
     //
     // 覆盖账本的承重点是「程序定账本」，不是「模型抄账本」——校验一条不减。
+    // system 段必须逐请求逐字一致，否则前缀缓存永远打不中。
+    //
+    // 主流 provider（OpenAI / DeepSeek / 通义 等）对 system 前缀是**自动**缓存的，
+    // 命中条件是「前缀逐字节相同」；Anthropic 需要显式 cache_control。这里只做前者：
+    // 稳定化是纯文本层面的改动，对所有 provider 都无副作用，也不给不认识该字段的
+    // provider 发厂商专有结构（发了会被 400 拒或静默忽略 → 那才是"挑模型"）。
+    // 所以协议硬约束里绝不能插入随请求变化的值（单元数、指纹、宽度）。
     var sys = buildSystemPrompt(opts.targetLang, opts.systemPrompt) +
       "\n协议硬约束：只返回 {\"translations\":[{\"unitId\":\"…\",\"translation\":\"…\"}]}；" +
       "unitId 必须原样复制，每个输入单元恰好一条，不多不少，不要输出其他字段。";
+    // sourceFingerprint 不再发给模型：它是程序侧跨块一致性校验用的内部指纹，
+    // 模型翻译时完全不需要，实测常见值为空串或短哈希——发它纯属占位。
+    // 承重的指纹一致性校验在上面 fingerprints 那段已 fail-closed，与发不发无关。
     var userContent = JSON.stringify({
-      sourceFingerprint: Object.keys(fingerprints)[0] || "",
-      maxVisualWidth: units[0] && units[0].maxVisualWidth || TRANSLATION_DISPLAY_MAX_WIDTH,
-      units: units.map(function (unit) {
+      maxVisualWidth: aliasUnits[0] && aliasUnits[0].maxVisualWidth || TRANSLATION_DISPLAY_MAX_WIDTH,
+      units: aliasUnits.map(function (unit) {
         return { unitId: unit.unitId, sourceText: unit.sourceText };
       }),
     });
@@ -3554,10 +3582,47 @@
       onUsage: opts.onUsage,
       signal: opts.signal,
     });
-    var coverage = parseTranslationCoverageResponse(content, units, { maxLineChars: opts.maxLineChars, lenient: !!opts.lenient });
+    // 校验按别名进行（模型看到的就是别名），通过后立刻映射回真实 unitId：
+    // 下游 applyTranslationCoverage / 渲染层全部按真实 unitId 索引，别名不得泄漏出本函数。
+    var aliasCoverage = parseTranslationCoverageResponse(content, aliasUnits, { maxLineChars: opts.maxLineChars, lenient: !!opts.lenient });
+    var coverage = remapAliasCoverage(aliasCoverage, aliasToUnitId, units);
     var lines = coverage.map(function (entry) { return entry.translation; });
     Object.defineProperty(lines, "coverage", { value: coverage, enumerable: false });
     return lines;
+  }
+
+  // 把「模型看到的短别名」回落成真实 unitId，并对回落结果本身 fail-closed。
+  //
+  // 抽成独立纯函数而不是内联在 translateClipLines 里，是为了让守卫可被直接测试：
+  // 内联时 parseTranslationCoverageResponse 已按别名集合拦掉一切坏 unitId，本守卫在
+  // 正常路径下永远拿不到坏输入 —— 实测消融（把守卫改回 fail-open）后没有任何测试变红，
+  // 也就是说它当时是条空跑门禁。守卫不可达就无法证明承重，必须留一个能直接喂坏输入
+  // 的接缝。它守的是「映射层自己出错」这一类故障：上游放宽（为兼容弱模型做模糊匹配）、
+  // 或别名表构造 bug 让两个别名指向同一真实 id。这类错误一旦放行是静默的 —— 译文会
+  // 接到错误的 cue 区间上，用户看到的是「字幕串台」而不是报错。
+  function remapAliasCoverage(aliasCoverage, aliasToUnitId, expectedUnits) {
+    var entries = Array.isArray(aliasCoverage) ? aliasCoverage : [];
+    var map = aliasToUnitId || {};
+    var coverage = entries.map(function (entry) {
+      var mapped = Object.assign({}, entry);
+      var alias = entry && entry.unitId != null ? String(entry.unitId) : "";
+      if (!Object.prototype.hasOwnProperty.call(map, alias)) {
+        throw new Error("translation coverage unmapped unit alias");
+      }
+      mapped.unitId = map[alias];
+      return mapped;
+    });
+    // 回落后按真实 unitId 校验双射：每个期望单元恰好一条，不重不漏。
+    // 承重点必须落在真实 id 上，因为下游 applyTranslationCoverage 和渲染层全按它索引。
+    var seen = {};
+    coverage.forEach(function (entry) {
+      if (seen[entry.unitId]) throw new Error("translation coverage duplicate mapped unit");
+      seen[entry.unitId] = true;
+    });
+    (expectedUnits || []).forEach(function (unit) {
+      if (!seen[unit.unitId]) throw new Error("translation coverage missing mapped unit");
+    });
+    return coverage;
   }
 
   async function translateClipWithBoundaryRepair(opts) {
@@ -6073,6 +6138,7 @@
     preferManualTrack: preferManualTrack,
     translationCoverageUnitsFromCues: translationCoverageUnitsFromCues,
     parseTranslationCoverageResponse: parseTranslationCoverageResponse,
+    remapAliasCoverage: remapAliasCoverage,
     extractJsonObject: extractJsonObject,
     DEFAULT_BLOCK_TRANSLATION_PROMPT: DEFAULT_BLOCK_TRANSLATION_PROMPT,
     blockSourceCues: blockSourceCues,
