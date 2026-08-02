@@ -612,12 +612,12 @@
           var cachedResult = await readVerifiedClipCache(clip, segmentationMode, identity, generation);
           if (cachedResult) return { cached: cachedResult };
           if (!identity.apiBaseUrl || !identity.apiModel) throw new Error("translation configuration missing");
-          var contextBefore = state.cues.slice(Math.max(0, clip.startIndex - 3), clip.startIndex);
-          var contextAfter = state.cues.slice(clip.startIndex + clip.cues.length, clip.startIndex + clip.cues.length + 3);
+          // 不再计算 contextBefore/contextAfter：translateContextBlock 把它们透传给
+          // translateClipLines，而 payload 构造只取 unitId + sourceText，两者在函数边界
+          // 就被丢弃 —— 传了从不使用。真正的跨块连贯性由 block 分段本身保证（整段连续
+          // 语音一次翻），不靠额外发相邻 cue。
           var result = await Core.translateContextBlock({
             cues: clip.cues,
-            contextBefore: contextBefore,
-            contextAfter: contextAfter,
             apiBaseUrl: identity.apiBaseUrl,
             apiKey: identity.apiKey,
             apiModel: identity.apiModel,

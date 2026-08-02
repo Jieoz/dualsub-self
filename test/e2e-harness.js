@@ -180,9 +180,8 @@ async function run() {
     const clip = clips[ci], ct0 = Date.now();
     let result;
     try {
-      const before=reseg.slice(Math.max(0,clip.startIndex-3),clip.startIndex);
-      const after=reseg.slice(clip.startIndex+clip.cues.length,clip.startIndex+clip.cues.length+3);
-      result=await Core.translateContextBlock(Object.assign({cues:clip.cues,contextBefore:before,contextAfter:after,maxVisualWidth:48},apiCfg));
+      // 与生产一致：不再传 contextBefore/contextAfter（payload 从不读取）。
+      result=await Core.translateContextBlock(Object.assign({cues:clip.cues,maxVisualWidth:48},apiCfg));
     } catch(e) { console.warn("[harness] clip",ci,"翻译失败：",e.message);stats.clipFallbacks++;result=null; }
     if(!result||!result.units||!result.units.length){
       stats.emptyClips++;for(const cue of clip.cues)renderUnits.push({start:cue.start,end:cue.end,originalText:cue.content,translation:""});

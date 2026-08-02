@@ -3982,6 +3982,130 @@ test("importConfig 空 fontFamily 字段保留为空串（默认族）", () => {
 
 /* ============ 6. translateBatch（mock fetch 跑通整链路）============ */
 async function main() {
+  await asyncTest("token 审计：请求体不得携带模型用不到的字段，unitId 用短别名且译文按真实 unitId 回落", async () => {
+    // 承重点在**真实请求体**上，不是源码文本：拦 fetch 拿 body 逐字段判。
+    const cues = [
+      { unitId: "fp7:u0:0-4", sourceFingerprint: "fp7", tokenStart: 0, tokenEnd: 4, content: "hello there my friend", start: 0, end: 1200 },
+      { unitId: "fp7:u1:4-8", sourceFingerprint: "fp7", tokenStart: 4, tokenEnd: 8, content: "this is the second line", start: 1200, end: 2400 },
+    ];
+    let captured = null;
+    const fetchImpl = async (url, options) => {
+      captured = JSON.parse(options.body);
+      const payload = JSON.parse(captured.messages[1].content);
+      return {
+        ok: true,
+        json: async () => ({
+          choices: [{ message: { content: JSON.stringify({
+            translations: payload.units.map((u) => ({ unitId: u.unitId, translation: "译文" + u.unitId })),
+          }) } }],
+        }),
+      };
+    };
+    // 别名回落要在 translateClipLines 的 coverage 上验（translateContextBlock 只回 segments/units）。
+    const lines = await Core.translateClipLines({
+      cues, apiBaseUrl: "https://gw/v1", apiKey: "k", apiModel: "m",
+      targetLang: "zh-Hans", maxLineChars: 48, fetchImpl,
+    });
+    const payload = JSON.parse(captured.messages[1].content);
+    // P3：sourceFingerprint 是程序侧内部指纹，模型不需要。
+    assert.ok(!("sourceFingerprint" in payload), "请求体不得携带 sourceFingerprint");
+    payload.units.forEach((u) => {
+      assert.deepStrictEqual(Object.keys(u).sort(), ["sourceText", "unitId"], "单元只发 unitId + sourceText");
+    });
+    // P5：unitId 用短别名，不让模型抄 "指纹:u序号:起-止"。
+    assert.deepStrictEqual(payload.units.map((u) => u.unitId), ["u0", "u1"], "发给模型的 unitId 必须是短别名");
+    assert.ok(!JSON.stringify(payload).includes("fp7"), "长 unitId 与指纹不得出现在请求体里");
+    // 别名不得泄漏：下游按真实 unitId 索引。
+    assert.deepStrictEqual(lines.coverage.map((c) => c.unitId), ["fp7:u0:0-4", "fp7:u1:4-8"], "译文必须按真实 unitId 回落");
+    // P6：system 段逐请求逐字稳定，才可能命中前缀缓存；且不得发厂商专有缓存字段。
+    const sys1 = captured.messages[0].content;
+    await Core.translateClipLines({
+      cues: [cues[0]], apiBaseUrl: "https://gw/v1", apiKey: "k", apiModel: "m",
+      targetLang: "zh-Hans", maxLineChars: 48, fetchImpl,
+    });
+    assert.strictEqual(captured.messages[0].content, sys1, "system 段必须与单元数无关，逐字一致");
+    assert.ok(!/cache_control|prompt_cache|cachePoint/.test(JSON.stringify(captured)), "不得发厂商专有缓存字段");
+  });
+
+  await asyncTest("unitId 别名对抗：伪造真实 id / 未知别名 / 重复 / 空 id 一律 fail-closed，顺序颠倒按 id 归位", async () => {
+    const cues = [
+      { unitId: "fp7:u0:0-4", sourceFingerprint: "fp7", tokenStart: 0, tokenEnd: 4, content: "first source line here", start: 0, end: 1200 },
+      { unitId: "fp7:u1:4-8", sourceFingerprint: "fp7", tokenStart: 4, tokenEnd: 8, content: "second source line here", start: 1200, end: 2400 },
+    ];
+    const mk = (respFn) => async (u, o) => {
+      const payload = JSON.parse(JSON.parse(o.body).messages[1].content);
+      return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: JSON.stringify(respFn(payload)) } }] }) };
+    };
+    const call = (respFn, lenient) => Core.translateClipLines({
+      cues, apiBaseUrl: "https://gw/v1", apiKey: "k", apiModel: "m",
+      targetLang: "zh-Hans", maxLineChars: 48, lenient, fetchImpl: mk(respFn),
+    });
+    // 结构性违规在 lenient（运行时）与严格（导出）两种模式下都必须 fail-closed：
+    // 它们是协议漂移/身份错配，不是单条译文内容问题，不能降级为"该句回退原文"。
+    const forged = () => ({ translations: [
+      { unitId: "fp7:u0:0-4", translation: "第一句译文" },
+      { unitId: "fp7:u1:4-8", translation: "第二句译文" },
+    ] });
+    for (const lenient of [false, true]) {
+      await assert.rejects(() => call(forged, lenient), /unknown or duplicate unit/, "模型伪造真实长 id 必须拒绝（它没见过这些 id）");
+      await assert.rejects(() => call(() => ({ translations: [
+        { unitId: "u0", translation: "第一句译文" },
+        { unitId: "u9", translation: "第二句译文" },
+      ] }), lenient), /unknown or duplicate unit/, "未知别名必须拒绝");
+      await assert.rejects(() => call(() => ({ translations: [
+        { unitId: "", translation: "第一句译文" },
+        { unitId: "u1", translation: "第二句译文" },
+      ] }), lenient), /unknown or duplicate unit/, "空 unitId 必须拒绝");
+      await assert.rejects(() => call(() => ({ translations: [
+        { unitId: "u0", translation: "第一句译文" },
+        { unitId: "u0", translation: "第二句译文" },
+      ] }), lenient), /unknown or duplicate unit/, "重复别名必须拒绝");
+    }
+    // 顺序颠倒是合法的（覆盖账本按 id 归位，不按数组下标），译文必须跟着 id 走。
+    const rev = await call((p) => ({
+      translations: p.units.slice().reverse().map((u) => ({ unitId: u.unitId, translation: "译文-" + u.unitId })),
+    }), false);
+    assert.deepStrictEqual(rev.coverage.map((c) => c.unitId), ["fp7:u0:0-4", "fp7:u1:4-8"], "颠倒顺序也必须回落成真实 unitId 且按账本排序");
+    assert.deepStrictEqual(rev.coverage.map((c) => c.translation), ["译文-u0", "译文-u1"], "译文必须跟随 unitId 归位，不得按下标错配");
+  });
+
+  test("remapAliasCoverage 对映射层自身故障 fail-closed（直击守卫，不经上游拦截）", () => {
+    // 这条必须直接调 remapAliasCoverage。经 translateClipLines 走时，
+    // parseTranslationCoverageResponse 已按别名集合拦掉一切坏 unitId，本守卫拿不到坏输入，
+    // 消融它不会有任何测试变红（实测确认过是空跑）。守卫不可达就无法证明承重。
+    const expected = [{ unitId: "fp7:u0:0-4" }, { unitId: "fp7:u1:4-8" }];
+    const map = { u0: "fp7:u0:0-4", u1: "fp7:u1:4-8" };
+
+    // 正常回落：别名换成真实 id，其余字段原样保留。
+    const ok = Core.remapAliasCoverage(
+      [{ unitId: "u0", translation: "第一句" }, { unitId: "u1", translation: "第二句" }], map, expected);
+    assert.deepStrictEqual(ok.map((e) => e.unitId), ["fp7:u0:0-4", "fp7:u1:4-8"]);
+    assert.deepStrictEqual(ok.map((e) => e.translation), ["第一句", "第二句"], "回落不得改动译文");
+
+    // 未映射别名（模拟上游放宽后漏进来的脏 id）：必须抛，不能原样放行。
+    // 放行的后果是静默错配 —— 译文接到错误 cue 区间，用户看到字幕串台而非报错。
+    assert.throws(() => Core.remapAliasCoverage(
+      [{ unitId: "u0", translation: "第一句" }, { unitId: "u9", translation: "第二句" }], map, expected),
+      /unmapped unit alias/, "未映射别名必须 fail-closed");
+    assert.throws(() => Core.remapAliasCoverage(
+      [{ unitId: "fp7:u0:0-4", translation: "第一句" }], map, expected),
+      /unmapped unit alias/, "真实长 id 不是合法别名，必须 fail-closed");
+    assert.throws(() => Core.remapAliasCoverage(
+      [{ unitId: "", translation: "第一句" }], map, expected),
+      /unmapped unit alias/, "空 unitId 必须 fail-closed");
+
+    // 别名表构造 bug：两个别名指向同一真实 id → 回落后重复，必须抛。
+    assert.throws(() => Core.remapAliasCoverage(
+      [{ unitId: "u0", translation: "第一句" }, { unitId: "u1", translation: "第二句" }],
+      { u0: "fp7:u0:0-4", u1: "fp7:u0:0-4" }, expected),
+      /duplicate mapped unit/, "两个别名映射到同一真实 id 必须 fail-closed");
+
+    // 缺单元：期望两条只回一条，必须抛（不能让下游拿到有缺口的账本）。
+    assert.throws(() => Core.remapAliasCoverage(
+      [{ unitId: "u0", translation: "第一句" }], map, expected),
+      /missing mapped unit/, "缺少期望单元必须 fail-closed");
+  });
+
   console.log("\n[第3层 自适应 gate：makeAdaptiveGate]");
 
   await asyncTest("chatCompletion 遇到 200 HTML 响应给出 Base URL 诊断而不是 JSON 语法错误", async () => {
@@ -4184,8 +4308,12 @@ async function main() {
 
   test("运行时使用整块翻译：源译不逐 cue 对齐，缓存只保存规范化 segments", () => {
     const src = fs.readFileSync(path.join(ROOT, "isolated.js"), "utf8");
-    assert.match(src, /Core\.translateContextBlock\(\{[\s\S]{0,500}?contextBefore:[\s\S]{0,120}?contextAfter:/,
-      "运行时必须把连续源块及前后只读上下文交给 block 翻译入口");
+    assert.match(src, /Core\.translateContextBlock\(\{[\s\S]{0,600}?cues: clip\.cues/,
+      "运行时必须把连续源块交给 block 翻译入口");
+    // 反向门禁：contextBefore/contextAfter 在 payload 构造处就被丢弃（只取 unitId+sourceText），
+    // 传了从不使用。此前这里断言"必须传"，把死参数钉成了契约。
+    assert.doesNotMatch(src, /context(?:Before|After)\s*:/,
+      "不得再传 contextBefore/contextAfter：translateClipLines 的 payload 从不读取它们");
     assert.match(src, /cached\.segments[\s\S]{0,200}?Core\.materializeBlockTranslation\(cached\.segments, clip\.cues, \{ maxVisualWidth: identity\.maxLineChars, requireIntegrity: true \}\)/,
       "缓存命中必须用当前源 cue 重新物化时间，不得复用旧逐 cue coverage");
     assert.match(src, /writeCache\(key, \{ segments: out\.segments \}, generation\)/,
@@ -4571,7 +4699,7 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     assert.ok(/timelineEpoch !== state\.timelineEpoch/.test(src), "旧时间轴异步请求不得写入新时间轴");
     assert.ok(/function resetForNewVideo\(\)[\s\S]{0,120}invalidateRuntimeRequests\(\)[\s\S]{0,120}state\.timelineEpoch\+\+/.test(src), "切视频必须废止旧请求");
     assert.ok(/Core\.translateContextBlock/.test(src), "所有运行时 clip 必须走 block 翻译入口");
-    assert.ok(/contextBefore[\s\S]{0,200}contextAfter/.test(src), "相邻 cue 只作为上下文发送，不能要求逐条输出");
+    assert.ok(!/context(?:Before|After)\s*:/.test(src), "不得传 payload 从不读取的 contextBefore/contextAfter");
     assert.ok(/"dsc-v90"/.test(fs.readFileSync(path.join(ROOT, "core.js"), "utf8")), "block 协议必须隔离旧缓存");
     assert.ok(/white-space:nowrap/.test(src) && !/text-overflow:ellipsis/.test(src), "字幕保持单屏且不得省略内容");
     assert.ok(/function fitSubtitleRows/.test(src) && /scrollWidth/.test(src), "仍需按真实 DOM 宽度适配");
