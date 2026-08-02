@@ -22,7 +22,18 @@
 
 ## 安装（加载已解压的扩展程序）
 
-当前版本：**v0.9.4**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.9.4) 下载 Chrome MV3 安装包。
+当前版本：**v0.9.5**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.9.5) 下载 Chrome MV3 安装包。
+
+v0.9.5 新增**中文源轨完全不介入**，修掉两个会让字幕停在画面上的状态残留缺陷，并补上两条此前**空转**的门禁。
+
+- **源轨已是中文时，扩展完全隐身。** 译文固定 zh-Hans，源轨本来就是中文的话这个扩展没有存在意义——照旧流程会白烧 API 的钱，还会用译文层盖掉 YouTube 原生字幕。现在 `pickTrack` 出口单点判定后返回 `null`，调用侧本就有的「无可用轨」分支会摘掉 `dualsub-hide-native-captions`，原生字幕照常显示，不新增第二条路径。`zh-Hant → zh-Hans` 属字形转换不是翻译，一并跳过；**`yue`（粤语）是例外要翻译**——书面粤语（唔、係、嘅、咁樣）与标准中文差异大，且判据用前缀匹配，不会误伤 `yue`/`zhuang`/`zha`/`nan`/`hak`/`wuu`。判据覆盖 `zh` 与 `cmn`（官话的 ISO 639-3 码）两族、`-` 与 `_` 两种分隔符、以及 `-asr` 后缀。
+- **切到中文源时的清理走同一条路径。** 上面那条修复暴露出一个既有缺陷：源语言变更后选不到轨时，代码只调 `bindVideo()` 重绑播放循环，**既不清 `renderUnits` 也不摘 `hide-native-captions`** —— 于是上一条轨的字幕永久挂在画面上，同时原生字幕仍被隐藏，用户两头都没有正确字幕。现在与「无可用轨」分支共用 `resetForNewVideo()`。**消融实测：残留 9 帧，`If you're a human person` / `我先说明一点` 停在画面上。**
+
+- **SPA 换片时渲染层自己作废，不等 manifest。** 新 manifest 由 `main.js` 每 3 秒轮询产出，且要过「播放器就绪 / 已开播 / 轨道挂上 / pot 签名齐备」四道关，慢时远超一轮；这段窗口里 `renderUnits` 还是上一部片的。`main.js` 的 `checkRoute` 只清它自己的 `lastSignature`，管不到 ISOLATED world 的渲染状态。现在 `onRenderTick` 每轮比对 `location` 的 videoId，一变就清 `videoId`/`manifestIdentity` 并重置渲染（清空 videoId 是为了让随后到达的 manifest 走 `changedVideo` 分支，同片重进时也不漏轨道身份重锁）。**实测消融后切换 URL 900ms 仍有 13 帧上一部片的双语字幕挂在新片上。**
+- **没有新增常驻定时器。** 这个检查放进本来就在跑的渲染 tick（250ms 兜底 + 帧回调），而不是第三个 `setInterval`：tick 开头的 `!state.renderUnits.length` 早返回恰好等于「没有字幕可残留时天然不检查」。独立定时器会在没有字幕、甚至没在看视频时也持续唤醒页面，低配设备上是白烧电。
+- **两条门禁此前是空转的，用消融法查出来。** 绿灯不等于被测到：把修复本身关掉、看测试是否变红，才是判据是否承重的唯一证明。
+  - `soundCueBoundary`（音效标记不与台词同屏）：关掉后症状不复现。原因是旧 fixture 那句台词有 86 字符，**超宽度封顶被拆开、第一片正好落在标记边界上**——宽度层替它顶了工作。换成 29/21 字符的短台词后（宽度层完全没理由介入）判据才独自承重。
+  - `WIDTH_OVERSHOOT_LIMIT`（长词宽度封顶）：从 `1.25` 抬到 `999`，306 条测试**全绿**，即任何人顺手调大它都不会有任何测试报警。先确认它是活代码（`overshootCap` 参与 `tokenCapFor` 的返回值）而非死代码，再补门禁——现在关掉它，那句会从 43 字符涨到 108。**不给死代码写测试，先判 live 再写断言。**
 
 v0.9.4 修掉**一屏里塞进两个完整句子**的分屏缺陷——它让译文读起来是断裂的。
 
@@ -405,7 +416,7 @@ test/           离线测试（node 直接跑）
 
 - **双脚本 + 自建 RPC**：`main.js`（MAIN world，能访问 YouTube 播放器私有对象但不能用 `chrome.*`）与 `isolated.js`（ISOLATED world，能用 `chrome.storage`/`chrome.runtime`）通过一条固定随机字符串常量的 `CustomEvent` 通道通信，兼容 Firefox `cloneInto`。
 - **轨道抓取**：main.js 每 3 秒轮询 `#movie_player`，读 `getVideoData().video_id` 与 `getAudioTrack().captionTracks`。**关键：必须等轨道 URL 带上 `pot` 签名参数后才算有效**，否则字幕请求 403；给 URL 设 `fmt=json3` + `c=WEB`（移动端 `MWEB`）。SPA 路由变化靠轮询 `location.search` 的 `v` 检测。
-- **渲染**：`.dualsub-renderer` 挂到 `.html5-video-player`，监听 `<video>` 的 `timeupdate`，按 `currentTime*1000` 查当前 cue。样式用 CSS 变量控制。
+- **渲染**：`.dualsub-renderer` 挂到 `.html5-video-player`，监听 `<video>` 的 `timeupdate`，按 `currentTime*1000` 查当前 cue。样式用 CSS 变量控制。渲染 tick 还兼任 **SPA 换片自检**：取轨脚本的路由检测只清它自己的签名（在 MAIN world，拿不到 `Core`），而新 manifest 要等轮询 + 四道关，所以渲染层每轮独立比对 `location` 的 videoId，一变即作废上一部片的渲染，不新增定时器。
 
 ---
 
@@ -443,7 +454,7 @@ node test/run-tests.js
 node test/run-semantic-corpus.js
 
 # Chromium 状态机回放（需有 CDP 9222；可用 DUALSUB_CDP_URL / DUALSUB_REPLAY_HOST 覆盖）
-# 覆盖正常接管、语义恢复过慢先 fallback 翻译、语义恢复失败后 fallback 双语降级、partial semantic install 自恢复、预热失败和等待期间 seek
+# 覆盖正常接管、语义恢复过慢先 fallback 翻译、语义恢复失败后 fallback 双语降级、partial semantic install 自恢复、预热失败、等待期间 seek、SPA 换片后不得残留上一部片的字幕，以及切到中文源轨后必须清空渲染并恢复原生字幕
 node test/browser-replay/run.js
 
 # popup 真实点击：全轨费用确认、进度、完整导出和取消
