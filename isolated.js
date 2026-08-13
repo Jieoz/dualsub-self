@@ -89,6 +89,13 @@
     clipBackoff: {}, // clipIndex -> backoff 控制器（失败退避）
     clipRevived: {}, // clipIndex -> 已用掉「用户播到此处」的那一次复活机会（见 translateClip）
     clipInflight: {}, // clipIndex -> bool：translateClip 进行中（重入互斥，防同 clip 并发）
+    // 轨道稳定身份 -> true：内容级检测判定为中文源、已决定不介入的轨。
+    // 必须持久于 resetForNewVideo()，否则 activeTrack 被置 null 后 onManifest
+    // 下一轮轮询又会重新选中并重拉同一条轨（实测 10 轮轮询 fetch 10 次）。
+    // 键用 code|languageCode|kind（同 manifestIdentity 的约定）而不是 URL：
+    // YouTube timedtext URL 带会轮换的 pot 签名参数，用 URL 做键会在签名刷新后
+    // miss，退化回每轮重拉。切视频时清空（见 changedVideo 分支）。
+    skippedChineseTracks: {},
     retryTimer: null, // 后台失败重试调度器 id（第2层；只在有 error clip 时活跃）
     renderer: null, // 叠加层 DOM
     videoEl: null,
@@ -350,9 +357,13 @@
   }
 
   function manifestIdentity(manifest) {
-    return manifest.videoId + "|" + manifest.files.map(function (track) {
-      return [track.code, track.languageCode, track.kind].join("\x1f");
-    }).join("\x1e");
+    return manifest.videoId + "|" + manifest.files.map(trackIdentity).join("\x1e");
+  }
+
+  // 单条轨的稳定身份：不含 URL，因为 YouTube timedtext URL 带会轮换的 pot 签名。
+  // 与 manifestIdentity 共用同一组字段，避免两处对「轨道身份」有不同定义。
+  function trackIdentity(track) {
+    return [track.code, track.languageCode, track.kind].join("\x1f");
   }
 
   function onManifest(content) {
@@ -373,6 +384,10 @@
     if (changedVideo) {
       // 切换视频：清空所有缓存与渲染，并锁定当前页面实际视频的轨道身份。
       resetForNewVideo();
+      // 中文源判定按视频作用域失效：清在这里而不是 resetForNewVideo() 里，
+      // 因为跳过中文轨时也会调 resetForNewVideo()，在那里清等于自己擦掉刚记下的结论
+      // → 又变回每轮重拉。
+      state.skippedChineseTracks = {};
       state.manifestIdentity = nextIdentity;
     } else if (!state.manifestIdentity) {
       state.manifestIdentity = nextIdentity;
@@ -383,6 +398,9 @@
 
     if (!config.enabled) return;
     var track = pickTrack(state.tracks, config.sourceLang);
+    // 已判定为中文源的轨：当作「无可用轨」。pickTrack 仍会选中它（元数据看着不是中文），
+    // 不在这里短路的话每轮轮询都会重拉整轨。
+    if (track && state.skippedChineseTracks[trackIdentity(track)]) track = null;
     if (!track) {
       // 无可用轨 / 中文源被跳过：清渲染，避免上一视频字幕残留
       if (state.activeTrack || state.renderUnits.length || state.cues.length) {
@@ -503,6 +521,30 @@
       if (!cues.length) {
         // 200 + 合法 JSON 但没有任何字幕内容 —— 典型的限流/降级响应,重试通常能拿到真轨
         retryLater("轨道为空");
+        return;
+      }
+      // 内容级中文检测：轨道元数据判不出来的中文轨在这里拦下。
+      //
+      // pickTrack 只能看语言码，而真实中文轨常常码不对（上传者选错标成 en、
+      // YouTube 未识别给 und、搬运号轨名写中文但码是 en）。那些轨会一路走到这里，
+      // 然后被送去把中文「翻译」成中文 —— 白烧 API 钱且字幕被重排得更差。
+      //
+      // 拦点放在解析后而非 pickTrack 内：判据需要真实 cue 文本，选轨阶段
+      // 只有 URL 还没有内容。这里是内容第一次可得、且翻译尚未启动的位置。
+      // 走 resetForNewVideo() 复用「无可用轨」那条既有清理路径（会
+      // restoreNativeCaptions() 让原生字幕照常显示），不新增第二条隐身路径。
+      //
+      // 必须记住判定结果（skippedChineseTracks）：resetForNewVideo() 会把
+      // activeTrack 置 null，而 pickTrack 仍会选中这条轨（它的元数据看着是 en），
+      // 于是 onManifest 下一轮轮询看到「无活动轨」又重新 switchTrack 同一条轨。
+      // 实测不记住的话 10 轮轮询 fetch 10 次 —— 每次轮询重拉整轨，
+      // 既费流量又反复重跑检测。记住后同一条轨只判一次。
+      if (Core.looksChineseCueList(cues)) {
+        console.info("[dualsub] 源字幕内容为中文（轨道语言码 " +
+          ((track && (track.languageCode || track.code)) || "未知") +
+          "），本扩展不介入");
+        state.skippedChineseTracks[trackIdentity(track)] = true;
+        resetForNewVideo();
         return;
       }
       // 先立即建立稳定 fallback 原文时间轴；技术 cue 不翻译。语义恢复是整轨模型工作，不能阻塞首字幕。
@@ -1928,6 +1970,10 @@
         // 源语言变了 → 重新选轨并重载
         if (config.sourceLang !== prevSource || !prevEnabled) {
           var track = pickTrack(state.tracks, config.sourceLang);
+          // 与 onManifest 同一判据：已判定为中文源的轨当作无可用轨。
+          // 不在这里短路的话，用户切到这条轨会白拉一次整轨再被 loadTrack 拦下 ——
+          // 结果一样但多一次请求，且让「中文源不介入」有了两套判断。
+          if (track && state.skippedChineseTracks[trackIdentity(track)]) track = null;
           if (track) {
             switchTrack(track); // 单一 transition：先取消旧轨，再加载新轨
           } else {

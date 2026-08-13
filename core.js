@@ -2397,6 +2397,83 @@
     return /^(?:zh|cmn)(?:[-_]|$)/.test(s);
   }
 
+  /**
+   * 按**字幕实际内容**判断这条轨是不是中文。
+   *
+   * 为什么光看语言码不够：isChineseTrackCode 只认元数据，而真实轨里中文字幕
+   * 常常不带中文码 —— 上传者人工上传时语言选错（标成 en）、YouTube 未能识别
+   * （languageCode="und"）、搬运号轨名写「简体中文」但码是 en。实测这几种形状
+   * 全都绕过了码判据，整轨被送去「翻译」，等于花钱把中文翻成中文。
+   *
+   * 判据用字形而不是语言码，因为字形是内容自带的、不依赖任何人填对元数据。
+   * 两个必须避开的误伤：
+   *  - 日语：日文混用汉字，光看汉字会把日语轨当中文跳过。假名（平假名/片假名）
+   *    是日语的排他信号 —— 中文正文不会出现假名，所以见到成比例的假名即判日语。
+   *  - 粤语：项目刻意要翻译书面粤语（见 isChineseTrackCode 注释）。粤语专用字
+   *    在标准中文里几乎不出现，命中即放行去翻译。
+   *
+   * 阈值取「汉字占中日韩字符的多数」而非绝对数量：中文轨里夹英文专名很常见
+   * （「用 ChatGPT 写代码」），按绝对数量会被几个拉丁词带偏。
+   */
+  var CANTONESE_MARKERS = /[唔係嘅咁哋嚟攞睇冇喺乜嗰啲噉]/;
+  function looksChineseSubtitleText(text) {
+    var s = String(text == null ? "" : text);
+    if (!s.trim()) return false;
+    // 假名 = 日语排他信号。中文正文不含假名，出现即判日语，不跳过。
+    var kana = (s.match(/[\p{scx=Hiragana}\p{scx=Katakana}]/gu) || []).length;
+    var han = (s.match(/\p{scx=Han}/gu) || []).length;
+    var hangul = (s.match(/\p{scx=Hangul}/gu) || []).length;
+    if (!han) return false;
+    // 假名达到汉字的 5% 就当日语：日文里汉字可以很密（新闻体），但只要是日语
+    // 就一定有助词假名（の、を、は…）。中文轨的假名只可能来自零星外来词引用。
+    if (kana * 20 >= han) return false;
+    if (hangul >= han) return false;
+    // 粤语专用字命中 → 是真翻译目标，放行。
+    if (CANTONESE_MARKERS.test(s)) return false;
+    // 汉字须占 CJK 字符的多数（此处 kana/hangul 已被上面压到少数，等价于汉字为主）。
+    return han > kana + hangul;
+  }
+
+  /**
+   * 抽样整轨 cue 文本判语言。
+   *
+   * 抽样而非全量：低配 Chromebook 是目标环境之一，整轨可能上万条 cue，
+   * 逐条跑 Unicode 正则是白烧 CPU。判语言只需要有代表性的样本。
+   * 取头中尾三段而非只取开头：开头常是台标/赞助商念白（"本视频由…赞助"），
+   * 只看开头会被一段外语开场带偏。
+   *
+   * 文本字段读 content 而非 text：cleanupCues 产出的 cue 用的是 content
+   * （见 cleanupCues），只读 text 会全拿到空串 → 恒判「非中文」→ 守卫静默失效。
+   * 首次实现就踩了这个坑：单测用 {text:…} 造 fixture 所以全绿，真机浏览器
+   * 回放立刻红（仍发起 1 次翻译）。两个名字都接受，避免再被字段名咬。
+   */
+  function cueDisplayText(cue) {
+    if (!cue) return "";
+    var v = cue.content;
+    if (v == null || v === "") v = cue.text;
+    return v == null ? "" : String(v);
+  }
+
+  function looksChineseCueList(cues, sampleLimit) {
+    var list = Array.isArray(cues) ? cues : [];
+    if (!list.length) return false;
+    var limit = sampleLimit || 60;
+    var texts = [];
+    if (list.length <= limit) {
+      texts = list.map(cueDisplayText);
+    } else {
+      // 头中尾各取三分之一，覆盖开场、正片、结尾。
+      var per = Math.floor(limit / 3);
+      var mid = Math.floor(list.length / 2) - Math.floor(per / 2);
+      [0, mid, list.length - per].forEach(function (start) {
+        list.slice(Math.max(0, start), Math.max(0, start) + per).forEach(function (c) {
+          texts.push(cueDisplayText(c));
+        });
+      });
+    }
+    return looksChineseSubtitleText(texts.join("\n"));
+  }
+
   function pickTrack(tracks, sourceLang) {
     if (!tracks || !tracks.length) return null;
     var list = tracks;
@@ -6139,6 +6216,8 @@
     translationCoverageUnitsFromCues: translationCoverageUnitsFromCues,
     parseTranslationCoverageResponse: parseTranslationCoverageResponse,
     remapAliasCoverage: remapAliasCoverage,
+    looksChineseSubtitleText: looksChineseSubtitleText,
+    looksChineseCueList: looksChineseCueList,
     extractJsonObject: extractJsonObject,
     DEFAULT_BLOCK_TRANSLATION_PROMPT: DEFAULT_BLOCK_TRANSLATION_PROMPT,
     blockSourceCues: blockSourceCues,
