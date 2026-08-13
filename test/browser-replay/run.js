@@ -5,7 +5,7 @@ const ROOT=path.resolve(__dirname,"../..");
 const FIX=__dirname;
 const endpoint=process.env.DUALSUB_CDP_URL||"http://172.19.0.33:9222";
 const publicHost=process.env.DUALSUB_REPLAY_HOST||Object.values(os.networkInterfaces()).flat().find(x=>x&&x.family==="IPv4"&&!x.internal&&/^172\./.test(x.address))?.address||"127.0.0.1";
-const scenarios=(process.env.DUALSUB_REPLAY_SCENARIOS||"happy,empty-track-retry,empty-track-exhaust,block-long-fallback,block-failure,seek-race,block-cache,config-race,disable-inflight,track-switch-race,full-srt,full-srt-cancel,priority-overtake,spa-switch-stale,source-lang-chinese,netflix-happy").split(",");
+const scenarios=(process.env.DUALSUB_REPLAY_SCENARIOS||"happy,empty-track-retry,empty-track-exhaust,block-long-fallback,block-failure,seek-race,block-cache,config-race,disable-inflight,track-switch-race,full-srt,full-srt-cancel,priority-overtake,spa-switch-stale,source-lang-chinese,zh-content-en-code,netflix-happy").split(",");
 for(const name of ["index.html","track.json","semantic.json"])assert.ok(fs.existsSync(path.join(FIX,name)),`missing fixture: ${name}`);
 class CDP{constructor(ws){this.ws=ws;this.id=0;this.pending=new Map();this.onEvent=null;ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.id&&this.pending.has(m.id)){const {resolve,reject}=this.pending.get(m.id);this.pending.delete(m.id);m.error?reject(new Error(m.error.message)):resolve(m.result)}else if(m.method&&this.onEvent){this.onEvent(m)}}}send(method,params={},sessionId){return new Promise((resolve,reject)=>{const id=++this.id;this.pending.set(id,{resolve,reject});this.ws.send(JSON.stringify({id,method,params,...(sessionId?{sessionId}:{})}))})}}
 /* 生产 isolated.js 按 location.hostname 选站点适配器，未支持的站点直接退出。
@@ -60,6 +60,28 @@ if(name==="spa-switch-stale"){
 // 中文源轨不介入：切到 zh-Hans 后 pickTrack 返回 null,此时必须走和「无可用轨」
 // 同一条清理路径。曾经只调 bindVideo() —— 不清 renderUnits、不摘 hide-native,
 // 于是上一条轨的字幕永久挂在画面上,同时原生字幕仍被隐藏,两头都没有正确字幕。
+// 内容级中文检测：轨道元数据声明 en-asr，实际内容是中文。语言码判据完全绕过，
+// 只能靠 loadTrack 里的 looksChineseCueList 拦下。承重点是「一次翻译请求都不许发出」——
+// 光断言「没有译文上屏」不够，请求发出去钱就烧了。
+if(name==="zh-content-en-code"){
+  assert.ok(r.events.some(x=>x.type==="zh-track-served"),"中文内容轨未被请求,场景没跑起来");
+  // 承重点：一次翻译都不许发起。r.apiCalls 在本 harness 里不存在（写它等于恒真假门禁），
+  // 真实信号是 translateContextBlock 的 translation-start 事件。
+  const starts=(r.events||[]).filter(x=>x.type==="translation-start");
+  assert.equal(starts.length,0,"中文内容轨仍发起了 "+starts.length+" 次翻译 —— 把中文翻成中文,白烧 API 钱");
+  // 不得每轮轮询重拉同一条轨：resetForNewVideo() 把 activeTrack 置 null，而 pickTrack
+  // 仍会选中它（元数据看着是 en），不记住判定结果就会无限重拉整轨。
+  // 用例自检：必须真的发生了多轮清单轮询，否则「只拉一次」是空窗假绿。
+  const repolls=(r.events||[]).filter(x=>x.type==="manifest-repoll");
+  assert.ok(repolls.length>=5,"清单只重发了 "+repolls.length+" 轮 —— 重拉断言失去判别力(空窗假绿)");
+  const served=(r.events||[]).filter(x=>x.type==="zh-track-served");
+  assert.equal(served.length,1,"中文轨被拉取了 "+served.length+" 次 —— 每轮清单轮询都在重拉整轨(应只判一次)");
+  const painted=(r.paints||[]).filter(x=>String(x.trans||"").trim()&&x.trans!=="翻译中…");
+  assert.equal(painted.length,0,"中文内容轨仍渲染了译文("+painted.length+" 帧): "+JSON.stringify(painted.slice(0,2).map(p=>p.trans)));
+  // 隐身必须彻底：原生字幕要还回去，否则用户两头都没有字幕
+  assert.ok(r.nativeRestored,"中文内容轨被跳过后仍隐藏着原生字幕 —— 用户看不到任何字幕");
+  return;
+}
 if(name==="source-lang-chinese"){const switchAt=(r.events.find(x=>x.type==="config-switch")||{}).t;assert.ok(switchAt!=null,"未发生 sourceLang 切换,场景没跑起来");
 // 前置条件:切换前必须真的在渲染双语字幕、且真的隐藏了原生字幕。
 // 少了这两条,「切换后无残留」会因为「压根没渲染过」而假绿 —— 空的观察窗

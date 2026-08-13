@@ -4106,6 +4106,65 @@ async function main() {
       /missing mapped unit/, "缺少期望单元必须 fail-closed");
   });
 
+  test("looksChineseCueList 按内容拦下语言码不可信的中文轨（元数据判不出来的那些）", () => {
+    // 根因：pickTrack 只看语言码，但真实中文轨常常码不对 —— 上传者选错标成 en、
+    // YouTube 未识别给 und、搬运号轨名写中文但码是 en。实测这几种形状全绕过码判据，
+    // 整轨被送去把中文「翻译」成中文（白烧 API 钱 + 字幕被重排得更差）。
+    // fixture 必须用真实字段名 content：cleanupCues 产出的 cue 用 content，
+    // 首版用 {text:…} 造 fixture 导致单测全绿而真机仍发起翻译（字段读空串→恒判非中文）。
+    const cues = (arr) => arr.map((t, i) => ({ start: i, end: i + 1, content: t }));
+
+    // 必须跳过：真中文，无论语言码写什么
+    assert.strictEqual(Core.looksChineseCueList(cues([
+      "大家好，欢迎回到我的频道", "今天我们要聊一个很有意思的话题", "记得点赞订阅",
+    ])), true, "简体中文轨必须被判为中文");
+    assert.strictEqual(Core.looksChineseCueList(cues([
+      "大家好，歡迎回到我的頻道", "今天我們要聊一個很有意思的話題",
+    ])), true, "繁体中文轨必须被判为中文（zh-Hant→zh-Hans 是转码不是翻译）");
+    // 中文轨夹英文专名极常见，不能被几个拉丁词带偏（所以判据用占比不用绝对数量）
+    assert.strictEqual(Core.looksChineseCueList(cues([
+      "我们用 ChatGPT 和 Claude 写代码", "这个 framework 的性能比 React 好很多",
+    ])), true, "中文夹英文专名仍是中文轨");
+
+    // 必须介入：日语混用汉字，光看汉字会误伤 —— 假名是日语的排他信号
+    assert.strictEqual(Core.looksChineseCueList(cues([
+      "みなさん、こんにちは", "今日は面白い話をします",
+    ])), false, "日语轨不得被当成中文跳过");
+    assert.strictEqual(Core.looksChineseCueList(cues([
+      "政府は新型経済対策を発表した", "今年度の予算案は過去最大規模となる",
+    ])), false, "日语新闻体汉字很密，但助词假名仍能判出日语");
+
+    // 必须介入：书面粤语是项目刻意要翻译的目标（见 isChineseTrackCode 注释）
+    assert.strictEqual(Core.looksChineseCueList(cues([
+      "大家好，今日我哋要講一個好有趣嘅話題", "如果你覺得有用嘅話唔好忘記訂閱",
+    ])), false, "书面粤语必须放行去翻译，不能按中文跳过");
+
+    assert.strictEqual(Core.looksChineseCueList(cues([
+      "Hey everyone welcome back", "Today we talk about something interesting",
+    ])), false, "英语轨必须介入");
+    assert.strictEqual(Core.looksChineseCueList(cues([
+      "안녕하세요 여러분", "오늘은 재미있는 이야기를 하겠습니다",
+    ])), false, "韩语轨必须介入");
+
+    // 边界：无内容不得误判为中文（否则会把加载失败的轨当中文静默跳过）
+    assert.strictEqual(Core.looksChineseCueList([]), false, "空轨不得判为中文");
+    assert.strictEqual(Core.looksChineseCueList(cues(["[Music]", "♪♪♪"])), false, "纯音效标记不得判为中文");
+
+    // 抽样必须取头中尾：开头常是赞助商念白，只看开头会被外语开场带偏
+    const mixed = cues([
+      ...Array(20).fill("This video is sponsored by our partner"),
+      ...Array(200).fill("我们今天来讲讲这个话题的核心内容"),
+      ...Array(20).fill("我们下期再见，感谢观看"),
+    ]);
+    assert.strictEqual(Core.looksChineseCueList(mixed), true, "外语开场+中文正片必须判为中文轨");
+
+    // 性能：低配 Chromebook 是目标环境，整轨上万条不能逐条跑 Unicode 正则
+    const huge = cues(Array(12000).fill("我们今天来讲讲这个话题的核心内容和一些细节"));
+    const t0 = Date.now();
+    assert.strictEqual(Core.looksChineseCueList(huge), true);
+    assert.ok(Date.now() - t0 < 50, "12000 条 cue 判定必须走抽样（<50ms），不得全量扫");
+  });
+
   console.log("\n[第3层 自适应 gate：makeAdaptiveGate]");
 
   await asyncTest("chatCompletion 遇到 200 HTML 响应给出 Base URL 诊断而不是 JSON 语法错误", async () => {
