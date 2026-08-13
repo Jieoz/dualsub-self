@@ -1970,6 +1970,10 @@
         // 源语言变了 → 重新选轨并重载
         if (config.sourceLang !== prevSource || !prevEnabled) {
           var track = pickTrack(state.tracks, config.sourceLang);
+          // 与 onManifest 同一判据：已判定为中文源的轨当作无可用轨。
+          // 不在这里短路的话，用户切到这条轨会白拉一次整轨再被 loadTrack 拦下 ——
+          // 结果一样但多一次请求，且让「中文源不介入」有了两套判断。
+          if (track && state.skippedChineseTracks[trackIdentity(track)]) track = null;
           if (track) {
             switchTrack(track); // 单一 transition：先取消旧轨，再加载新轨
           } else {
