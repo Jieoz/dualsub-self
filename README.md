@@ -22,7 +22,13 @@
 
 ## 安装（加载已解压的扩展程序）
 
-当前版本：**v0.9.5**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.9.5) 下载 Chrome MV3 安装包。
+当前版本：**v0.9.6**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.9.6) 下载 Chrome MV3 安装包。
+
+v0.9.6 真正修好**中文源轨跳过**（v0.9.5 只看元数据码，实际没拦住），并**瘦身翻译请求 13-16%**。
+
+- **v0.9.5 说「中文源轨不介入」但实际没拦住。** 根因：判据只看轨道元数据的语言码（`zh`/`cmn`），而真实中文轨常常码不对——上传者语言选错标成 `en`、YouTube 未识别给 `und`、搬运号轨名写「简体中文」但码是 `en`。实测这几种形状全部绕过码判据，整轨被送去把中文「翻译」成中文：白烧 API 钱，且字幕被重排得更差。现在加**内容级检测**，按字幕实际字形的占比判定——字形是内容自带的，不依赖任何人填对元数据。日语混用汉字但假名是排他信号（`kana*20 >= han` 判日语）；书面粤语（唔、係、嘅、嘢）是项目刻意要翻译的目标，粤语专用字命中即放行。
+- **拦下后不再无限重拉整轨。** 拦截会把 `activeTrack` 置 null，而 `pickTrack` 仍会选中这条轨（元数据看着是 `en`），下一轮清单轮询又重新拉取——实测 10 轮轮询 fetch 10 次。用 `skippedChineseTracks` 记住判定结果，键用 `code|languageCode|kind`（不含 URL，因为 YouTube timedtext URL 带会轮换的 `pot` 签名，用 URL 做键会在签名刷新后退化为每轮重拉——已用轮换签名场景消融证实）。
+- **翻译请求 payload 瘦身 13-16%。** 发给模型的 unitId 改成短别名 `u0/u1`（真实 id 不出网），停发 `sourceFingerprint`，system prompt 前缀稳定化走各家自动前缀缓存（不发厂商专有缓存字段），清掉 `isolated.js` 透传的死参数 `contextBefore/contextAfter`。真实 fixture 实测 user payload 省 17.2~21.3%，含 system 合计省 12.8~15.9%。
 
 v0.9.5 新增**中文源轨完全不介入**，修掉两个会让字幕停在画面上的状态残留缺陷，并补上两条此前**空转**的门禁。
 
