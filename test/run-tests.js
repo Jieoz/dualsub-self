@@ -1212,25 +1212,32 @@ test("block 切片不按停顿切块，长停顿只在装载时钳每屏时间",
   assert.equal(clips[0].cues.length, 2);
 });
 
-test("translateContextBlock 使用程序侧 coverage ledger，模型不得自报覆盖范围", async () => {
+test("translateContextBlock 整段投喂：模型看到完整语流而非逐 cue 碎片", async () => {
   const cues = [{ start: 100, end: 1100, content: "first source cue" }, { start: 1100, end: 2400, content: "continues here" }];
   let sent;
   const result = await Core.translateContextBlock({
     cues, apiBaseUrl: "https://example.test", ["api" + "Key"]: String.fromCharCode(107), apiModel: "m", targetLang: "zh-Hans", maxVisualWidth: 48,
     fetchImpl: async (_url, req) => {
       const body = JSON.parse(req.body); sent = JSON.parse(body.messages[1].content);
-      const translations = sent.units.map((u, i) => ({ unitId: u.unitId, coverFrom: u.coverFrom, coverTo: u.coverTo, translation: i === 0 ? "第一句译文" : "第二句译文" }));
-      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ translations }) } }] }) };
+      // v10 协议：模型返回 segments+screens，不是 translations
+      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({
+        segments: [{ sourceFrom: "c0", sourceTo: "c0", screens: [{ sourceFrom: "c0", sourceTo: "c0", text: "第一句译文" }] },
+                    { sourceFrom: "c1", sourceTo: "c1", screens: [{ sourceFrom: "c1", sourceTo: "c1", text: "第二句译文" }] }]
+      }) } }] }) };
     },
   });
-  assert.deepStrictEqual(sent.units.map((unit) => unit.sourceText), ["first source cue", "continues here"]);
+  // 整段投喂：sourceText 是所有 cue 拼接，不是逐 cue 的 units[]
+  assert.ok(sent.sourceText, "必须有 sourceText（整段原文）");
+  assert.strictEqual(sent.sourceText, "first source cue continues here");
+  assert.ok(sent.sourceCues, "必须有 sourceCues（cue 边界+时间）");
+  assert.ok(!sent.units, "不得发逐 cue units[]（v9 回退已被修复）");
   assert.equal(result.segments.length, 2);
   assert.equal(result.units.length, 2);
   assert.equal(result.units[0].startMs, 100);
   assert.equal(result.units[1].startMs, 1100);
 });
 
-test("block-v1 对多书写系统使用同一请求、parser 与时间物化路径", async () => {
+test("block-v10 对多书写系统使用同一请求、parser 与时间物化路径", async () => {
   const samples = [
     ["Electric kettles are useful", "though they are slower here"],
     ["Zażółć gęślą jaźń", "to nadal działa poprawnie"],
@@ -1247,17 +1254,22 @@ test("block-v1 对多书写系统使用同一请求、parser 与时间物化路�
       cues, apiBaseUrl: "https://example.test", ["api" + "Key"]: "k", apiModel: "m", targetLang: "zh-Hans",
       fetchImpl: async (_url, req) => {
         sent = JSON.parse(JSON.parse(req.body).messages[1].content);
-        const translations = sent.units.map((u, i) => ({ unitId: u.unitId, translation: i === 0 ? "第一句译文" : "第二句译文" }));
-        return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ translations }) } }] }) };
+        // v10 协议：模型返回 segments+screens
+        return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({
+          segments: [{ sourceFrom: "c0", sourceTo: "c0", screens: [{ sourceFrom: "c0", sourceTo: "c0", text: "第一句译文" }] },
+                      { sourceFrom: "c1", sourceTo: "c1", screens: [{ sourceFrom: "c1", sourceTo: "c1", text: "第二句译文" }] }]
+        }) } }] }) };
       },
     });
+    // 整段投喂：sourceText 包含所有 cue 的原文
+    assert.ok(sent.sourceText, "必须有 sourceText");
     pair.forEach((content) => {
-      assert.ok(sent.units.some((unit) => unit.sourceText === content), `ledger 缺原文: ${content}`);
+      assert.ok(sent.sourceText.includes(content), `sourceText 缺原文: ${content}`);
     });
-    // 账本仍由程序侧唯一决定，但不再发给模型（unitId 已编码范围）。承重点是
-    // 「每单元有稳定 unitId 且译文按 unitId 原子归位」，不是「模型抄回 span」。
-    assert.ok(sent.units.every((unit) => unit.unitId), "units 必须携带稳定 unitId");
-    assert.ok(sent.units.every((unit) => unit.coverFrom === undefined && unit.coverTo === undefined), "不得把范围冗余发给模型");
+    // sourceCues 只发 id+时间，不发全文（v9 token 精简保留）
+    assert.ok(sent.sourceCues, "必须有 sourceCues");
+    assert.ok(sent.sourceCues.every((c) => c.id && c.startMs != null && c.endMs != null), "sourceCues 必须有 id+时间");
+    assert.ok(sent.sourceCues.every((c) => c.text === undefined), "sourceCues 不得重发全文");
     assert.deepStrictEqual(out.units.map((u) => u.translation), ["第一句译文", "第二句译文"]);
   }
   const coreSrc = fs.readFileSync(path.join(ROOT, "core.js"), "utf8");

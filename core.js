@@ -3787,7 +3787,11 @@
   // 屏级覆盖范围，程序只能按比例猜配，正是整句重译和屏级错位的根因。
   // v9：请求只发 unitId + sourceText（去掉 coverFrom/coverTo/maxVisualWidth/semanticGroupId
   // 逐单元冗余），响应只要求 unitId + translation。输出形态变了必须升版本作废旧缓存。
-  var BLOCK_CONTRACT_VERSION = "block-v9";
+  // v10：恢复整段投喂。v9 把 sourceText 换成逐 cue units[] 导致模型只看到碎片，
+  // 译文碎片化（丢 "and"、猜错 "I" 上下文）。v10 恢复 sourceText 为整段拼接，
+  // 同时保留 v9 的 sourceCues 精简（只发 id+时间不发全文）。旧缓存里存的是逐 cue
+  // 译文，其 integrity 自洽会通过校验，不升版会继续命中那批碎片化译文。
+  var BLOCK_CONTRACT_VERSION = "block-v10";
 
   var BLOCK_SEGMENT_MAX_GAP_MS = 750;
   var BLOCK_MIN_DISPLAY_MS = 300;
@@ -4818,40 +4822,38 @@
     opts = opts || {};
     var cues = opts.cues || [];
     if (!cues.length) return { segments: [], units: [] };
+    var source = blockSourceCues(cues);
     var maxWidth = Math.max(8, Math.floor(Number(opts.maxVisualWidth || opts.maxLineChars) || TRANSLATION_DISPLAY_MAX_WIDTH));
-    // 根修复：运行态不再使用 block screens 契约。
+    // 整段投喂：模型看到的是完整语流（sourceText = 所有 cue 拼成一段），不是逐 cue 碎片。
     //
-    // block-v7/v8 的根问题是让模型同时决定「怎么翻译」和「每屏覆盖哪段源文」。模型
-    // 一旦把覆盖范围声明错，程序即使严格校验 JSON 也只是在校验错误声明，仍会出现
-    // 整句重译、译文提前/滞后和短屏读不完。真正的权威覆盖必须由程序先定：每个 cue
-    // 生成一个 unitId + token span，模型只复制 ledger 并翻译该 unit。parseTranslationCoverageResponse
-    // 会 fail-closed 校验 unitId、coverFrom、coverTo、数量、重复和缺口。
-    var lines = await translateClipLines(Object.assign({}, opts, {
-      cues: cues.map(function (cue, index) {
-        var c = Object.assign({}, cue);
-        c.maxVisualWidth = maxWidth;
-        c.semanticGroupId = cue && cue.semanticGroupId != null ? cue.semanticGroupId : "block:" + index;
-        return c;
+    // v9 的根缺陷是把整段 sourceText 换成了逐 cue units[]，模型从未看到完整句子，
+    // 译文碎片化（"this is the lock-picking lawyer and" → "这里是开锁律师"，丢 "and"）。
+    // v9 的 token 精简（sourceCues 只发 id+时间不发全文）是对的，保留；
+    // 但 sourceText 必须是整段，不能是逐 cue 的 sourceText。
+    //
+    // DEFAULT_BLOCK_TRANSLATION_PROMPT 要求模型先通读整段再译，返回 segments+screens
+    // （语义分段，不要求 1:1）。parseBlockTranslationResponse 校验连续覆盖，materializeBlockTranslation
+    // 按源词推进和语音时长比例分配时间。
+    var sys = buildSystemPrompt(opts.targetLang, opts.systemPrompt) + "\n" + (opts.blockSystemPrompt || DEFAULT_BLOCK_TRANSLATION_PROMPT);
+    var content = await chatCompletion({
+      apiBaseUrl: opts.apiBaseUrl,
+      apiKey: opts.apiKey,
+      apiModel: opts.apiModel,
+      temperature: opts.temperature,
+      reasoningEffort: opts.reasoningEffort,
+      systemContent: sys,
+      userContent: JSON.stringify({
+        sourceText: source.map(function (c) { return c.text; }).join(" "),
+        sourceCues: source.map(function (c) {
+          return { id: c.id, startMs: c.startMs, endMs: c.endMs };
+        }),
       }),
-      maxLineChars: maxWidth,
-      lenient: !!opts.lenient,
-    }));
-    if (lines.length !== cues.length) throw new Error("translation coverage alignment mismatch");
-    // 分屏/宽度兜底/句末拆分/悬挂助词合并/屏尾去标点只有一条权威实现：
-    // parseBlockTranslationResponse。这里把程序侧 ledger 结果编成同一份 v8 契约再过
-    // 那条路径，而不是在本函数里复制一遍同样的行整形逻辑（那正是双实现漂移的来源，
-    // browser-replay 就是被这种漂移打红的）。
-    var payload = { segments: cues.map(function (cue, index) {
-      return {
-        sourceFrom: "c" + index,
-        sourceTo: "c" + index,
-        screens: [{ sourceFrom: "c" + index, sourceTo: "c" + index, text: String(lines[index] || "") }],
-      };
-    }) };
-    var segments = parseBlockTranslationResponse(JSON.stringify(payload), cues, {
-      maxVisualWidth: maxWidth,
-      lenient: !!opts.lenient,
+      timeoutMs: opts.timeoutMs,
+      fetchImpl: opts.fetchImpl,
+      onUsage: opts.onUsage,
+      signal: opts.signal,
     });
+    var segments = parseBlockTranslationResponse(content, cues, { maxVisualWidth: maxWidth, lenient: !!opts.lenient });
     return { segments: segments, units: materializeBlockTranslation(segments, cues, { maxVisualWidth: maxWidth }) };
   }
 
