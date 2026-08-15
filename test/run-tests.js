@@ -1133,13 +1133,17 @@ test("block translation 锁定连续源范围，并只在目标词法边界兜�
   assert.ok(!numberUnit.some((line, i) => /0\.1\s*$/.test(line) && /^mm\b/.test(numberUnit[i + 1] || "")), "数字与紧邻单位不得拆屏");
 
   const paused = [{ start: 0, end: 500, content: "before pause" }, { start: 1500, end: 2200, content: "after pause" }];
-  // block-v8：屏级覆盖范围是权威时间范围，一屏不得跨越长停顿；跨停顿必须拆成两屏声明。
-  assert.throws(
-    () => Core.parseBlockTranslationResponse(JSON.stringify({ segments: [
-      v8Segment("c0", "c1", "这是停顿之前说的那一整句话，而这是停顿之后接着说的另一整句话"),
-    ] }), paused),
-    /long pause/,
-  );
+  // block-v12：屏跨长停顿不再拒绝整块，而是在停顿处拆屏。
+  // 以前跨停顿的 screen 会被 throw 拒绝，导致整块 30 秒字幕全部丢失。
+  // 现在在停顿处拆成两个子范围，译文按语音时长比例分配。
+  const crossPause = Core.parseBlockTranslationResponse(JSON.stringify({ segments: [
+    v8Segment("c0", "c1", "这是停顿之前说的那一整句话，而这是停顿之后接着说的另一整句话"),
+  ] }), paused);
+  assert.ok(crossPause.length >= 2, "跨停顿的屏必须在停顿处拆开");
+  assert.equal(crossPause[0].sourceFrom, 0);
+  assert.equal(crossPause[0].sourceTo, 0);
+  assert.equal(crossPause[1].sourceFrom, 1);
+  assert.equal(crossPause[1].sourceTo, 1);
   const split = Core.parseBlockTranslationResponse(JSON.stringify({ segments: [
     v8Segment("c0", "c0", "停顿前"),
     v8Segment("c1", "c1", "停顿后"),

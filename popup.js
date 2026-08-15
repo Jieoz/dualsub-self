@@ -60,12 +60,17 @@
     });
   }
 
-  /** 从 tab.url 取 origin（用于拼 storage key） */
+  /** 从 tab.url 取 origin（用于拼 storage key）。
+   *  非 YouTube/Netflix 页面（chrome://newtab、chrome://extensions 等）的 origin
+   *  不可用作存储 key——回退到 YouTube origin，让用户在任何页面都能保存配置。 */
+  var FALLBACK_ORIGIN = "https://www.youtube.com";
   function originOf(url) {
     try {
-      return new URL(url).origin;
+      var u = new URL(url);
+      if (u.origin === "https://www.youtube.com" || u.origin === "https://www.netflix.com") return u.origin;
+      return FALLBACK_ORIGIN;
     } catch (e) {
-      return null;
+      return FALLBACK_ORIGIN;
     }
   }
 
@@ -249,7 +254,7 @@
     currentTabId = tab ? tab.id : null;
     currentOrigin = tab ? originOf(tab.url || "") : null;
     if (!tab || !/youtube\.com/.test(tab.url || "")) {
-      setStatus("请在 YouTube 页面打开本扩展。设置仍可填写并保存。", "");
+      setStatus("设置保存在 YouTube 配置下，刷新 YouTube 播放页后生效。", "");
     }
 
     // 关键：直接从 storage 读配置回显，不依赖内容脚本是否在跑

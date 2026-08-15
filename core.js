@@ -3733,6 +3733,7 @@
     "删掉「御寒」这个原因就是删减，不允许。两者冲突时保留信息，宁可该屏偏长。\n" +
     "screens 是把该段完整译文按语义切好的字幕屏：每个 screen 对象必须写 sourceFrom、sourceTo、text；" +
     "screen 的 sourceFrom/sourceTo 表示这屏译文覆盖的源 cue 范围，必须按源 cue 顺序连续、无重叠、无缺口；" +
+    "sourceFrom/sourceTo 必须准确对应这屏译文实际翻译的源文片段，错配会导致中英双语错位；" +
     "同一源 cue 范围不得翻译两次，不得返回两个 screen 覆盖同一段原文；如果一句话需要两屏，必须把源 cue 范围也切成前后两段。\n" +
     "目标 12-24 个汉字，但这是排版目标而非删减理由 —— 意思单元超长也要完整写出，宁可该屏偏长，绝不省略；" +
     "每屏覆盖的源文不超过 12 个英文词，超过时在语义边界处拆成多屏；" +
@@ -3794,7 +3795,9 @@
   // 译文，其 integrity 自洽会通过校验，不升版会继续命中那批碎片化译文。
   // v11：ASCII 句号纳入屏尾去标点集 + splitAtSentenceEnd + SENTENCE_FINAL_PUNCT；
   // prompt 增加每屏英文词数上限（≤12 词），防止 32 词塞一屏。
-  var BLOCK_CONTRACT_VERSION = "block-v11";
+  // v12：屏跨长停顿不再拒绝整块，改为在停顿处拆屏分配译文；
+  // 源词 >14 时程序侧兜底拆屏；prompt 强调 sourceFrom/sourceTo 准确性。
+  var BLOCK_CONTRACT_VERSION = "block-v14";
 
   var BLOCK_SEGMENT_MAX_GAP_MS = 750;
   var BLOCK_MIN_DISPLAY_MS = 300;
@@ -4283,7 +4286,14 @@
       if (keys !== "screens|sourceFrom|sourceTo") throw new Error("block translation segment fields invalid");
       var from = cueIndex(segment.sourceFrom);
       var to = cueIndex(segment.sourceTo);
-      if (from !== cursor || to < from) throw new Error("block translation source coverage gap, overlap, or reorder");
+      if (from !== cursor || to < from) {
+        if (!opts.lenient) throw new Error("block translation source coverage gap, overlap, or reorder");
+        // lenient：segment 不连续，补缺失 cue 的原文回退
+        for (var gi = cursor; gi < from; gi++) {
+          screenItems.push({ from: gi, to: gi, text: "" });
+        }
+        cursor = from;
+      }
       if (!Array.isArray(segment.screens) || !segment.screens.length) throw new Error("block translation screens invalid");
       var screenCursor = from;
       segment.screens.forEach(function (screen) {
@@ -4291,17 +4301,77 @@
         if (Object.keys(screen).sort().join("|") !== "sourceFrom|sourceTo|text") throw new Error("block translation screen fields invalid");
         var sf = cueIndex(screen.sourceFrom);
         var st = cueIndex(screen.sourceTo);
-        if (sf !== screenCursor || st < sf || st > to) throw new Error("block translation screen coverage gap, overlap, or reorder");
-        if (crossesLongPause(sf, st)) throw new Error("block translation screen crosses long pause");
+        if (sf !== screenCursor || st < sf || st > to) {
+          if (!opts.lenient) throw new Error("block translation screen coverage gap, overlap, or reorder");
+          // lenient：screen 不连续，补缺失 cue 的原文回退
+          for (var si2 = screenCursor; si2 < sf; si2++) {
+            screenItems.push({ from: si2, to: si2, text: "" });
+          }
+          screenCursor = sf;
+        }
         var textLine = collapseWhitespace(String(screen.text == null ? "" : screen.text));
-        if (!textLine) throw new Error("block translation screen text empty");
-        screenItems.push({ from: sf, to: st, text: textLine });
+        if (!textLine) {
+          if (!opts.lenient) throw new Error("block translation screen text empty");
+          screenItems.push({ from: sf, to: st, text: "" });
+          screenCursor = st + 1;
+          return;
+        }
+        // 屏跨越长停顿：不再拒绝整块，而是在停顿处拆屏。
+        // 模型不知道停顿位置，返回的 screen 跨越 ≥750ms 静音时，
+        // 按停顿分组把源范围切开，译文按各组语音时长比例分配。
+        // 这样停顿两侧的语音都有字幕，且不丢失模型的译文。
+        var subRanges = [{ from: sf, to: sf }];
+        for (var si = sf + 1; si <= st; si++) {
+          var prevGap = source[si].startMs - source[si - 1].endMs;
+          if (maxInternalGapMs > 0 && prevGap >= maxInternalGapMs) {
+            subRanges.push({ from: si, to: si });
+          } else {
+            subRanges[subRanges.length - 1].to = si;
+          }
+        }
+        if (subRanges.length === 1) {
+          screenItems.push({ from: sf, to: st, text: textLine });
+        } else {
+          // 按各子范围语音时长比例分配译文
+          var subActiveMs = subRanges.map(function (r) {
+            var ms = 0;
+            for (var ri = r.from; ri <= r.to; ri++) ms += Math.max(0, source[ri].endMs - source[ri].startMs);
+            return Math.max(1, ms);
+          });
+          var subTotal = subActiveMs.reduce(function (a, b) { return a + b; }, 0);
+          // 用显示分词切译文，按比例分到各子范围
+          var transWords = splitDisplayWords(textLine);
+          var transCursor = 0;
+          for (var sri = 0; sri < subRanges.length; sri++) {
+            var isLast = sri === subRanges.length - 1;
+            var take = isLast ? transWords.length - transCursor
+              : Math.max(1, Math.round(transWords.length * subActiveMs[sri] / subTotal));
+            take = Math.min(take, transWords.length - transCursor);
+            var subText = transWords.slice(transCursor, transCursor + take).join("");
+            transCursor += take;
+            if (subText.trim()) {
+              screenItems.push({ from: subRanges[sri].from, to: subRanges[sri].to, text: collapseWhitespace(subText) });
+            }
+          }
+        }
         screenCursor = st + 1;
       });
-      if (screenCursor !== to + 1) throw new Error("block translation screen coverage incomplete");
+      if (screenCursor !== to + 1) {
+        if (!opts.lenient) throw new Error("block translation screen coverage incomplete");
+        // lenient：模型漏了部分 cue 的 screens，补原文回退 segment
+        for (var mi = screenCursor; mi <= to; mi++) {
+          screenItems.push({ from: mi, to: mi, text: "" });
+        }
+      }
       cursor = to + 1;
     });
-    if (cursor !== source.length) throw new Error("block translation source coverage incomplete");
+    if (cursor !== source.length) {
+      if (!opts.lenient) throw new Error("block translation source coverage incomplete");
+      // lenient：模型漏了尾部 segments，补原文回退
+      for (var ti = cursor; ti < source.length; ti++) {
+        screenItems.push({ from: ti, to: ti, text: "" });
+      }
+    }
 
     var out = [];
     screenItems.forEach(function (item) {
@@ -4320,7 +4390,23 @@
         if (opts.lenient && !item.text) { lines = [""]; }
         else throw new Error("block translation produced no display lines");
       }
-      if (lines.length > maxBlockDisplayLines(activeMsForRange(item.from, item.to))) throw new Error("block translation has too many display lines for source duration");
+      // 源词超限兜底：模型常给 1 屏覆盖 18 个英文词的单 cue，prompt 里的 ≤12 词限制
+      // 被忽略。程序侧强制拆译文为多行，materializeBlockTranslation 会按比例分配源词。
+      // 只对空格分词语言（拉丁/西里尔等）计数，CJK/泰文按字符宽度判定。
+      var srcWordCount = 0;
+      for (var swi = item.from; swi <= item.to; swi++) {
+        var swText = source[swi].text || "";
+        srcWordCount += swText.indexOf(" ") >= 0 ? swText.split(/\s+/).filter(Boolean).length : 0;
+      }
+      if (lines.length === 1 && srcWordCount > 14 && displayedWidth(lines[0]) > Math.max(6, Math.floor(maxWidth / 2))) {
+        var forceSplit = splitTargetDisplayLine(lines[0], Math.max(4, Math.ceil(displayedWidth(lines[0]) / 2)));
+        if (forceSplit.length > 1) lines = forceSplit;
+      }
+      if (lines.length > maxBlockDisplayLines(activeMsForRange(item.from, item.to))) {
+        if (!opts.lenient) throw new Error("block translation has too many display lines for source duration");
+        // lenient：截断到允许的最大行数
+        lines = lines.slice(0, maxBlockDisplayLines(activeMsForRange(item.from, item.to)));
+      }
       var normalized = { segmentId: "b" + out.length, sourceFrom: item.from, sourceTo: item.to, lines: lines };
       normalized.integrity = blockSegmentIntegrity(normalized);
       out.push(normalized);
