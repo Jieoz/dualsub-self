@@ -3735,6 +3735,7 @@
     "screen 的 sourceFrom/sourceTo 表示这屏译文覆盖的源 cue 范围，必须按源 cue 顺序连续、无重叠、无缺口；" +
     "同一源 cue 范围不得翻译两次，不得返回两个 screen 覆盖同一段原文；如果一句话需要两屏，必须把源 cue 范围也切成前后两段。\n" +
     "目标 12-24 个汉字，但这是排版目标而非删减理由 —— 意思单元超长也要完整写出，宁可该屏偏长，绝不省略；" +
+    "每屏覆盖的源文不超过 12 个英文词，超过时在语义边界处拆成多屏；" +
     "分开后某半太短读起来断气就不分，分开后各自更清楚就分；不切开词语、专名、数字+单位；" +
     "一句话说完必须写句号（或问号、感叹号），不得省略 —— 这是屏边界的判据；" +
     "一屏里不要放两个完整句子。\n" +
@@ -3791,7 +3792,9 @@
   // 译文碎片化（丢 "and"、猜错 "I" 上下文）。v10 恢复 sourceText 为整段拼接，
   // 同时保留 v9 的 sourceCues 精简（只发 id+时间不发全文）。旧缓存里存的是逐 cue
   // 译文，其 integrity 自洽会通过校验，不升版会继续命中那批碎片化译文。
-  var BLOCK_CONTRACT_VERSION = "block-v10";
+  // v11：ASCII 句号纳入屏尾去标点集 + splitAtSentenceEnd + SENTENCE_FINAL_PUNCT；
+  // prompt 增加每屏英文词数上限（≤12 词），防止 32 词塞一屏。
+  var BLOCK_CONTRACT_VERSION = "block-v11";
 
   var BLOCK_SEGMENT_MAX_GAP_MS = 750;
   var BLOCK_MIN_DISPLAY_MS = 300;
@@ -3967,11 +3970,11 @@
    */
   // 顿号「、」刻意不在此列：它分隔并列项，不是小句边界。把它当断点会把型号列表劈开
   // （实测「标准的 AA、AAA」/「C 和 D 电池…」）。Jay 说的「一视同仁」指句号逗号分号。
-  var BREAKABLE_PUNCT_CHARS = "。！？!?…，；：,;:";
+  var BREAKABLE_PUNCT_CHARS = "。！？!?…，；：,;:.";
   var BREAKABLE_PUNCT = new RegExp("[" + BREAKABLE_PUNCT_CHARS + "]", "u");
   // 句末标点 —— 断点强弱上与逗号同级（Jay：「一视同仁」），但它额外是**硬边界**：
   // 一件事说完了，下一件不得挤进同一屏。装填时用它强制换屏。
-  var SENTENCE_FINAL_PUNCT = /[。！？!?…]\s*$/u;
+  var SENTENCE_FINAL_PUNCT = /[。！？!?….]\s*$/u;
 
   /**
    * 在句末标点后断开一屏。
@@ -3986,9 +3989,9 @@
     var buf = "";
     for (var i = 0; i < text.length; i++) {
       buf += text[i];
-      if (!/[。！？!?…]/u.test(text[i])) continue;
+      if (!/[。！？!?….]/u.test(text[i])) continue;
       // 连续的句末标点（「？！」「……」）算同一个边界，全部吞掉再断。
-      while (i + 1 < text.length && /[。！？!?…]/u.test(text[i + 1])) { buf += text[++i]; }
+      while (i + 1 < text.length && /[。！？!?….]/u.test(text[i + 1])) { buf += text[++i]; }
       parts.push(buf);
       buf = "";
     }

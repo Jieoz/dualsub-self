@@ -22,9 +22,12 @@
 
 ## 安装（加载已解压的扩展程序）
 
-当前版本：**v0.9.7**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.9.7) 下载 Chrome MV3 安装包。
+当前版本：**v0.9.8**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.9.8) 下载 Chrome MV3 安装包。
 
-v0.9.7 修掉**翻译碎片化**——v0.9.2 的 token 精简误把整段原文改成逐 cue 投喂，模型从未看到完整句子。
+v0.9.8 修掉**英文行超长**和**中文句尾 ASCII 句号**——v0.9.7 恢复整段投喂后暴露的两个遗留问题。
+
+- **英文行超长（最多 32 词/屏）。** prompt 只限制了中文 12-24 字，没有限制每屏覆盖的英文词数。模型把 8 个 cue、32 个英文词、15.2 秒全塞进 1 屏。现在 prompt 明确要求每屏源文不超过 12 个英文词，超过时在语义边界拆成多屏。
+- **中文句尾 ASCII 句号 `.`。** prompt 告诉模型写句号做屏边界判据，但 `TRAILING_BREAKABLE_PUNCT`、`splitAtSentenceEnd`、`SENTENCE_FINAL_PUNCT` 三个标点集都不含 ASCII `.`。模型写 ASCII `.` 后被当作正常字符保留。现在三个标点集统一纳入 ASCII `.`。
 
 - **根因：v9 契约回退。** v0.9.2（`608c0f5`）把 `translateContextBlock` 的输入从整段 `sourceText`（所有 cue 拼接）改成了逐 cue `units[]`（每条 cue 一个独立翻译单元）。模型看到的是 `"this is the lock-picking lawyer and"` 这样的碎片，而不是完整语流。`DEFAULT_BLOCK_TRANSLATION_PROMPT`（"先通读整段"）变成死代码——只参与缓存 key 哈希，从未发送给模型。
 - **症状：逐 cue 碎片翻译。** "this is the lock-picking lawyer and" → "这里是开锁律师"（丢 "and"）；"I" 单独翻成"当我"（猜错上下文）；连词 "so"/"but"/"then" 落到错误的 cue。这些都不是模型能力问题，而是模型根本没有上下文。
