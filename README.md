@@ -22,7 +22,13 @@
 
 ## 安装（加载已解压的扩展程序）
 
-当前版本：**v0.9.6**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.9.6) 下载 Chrome MV3 安装包。
+当前版本：**v0.9.7**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.9.7) 下载 Chrome MV3 安装包。
+
+v0.9.7 修掉**翻译碎片化**——v0.9.2 的 token 精简误把整段原文改成逐 cue 投喂，模型从未看到完整句子。
+
+- **根因：v9 契约回退。** v0.9.2（`608c0f5`）把 `translateContextBlock` 的输入从整段 `sourceText`（所有 cue 拼接）改成了逐 cue `units[]`（每条 cue 一个独立翻译单元）。模型看到的是 `"this is the lock-picking lawyer and"` 这样的碎片，而不是完整语流。`DEFAULT_BLOCK_TRANSLATION_PROMPT`（"先通读整段"）变成死代码——只参与缓存 key 哈希，从未发送给模型。
+- **症状：逐 cue 碎片翻译。** "this is the lock-picking lawyer and" → "这里是开锁律师"（丢 "and"）；"I" 单独翻成"当我"（猜错上下文）；连词 "so"/"but"/"then" 落到错误的 cue。这些都不是模型能力问题，而是模型根本没有上下文。
+- **修复：恢复整段投喂。** `sourceText` 重新拼回整段，`sourceCues` 只发 id+时间（保留 v9 的 token 精简——不发全文冗余）。模型用 `DEFAULT_BLOCK_TRANSLATION_PROMPT` 返回 `segments+screens` 语义分段（不要求 1:1），`parseBlockTranslationResponse` 校验连续覆盖，`materializeBlockTranslation` 分配时间。契约升 `block-v10` 作废旧缓存。
 
 v0.9.6 真正修好**中文源轨跳过**（v0.9.5 只看元数据码，实际没拦住），并**瘦身翻译请求 13-16%**。
 
