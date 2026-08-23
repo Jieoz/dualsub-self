@@ -631,8 +631,16 @@
     try {
       var units = Core.materializeSemanticTranslation(cached.segments, clip.cues, { requireIntegrity: true });
       return { key: key, cues: clip.cues, segments: cached.segments, units: units, fromCache: true };
-    } catch (_) {
-      try { await storageRemove([entryStorageKey(CACHE_ENTRY_PREFIX, key)]); } catch (_) {}
+    } catch (err) {
+      // 这条降级路径曾经是 `catch (_) {}`：缓存反序列化失败被完全静默，表现只是
+      // "缓存莫名其妙不命中、又发了一次请求"，而真实原因（契约不匹配 / 完整性校验
+      // 失败 / 源指纹漂移）一个字都不会出现。2026-08-23 的 CI block-cache 失败就是
+      // 这样：断言只能看到 starts.length===3，看不到为什么。降级本身是对的
+      // （坏缓存必须丢弃），但必须留下可观测证据。
+      console.warn("[dualsub] 缓存物化失败，丢弃该条缓存并重新翻译:", err && err.message ? err.message : err);
+      try { await storageRemove([entryStorageKey(CACHE_ENTRY_PREFIX, key)]); } catch (removeErr) {
+        console.warn("[dualsub] 丢弃坏缓存失败:", removeErr && removeErr.message ? removeErr.message : removeErr);
+      }
       return null;
     }
   }

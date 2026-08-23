@@ -4478,7 +4478,12 @@ async function main() {
     assert.doesNotMatch(iso, /contractVersion:\s*"coverage-v1"/);
     assert.match(iso, /writeCache\(key, \{ segments: out\.segments \}, generation\)/);
     assert.match(iso, /Core\.materializeSemanticTranslation\(cached\.segments, clip\.cues, \{ requireIntegrity: true \}\)/);
-    assert.match(iso, /catch \(_\) \{[\s\S]{0,160}?storageRemove\(\[entryStorageKey\(CACHE_ENTRY_PREFIX, key\)\]\)/, "损坏 block 缓存必须主动删除");
+    // 这条断言原本写死了 `catch (_)` 这个变量名，把"坏缓存必须删除"的意图和
+    // "catch 参数必须叫下划线"绑在了一起。2026-08-23 给这个 catch 补上
+    // console.warn 可观测性（参数随之改名 err）时，断言因此误报——它守的是
+    // 写法而不是行为。改为只要求：catch 块里确实调用了 storageRemove 清掉这条
+    // 缓存键。参数叫什么无关紧要。
+    assert.match(iso, /catch \([A-Za-z_$][\w$]*\) \{[\s\S]{0,400}?storageRemove\(\[entryStorageKey\(CACHE_ENTRY_PREFIX, key\)\]\)/, "损坏 block 缓存必须主动删除");
   })
 
   test("block 翻译和完整 SRT 共用自适应并发闸门", () => {
