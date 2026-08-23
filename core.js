@@ -3029,9 +3029,13 @@
   var SEMANTIC_REFINE_MAX_WORDS = 16;
 
   var DEFAULT_REFINE_PROMPT =
-    "你是字幕语义边界规划器。给你的是一个**过长**的字幕单元，它当前是一个完整语义，但一屏放不下。\n" +
-    "请在它内部找出可以独立成句的分句边界（并列分句、从句边界、话题转折处），使切开后的每一段仍然各自表达完整意思。\n" +
-    "宁可少切也不要切坏：如果内部确实没有能独立成句的位置，返回空数组。\n" +
+    "你是字幕语义边界规划器。给你的是一个**过长**的字幕单元，一屏放不下，必须切开。\n" +
+    "目标：切开后每一段都不超过 targetMaxWords 个词。段落越长，需要的切点越多——切一刀不够就继续切。\n" +
+    "切点按优先级选（前面找不到再降级）：\n" +
+    "1) 并列分句、从句边界、话题转折处（最优，切开后各自语义自足）\n" +
+    "2) 介词短语、状语从句、同位语的起始处\n" +
+    "3) 上面都没有时，选最接近目标长度的短语边界——读者读不完的长屏比切在次优位置更糟。\n" +
+    "只有整段本来就不超过 targetMaxWords 时，才返回空数组。\n" +
     "不得回显、改写、增删或重排任何 token。\n" +
     "只返回严格 JSON：{\"semanticCutsAfter\":[\"token-id\",...]}; 每个 id 必须是 group.toId 且严格递增，且不得是本段最后一个 token。不要返回其它字段、正文、Markdown 或解释。";
 
@@ -3453,15 +3457,31 @@
   // 这里在**已有的词法组边界**上补切点（组边界仍是可验证的源 token 位置，
   // 不是按比例或宽度猜的），组边界仍不够时才在上限处硬切。
   // 永不抛错：宁可多一个切点，也不能让整个 clip 丢失译文。
-  function enforceSemanticTokenLimitMarks(tokens, marks, maxTokens) {
+  // 兜底切分：把「词数」和「视觉宽度」两个上限一起守住。
+  //
+  // 2026-08-23：原本这里只按词数(maxTokens=40)兜底，但注释在 SEMANTIC_MAX_TOKENS
+  // 处已经写明——真正的显示硬门禁是 SOURCE_DISPLAY_MAX_WIDTH 的视觉宽度，词数只是
+  // 模型输入保险丝。结果真实跑里出现 40 词 / 中文 137 宽（约合规屏的 2.8 倍）的单元：
+  // 词数恰好不超过 40，兜底一刀不落，而它显示上根本读不完。
+  // 现在两个判据谁先触发就在谁那里切，切点仍只落在词法组边界（可验证的源 token
+  // 位置），不按比例、不按译文长度猜。
+  function enforceSemanticTokenLimitMarks(tokens, marks, maxTokens, maxVisualWidth) {
     var out = (marks || []).slice();
     var groups = semanticPlanningGroups(tokens).groups;
     var boundaries = {};
     groups.forEach(function (group) { boundaries[group.tokenEnd] = true; });
+    var widthCap = Number(maxVisualWidth) > 0 ? Number(maxVisualWidth) : 0;
+    // 累计当前单元的视觉宽度：源文按 token 文本量（含词间空格）估算。
+    function widthOf(from, to) {
+      var text = joinRestoredWords(tokens.slice(from, to + 1).map(function (t) { return String(t.text); }));
+      return semanticDisplayWidth(text);
+    }
     var start = 0;
     for (var i = 0; i < tokens.length; i++) {
       var isCut = out[i] === "." || out[i] === "|";
-      if (i - start + 1 > maxTokens) {
+      var tooManyWords = i - start + 1 > maxTokens;
+      var tooWide = widthCap > 0 && !tooManyWords && widthOf(start, i) > widthCap;
+      if (tooManyWords || tooWide) {
         // 从当前位置往回找最近的词法组边界作为切点。
         var cut = -1;
         for (var b = i; b > start; b--) {
@@ -3469,6 +3489,7 @@
         }
         if (cut < start) cut = start + maxTokens - 1;
         if (cut >= i) cut = i - 1;
+        if (cut < start) cut = start;
         if (out[cut] !== ".") out[cut] = "|";
         start = cut + 1;
         isCut = out[i] === "." || out[i] === "|";
@@ -3499,7 +3520,7 @@
     }
     // 语义切点定下之后，对仍然过长的单元做一次定向补切（只问模型，不盲切）。
     restored.marks = await refineOversizedSemanticUnits(restored.tokens, restored.marks, opts);
-    restored.marks = enforceSemanticTokenLimitMarks(restored.tokens, restored.marks, SEMANTIC_MAX_TOKENS);
+    restored.marks = enforceSemanticTokenLimitMarks(restored.tokens, restored.marks, SEMANTIC_MAX_TOKENS, maxVisualWidth);
     // 显示分屏**不能**放在这里：这一步的产物是「送去翻译的语义单元」，
     // 在翻译前按宽度切开会让模型收到 "you can see all of the inner" 这种残句，
     // 正是碎片化翻译的根源。分屏必须发生在拿到完整语义译文之后。
@@ -5196,6 +5217,18 @@
   }
 
 
+  // 记住哪些 (baseUrl|model) 拒绝 reasoning_effort，避免每个 clip 都白撞一次 400。
+  // 一轨 50 clip × 2 请求，不记的话就是上百次无谓往返。
+  var REASONING_EFFORT_UNSUPPORTED = Object.create(null);
+  function reasoningEffortKey(baseUrl, model) { return String(baseUrl || "") + "|" + String(model || ""); }
+  // 各家兼容网关对「不认识的字段」措辞不一（Unrecognized request argument /
+  // unknown field / unsupported parameter…），统一按 reasoning_effort 是否出现在
+  // 错误文本里判定，不去枚举措辞。
+  function isUnsupportedReasoningEffortError(status, message) {
+    if (status !== 400 && status !== 422) return false;
+    return /reasoning_effort/i.test(String(message || ""));
+  }
+
   /**
    * 发一次 chat/completions 并返回 message.content 字符串。
    * translateClipLines 复用：构造请求、AbortController 超时、
@@ -5215,7 +5248,10 @@
       ],
     };
     var re = opts.reasoningEffort;
-    if (re && re !== "default" && re !== "none") body.reasoning_effort = String(re);
+    var reKey = reasoningEffortKey(opts.apiBaseUrl, opts.apiModel);
+    // 已知该端点/模型不认识这个字段就别再发（下面 400 分支会记住）。
+    var sendReasoningEffort = !!(re && re !== "default" && re !== "none") && !REASONING_EFFORT_UNSUPPORTED[reKey];
+    if (sendReasoningEffort) body.reasoning_effort = String(re);
     var timeoutMs = typeof opts.timeoutMs === "number" ? opts.timeoutMs : TRANSLATE_TIMEOUT_MS;
     var fetchOpts = {
       method: "POST",
@@ -5272,6 +5308,18 @@
       }
       if (!resp.ok) {
         var apiMessage = data && data.error && (data.error.message || data.error.code) || "";
+        // 兼容性降级：不认识 reasoning_effort 的模型会 400/422 直接拒掉整个请求，
+        // 而该字段默认就是 "low"——用户什么都不改就会撞上，整条语义路径对这些模型
+        // 完全不可用。记住这个端点/模型并当场重发一次（不带该字段）。
+        // 只在本次确实发了该字段时才重试，避免把无关的 400 也当成它。
+        if (sendReasoningEffort && isUnsupportedReasoningEffortError(resp.status, apiMessage)) {
+          REASONING_EFFORT_UNSUPPORTED[reKey] = true;
+          cleanupAbortContext();
+          var retryOpts = {};
+          for (var k in opts) { if (Object.prototype.hasOwnProperty.call(opts, k)) retryOpts[k] = opts[k]; }
+          retryOpts.reasoningEffort = "";
+          return await chatCompletion(retryOpts);
+        }
         var httpErr = new Error("translate HTTP " + resp.status + (apiMessage ? " " + String(apiMessage).slice(0, 200) : ""));
         if (resp.status === 429) httpErr.code = "429";
         throw httpErr;

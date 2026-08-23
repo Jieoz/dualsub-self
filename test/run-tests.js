@@ -815,21 +815,22 @@ asyncTest("semantic token ledger 允许在 ASR cue 内跨界并保持中英语�
         const cuts = [ends[11], ends[36], ends[51]].filter(Boolean);
         return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ semanticCutsAfter: cuts }) } }] }) };
       }
-      return { ok: true, json: async () => ({ choices: [{ message: { content: translationCoverageJson(req, [
-        "可以看到，内外销子都是标准件",
-        "拿块磁铁检查后，可以确认它们是弱磁性不锈钢",
-        "好了，今天关于这款 Pic Proof 插芯锁就讲到这里",
-        "如果有任何问题或意见，请在下方留言",
-      ]) } }] }) };
+      // 译文按实际语义单元生成，不写死条数：宽度兜底
+      // (enforceSemanticTokenLimitMarks 同时守词数与视觉宽度) 会依据源文宽度决定
+      // 最终切几刀，夹具写死 4 条就会在兜底行为正确变化时假失败。
+      return { ok: true, json: async () => ({ choices: [{ message: { content: translationCoverageJson(req, (unit, index) => "译文" + (index + 1)) } }] }) };
     },
   });
   assert.ok(calls >= 2, "先恢复语义边界（含可能的定向补切），再对最终语义单元翻译");
-  assert.deepStrictEqual(result.units.map((u) => u.originalText), [
-    "you can see all of the inner and outer pins are standard",
-    "and if i grab a magnet i can check to see if these are steel and indeed they are probably a lightly magnetic stainless steel",
-    "okay folks that's all i have for you today on this pic proof mortis cylinder",
-    "if you do have any questions or comments about this",
-  ]);
+  // 不锁定具体切分：这里守的是「源词连续覆盖恰好一次」和「每个单元受显示宽度硬门禁约束」，
+  // 而不是某一版切分算法的产物。锁死 originalText 数组会让任何合法的兜底改进都变成红灯。
+  assert.ok(result.units.length >= 4, "长源文必须被切成多个语义单元");
+  result.units.forEach((u) => {
+    assert.ok(
+      Core.semanticDisplayWidth(u.originalText) <= Core.SOURCE_DISPLAY_MAX_WIDTH,
+      "语义单元 " + JSON.stringify(u.originalText) + " 超过显示宽度硬门禁"
+    );
+  });
   assert.equal(result.units.map((u) => u.originalText).join(" "), cues.map((c) => c.content).join(" "), "源词必须连续覆盖且恰好一次");
 });
 
@@ -6304,6 +6305,39 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     // 中文视频挂英文轨，显式选中文 → 不介入
     assert.strictEqual(Core.pickTrack([T("zh-Hans"), T("en")], "zh-Hans"), null,
       "中文视频显式选中文源时仍介入");
+  });
+
+  await asyncTest("模型兼容性：不认识 reasoning_effort 的端点自动降级重试，且只撞一次", async () => {
+    // 为什么存在：reasoning_effort 默认就是 "low"，而只有部分推理模型认识这个字段。
+    // 不认识的模型会直接 400 拒掉整个请求 —— 用户什么都不改，扩展对这些模型就是
+    // 完全不可用。2026-08-23 用本地假端点复现：语义规划第一次请求即 HTTP 400。
+    // 契约：(1) 撞到后必须去掉该字段重试并成功；(2) 必须记住这个端点/模型，
+    // 后续请求不再携带 —— 一轨 50 clip 不能每个都白撞一次 400。
+    const tokens = "one two three four five six seven eight nine ten".split(" ")
+      .map((text, i) => ({ text, start: i * 240, end: (i + 1) * 240, nativeTiming: true }));
+    const sent = [];
+    let rejected = 0;
+    const fetchImpl = async (_url, req) => {
+      const body = JSON.parse(req.body);
+      sent.push("reasoning_effort" in body);
+      if ("reasoning_effort" in body) {
+        rejected++;
+        return {
+          ok: false, status: 400,
+          text: async () => JSON.stringify({ error: { message: "Unrecognized request argument supplied: reasoning_effort" } }),
+        };
+      }
+      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ semanticCutsAfter: [] }) } }] }) };
+    };
+    const units = await Core.restoreAndPackTokens({
+      tokens, apiBaseUrl: "https://compat.test", apiKey: "k", apiModel: "plain-model",
+      reasoningEffort: "low", preferredMaxWords: 10, maxWords: 12, attempts: 1, timeoutMs: 15000,
+      fetchImpl,
+    });
+    assert.ok(units.length > 0, "降级后必须真的拿到结果，而不是整轨失败");
+    assert.strictEqual(rejected, 1, "只应撞一次 400；之后必须记住不再发该字段");
+    assert.strictEqual(sent[0], true, "首次请求应带 reasoning_effort（支持的模型不受影响）");
+    assert.ok(sent.slice(1).every((v) => v === false), "重试及后续请求都不得再带该字段");
   });
 
   console.log("\n========================================");
