@@ -6568,6 +6568,13 @@
     parseBlockTranslationResponse: parseBlockTranslationResponse,
     materializeBlockTranslation: materializeBlockTranslation,
     materializeSemanticTranslation: materializeSemanticTranslation,
+    // semantic segment 的完整性戳与其底层 hash 一并导出：缓存读回时
+    // materializeSemanticTranslation({requireIntegrity:true}) 会复算它，
+    // 任何要产出「与 translateContextBlock 同形」segments 的外部调用方
+    // （回放夹具、离线重放工具）都必须能复算同一个戳，否则只能写出
+    // tokenStart/sourceFingerprint 为空的伪 segment，缓存必然被丢弃。
+    semanticSegmentIntegrity: semanticSegmentIntegrity,
+    hashCacheIdentity: hashCacheIdentity,
     translateContextBlock: translateContextBlock,
     translateClipLines: translateClipLines,
     translateClipWithBoundaryRepair: translateClipWithBoundaryRepair,
