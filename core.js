@@ -2347,7 +2347,7 @@
   // {TARGET_LANG} 仅供自定义 prompt 替换。
   var DEFAULT_SYSTEM_PROMPT =
     "你是专业中文字幕翻译。源字幕可以是任意语言。先理解给出的连续语流和上下文，再用自然、准确、简洁的简体中文表达说话者的完整意思。\n" +
-    "理解和可读性优先于逐词、逐行对齐；不得遗漏、重复、臆造或把只读上下文的信息提前写入当前译文。\n" +
+    "理解和可读性优先于逐词、逐行对齐；不得遗漏、重复、臆造或把只读上下文的信息提前写入当前译文。每个输入 unit 必须独立表达该 unit 的完整意思；如果源文在该 unit 结束处已经完整，中文不得以‘和、但、如果、因为、所以、从、到、与、或、并且、可能’等悬空连接词收尾。\n" +
     "中文字幕不输出中文句号“。”；疑问句和感叹句保留问号或感叹号，必要的逗号可以保留。专名、数字、单位和固定表达必须保持完整。\n" +
     "严格遵守随后给出的 JSON 协议，只返回 JSON，不要返回 Markdown、解释或思考过程。";
 
@@ -2674,7 +2674,8 @@
   var DEFAULT_RESTORATION_PROMPT =
     "你是多语言字幕语义边界规划器。源文可能是任意语言；sourceText 是完整连续原文，groups 是按 Unicode 词法边界映射回 canonical token 的原子组。\n" +
     "只决定应在哪些 token 之后结束一个字幕单元；不得回显、改写、添加、删除、合并、拆分或重排任何 token。\n" +
-    "只判断完整句、完整分句或自然话语的含义在哪里结束；短屏排版由独立阶段处理。不得在条件与结果、否定范围、因果、转折、指代、短语、修饰关系、数字+单位、专名、URL、复合词或不可分割表达中间结束语义。\n" +
+    "只判断完整句、完整分句或自然话语的含义在哪里结束。不得在条件与结果、否定范围、因果、转折、指代、短语、修饰关系、数字+单位、专名、URL、复合词或不可分割表达中间结束语义。\n" +
+    "字幕一屏只能放下有限内容：请在保证每段语义自足的前提下尽量多切。一个单元通常不应超过约 14 个英文词；超过时，请在它内部找到同样能独立成句的分句边界（并列分句、从句边界、话题转折处）再切一刀，而不是留成一个长段。确实切不动才允许保留长段。\n" +
     "只返回严格 JSON：{\"semanticCutsAfter\":[\"token-id\",...]}; 每个 id 必须是 group.toId 且严格递增。不要返回其它字段、正文、Markdown 或解释。";
 
   // 语义字幕长度不能再用“英文词数”一把尺子量所有语言。这里按实际字符视觉负载
@@ -2707,8 +2708,15 @@
   // 标准 Intl.Segmenter 在重建全文上形成不可切开的候选组，并把每组映射回 canonical
   // token ID。没有 languageCode、脚本名单或逐语言规则；不支持 Segmenter 的运行时则
   // 安全退回一 token 一组。模型只能返回组末 token ID，正文和时间都不能被它改写。
+  function semanticPlanningTokenId(token) {
+    var value = token && token.tokenId != null ? token.tokenId : (token && token.id != null ? token.id : null);
+    if (value == null || String(value) === "") throw new Error("semantic planning token id missing");
+    return String(value);
+  }
+
   function semanticPlanningGroups(tokens) {
     var list = (tokens || []).filter(function (t) { return t && String(t.text || "").trim(); });
+    list.forEach(semanticPlanningTokenId);
     if (!list.length) return { sourceText: "", groups: [] };
     var texts = list.map(function (t) { return String(t.text); });
     var sourceText = joinRestoredWords(texts);
@@ -2745,13 +2753,13 @@
       var previous = groups[groups.length - 1];
       if (previous && first < previous.tokenEnd) {
         previous.tokenEnd = Math.max(previous.tokenEnd, last + 1);
-        previous.toId = String(list[previous.tokenEnd - 1].tokenId);
+        previous.toId = semanticPlanningTokenId(list[previous.tokenEnd - 1]);
         previous.text = joinRestoredWords(texts.slice(previous.tokenStart, previous.tokenEnd));
         return;
       }
       groups.push({
-        fromId: String(list[first].tokenId),
-        toId: String(list[last].tokenId),
+        fromId: semanticPlanningTokenId(list[first]),
+        toId: semanticPlanningTokenId(list[last]),
         text: joinRestoredWords(texts.slice(first, last + 1)),
         visualWidth: semanticDisplayWidth(joinRestoredWords(texts.slice(first, last + 1))),
         tokenStart: first,
@@ -3016,6 +3024,100 @@
       }
     }
     return { tokens: tokens, marks: marks };
+  }
+
+  var SEMANTIC_REFINE_MAX_WORDS = 16;
+
+  var DEFAULT_REFINE_PROMPT =
+    "你是字幕语义边界规划器。给你的是一个**过长**的字幕单元，它当前是一个完整语义，但一屏放不下。\n" +
+    "请在它内部找出可以独立成句的分句边界（并列分句、从句边界、话题转折处），使切开后的每一段仍然各自表达完整意思。\n" +
+    "宁可少切也不要切坏：如果内部确实没有能独立成句的位置，返回空数组。\n" +
+    "不得回显、改写、增删或重排任何 token。\n" +
+    "只返回严格 JSON：{\"semanticCutsAfter\":[\"token-id\",...]}; 每个 id 必须是 group.toId 且严格递增，且不得是本段最后一个 token。不要返回其它字段、正文、Markdown 或解释。";
+
+  /**
+   * 语义阶段的定向补切：只对超长单元再问一次模型。
+   *
+   * 为什么不做确定性宽度切分：那样切出来的是 "you can see all of the inner"
+   * 这种残句，正是碎片化翻译的根源。语义自足只有模型判断得了，程序只负责
+   * 「找出哪些段过长」和「校验返回的切点合法」。
+   * 失败、超时、返回空一律保留原样 —— 过长优于切坏。
+   */
+  async function refineOversizedSemanticUnits(tokens, marks, opts) {
+    opts = opts || {};
+    var list = tokens || [];
+    if (!list.length) return marks;
+    var out = (marks || []).slice();
+    var maxWords = Math.max(8, Math.floor(Number(opts.refineMaxWords) || SEMANTIC_REFINE_MAX_WORDS));
+
+    // 枚举当前语义段 [start, end]（end 处 mark 为 "."，末段收尾）。
+    var segments = [];
+    var segStart = 0;
+    for (var i = 0; i < list.length; i++) {
+      if (out[i] === "." || i === list.length - 1) {
+        segments.push({ start: segStart, end: i });
+        segStart = i + 1;
+      }
+    }
+    var oversized = segments.filter(function (seg) { return seg.end - seg.start + 1 > maxWords; });
+    if (!oversized.length) return out;
+
+    for (var s = 0; s < oversized.length; s++) {
+      var seg = oversized[s];
+      var chunk = list.slice(seg.start, seg.end + 1);
+      var planning = semanticPlanningGroups(chunk);
+      var lastTokenId = String(chunk[chunk.length - 1].tokenId);
+      // allowed 必须是**完整**的 group 边界列表：parseTokenCutsResponse 用它建立
+      // 位置索引并校验递增，事先剔除段末会让索引错位，导致模型返回的合法切点
+      // 被判为 unknown 而整包抛错（表现为补切请求发了但一刀不落）。
+      // 段末切点在拿到结果之后再丢弃。
+      var allowed = planning.groups.map(function (group) { return group.toId; });
+      if (allowed.length < 2) continue;
+      var payload = {
+        sourceText: planning.sourceText,
+        groups: planning.groups.map(function (group) {
+          return { fromId: group.fromId, toId: group.toId, text: group.text };
+        }),
+        currentWordCount: chunk.length,
+        targetMaxWords: maxWords,
+      };
+      try {
+        var doChat = (function (body) {
+          return function () {
+            return chatCompletion({
+              apiBaseUrl: opts.apiBaseUrl,
+              apiKey: opts.apiKey,
+              apiModel: opts.apiModel,
+              reasoningEffort: opts.reasoningEffort,
+              systemContent: opts.refineSystemPrompt || DEFAULT_REFINE_PROMPT,
+              userContent: JSON.stringify(body),
+              timeoutMs: opts.timeoutMs || TRANSLATE_TIMEOUT_MS,
+              fetchImpl: opts.fetchImpl,
+              onUsage: opts.onUsage,
+              signal: opts.signal,
+            });
+          };
+        })(payload);
+        var runner = typeof opts.runRefineRequest === "function" ? opts.runRefineRequest : opts.runRequest;
+        var response = typeof runner === "function" ? await runner(doChat) : await doChat();
+        var cuts = parseTokenCutsResponse(response, allowed, "semanticCutsAfter");
+        var cutSet = {};
+        // 段末切点在这里丢弃：切在末尾等于没切，但它不该让整包作废。
+        (cuts || []).forEach(function (id) { if (id !== lastTokenId) cutSet[id] = true; });
+        for (var pos = seg.start; pos < seg.end; pos++) {
+          if (cutSet[String(list[pos].tokenId)]) out[pos] = ".";
+        }
+      } catch (error) {
+        // 网络/超时/解析失败都不升级为整轨失败：保留原语义段。
+        // 但必须可观测——静默吞掉解析失败会让「请求发了却一刀不落」这类
+        // bug 藏在正常日志里（实测藏了整整一轮真实跑）。
+        if (typeof opts.onRefineFailure === "function") {
+          try { opts.onRefineFailure(String((error && error.message) || error)); } catch (_) {}
+        }
+        if (error && /translate aborted/i.test(String(error.message || error))) throw error;
+      }
+    }
+    return out;
   }
 
   async function suggestDisplayTokenBoundaries(tokens, semanticMarks, opts) {
@@ -3347,6 +3449,35 @@
     return out;
   }
 
+  // 语义单元长度上限的兜底切分。模型给的切点可能让某段远超上限；
+  // 这里在**已有的词法组边界**上补切点（组边界仍是可验证的源 token 位置，
+  // 不是按比例或宽度猜的），组边界仍不够时才在上限处硬切。
+  // 永不抛错：宁可多一个切点，也不能让整个 clip 丢失译文。
+  function enforceSemanticTokenLimitMarks(tokens, marks, maxTokens) {
+    var out = (marks || []).slice();
+    var groups = semanticPlanningGroups(tokens).groups;
+    var boundaries = {};
+    groups.forEach(function (group) { boundaries[group.tokenEnd] = true; });
+    var start = 0;
+    for (var i = 0; i < tokens.length; i++) {
+      var isCut = out[i] === "." || out[i] === "|";
+      if (i - start + 1 > maxTokens) {
+        // 从当前位置往回找最近的词法组边界作为切点。
+        var cut = -1;
+        for (var b = i; b > start; b--) {
+          if (boundaries[b]) { cut = b - 1; break; }
+        }
+        if (cut < start) cut = start + maxTokens - 1;
+        if (cut >= i) cut = i - 1;
+        if (out[cut] !== ".") out[cut] = "|";
+        start = cut + 1;
+        isCut = out[i] === "." || out[i] === "|";
+      }
+      if (isCut) start = i + 1;
+    }
+    return out;
+  }
+
   async function restoreAndPackTokens(opts) {
     opts = opts || {};
     var restored = await restoreTokenBoundaries(opts);
@@ -3366,12 +3497,18 @@
         if (restored.marks[di] !== "." && displaySet[String(restored.tokens[di].tokenId)]) restored.marks[di] = "|";
       }
     }
-    restored.marks = enforceVisualDisplayMarks(restored.tokens, restored.marks, maxVisualWidth);
+    // 语义切点定下之后，对仍然过长的单元做一次定向补切（只问模型，不盲切）。
+    restored.marks = await refineOversizedSemanticUnits(restored.tokens, restored.marks, opts);
+    restored.marks = enforceSemanticTokenLimitMarks(restored.tokens, restored.marks, SEMANTIC_MAX_TOKENS);
+    // 显示分屏**不能**放在这里：这一步的产物是「送去翻译的语义单元」，
+    // 在翻译前按宽度切开会让模型收到 "you can see all of the inner" 这种残句，
+    // 正是碎片化翻译的根源。分屏必须发生在拿到完整语义译文之后。
+    if (opts.semanticOnly !== true) restored.marks = enforceVisualDisplayMarks(restored.tokens, restored.marks, maxVisualWidth);
     var units = packRestoredTokens(restored.tokens, restored.marks, { maxWords: maxWords });
     for (var ri = 0; ri < units.length; ri++) {
       var finalWords = unitWordCount(units[ri]);
       var finalWidth = semanticDisplayWidth(units[ri].content);
-      if (finalWords > SEMANTIC_MAX_TOKENS || finalWidth > maxVisualWidth) {
+      if (opts.semanticOnly !== true && (finalWords > SEMANTIC_MAX_TOKENS || finalWidth > maxVisualWidth)) {
         throw new Error("unresolved oversized semantic unit: " + finalWords + " tokens / " + finalWidth + " width");
       }
     }
@@ -3797,7 +3934,7 @@
   // prompt 增加每屏英文词数上限（≤12 词），防止 32 词塞一屏。
   // v12：屏跨长停顿不再拒绝整块，改为在停顿处拆屏分配译文；
   // 源词 >14 时程序侧兜底拆屏；prompt 强调 sourceFrom/sourceTo 准确性。
-  var BLOCK_CONTRACT_VERSION = "block-v14";
+  var BLOCK_CONTRACT_VERSION = "block-v15";
 
   var BLOCK_SEGMENT_MAX_GAP_MS = 750;
   var BLOCK_MIN_DISPLAY_MS = 300;
@@ -4622,6 +4759,65 @@
     return joinRestoredWords(slice);
   }
 
+  function semanticSegmentIntegrity(segment) {
+    return hashCacheIdentity([
+      "semantic-span-v2",
+      String(segment.sourceFingerprint || ""),
+      String(segment.sourceTextHash || ""),
+      String(segment.segmentId || ""),
+      Number(segment.tokenStart),
+      Number(segment.tokenEnd),
+      String(segment.translation || ""),
+    ].join("\x1f"));
+  }
+
+  /** Materialize model-free semantic token spans; cue boundaries are never used as cuts. */
+  function materializeSemanticTranslation(segments, sourceCues, opts) {
+    opts = opts || {};
+    var timeline = opts.tokens && opts.tokens.tokens ? opts.tokens : (opts.tokens ? { tokens: opts.tokens } : buildCanonicalTokenTimeline(sourceCues || []));
+    var tokens = timeline.tokens || [];
+    var sourceFingerprint = String(timeline.sourceFingerprint || "");
+    var maxVisualWidth = Math.max(8, Math.floor(Number(opts.maxVisualWidth) || TRANSLATION_DISPLAY_MAX_WIDTH));
+    var cursor = 0;
+    var output = (segments || []).map(function (segment, index) {
+      if (!segment || segment.segmentId !== "b" + index ||
+          !Number.isInteger(segment.tokenStart) || !Number.isInteger(segment.tokenEnd) ||
+          segment.tokenStart !== cursor || segment.tokenEnd <= segment.tokenStart || segment.tokenEnd > tokens.length) {
+        throw new Error("semantic translation coverage invalid");
+      }
+      if (opts.requireIntegrity && segment.integrity !== semanticSegmentIntegrity(segment)) {
+        throw new Error("semantic translation integrity mismatch");
+      }
+      var span = tokens.slice(segment.tokenStart, segment.tokenEnd);
+      if (span.length > SEMANTIC_MAX_TOKENS) throw new Error("semantic translation span exceeds token limit");
+      if (!span.length) throw new Error("semantic translation span empty");
+      var originalText = joinRestoredWords(span.map(function (token) { return token.text; }));
+      if (segment.sourceFingerprint != null && segment.sourceFingerprint !== sourceFingerprint) throw new Error("semantic translation source fingerprint mismatch");
+      if (segment.sourceTextHash != null && segment.sourceTextHash !== hashCacheIdentity(originalText)) throw new Error("semantic translation source text mismatch");
+      var translation = sanitizeSubtitleLine(String(segment.translation == null ? "" : segment.translation)).replace(/。/g, "");
+      // 过宽不再让整个 clip 失败：整块回退英文远比一行略宽严重。
+      // 这里只标记 overflow，由显示层分屏承担；token span 不因此改变。
+      var overflow = semanticDisplayWidth(translation) > maxVisualWidth * 2 + DISPLAY_SOFT_OVERFLOW;
+      var unit = {
+        unitId: timeline.sourceFingerprint + ":u" + index + ":" + segment.tokenStart + "-" + segment.tokenEnd,
+        tokenStart: segment.tokenStart,
+        tokenEnd: segment.tokenEnd,
+        startMs: span[0].startMs,
+        endMs: Math.max(span[span.length - 1].endMs, span[0].startMs),
+        originalText: originalText,
+        translation: translation,
+        srcStart: segment.tokenStart + 1,
+        srcEnd: segment.tokenEnd,
+        semanticGroupId: "sg" + index,
+        displayOverflow: overflow,
+      };
+      cursor = segment.tokenEnd;
+      return unit;
+    });
+    if (cursor !== tokens.length) throw new Error("semantic translation coverage tail missing");
+    return output;
+  }
+
   function materializeBlockTranslation(parsedSegments, sourceCues, opts) {
     opts = opts || {};
     var source = blockSourceCues(sourceCues);
@@ -4911,40 +5107,94 @@
     opts = opts || {};
     var cues = opts.cues || [];
     if (!cues.length) return { segments: [], units: [] };
-    var source = blockSourceCues(cues);
-    var maxWidth = Math.max(8, Math.floor(Number(opts.maxVisualWidth || opts.maxLineChars) || TRANSLATION_DISPLAY_MAX_WIDTH));
-    // 整段投喂：模型看到的是完整语流（sourceText = 所有 cue 拼成一段），不是逐 cue 碎片。
-    //
-    // v9 的根缺陷是把整段 sourceText 换成了逐 cue units[]，模型从未看到完整句子，
-    // 译文碎片化（"this is the lock-picking lawyer and" → "这里是开锁律师"，丢 "and"）。
-    // v9 的 token 精简（sourceCues 只发 id+时间不发全文）是对的，保留；
-    // 但 sourceText 必须是整段，不能是逐 cue 的 sourceText。
-    //
-    // DEFAULT_BLOCK_TRANSLATION_PROMPT 要求模型先通读整段再译，返回 segments+screens
-    // （语义分段，不要求 1:1）。parseBlockTranslationResponse 校验连续覆盖，materializeBlockTranslation
-    // 按源词推进和语音时长比例分配时间。
-    var sys = buildSystemPrompt(opts.targetLang, opts.systemPrompt) + "\n" + (opts.blockSystemPrompt || DEFAULT_BLOCK_TRANSLATION_PROMPT);
-    var content = await chatCompletion({
+    var timeline = buildCanonicalTokenTimeline(cues);
+    var semantic = await restoreAndPackTokens({
+      tokens: timeline.tokens,
       apiBaseUrl: opts.apiBaseUrl,
       apiKey: opts.apiKey,
       apiModel: opts.apiModel,
-      temperature: opts.temperature,
-      reasoningEffort: opts.reasoningEffort,
-      systemContent: sys,
-      userContent: JSON.stringify({
-        sourceText: source.map(function (c) { return c.text; }).join(" "),
-        sourceCues: source.map(function (c) {
-          return { id: c.id, startMs: c.startMs, endMs: c.endMs };
-        }),
-      }),
+      targetLang: opts.targetLang,
+      systemPrompt: opts.boundarySystemPrompt,
+      preferredMaxWords: opts.preferredMaxWords,
+      maxWords: opts.maxWords,
+      preferredVisualWidth: opts.preferredVisualWidth,
+      maxVisualWidth: opts.maxVisualWidth,
+      semanticOnly: true,
+      onRefineFailure: opts.onRefineFailure,
+      attempts: opts.attempts,
       timeoutMs: opts.timeoutMs,
       fetchImpl: opts.fetchImpl,
       onUsage: opts.onUsage,
       signal: opts.signal,
     });
-    var segments = parseBlockTranslationResponse(content, cues, { maxVisualWidth: maxWidth, lenient: !!opts.lenient });
-    return { segments: segments, units: materializeBlockTranslation(segments, cues, { maxVisualWidth: maxWidth }) };
+    var semanticCues = [];
+    var tokenCursor = 0;
+    (semantic || []).forEach(function (unit, index) {
+      var count = unit.tokens.length;
+      semanticCues.push({
+        start: unit.start,
+        end: unit.end,
+        content: unit.content,
+        tokens: unit.tokens,
+        tokenStart: tokenCursor,
+        tokenEnd: tokenCursor + count,
+        unitId: "u" + index,
+        semanticGroupId: unit.semanticGroupId,
+      });
+      tokenCursor += count;
+    });
+    if (tokenCursor !== timeline.tokens.length) throw new Error("semantic token packing coverage mismatch");
+    var translated;
+    try {
+      translated = await translateClipLines({
+        cues: semanticCues,
+        apiBaseUrl: opts.apiBaseUrl,
+        apiKey: opts.apiKey,
+        apiModel: opts.apiModel,
+        targetLang: opts.targetLang,
+        systemPrompt: opts.systemPrompt,
+        temperature: opts.temperature,
+        reasoningEffort: opts.reasoningEffort,
+        timeoutMs: opts.timeoutMs,
+        fetchImpl: opts.fetchImpl,
+        onUsage: opts.onUsage,
+        signal: opts.signal,
+        lenient: !!opts.lenient,
+      });
+    } catch (error) {
+      var message = String(error && error.message || error);
+      if (!/translation coverage invalid Chinese unit|translation coverage alignment mismatch/i.test(message)) throw error;
+      translated = await translateClipLines({
+        cues: semanticCues,
+        apiBaseUrl: opts.apiBaseUrl,
+        apiKey: opts.apiKey,
+        apiModel: opts.apiModel,
+        targetLang: opts.targetLang,
+        systemPrompt: String(opts.systemPrompt || "") + "\n上一次译文未通过完整语义校验；请重新翻译同一批 unit，逐条给出完整自然中文，不要以悬空连接词收尾。",
+        temperature: opts.temperature,
+        reasoningEffort: opts.reasoningEffort,
+        timeoutMs: opts.timeoutMs,
+        fetchImpl: opts.fetchImpl,
+        onUsage: opts.onUsage,
+        signal: opts.signal,
+        lenient: !!opts.lenient,
+      });
+    }
+    var segments = semanticCues.map(function (cue, index) {
+      var segment = {
+        segmentId: "b" + index,
+        sourceFingerprint: timeline.sourceFingerprint,
+        sourceTextHash: hashCacheIdentity(joinRestoredWords(cue.tokens.map(function (token) { return token.text; }))),
+        tokenStart: cue.tokenStart,
+        tokenEnd: cue.tokenEnd,
+        translation: translated[index] || "",
+      };
+      segment.integrity = semanticSegmentIntegrity(segment);
+      return segment;
+    });
+    return { segments: segments, units: materializeSemanticTranslation(segments, cues, { tokens: timeline, maxVisualWidth: opts.maxVisualWidth }) };
   }
+
 
   /**
    * 发一次 chat/completions 并返回 message.content 字符串。
@@ -6267,6 +6517,9 @@
     DISPLAY_UNIT_MAX_WORDS: DISPLAY_UNIT_MAX_WORDS,
     SOURCE_UNIT_MAX_WORDS: SOURCE_UNIT_MAX_WORDS,
     SEMANTIC_MAX_TOKENS: SEMANTIC_MAX_TOKENS,
+    SEMANTIC_REFINE_MAX_WORDS: SEMANTIC_REFINE_MAX_WORDS,
+    DEFAULT_REFINE_PROMPT: DEFAULT_REFINE_PROMPT,
+    refineOversizedSemanticUnits: refineOversizedSemanticUnits,
     SOURCE_DISPLAY_PREFERRED_WIDTH: SOURCE_DISPLAY_PREFERRED_WIDTH,
     SOURCE_DISPLAY_MAX_WIDTH: SOURCE_DISPLAY_MAX_WIDTH,
     READING_MS_PER_CHAR: READING_MS_PER_CHAR,
@@ -6314,6 +6567,7 @@
     blockSourceCues: blockSourceCues,
     parseBlockTranslationResponse: parseBlockTranslationResponse,
     materializeBlockTranslation: materializeBlockTranslation,
+    materializeSemanticTranslation: materializeSemanticTranslation,
     translateContextBlock: translateContextBlock,
     translateClipLines: translateClipLines,
     translateClipWithBoundaryRepair: translateClipWithBoundaryRepair,

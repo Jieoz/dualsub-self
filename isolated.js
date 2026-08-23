@@ -629,7 +629,7 @@
     if (generation !== state.requestGeneration || !config.enabled) throw runtimeAbortError();
     if (!cached || !Array.isArray(cached.segments)) return null;
     try {
-      var units = Core.materializeBlockTranslation(cached.segments, clip.cues, { maxVisualWidth: identity.maxLineChars, requireIntegrity: true });
+      var units = Core.materializeSemanticTranslation(cached.segments, clip.cues, { requireIntegrity: true });
       return { key: key, cues: clip.cues, segments: cached.segments, units: units, fromCache: true };
     } catch (_) {
       try { await storageRemove([entryStorageKey(CACHE_ENTRY_PREFIX, key)]); } catch (_) {}

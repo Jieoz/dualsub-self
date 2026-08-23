@@ -31,8 +31,13 @@ jobs:
           node --check test/browser-popup/run.js
           node --check test/browser-popup/layout.js
           node --check test/run-tests.js
+          node --check test/check-silent-catch.js
           node --check test/run-semantic-corpus.js
           node --check test/run-real-semantic-corpus.js
+      - name: Silent fail-soft catch gate
+        run: |
+          node test/check-silent-catch.test.js
+          node test/check-silent-catch.js
       - name: Unit and regression tests
         run: node test/run-tests.js
       - name: Semantic adversarial corpus

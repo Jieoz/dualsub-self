@@ -1,11 +1,12 @@
 /*
  * test/e2e-harness.js — 真·E2E 调试 harness（node 直接跑，零外部依赖除 fetch）
  * =============================================================================
- * block 架构（当前契约版本见 core.js BLOCK_CONTRACT_VERSION）：连续源 cue block 整体
- * 翻译，目标语言可自然合并和重新分屏。
+ * semantic token-span 架构（当前契约版本见 core.js BLOCK_CONTRACT_VERSION）：先对连续源 cue
+ * 构建 canonical token ledger，再由模型只返回语义切点；第二次请求逐语义 unit 翻译。
+ * 程序以连续 tokenStart/tokenEnd 证明无缺口、无重叠，不按 cue、译文宽度或时间比例猜映射。
  *   本 harness 跑完整主链路：cleanupCues → resegmentCues → sliceClipsByCue
- *     → translateContextBlock(严格 segments JSON)
- *     → materializeBlockTranslation(粗粒度时间映射 + 缓存 round-trip) → buildSrt
+ *     → translateContextBlock(boundary plan + coverage translation)
+ *     → materializeSemanticTranslation(token span + cache round-trip) → buildSrt
  *   产出 SRT + 并排 HTML（原文 | 译文 | 时间轴）供肉眼核对断句/丢字，并打点延迟统计。
  *
  * 两种模型后端：
@@ -97,8 +98,14 @@ function makeMockFetch(stats, opts) {
   opts=opts||{};const REASON_MS=opts.reasonMs!=null?opts.reasonMs:20,PER_CHAR_MS=opts.perCharMs!=null?opts.perCharMs:1;
   return function mockFetch(url,fetchOpts){
     const body=JSON.parse(fetchOpts.body),payload=JSON.parse((body.messages[1]&&body.messages[1].content)||"{}");
+    if (Array.isArray(payload.tokens)) {
+      const cuts = (payload.groups || []).filter((_, i) => i >= 11 && i % 12 === 11).map((g) => g.toId);
+      const content = JSON.stringify({ semanticCutsAfter: cuts });
+      const t0=Date.now(),thinkMs=REASON_MS+content.length*PER_CHAR_MS;
+      return new Promise(resolve=>setTimeout(()=>{stats.requestMs.push(Date.now()-t0);resolve({ok:true,status:200,json:async()=>({choices:[{message:{content}}]}),text:async()=>""})},thinkMs));
+    }
     const units=payload.units||[];
-    const translations=units.map((u,i)=>({unitId:u.unitId,coverFrom:u.coverFrom,coverTo:u.coverTo,translation:structuralMockZh(i)}));
+    const translations=units.map((u,i)=>({unitId:u.unitId,translation:structuralMockZh(i)}));
     const content=JSON.stringify({translations}),t0=Date.now(),thinkMs=REASON_MS+content.length*PER_CHAR_MS;
     return new Promise(resolve=>setTimeout(()=>{stats.requestMs.push(Date.now()-t0);resolve({ok:true,status:200,json:async()=>({choices:[{message:{content}}]}),text:async()=>""})},thinkMs));
   };
@@ -137,6 +144,7 @@ async function run() {
   });
 
   const stats = { requestMs: [], retries429: 0, clipFallbacks: 0, emptyClips: 0,
+                  refineFailures: [],
                   firstUnitMs: null, totalMs: 0, clipMs: [] };
 
 
@@ -176,17 +184,29 @@ async function run() {
   const t0 = Date.now();
   const renderUnits = [];
   let cacheRoundTrips = 0;
+  let ledgerExact = true;
   for (let ci = 0; ci < clips.length; ci++) {
     const clip = clips[ci], ct0 = Date.now();
     let result;
     try {
       // 与生产一致：不再传 contextBefore/contextAfter（payload 从不读取）。
-      result=await Core.translateContextBlock(Object.assign({cues:clip.cues,maxVisualWidth:48},apiCfg));
+      result=await Core.translateContextBlock(Object.assign({cues:clip.cues,maxVisualWidth:48,onRefineFailure:(m)=>stats.refineFailures.push(m)},apiCfg));
     } catch(e) { console.warn("[harness] clip",ci,"翻译失败：",e.message);stats.clipFallbacks++;result=null; }
     if(!result||!result.units||!result.units.length){
       stats.emptyClips++;for(const cue of clip.cues)renderUnits.push({start:cue.start,end:cue.end,originalText:cue.content,translation:""});
     }else{
-      const cached=Core.materializeBlockTranslation(JSON.parse(JSON.stringify(result.segments)),clip.cues,{maxVisualWidth:48});
+      const cached=Core.materializeSemanticTranslation(JSON.parse(JSON.stringify(result.segments)),clip.cues,{requireIntegrity:true});
+      const clipTokens = Core.buildCanonicalTokenTimeline(clip.cues).tokens;
+      const clipTokenCount = clipTokens.length;
+      let clipCursor = 0;
+      for (const unit of result.units) {
+        if (unit.tokenStart !== clipCursor || unit.tokenEnd <= unit.tokenStart || unit.tokenEnd > clipTokenCount) ledgerExact = false;
+        clipCursor = unit.tokenEnd;
+      }
+      if (clipCursor !== clipTokenCount) ledgerExact = false;
+      const expectedWords = clipTokens.map((token)=>token.text);
+      const actualWords = result.units.flatMap((unit)=>String(unit.originalText||"").split(/\s+/).filter(Boolean));
+      if (expectedWords.length !== actualWords.length || !expectedWords.every((word,index)=>word===actualWords[index])) ledgerExact = false;
       assertBlockRoundTrip(result.units,cached,ci);cacheRoundTrips++;
       for(const u of result.units)renderUnits.push({start:u.startMs,end:u.endMs,originalText:u.originalText,translation:u.translation});
       if(stats.firstUnitMs==null)stats.firstUnitMs=Date.now()-t0;
@@ -214,10 +234,7 @@ async function run() {
   // coverage ledger 门禁：每个源词必须恰好出现一次、顺序不变。
   // 不能用「渲染单元数 == 源 cue 数」来判 —— 可读性合并会合法减少屏数，
   // 而重译/漏译才是要抓的缺陷，判据是原文词序列本身。
-  const wordsOf=(s)=>String(s||"").split(/\s+/).filter(Boolean);
-  const srcWords=reseg.flatMap(c=>wordsOf(c.content));
-  const gotWords=renderUnits.flatMap(u=>wordsOf(u.originalText));
-  const ledgerExact=srcWords.length===gotWords.length&&srcWords.every((w,i)=>w===gotWords[i]);
+  // coverage ledger 已按生产 clip 粒度逐个验证：token span 连续、完整且展示原文逐词一致。
   const noChineseFullStop=renderUnits.every(u=>!(u.translation||"").includes("。"));
   const cacheOk=stats.cacheRoundTrips===clips.length;
   console.log("coverage ledger :",ledgerExact?"PASS":"FAIL");
@@ -325,6 +342,13 @@ function printStats(stats, renderUnits, a) {
   console.log("clip 翻译失败 :", stats.clipFallbacks);
   console.log("空 clip(显原文):", stats.emptyClips);
   console.log("429 次数      :", stats.retries429);
+  if (stats.refineFailures && stats.refineFailures.length) {
+    const byReason = {};
+    stats.refineFailures.forEach((m) => { byReason[m] = (byReason[m] || 0) + 1; });
+    console.log("补切失败      :", stats.refineFailures.length, JSON.stringify(byReason));
+  } else {
+    console.log("补切失败      : 0");
+  }
   console.log("渲染单元总数  :", renderUnits.length);
 }
 
