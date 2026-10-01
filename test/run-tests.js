@@ -1939,21 +1939,29 @@ test("整句协议提示词要求少屏：放得下就合并，不按英文 piec
   // 一句切三屏，中间屏只有 1.3 秒。模型默认一 piece 一屏，必须明说合并优先。
   assert.ok(/屏数越少越好/.test(Core.SCREEN_PROTOCOL_PROMPT));
   assert.ok(/相邻两屏合起来不超过 maxChars 就合成一屏/.test(Core.SCREEN_PROTOCOL_PROMPT));
+  // ds-40-v18 第 15/16 屏：「电源实在没劲」|「让电热水壶变得不值得使用」——目的从句被切开后意思反了。
+  assert.ok(/绝不跨句合并/.test(Core.SCREEN_PROTOCOL_PROMPT));
+  assert.ok(/否定、条件、目的、比较不得被切到两屏/.test(Core.SCREEN_PROTOCOL_PROMPT));
 });
 
 test("parseScreenCoverageResponse 结构违规 fail-closed，单 piece 屏可省略 to", () => {
-  const pieces = [0, 1, 2].map((i) => ({ alias: "u" + i, sourceText: "w" + i + ".", tokenStart: i, tokenEnd: i + 1, semanticGroupId: "sg" + i }));
+  const pieces = [0, 1, 2].map((i) => ({ alias: "u" + i, sourceText: i === 0 ? "first sentence." : "w" + i, tokenStart: i, tokenEnd: i + 1, semanticGroupId: "sg" + i }));
   const ok = Core.parseScreenCoverageResponse(JSON.stringify({ screens: [{ from: "u0", text: "一" }, { from: "u1", to: "u2", text: "二三" }] }), pieces);
   assert.deepStrictEqual(ok.map((s) => [s.from, s.to]), [[0, 0], [1, 2]]);
   assert.throws(() => Core.parseScreenCoverageResponse(JSON.stringify({ screens: [{ from: "u0", to: "u0", text: "一" }, { from: "u2", to: "u2", text: "三" }] }), pieces), /gap or overlap/);
-  assert.throws(() => Core.parseScreenCoverageResponse(JSON.stringify({ screens: [{ from: "u0", to: "u1", text: "一二" }] }), pieces), /tail missing/);
+  assert.throws(() => Core.parseScreenCoverageResponse(JSON.stringify({ screens: [{ from: "u0", to: "u0", text: "一" }] }), pieces), /tail missing/);
   assert.throws(() => Core.parseScreenCoverageResponse(JSON.stringify({ screens: [{ from: "u0", to: "u9", text: "x" }] }), pieces), /unknown piece/);
+  // 跨句合并：u0 以句号收尾，一屏不得越过它（ds-40-v18「它被引用了三次，但到视频结束时」）
+  assert.throws(() => Core.parseScreenCoverageResponse(JSON.stringify({ screens: [{ from: "u0", to: "u1", text: "一二" }, { from: "u2", text: "三" }] }), pieces), /crosses sentence/);
+  const noFinal = pieces.map((p) => ({ ...p, sourceText: "w", endsSentence: undefined }));
+  assert.strictEqual(Core.parseScreenCoverageResponse(JSON.stringify({ screens: [{ from: "u0", to: "u2", text: "一二三" }] }), noFinal).length, 1,
+    "无句末标点时跨语义分组合并照常允许（electric | kettles）");
   const lenient = Core.parseScreenCoverageResponse(JSON.stringify({ screens: [{ from: "u0", text: "" }, { from: "u1", to: "u2", text: "二三" }] }), pieces, { lenient: true });
   assert.strictEqual(lenient[0].text, "", "lenient 只把坏屏置空");
 });
 
 test("提示词改变显示形态必须伴随缓存契约升版", () => {
-  assert.strictEqual(Core.BLOCK_CONTRACT_VERSION, "block-v18");
+  assert.strictEqual(Core.BLOCK_CONTRACT_VERSION, "block-v19");
   assert.ok(!/每屏译文以句号/.test(Core.DEFAULT_SYSTEM_PROMPT), "提示词不得同时要求写句号又禁止句号");
   // 2026-10-01 真轨：示例里把 "I could get my hands on" 写成「烧水的速度还比炉灶快得多」，
   // 等于教模型臆造；ds-40-r1001 出现「也就是在北美这边」「至于测试结果，稍后再看」。

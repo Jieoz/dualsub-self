@@ -2861,7 +2861,8 @@
     "\n输入 sentences 按顺序给出若干句原文，每句由一个或多个连续片段 piece 组成；piece 只是可选的切屏位置，不是翻译单位。\n" +
     "做法：每句先整句译成通顺中文，再把这句中文切成字幕屏。每屏覆盖连续的若干 piece（from 到 to，可以只有一个，也可以合并多个），屏的切口只能落在 piece 之间。\n" +
     "中文切口要在自然停顿处（逗号、分句之间），绝不能把一个词、专名或数字+单位劈到两屏；每屏不超过 maxChars 个汉字。屏数越少越好：一句话不超过 maxChars 就整句一屏；相邻两屏合起来不超过 maxChars 就合成一屏，只有放不下才切。\n" +
-    "每屏文字对应它覆盖的那段原文，可以在一句之内为中文语序微调，但不得把别的句子的内容提前或挪后。屏尾不留逗号、顿号、冒号。\n" +
+    "每屏文字对应它覆盖的那段原文，可以在一句之内为中文语序微调，但不得把别的句子的内容提前或挪后。原文句末标点（. ! ? 等）之后必须换屏，绝不跨句合并。\n" +
+    "每屏单独读也必须忠实于原意：否定、条件、目的、比较不得被切到两屏，以致前后屏连读时意思变反或变弱；拆不开就压缩措辞放进一屏。屏尾不留逗号、顿号、冒号。\n" +
     "协议硬约束：只返回 {\"screens\":[{\"from\":\"u0\",\"to\":\"u1\",\"text\":\"…\"}]}；所有屏按顺序首尾相接、恰好覆盖全部 piece 一次，from/to 原样复制 piece id，不要输出其他字段。";
 
   /**
@@ -2874,7 +2875,10 @@
     var payload = extractJsonObject(raw, "screens");
     if (!payload || !Array.isArray(payload.screens)) throw new Error("screen coverage invalid JSON");
     var indexById = {};
-    pieces.forEach(function (piece, index) { indexById[piece.alias] = index; });
+    pieces.forEach(function (piece, index) {
+      indexById[piece.alias] = index;
+      if (piece.endsSentence == null) piece.endsSentence = SENTENCE_FINAL_RE.test(String(piece.sourceText || ""));
+    });
     var cursor = 0;
     var out = payload.screens.map(function (item) {
       if (!item || typeof item !== "object") throw new Error("screen coverage entry invalid");
@@ -2883,6 +2887,12 @@
       var to = item.to == null ? from : indexById[String(item.to)];
       if (from == null || to == null) throw new Error("screen coverage unknown piece");
       if (from !== cursor || to < from) throw new Error("screen coverage gap or overlap");
+      // 原文句末标点之后必须换屏：跨句合并会把上一句的尾巴和下一句的开头拼进同一屏
+      // （ds-40-v18 第 18 屏「它被引用了三次，但到视频结束时」）。只认源文自带的句末标点，
+      // 不认语义阶段的分组：分组是分句级的，按它拦会挡掉「electric | kettles」这类必须的合并。
+      for (var k = from; k < to; k++) {
+        if (pieces[k].endsSentence) throw new Error("screen coverage crosses sentence boundary");
+      }
       var tokenCount = pieces[to].tokenEnd - pieces[from].tokenStart;
       if (tokenCount > SEMANTIC_MAX_TOKENS) throw new Error("screen coverage span exceeds token limit");
       var rawText = item.text != null ? item.text : item.translation;
@@ -2902,6 +2912,8 @@
     return out;
   }
 
+  var SENTENCE_FINAL_RE = /[.!?。！？…‼⁇]["'”’)\]]*$/;
+
   /** 整句送译，返回按 piece 覆盖的中文屏 [{from,to,text}]（from/to 为 piece 下标）。 */
   async function translateSentenceScreens(opts) {
     opts = opts || {};
@@ -2912,6 +2924,7 @@
         tokenStart: piece.tokenStart,
         tokenEnd: piece.tokenEnd,
         semanticGroupId: String(piece.semanticGroupId != null ? piece.semanticGroupId : "sg" + index),
+        endsSentence: SENTENCE_FINAL_RE.test(collapseWhitespace(piece.content || "")),
       };
     });
     if (!pieces.length) return [];
@@ -2931,7 +2944,7 @@
         apiModel: opts.apiModel,
         temperature: opts.temperature,
         reasoningEffort: opts.reasoningEffort,
-        systemContent: attempt ? baseSys + "\n上一次输出未通过覆盖校验：屏必须按顺序首尾相接、恰好覆盖全部 piece 一次。" : baseSys,
+        systemContent: attempt ? baseSys + "\n上一次输出未通过覆盖校验（" + String(lastError && lastError.message) + "）：屏必须按顺序首尾相接、恰好覆盖全部 piece 一次，且原文句末标点之后必须换屏。" : baseSys,
         userContent: userContent,
         timeoutMs: opts.timeoutMs,
         fetchImpl: opts.fetchImpl,
@@ -3028,7 +3041,7 @@
   // 源词 >14 时程序侧兜底拆屏；prompt 强调 sourceFrom/sourceTo 准确性。
   // v15: 语义主路径（semanticOnly）。
   // v16: 提示词要求每屏中文本地闭合；语义路径接可读性合并，合并处补逗号。
-  var BLOCK_CONTRACT_VERSION = "block-v18";
+  var BLOCK_CONTRACT_VERSION = "block-v19";
 
   var BLOCK_SEGMENT_MAX_GAP_MS = 750;
   var BLOCK_MIN_DISPLAY_MS = 300;
