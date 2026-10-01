@@ -2927,6 +2927,14 @@
         if (out.length && /^的(?![确士])/.test(text)) {
           throw new Error("screen coverage soft: 第 " + (out.length + 1) + " 屏「" + text + "」以「的」开头，把定语和中心语劈到了两屏，请换切口或调整语序");
         }
+        // 相邻屏重复同一段话：模型把后屏内容提前塞进前屏又照写一遍（v21 抽样
+        // 「但我知道整台设备总功率是8.8千瓦」|「整台设备总功率是8.8千瓦」）。v19 全片 465 屏里
+        // 合法复用的最长公共子串是 5 字（「电热水壶却」类），阈值取 6。
+        var prevText = out.length ? out[out.length - 1].text : "";
+        var repeated = prevText ? longestCommonRun(prevText, text) : "";
+        if (repeated.length >= 6) {
+          throw new Error("screen coverage soft: 第 " + out.length + "、" + (out.length + 1) + " 屏重复了「" + repeated + "」，每段意思只能出现在它对应原文所在的那一屏");
+        }
         var haveMs = Number(pieces[to].endMs) - Number(pieces[from].startMs);
         var needMs = Math.ceil(semanticDisplayWidth(text) / 2) * READING_MS_PER_CHAR;
         if (haveMs > 0 && needMs > haveMs * 2.5 && needMs > haveMs + 800) {
@@ -2941,6 +2949,16 @@
     return out;
   }
 
+  // 两段文字的最长公共连续子串（忽略标点）。屏只有十几个字，O(n·m) 足够。
+  function longestCommonRun(a, b) {
+    var strip = function (x) { return String(x || "").replace(/[\s，、。？！：；,.?!:;]/g, ""); };
+    a = strip(a); b = strip(b);
+    var best = "";
+    for (var i = 0; i < a.length; i++) {
+      for (var j = i + best.length + 1; j <= a.length && b.indexOf(a.slice(i, j)) >= 0; j++) best = a.slice(i, j);
+    }
+    return best;
+  }
   var SENTENCE_FINAL_RE = /[.!?。！？…‼⁇]["'”’)\]]*$/;
 
   /** 整句送译，返回按 piece 覆盖的中文屏 [{from,to,text}]（from/to 为 piece 下标）。 */

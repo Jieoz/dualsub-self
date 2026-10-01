@@ -1916,6 +1916,12 @@ test("整句协议：超宽屏/文字远多于语音的屏首轮带原因重试�
   r = await run([lead, good]);
   assert.strictEqual(r.sys.length, 2, "屏首「的」必须触发一次重试");
   assert.match(JSON.stringify(r.sys[1]), /以「的」开头/);
+  const dup = { screens: [
+    { from: "u0", to: "u1", text: "但所需能量是1500瓦电水壶的三倍" },
+    { from: "u2", to: "u2", text: "1500瓦电水壶的三倍才烧得一样快" } ] };
+  r = await run([dup, good]);
+  assert.strictEqual(r.sys.length, 2, "相邻屏重复 ≥6 字必须触发一次重试");
+  assert.match(JSON.stringify(r.sys[1]), /重复了「1500瓦电水壶的三倍」/);
   r = await run([good]);
   assert.strictEqual(r.sys.length, 1, "合格输出不得多发请求");
 });
