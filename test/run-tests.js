@@ -80,6 +80,16 @@ function assertVisualSemanticUnits(units, source) {
 function translationCoverageJson(requestOptions, translations, reverse=false) {
   const body = JSON.parse(requestOptions.body);
   const payload = JSON.parse(body.messages[1].content);
+  if (Array.isArray(payload.sentences)) {
+    // block-v17 整句协议：每个 piece 一屏，测试只关心覆盖与归位。
+    const pieces = payload.sentences.flat().map((p) => ({ unitId: p.id, sourceText: p.text }));
+    const screens = pieces.map((unit, index) => ({
+      from: unit.unitId, to: unit.unitId,
+      text: typeof translations === "function" ? translations(unit, index) : translations[index],
+    }));
+    if (reverse) screens.reverse();
+    return JSON.stringify({ screens });
+  }
   const entries = payload.units.map((unit, index) => ({
     unitId: unit.unitId,
     coverFrom: unit.coverFrom,
@@ -1347,7 +1357,7 @@ test("translateContextBlock 整段投喂：模型看到完整语流而非逐 cue
     },
   });
   // 第一请求是完整 sourceText 的边界恢复；第二请求只携带最终语义 units。
-  assert.ok(sent.units, "翻译请求必须携带最终语义 units");
+  assert.ok(sent.sentences, "翻译请求必须按整句携带最终语义 pieces");
   assert.equal(result.segments.length, 2);
   assert.equal(result.units.length, 2);
   assert.equal(result.units[0].startMs, 100);
@@ -1380,13 +1390,13 @@ test("block-v10 对多书写系统使用同一请求、parser 与时间物化路
       },
     });
     // 最后一次请求只翻译完整语义单元，原文仍逐单元完整保留。
-    assert.ok(sent.units, "翻译请求必须有语义 units");
+    assert.ok(sent.sentences, "翻译请求必须按整句发送");
+    const sentPieces = sent.sentences.flat();
     pair.forEach((content) => {
-      assert.ok(sent.units.some((u) => u.sourceText.includes(content)), `units 缺原文: ${content}`);
+      assert.ok(sentPieces.some((u) => u.text.includes(content)), `pieces 缺原文: ${content}`);
     });
-    assert.ok(sent.units.every((u) => u.unitId && u.sourceText), "每个语义单元必须有稳定 ID 和完整原文");
+    assert.ok(sentPieces.every((u) => u.id && u.text), "每个 piece 必须有稳定 ID 和完整原文");
     assert.ok(out.units.length >= 1);
-    assert.equal(out.units.length, sent.units.length);
     assert.ok(out.units.every((u) => u.translation.startsWith("译文-")), "每个多书写系统语义单元都必须有译文");
   }
   const coreSrc = fs.readFileSync(path.join(ROOT, "core.js"), "utf8");
@@ -3032,6 +3042,99 @@ test("读不完的屏必须合并相邻屏借时间，且不碰 startMs / 不越
   assert.strictEqual(fine.length, 2, "时间足够时必须原样保留模型断点");
 });
 
+test("合并相邻屏不得把两句中文粘成一句（ds-40-prog 真轨病例）", () => {
+  // 2026-08-25 真轨 luna --limit=40：物化时已去句号，合并直接拼接，屏上出现
+  //「其中一个用途就是烧水我们这么做有很多原因」「我也说不好不过这并不重要」。
+  const mk = (s, e, t) => ({ pauseGroupId: 0, srcStart: 1, srcEnd: 1, originalText: "src", translation: t, startMs: s, endMs: e });
+  const merged = Core.mergeUnreadableUnits([mk(20300, 20700, "我也说不好"), mk(20700, 21500, "不过这并不重要")], { maxVisualWidth: 48 });
+  assert.strictEqual(merged.length, 1, "两屏都读不完，应合并");
+  assert.strictEqual(merged[0].translation, "我也说不好，不过这并不重要");
+  // 左屏已有标点 / 拉丁边界：不重复补逗号
+  assert.strictEqual(Core.joinDisplayScreens("真的吗？", "我不信"), "真的吗？我不信");
+  assert.strictEqual(Core.joinDisplayScreens("一个逗号，", "后半"), "一个逗号，后半");
+  assert.strictEqual(Core.joinDisplayScreens("Hello", "world"), "Hello world");
+});
+
+test("语义路径：缓存命中与网络路径走同一显示管线（合并后屏数一致）", () => {
+  const cues = [
+    { start: 20300, end: 20700, content: "I don't know." },
+    { start: 20700, end: 21500, content: "Doesn't matter." },
+  ];
+  const timeline = Core.buildCanonicalTokenTimeline(cues);
+  const mkSeg = (i, a, b, t) => {
+    const seg = { segmentId: "b" + i, sourceFingerprint: timeline.sourceFingerprint,
+      sourceTextHash: Core.hashCacheIdentity(timeline.tokens.slice(a, b).map((x) => x.text).join(" ")),
+      tokenStart: a, tokenEnd: b, translation: t };
+    seg.integrity = Core.semanticSegmentIntegrity(seg);
+    return seg;
+  };
+  const segs = [mkSeg(0, 0, 3, "我也说不好"), mkSeg(1, 3, timeline.tokens.length, "不过这并不重要")];
+  const units = Core.materializeReadableSemanticUnits(segs, cues, { requireIntegrity: true, maxVisualWidth: 48 });
+  assert.strictEqual(units.length, 1, "读不完的两屏必须在统一入口内合并");
+  assert.strictEqual(units[0].startMs, 20300);
+  assert.strictEqual(units[0].tokenStart, 0, "合并屏 token span 取并集");
+  assert.strictEqual(units[0].tokenEnd, timeline.tokens.length);
+  const iso = fs.readFileSync(path.join(__dirname, "..", "isolated.js"), "utf8");
+  assert.ok(!/Core\.materializeSemanticTranslation\(cached/.test(iso), "缓存路径不得绕过显示管线直接物化");
+});
+
+test("词数超限兜底切点取就近词法组边界（中点平衡切分已被真轨否决）", () => {
+  // 2026-08-23 真轨：中点切分 38→45 屏、<1.5s 屏 31%→55%，英文切成半句后
+  // 本地闭合提示词逼模型补词/重复/臆造。回退为就近切点，此测试锁死。
+  const core = fs.readFileSync(path.join(__dirname, "..", "core.js"), "utf8");
+  const at = core.indexOf("function enforceSemanticTokenLimitMarks");
+  const body = core.slice(at, core.indexOf("\n  function ", at + 10));
+  assert.ok(at > 0, "函数必须存在");
+  assert.ok(!/最接近该段中点|bestScore/.test(body), "不得重新引入中点平衡切分");
+});
+
+test("整句翻译：模型可把多个英文 piece 合成一屏，中文不再跟着英文切点劈词", async () => {
+  // 2026-10-01 真轨 ds-40-r1001b：英文被切成 "…to make electric" | "kettles worth it."，
+  // 逐屏翻译只能产出「让电热」|「水壶物有所值」。整句协议下模型把两段合成一屏。
+  const cues = [
+    { start: 46637, end: 48495, content: "supply just doesn't have the gusto to make electric" },
+    { start: 49440, end: 51800, content: "kettles worth it." },
+  ];
+  let sent;
+  const out = await Core.translateContextBlock({
+    cues, apiBaseUrl: "https://example.test", ["api" + "Key"]: "k", apiModel: "m", targetLang: "zh-Hans", maxVisualWidth: 48,
+    fetchImpl: async (_url, req) => {
+      sent = JSON.parse(JSON.parse(req.body).messages[1].content);
+      if (sent.tokens) {
+        const cut = sent.groups.find((g) => /electric$/.test(g.text));
+        return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ semanticCutsAfter: cut ? [cut.toId] : [] }) } }] }) };
+      }
+      const ids = sent.sentences.flat().map((p) => p.id);
+      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ screens: [{ from: ids[0], to: ids[ids.length - 1], text: "供电根本带不动电热水壶" }] }) } }] }) };
+    },
+  });
+  assert.ok(Array.isArray(sent.sentences) && typeof sent.maxChars === "number", "请求按整句发送并给出每屏字数上限");
+  assert.strictEqual(out.units.length, 1, "两个 piece 合成一屏");
+  assert.strictEqual(out.units[0].translation, "供电根本带不动电热水壶");
+  assert.strictEqual(out.units[0].startMs, 46637, "startMs 取首个 piece 的词级时间");
+  assert.ok(/electric kettles worth it/.test(out.units[0].originalText), "原文行同步合并");
+});
+
+test("parseScreenCoverageResponse 结构违规 fail-closed，单 piece 屏可省略 to", () => {
+  const pieces = [0, 1, 2].map((i) => ({ alias: "u" + i, sourceText: "w" + i + ".", tokenStart: i, tokenEnd: i + 1, semanticGroupId: "sg" + i }));
+  const ok = Core.parseScreenCoverageResponse(JSON.stringify({ screens: [{ from: "u0", text: "一" }, { from: "u1", to: "u2", text: "二三" }] }), pieces);
+  assert.deepStrictEqual(ok.map((s) => [s.from, s.to]), [[0, 0], [1, 2]]);
+  assert.throws(() => Core.parseScreenCoverageResponse(JSON.stringify({ screens: [{ from: "u0", to: "u0", text: "一" }, { from: "u2", to: "u2", text: "三" }] }), pieces), /gap or overlap/);
+  assert.throws(() => Core.parseScreenCoverageResponse(JSON.stringify({ screens: [{ from: "u0", to: "u1", text: "一二" }] }), pieces), /tail missing/);
+  assert.throws(() => Core.parseScreenCoverageResponse(JSON.stringify({ screens: [{ from: "u0", to: "u9", text: "x" }] }), pieces), /unknown piece/);
+  const lenient = Core.parseScreenCoverageResponse(JSON.stringify({ screens: [{ from: "u0", text: "" }, { from: "u1", to: "u2", text: "二三" }] }), pieces, { lenient: true });
+  assert.strictEqual(lenient[0].text, "", "lenient 只把坏屏置空");
+});
+
+test("提示词改变显示形态必须伴随缓存契约升版", () => {
+  assert.strictEqual(Core.BLOCK_CONTRACT_VERSION, "block-v17");
+  assert.ok(!/每屏译文以句号/.test(Core.DEFAULT_SYSTEM_PROMPT), "提示词不得同时要求写句号又禁止句号");
+  // 2026-10-01 真轨：示例里把 "I could get my hands on" 写成「烧水的速度还比炉灶快得多」，
+  // 等于教模型臆造；ds-40-r1001 出现「也就是在北美这边」「至于测试结果，稍后再看」。
+  assert.ok(!/烧水的速度还比炉灶快得多/.test(Core.DEFAULT_SYSTEM_PROMPT), "示范译文不得含原文没有的信息");
+  assert.match(Core.DEFAULT_SYSTEM_PROMPT, /不为了凑成整句而补出源文没有的内容/);
+});
+
 test("行整形只有一条权威实现：translateContextBlock 不得自己再切一遍", () => {
   // 本轮真实故障：production 的 translateContextBlock 自己复制了一份
   // splitAtSentenceEnd + splitTargetDisplayLine + mergeDanglingModifierLines +
@@ -3043,7 +3146,10 @@ test("行整形只有一条权威实现：translateContextBlock 不得自己再�
   const end = core.indexOf("\n  async function ", at + 10);
   const body = core.slice(at, end > at ? end : core.length);
   assert.ok(
-    body.includes("materializeSemanticTranslation(") && body.includes("translateClipLines("),
+    // 2026-10-01：物化改经 materializeReadableSemanticUnits（内部仍调 materializeSemanticTranslation），
+    // 网络与缓存两条路径共用一条显示管线。等价保证 = 入口调用它 + 它内部调物化。
+    body.includes("materializeReadableSemanticUnits(") && body.includes("translateSentenceScreens(") &&
+      /function materializeReadableSemanticUnits[\s\S]{0,1200}?materializeSemanticTranslation\(/.test(core),
     "translateContextBlock 必须复用语义跨度与 coverage ledger，不得复制分屏实现"
   );
   ["splitTargetDisplayLine(", "mergeDanglingModifierLines(", "stripTrailingBreakPunct", "splitAtSentenceEnd("].forEach((fn) => {
@@ -4478,7 +4584,7 @@ async function main() {
     assert.doesNotMatch(iso, /contractVersion:\s*"block-v\d+"/, "运行时不得硬编码契约版本字面量");
     assert.doesNotMatch(iso, /contractVersion:\s*"coverage-v1"/);
     assert.match(iso, /writeCache\(key, \{ segments: out\.segments \}, generation\)/);
-    assert.match(iso, /Core\.materializeSemanticTranslation\(cached\.segments, clip\.cues, \{ requireIntegrity: true \}\)/);
+    assert.match(iso, /Core\.materializeReadableSemanticUnits\(cached\.segments, clip\.cues, \{ requireIntegrity: true[^}]*\}\)/);
     // 这条断言原本写死了 `catch (_)` 这个变量名，把"坏缓存必须删除"的意图和
     // "catch 参数必须叫下划线"绑在了一起。2026-08-23 给这个 catch 补上
     // console.warn 可观测性（参数随之改名 err）时，断言因此误报——它守的是
@@ -4507,7 +4613,7 @@ async function main() {
     // 传了从不使用。此前这里断言"必须传"，把死参数钉成了契约。
     assert.doesNotMatch(src, /context(?:Before|After)\s*:/,
       "不得再传 contextBefore/contextAfter：translateClipLines 的 payload 从不读取它们");
-    assert.match(src, /cached\.segments[\s\S]{0,200}?Core\.materializeSemanticTranslation\(cached\.segments, clip\.cues, \{ requireIntegrity: true \}\)/,
+    assert.match(src, /cached\.segments[\s\S]{0,200}?Core\.materializeReadableSemanticUnits\(cached\.segments, clip\.cues, \{ requireIntegrity: true[^}]*\}\)/,
       "缓存命中必须用当前源 cue 重新物化时间，不得复用旧逐 cue coverage");
     assert.match(src, /writeCache\(key, \{ segments: out\.segments \}, generation\)/,
       "缓存只保存规范化 block segments，并受 generation 写门禁保护");
@@ -4904,7 +5010,7 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     assert.match(rebuild, /translated\.length[\s\S]*?unit\.startMs[\s\S]*?unit\.endMs[\s\S]*?unit\.translation/, "已翻 block units 必须直接组成渲染时间轴");
     assert.match(rebuild, /else if \(clip\)[\s\S]*?clip\.cues[\s\S]*?translation: null/, "未翻块必须立即显示源 cue");
     assert.doesNotMatch(rebuild, /clipUnits\.length !== clip\.cues\.length|translations\[sourceUnit\.id\]/, "渲染层不得恢复源译 1:1 约束");
-    assert.match(src, /Core\.materializeSemanticTranslation\(cached\.segments, clip\.cues, \{ requireIntegrity: true \}\)/, "缓存必须按当前源时间重新物化，保留 cue gap");
+    assert.match(src, /Core\.materializeReadableSemanticUnits\(cached\.segments, clip\.cues, \{ requireIntegrity: true[^}]*\}\)/, "缓存必须按当前源时间重新物化，保留 cue gap");
     assert.ok(/if \(ms < clips\[i\]\.startMs\) return i/.test(src), "播放头在 gap 时应预热下一块");
   });
 
@@ -4915,7 +5021,7 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
       assert.ok(!re.test(src), "isolated.js 不应再调用 Core." + fn + "（已删，会 is not a function 崩）");
     });
     assert.ok(/Core\.translateContextBlock\b/.test(src), "isolated.js 应调用 block 翻译入口");
-    assert.ok(/Core\.materializeSemanticTranslation\b/.test(src), "缓存读取应按源时间重新物化语义 units");
+    assert.ok(/Core\.materializeReadableSemanticUnits\b/.test(src), "缓存读取应按源时间重新物化语义 units（经统一显示管线）");
   });
 
   test("已删函数在 core.js 确实 0 定义、且不在导出表里", () => {

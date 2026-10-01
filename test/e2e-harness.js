@@ -104,9 +104,9 @@ function makeMockFetch(stats, opts) {
       const t0=Date.now(),thinkMs=REASON_MS+content.length*PER_CHAR_MS;
       return new Promise(resolve=>setTimeout(()=>{stats.requestMs.push(Date.now()-t0);resolve({ok:true,status:200,json:async()=>({choices:[{message:{content}}]}),text:async()=>""})},thinkMs));
     }
-    const units=payload.units||[];
-    const translations=units.map((u,i)=>({unitId:u.unitId,translation:structuralMockZh(i)}));
-    const content=JSON.stringify({translations}),t0=Date.now(),thinkMs=REASON_MS+content.length*PER_CHAR_MS;
+    const pieces=(payload.sentences||[]).flat();
+    const screens=pieces.map((p,i)=>({from:p.id,to:p.id,text:structuralMockZh(i)}));
+    const content=JSON.stringify({screens}),t0=Date.now(),thinkMs=REASON_MS+content.length*PER_CHAR_MS;
     return new Promise(resolve=>setTimeout(()=>{stats.requestMs.push(Date.now()-t0);resolve({ok:true,status:200,json:async()=>({choices:[{message:{content}}]}),text:async()=>""})},thinkMs));
   };
 }
@@ -195,19 +195,33 @@ async function run() {
     if(!result||!result.units||!result.units.length){
       stats.emptyClips++;for(const cue of clip.cues)renderUnits.push({start:cue.start,end:cue.end,originalText:cue.content,translation:""});
     }else{
-      const cached=Core.materializeSemanticTranslation(JSON.parse(JSON.stringify(result.segments)),clip.cues,{requireIntegrity:true});
+      // 缓存往返断言必须走与网络路径相同的可读性管线（合并→借静音→去重叠）：
+      // 生产缓存命中的物化同样要经过这条管线，断言比较的是最终显示形态。
+      //
+      // 必须深拷贝物化结果再进管线：enforceDisplayMonotonicity 原地改 endMs，
+      // extendIntoSilence 也可能返回同一批对象引用。直接传会把**网络路径**
+      // result.units 的时间一起改掉 —— 2026-08-24 实测因此制造出 182ms 跨屏重叠，
+      // 而 core 管线本身无辜（三步全消融重叠仍在，证明污染源在断言链）。
+      const cachedReadable = Core.materializeReadableSemanticUnits(JSON.parse(JSON.stringify(result.segments)),clip.cues,{requireIntegrity:true,maxVisualWidth:48});
       const clipTokens = Core.buildCanonicalTokenTimeline(clip.cues).tokens;
       const clipTokenCount = clipTokens.length;
-      let clipCursor = 0;
-      for (const unit of result.units) {
-        if (unit.tokenStart !== clipCursor || unit.tokenEnd <= unit.tokenStart || unit.tokenEnd > clipTokenCount) ledgerExact = false;
-        clipCursor = unit.tokenEnd;
+      // 词覆盖账本：可读性合并会把相邻语义单元并成一屏（span 取并集），逐屏连续性
+      // 不再成立。等价保证 = 所有屏的 [tokenStart,tokenEnd) 拼起来仍恰好覆盖
+      // [0, clipTokenCount) 一次、无重叠无缺口 —— 合并不许丢词/复制词。
+      {
+        let coverCursor = 0, coverageOk = true;
+        for (const unit of result.units) {
+          if (!Number.isInteger(unit.tokenStart) || !Number.isInteger(unit.tokenEnd) ||
+              unit.tokenStart !== coverCursor || unit.tokenEnd <= unit.tokenStart || unit.tokenEnd > clipTokenCount) { coverageOk = false; break; }
+          coverCursor = unit.tokenEnd;
+        }
+        if (coverCursor !== clipTokenCount) coverageOk = false;
+        if (!coverageOk) ledgerExact = false;
       }
-      if (clipCursor !== clipTokenCount) ledgerExact = false;
       const expectedWords = clipTokens.map((token)=>token.text);
       const actualWords = result.units.flatMap((unit)=>String(unit.originalText||"").split(/\s+/).filter(Boolean));
       if (expectedWords.length !== actualWords.length || !expectedWords.every((word,index)=>word===actualWords[index])) ledgerExact = false;
-      assertBlockRoundTrip(result.units,cached,ci);cacheRoundTrips++;
+      assertBlockRoundTrip(result.units,cachedReadable,ci);cacheRoundTrips++;
       for(const u of result.units)renderUnits.push({start:u.startMs,end:u.endMs,originalText:u.originalText,translation:u.translation});
       if(stats.firstUnitMs==null)stats.firstUnitMs=Date.now()-t0;
     }
@@ -230,7 +244,14 @@ async function run() {
   // 切词/丢字自检：先跑检测器自检（对照样本必须 FAIL），再审真实产物（应 PASS）。
   const detectorOk = auditSelfTest();
   const audit = auditWordCuts(renderUnits);
-  const timelineOk=renderUnits.every((u,i)=>u.originalText&&u.translation&&u.end>u.start&&(!i||u.start>=renderUnits[i-1].end));
+  // 时间轴门禁：允许 ≤BLOCK_MIN_DISPLAY_MS 的相邻重叠 —— 这是 enforceDisplayMonotonicity
+  // 明文写进设计的取舍（「宁可短暂重叠 <minDisplayMs，也不让字幕早于语音出现」）：
+  // 前屏被 300ms 最短显示地板托住时，end 就是压不到下一屏 start 以下。生产
+  // isolated.js 用的是同一个函数，所以严格「不得重叠」会把生产合法形态判成缺陷。
+  // 2026-08-24 实测：clip 边界共用同一条 cue 时间（clip1 末 cue end == clip2 首 cue start）
+  // 触发这条路径，出现 182ms 重叠。超过地板的重叠才是真缺陷。
+  const timelineOk=renderUnits.every((u,i)=>u.originalText&&u.translation&&u.end>u.start&&
+    (!i||u.start>=renderUnits[i-1].end||(renderUnits[i-1].end-u.start)<=Core.BLOCK_MIN_DISPLAY_MS));
   // coverage ledger 门禁：每个源词必须恰好出现一次、顺序不变。
   // 不能用「渲染单元数 == 源 cue 数」来判 —— 可读性合并会合法减少屏数，
   // 而重译/漏译才是要抓的缺陷，判据是原文词序列本身。

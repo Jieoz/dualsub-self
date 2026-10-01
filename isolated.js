@@ -629,7 +629,8 @@
     if (generation !== state.requestGeneration || !config.enabled) throw runtimeAbortError();
     if (!cached || !Array.isArray(cached.segments)) return null;
     try {
-      var units = Core.materializeSemanticTranslation(cached.segments, clip.cues, { requireIntegrity: true });
+      // 与网络路径同一条显示管线（物化→合并→借静音→去重叠），首播与重播显示一致。
+      var units = Core.materializeReadableSemanticUnits(cached.segments, clip.cues, { requireIntegrity: true, maxVisualWidth: translationIdentitySnapshot().maxLineChars });
       return { key: key, cues: clip.cues, segments: cached.segments, units: units, fromCache: true };
     } catch (err) {
       // 这条降级路径曾经是 `catch (_) {}`：缓存反序列化失败被完全静默，表现只是

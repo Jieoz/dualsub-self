@@ -2346,8 +2346,8 @@
   // 通用翻译角色；具体 block JSON schema、覆盖和分屏规则由调用路径追加。
   // {TARGET_LANG} 仅供自定义 prompt 替换。
   var DEFAULT_SYSTEM_PROMPT =
-    "你是专业中文字幕翻译。源字幕可以是任意语言。先理解给出的连续语流和上下文，再用自然、准确、简洁的简体中文表达说话者的完整意思。\n" +
-    "理解和可读性优先于逐词、逐行对齐；不得遗漏、重复、臆造或把只读上下文的信息提前写入当前译文。每个输入 unit 必须独立表达该 unit 的完整意思；如果源文在该 unit 结束处已经完整，中文不得以‘和、但、如果、因为、所以、从、到、与、或、并且、可能’等悬空连接词收尾。\n" +
+    "你是专业中文字幕翻译。源字幕可以是任意语言。先通读给出的连续语流，按整句理解，再用自然、准确、简洁的简体中文表达说话者的完整意思。\n" +
+    "理解和可读性优先于逐词、逐行对齐；不得遗漏、重复、臆造，不为了凑成整句而补出源文没有的内容。\n" +
     "中文字幕不输出中文句号“。”；疑问句和感叹句保留问号或感叹号，必要的逗号可以保留。专名、数字、单位和固定表达必须保持完整。\n" +
     "严格遵守随后给出的 JSON 协议，只返回 JSON，不要返回 Markdown、解释或思考过程。";
 
@@ -3826,6 +3826,106 @@
     return lines;
   }
 
+  // 整句翻译、中文自己切屏（2026-10-01 重构，思路移植自 VideoLingo 的 translate→align）。
+  //
+  // 旧路径先把英文切成屏再逐屏翻译：英文切点落在 "electric | kettles" 这种短语中间时，
+  // 中文要么被逼着补内容凑整句（臆造），要么跟着劈成「电热|水壶」。两轮真轨各中一种。
+  // 根因是顺序：切点在翻译之前就定死了。
+  //
+  // 现在英文片段（piece）只是「可选切口」：模型整句翻译后，自己决定每屏覆盖哪几个
+  // 连续 piece，可以把多个 piece 合成一屏。中文切口因此落在中文自然停顿处，每屏的时间
+  // 仍由它覆盖的 piece 的词级时间戳决定（startMs 红线不变）。
+  var SCREEN_PROTOCOL_PROMPT =
+    "\n输入 sentences 按顺序给出若干句原文，每句由一个或多个连续片段 piece 组成；piece 只是可选的切屏位置，不是翻译单位。\n" +
+    "做法：每句先整句译成通顺中文，再把这句中文切成字幕屏。每屏覆盖连续的若干 piece（from 到 to，可以只有一个，也可以合并多个），屏的切口只能落在 piece 之间。\n" +
+    "中文切口要在自然停顿处（逗号、分句之间），绝不能把一个词、专名或数字+单位劈到两屏；每屏不超过 maxChars 个汉字，一句话不长就整句一屏。\n" +
+    "每屏文字对应它覆盖的那段原文，可以在一句之内为中文语序微调，但不得把别的句子的内容提前或挪后。屏尾不留逗号、顿号、冒号。\n" +
+    "协议硬约束：只返回 {\"screens\":[{\"from\":\"u0\",\"to\":\"u1\",\"text\":\"…\"}]}；所有屏按顺序首尾相接、恰好覆盖全部 piece 一次，from/to 原样复制 piece id，不要输出其他字段。";
+
+  /**
+   * 校验 {screens:[{from,to,text}]}：按 piece 顺序首尾相接、恰好覆盖一次。
+   * 结构违规（缺口/重叠/未知 id/超 token 上限）一律 fail-closed；
+   * lenient 时只把内容不合格的屏置空（该屏回退原文），不连坐整个 clip。
+   */
+  function parseScreenCoverageResponse(raw, pieces, opts) {
+    opts = opts || {};
+    var payload = extractJsonObject(raw, "screens");
+    if (!payload || !Array.isArray(payload.screens)) throw new Error("screen coverage invalid JSON");
+    var indexById = {};
+    pieces.forEach(function (piece, index) { indexById[piece.alias] = index; });
+    var cursor = 0;
+    var out = payload.screens.map(function (item) {
+      if (!item || typeof item !== "object") throw new Error("screen coverage entry invalid");
+      var from = indexById[String(item.from)];
+      // 弱模型单 piece 屏常省略 to：按 from 处理。
+      var to = item.to == null ? from : indexById[String(item.to)];
+      if (from == null || to == null) throw new Error("screen coverage unknown piece");
+      if (from !== cursor || to < from) throw new Error("screen coverage gap or overlap");
+      var tokenCount = pieces[to].tokenEnd - pieces[from].tokenStart;
+      if (tokenCount > SEMANTIC_MAX_TOKENS) throw new Error("screen coverage span exceeds token limit");
+      var rawText = item.text != null ? item.text : item.translation;
+      var text = sanitizeSubtitleLine(String(rawText == null ? "" : rawText));
+      var continues = to + 1 < pieces.length && pieces[to + 1].semanticGroupId === pieces[to].semanticGroupId;
+      var verdict = text.trim()
+        ? validateChineseDisplayUnit(text, { sourceText: pieces[to].sourceText, continues: continues, maxVisualWidth: Number.MAX_SAFE_INTEGER })
+        : { ok: false, reason: "empty" };
+      if (!verdict.ok) {
+        if (!opts.lenient) throw new Error("screen coverage invalid Chinese unit: " + verdict.reason);
+        text = "";
+      }
+      cursor = to + 1;
+      return { from: from, to: to, text: text };
+    });
+    if (cursor !== pieces.length) throw new Error("screen coverage tail missing");
+    return out;
+  }
+
+  /** 整句送译，返回按 piece 覆盖的中文屏 [{from,to,text}]（from/to 为 piece 下标）。 */
+  async function translateSentenceScreens(opts) {
+    opts = opts || {};
+    var pieces = (opts.pieces || []).map(function (piece, index) {
+      return {
+        alias: "u" + index,
+        sourceText: collapseWhitespace(piece.content || ""),
+        tokenStart: piece.tokenStart,
+        tokenEnd: piece.tokenEnd,
+        semanticGroupId: String(piece.semanticGroupId != null ? piece.semanticGroupId : "sg" + index),
+      };
+    });
+    if (!pieces.length) return [];
+    var sentences = [];
+    pieces.forEach(function (piece, index) {
+      if (!index || piece.semanticGroupId !== pieces[index - 1].semanticGroupId) sentences.push([]);
+      sentences[sentences.length - 1].push({ id: piece.alias, text: piece.sourceText });
+    });
+    var maxChars = Math.max(4, Math.floor((Number(opts.maxVisualWidth) || TRANSLATION_DISPLAY_MAX_WIDTH) / 2));
+    var userContent = JSON.stringify({ maxChars: maxChars, sentences: sentences });
+    var baseSys = buildSystemPrompt(opts.targetLang, opts.systemPrompt) + SCREEN_PROTOCOL_PROMPT;
+    var lastError = null;
+    for (var attempt = 0; attempt < 2; attempt++) {
+      var content = await chatCompletion({
+        apiBaseUrl: opts.apiBaseUrl,
+        apiKey: opts.apiKey,
+        apiModel: opts.apiModel,
+        temperature: opts.temperature,
+        reasoningEffort: opts.reasoningEffort,
+        systemContent: attempt ? baseSys + "\n上一次输出未通过覆盖校验：屏必须按顺序首尾相接、恰好覆盖全部 piece 一次。" : baseSys,
+        userContent: userContent,
+        timeoutMs: opts.timeoutMs,
+        fetchImpl: opts.fetchImpl,
+        onUsage: opts.onUsage,
+        signal: opts.signal,
+      });
+      try {
+        return parseScreenCoverageResponse(content, pieces, { lenient: !!opts.lenient });
+      } catch (error) {
+        if (!/screen coverage/.test(String(error && error.message))) throw error;
+        lastError = error;
+      }
+    }
+    throw lastError;
+  }
+
   // 把「模型看到的短别名」回落成真实 unitId，并对回落结果本身 fail-closed。
   //
   // 抽成独立纯函数而不是内联在 translateClipLines 里，是为了让守卫可被直接测试：
@@ -3955,7 +4055,9 @@
   // prompt 增加每屏英文词数上限（≤12 词），防止 32 词塞一屏。
   // v12：屏跨长停顿不再拒绝整块，改为在停顿处拆屏分配译文；
   // 源词 >14 时程序侧兜底拆屏；prompt 强调 sourceFrom/sourceTo 准确性。
-  var BLOCK_CONTRACT_VERSION = "block-v15";
+  // v15: 语义主路径（semanticOnly）。
+  // v16: 提示词要求每屏中文本地闭合；语义路径接可读性合并，合并处补逗号。
+  var BLOCK_CONTRACT_VERSION = "block-v17";
 
   var BLOCK_SEGMENT_MAX_GAP_MS = 750;
   var BLOCK_MIN_DISPLAY_MS = 300;
@@ -4839,6 +4941,27 @@
     return output;
   }
 
+  /**
+   * 语义单元 → 最终显示单元的唯一入口：物化 → 合并读不完的屏 → 借静音 → 去重叠。
+   *
+   * 网络路径（translateContextBlock）和缓存命中路径（isolated.js readVerifiedClipCache）
+   * 必须走同一个函数。此前管线只接在网络路径，缓存命中直接用物化结果 —— 同一 clip
+   * 首播与重播显示不同，harness 只能手抄一份管线去比对。
+   *
+   * 合并处理的是算术（字数 vs 毫秒，Netflix 简中 9 字/秒），语感断点仍归模型。
+   */
+  function materializeReadableSemanticUnits(segments, cues, opts) {
+    opts = opts || {};
+    cues = cues || [];
+    var units = materializeSemanticTranslation(segments, cues, opts);
+    var lastCue = cues[cues.length - 1];
+    var pauses = longPauseRanges(cues, Math.max(0, Math.floor(Number(opts.maxInternalGapMs) || BLOCK_SEGMENT_MAX_GAP_MS)));
+    return enforceDisplayMonotonicity(
+      extendIntoSilence(mergeUnreadableUnits(units, { maxVisualWidth: opts.maxVisualWidth }), pauses,
+        { blockEndMs: Number(lastCue && lastCue.end) || 0 }),
+      Math.max(1, Math.floor(Number(opts.minDisplayMs) || BLOCK_MIN_DISPLAY_MS)));
+  }
+
   function materializeBlockTranslation(parsedSegments, sourceCues, opts) {
     opts = opts || {};
     var source = blockSourceCues(sourceCues);
@@ -5029,15 +5152,25 @@
           pauseGroupId: cur.pauseGroupId || 0,
           srcStart: cur.srcStart,
           srcEnd: next.srcEnd,
+          // token span 取并集：coverage ledger 靠它验证「每个源词恰好覆盖一次」。
+          // 漏传会让合并屏的 span 断裂，把合法合并误判成丢词 —— 2026-08-24 真轨实测
+          // 三个 clip 全部 span 断裂，而词流断言全过，证明词没丢、只是字段没带下去。
+          tokenStart: cur.tokenStart,
+          tokenEnd: next.tokenEnd,
           originalText: joinDisplayScreens(cur.originalText, next.originalText),
           translation: mergedText,
           startMs: cur.startMs,   // 红线：出现时刻取前屏，绝不前推
           endMs: next.endMs,      // 红线：结束取后屏，绝不越过它
         };
-        // 只在确实改善时接受：合并后每字可用时间必须变多，否则原样保留模型的断点。
-        var before = shortfall(cur);
-        var after = shortfall(mergedUnit);
-        if (!(after < before)) break;
+        // 只在确实改善时接受。判据是**每字可用毫秒**上升，不是缺口绝对值下降：
+        // 合并把两屏的字数和时间都相加，缺口绝对值完全可能变大（字加得比时间快），
+        // 但人均阅读时间被摊平 —— 那才是合并的目的（skill §3：91→156 ms/字）。
+        // 旧判据 `after < before` 用总缺口比较，把这类正确合并全部拒掉：
+        // 2026-08-24 真轨实测 7 屏可救未救（如 1.1s「你也许会把这归到烹饪一类」
+        // 132ms 缺口，并后 244ms/屏摊到 740ms 但每字 149ms > 原 109ms —— 明明更可读）。
+        var before = (cur.endMs - cur.startMs) / Math.max(1, readMsNeeded(cur.translation) / msPerChar);
+        var after = (mergedUnit.endMs - mergedUnit.startMs) / Math.max(1, readMsNeeded(mergedUnit.translation) / msPerChar);
+        if (!(after > before)) break;
         cur = mergedUnit;
         i++;
       }
@@ -5070,7 +5203,13 @@
       var needed = Math.ceil(semanticDisplayWidth(unit.translation) / 2) * msPerChar;
       var have = unit.endMs - unit.startMs;
       if (have >= needed) return unit;
-      var ceiling = index + 1 < units.length ? units[index + 1].startMs : unit.startMs + needed;
+      // 末屏的天花板：块内没有"下一屏"可当边界，但块之外还有内容 —— 借静音必须
+      // 止步于本块最后一条源 cue 的结束时刻，否则会探进下一个 clip 的首屏区间。
+      // 2026-08-24 实测：不设这个上界时，跨 clip 边界处出现 182ms 重叠（两屏同时在屏）。
+      // 生产渲染层(isolated.js)虽有最终去重叠，但块内不该先产出越界值再让下游收拾。
+      var ceiling = index + 1 < units.length ? units[index + 1].startMs
+        : (Number(opts.blockEndMs) > 0 ? Math.min(unit.startMs + needed, Number(opts.blockEndMs))
+                                       : unit.startMs + needed);
       var wanted = Math.min(unit.startMs + needed, ceiling);
       // 红线：不得把 end 推进长停顿（静音处不显示字幕）。
       var endMs = Math.round(clampToPauseSide(pauses || [], wanted, false));
@@ -5093,6 +5232,11 @@
     var right = collapseWhitespace(String(b == null ? "" : b));
     if (!left) return right;
     if (!right) return left;
+    // 两屏各自是闭合的中文句（句号已在物化时去掉）。直接拼会粘成
+    // 「其中一个用途就是烧水我们这么做有很多原因」—— 2026-08-25 真轨 ds-40-prog 实测。
+    // 左屏以汉字/假名收尾且无标点时补一个中文逗号；其余情况沿用原拼接口径。
+    if (/[\p{scx=Han}\p{scx=Hiragana}\p{scx=Katakana}]$/u.test(left) &&
+        /^[\p{scx=Han}\p{scx=Hiragana}\p{scx=Katakana}]/u.test(right)) return left + "，" + right;
     // 中日韩之间不加空格，拉丁字符之间加 —— 复用 joinRestoredWords 的既有口径。
     return joinRestoredWords([left, right]);
   }
@@ -5165,55 +5309,37 @@
       tokenCursor += count;
     });
     if (tokenCursor !== timeline.tokens.length) throw new Error("semantic token packing coverage mismatch");
-    var translated;
-    try {
-      translated = await translateClipLines({
-        cues: semanticCues,
-        apiBaseUrl: opts.apiBaseUrl,
-        apiKey: opts.apiKey,
-        apiModel: opts.apiModel,
-        targetLang: opts.targetLang,
-        systemPrompt: opts.systemPrompt,
-        temperature: opts.temperature,
-        reasoningEffort: opts.reasoningEffort,
-        timeoutMs: opts.timeoutMs,
-        fetchImpl: opts.fetchImpl,
-        onUsage: opts.onUsage,
-        signal: opts.signal,
-        lenient: !!opts.lenient,
-      });
-    } catch (error) {
-      var message = String(error && error.message || error);
-      if (!/translation coverage invalid Chinese unit|translation coverage alignment mismatch/i.test(message)) throw error;
-      translated = await translateClipLines({
-        cues: semanticCues,
-        apiBaseUrl: opts.apiBaseUrl,
-        apiKey: opts.apiKey,
-        apiModel: opts.apiModel,
-        targetLang: opts.targetLang,
-        systemPrompt: String(opts.systemPrompt || "") + "\n上一次译文未通过完整语义校验；请重新翻译同一批 unit，逐条给出完整自然中文，不要以悬空连接词收尾。",
-        temperature: opts.temperature,
-        reasoningEffort: opts.reasoningEffort,
-        timeoutMs: opts.timeoutMs,
-        fetchImpl: opts.fetchImpl,
-        onUsage: opts.onUsage,
-        signal: opts.signal,
-        lenient: !!opts.lenient,
-      });
-    }
-    var segments = semanticCues.map(function (cue, index) {
+    var screens = await translateSentenceScreens({
+      pieces: semanticCues,
+      apiBaseUrl: opts.apiBaseUrl,
+      apiKey: opts.apiKey,
+      apiModel: opts.apiModel,
+      targetLang: opts.targetLang,
+      systemPrompt: opts.systemPrompt,
+      maxVisualWidth: opts.maxVisualWidth,
+      temperature: opts.temperature,
+      reasoningEffort: opts.reasoningEffort,
+      timeoutMs: opts.timeoutMs,
+      fetchImpl: opts.fetchImpl,
+      onUsage: opts.onUsage,
+      signal: opts.signal,
+      lenient: !!opts.lenient,
+    });
+    var segments = screens.map(function (screen, index) {
+      var first = semanticCues[screen.from];
+      var last = semanticCues[screen.to];
       var segment = {
         segmentId: "b" + index,
         sourceFingerprint: timeline.sourceFingerprint,
-        sourceTextHash: hashCacheIdentity(joinRestoredWords(cue.tokens.map(function (token) { return token.text; }))),
-        tokenStart: cue.tokenStart,
-        tokenEnd: cue.tokenEnd,
-        translation: translated[index] || "",
+        sourceTextHash: hashCacheIdentity(joinRestoredWords(timeline.tokens.slice(first.tokenStart, last.tokenEnd).map(function (token) { return token.text; }))),
+        tokenStart: first.tokenStart,
+        tokenEnd: last.tokenEnd,
+        translation: screen.text,
       };
       segment.integrity = semanticSegmentIntegrity(segment);
       return segment;
     });
-    return { segments: segments, units: materializeSemanticTranslation(segments, cues, { tokens: timeline, maxVisualWidth: opts.maxVisualWidth }) };
+    return { segments: segments, units: materializeReadableSemanticUnits(segments, cues, { tokens: timeline, maxVisualWidth: opts.maxVisualWidth, maxInternalGapMs: opts.maxInternalGapMs, minDisplayMs: opts.minDisplayMs }) };
   }
 
 
@@ -6572,7 +6698,9 @@
     SOURCE_DISPLAY_MAX_WIDTH: SOURCE_DISPLAY_MAX_WIDTH,
     READING_MS_PER_CHAR: READING_MS_PER_CHAR,
     mergeUnreadableUnits: mergeUnreadableUnits,
+    joinDisplayScreens: joinDisplayScreens,
     extendIntoSilence: extendIntoSilence,
+    longPauseRanges: longPauseRanges,
     enforceDisplayMonotonicity: enforceDisplayMonotonicity,
     isNonSpeechMarker: isNonSpeechMarker,
     BLOCK_MIN_DISPLAY_MS: BLOCK_MIN_DISPLAY_MS,
@@ -6616,6 +6744,7 @@
     parseBlockTranslationResponse: parseBlockTranslationResponse,
     materializeBlockTranslation: materializeBlockTranslation,
     materializeSemanticTranslation: materializeSemanticTranslation,
+    materializeReadableSemanticUnits: materializeReadableSemanticUnits,
     // semantic segment 的完整性戳与其底层 hash 一并导出：缓存读回时
     // materializeSemanticTranslation({requireIntegrity:true}) 会复算它，
     // 任何要产出「与 translateContextBlock 同形」segments 的外部调用方
@@ -6624,6 +6753,9 @@
     semanticSegmentIntegrity: semanticSegmentIntegrity,
     hashCacheIdentity: hashCacheIdentity,
     translateContextBlock: translateContextBlock,
+    translateSentenceScreens: translateSentenceScreens,
+    parseScreenCoverageResponse: parseScreenCoverageResponse,
+    SCREEN_PROTOCOL_PROMPT: SCREEN_PROTOCOL_PROMPT,
     translateClipLines: translateClipLines,
     translateClipWithBoundaryRepair: translateClipWithBoundaryRepair,
     parseBoundaryPlanResponse: parseBoundaryPlanResponse,
