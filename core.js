@@ -2860,7 +2860,7 @@
   var SCREEN_PROTOCOL_PROMPT =
     "\n输入 sentences 按顺序给出若干句原文，每句由一个或多个连续片段 piece 组成；piece 只是可选的切屏位置，不是翻译单位。\n" +
     "做法：每句先整句译成通顺中文，再把这句中文切成字幕屏。每屏覆盖连续的若干 piece（from 到 to，可以只有一个，也可以合并多个），屏的切口只能落在 piece 之间。\n" +
-    "中文切口要在自然停顿处（逗号、分句之间），绝不能把一个词、专名或数字+单位劈到两屏；每屏不超过 maxChars 个汉字，一句话不长就整句一屏。\n" +
+    "中文切口要在自然停顿处（逗号、分句之间），绝不能把一个词、专名或数字+单位劈到两屏；每屏不超过 maxChars 个汉字。屏数越少越好：一句话不超过 maxChars 就整句一屏；相邻两屏合起来不超过 maxChars 就合成一屏，只有放不下才切。\n" +
     "每屏文字对应它覆盖的那段原文，可以在一句之内为中文语序微调，但不得把别的句子的内容提前或挪后。屏尾不留逗号、顿号、冒号。\n" +
     "协议硬约束：只返回 {\"screens\":[{\"from\":\"u0\",\"to\":\"u1\",\"text\":\"…\"}]}；所有屏按顺序首尾相接、恰好覆盖全部 piece 一次，from/to 原样复制 piece id，不要输出其他字段。";
 
@@ -3028,7 +3028,7 @@
   // 源词 >14 时程序侧兜底拆屏；prompt 强调 sourceFrom/sourceTo 准确性。
   // v15: 语义主路径（semanticOnly）。
   // v16: 提示词要求每屏中文本地闭合；语义路径接可读性合并，合并处补逗号。
-  var BLOCK_CONTRACT_VERSION = "block-v17";
+  var BLOCK_CONTRACT_VERSION = "block-v18";
 
   var BLOCK_SEGMENT_MAX_GAP_MS = 750;
   var BLOCK_MIN_DISPLAY_MS = 300;
