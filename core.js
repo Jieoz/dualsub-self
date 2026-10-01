@@ -3318,7 +3318,9 @@
     // 两屏各自是闭合的中文句（句号已在物化时去掉）。直接拼会粘成
     // 「其中一个用途就是烧水我们这么做有很多原因」—— 2026-08-25 真轨 ds-40-prog 实测。
     // 左屏以汉字/假名收尾且无标点时补一个中文逗号；其余情况沿用原拼接口径。
-    if (/[\p{scx=Han}\p{scx=Hiragana}\p{scx=Katakana}]$/u.test(left) &&
+    // 百分号收尾同理（「长约16%」|「为什么？」全片真轨实测粘连）；裸数字不补，
+    // 「1500」|「瓦」是数字+单位，补逗号反而拆开。
+    if (/[\p{scx=Han}\p{scx=Hiragana}\p{scx=Katakana}%％]$/u.test(left) &&
         /^[\p{scx=Han}\p{scx=Hiragana}\p{scx=Katakana}]/u.test(right)) return left + "，" + right;
     // 中日韩之间不加空格，拉丁字符之间加 —— 复用 joinRestoredWords 的既有口径。
     return joinRestoredWords([left, right]);

@@ -1861,6 +1861,11 @@ test("读不完的屏必须合并相邻屏借时间，且不碰 startMs / 不越
   assert.strictEqual(fine.length, 2, "时间足够时必须原样保留模型断点");
 });
 
+test("合并屏左侧以百分号收尾时也补逗号（全片真轨「长约16%为什么？」）", () => {
+  assert.strictEqual(Core.joinDisplayScreens("实测时间仍比这长约16%", "为什么？"), "实测时间仍比这长约16%，为什么？");
+  assert.strictEqual(Core.joinDisplayScreens("功率是1500", "瓦"), "功率是1500瓦", "数字+单位不得被逗号拆开");
+});
+
 test("以「到/和/与/从」收尾的完整词不算悬空（全片真轨 clip 6「真没想到」）", () => {
   for (const s of ["真没想到", "我终于做到", "今天挺暖和", "大家都来参与", "只能服从"]) {
     assert.strictEqual(Core.validateChineseDisplayUnit(s, { continues: false }).ok, true, s);
