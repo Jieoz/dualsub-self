@@ -102,14 +102,18 @@ function translationCoverageJson(requestOptions, translations, reverse=false) {
 let passed = 0;
 let failed = 0;
 
+// test() 也接受 async fn：返回的 promise 收进 pendingTests，main() 汇总前统一等待，
+// 失败照常计 ✗ —— 此前 async 断言失败会变成未处理 rejection，进程直接崩掉、不出统计。
+const pendingTests = [];
 function test(name, fn) {
+  const pass = () => { passed++; console.log("  ✓ " + name); };
+  const fail = (e) => { failed++; console.error("  ✗ " + name + "\n      " + (e && e.message ? e.message : e)); };
   try {
-    fn();
-    passed++;
-    console.log("  ✓ " + name);
+    const result = fn();
+    if (result && typeof result.then === "function") { pendingTests.push(result.then(pass, fail)); return; }
+    pass();
   } catch (e) {
-    failed++;
-    console.error("  ✗ " + name + "\n      " + (e && e.message ? e.message : e));
+    fail(e);
   }
 }
 
@@ -1518,6 +1522,19 @@ test("sliceClipsByCue 按 cue 边界就近切、不切碎句子", () => {
   assert.strictEqual(clips[0].cues.length + clips[1].cues.length, cues.length);
 });
 
+test("sliceClipsByCue 优先收在原文句末：回退到后半段最近句末，后半段无句末时保持原切点", () => {
+  const c = (start, content) => ({ start, end: start + 1000, content });
+  const cues = [c(0, "If we assume"), c(1000, "it was 2,000 watts."), c(2000, "That is fast,"),
+    c(3000, "very fast."), c(4000, "the time is exactly 6"), c(5000, "minutes and 29 seconds."), c(6000, "Done.")];
+  const clips = Core.sliceClipsByCue(cues, 4500);
+  assert.deepStrictEqual(clips.map((x) => x.cues.length), [4, 3], "句中切点回退到句末，被退回的 cue 进下一 clip");
+  assert.strictEqual(clips[1].cues[1].content, "minutes and 29 seconds.");
+  assert.deepStrictEqual(clips.flatMap((x) => x.cues), cues, "回退不得丢失或重复 cue");
+  const mono = [c(0, "Start."), c(1000, "a b"), c(2000, "c d"), c(3000, "e f"), c(4000, "g h"), c(5000, "i j.")];
+  assert.deepStrictEqual(Core.sliceClipsByCue(mono, 4500).map((x) => x.cues.length), [5, 1], "句末只在前半段时不回退，避免 clip 过短");
+  assert.deepStrictEqual(Core.sliceClipsByCue(cues, 4500, { preferSentenceEnd: false }).map((x) => x.cues.length), [5, 2]);
+});
+
 test("sliceClipsByCue 不得从 semanticGroup 中间切断模型上下文", () => {
   const cues = [
     { start: 0, end: 4000, content: "a", semanticGroupId: "g0" },
@@ -1893,6 +1910,12 @@ test("整句协议：超宽屏/文字远多于语音的屏首轮带原因重试�
   assert.match(JSON.stringify(r.sys[1]), /超过 16 字/);
   r = await run([bad, bad]);
   assert.strictEqual(r.out.length, 3, "重试仍违规时照收，不让整 clip 回退英文");
+  const lead = { screens: [
+    { from: "u0", to: "u1", text: "如果所需能量超过一台" },
+    { from: "u2", to: "u2", text: "的1500瓦电水壶三倍" } ] };
+  r = await run([lead, good]);
+  assert.strictEqual(r.sys.length, 2, "屏首「的」必须触发一次重试");
+  assert.match(JSON.stringify(r.sys[1]), /以「的」开头/);
   r = await run([good]);
   assert.strictEqual(r.sys.length, 1, "合格输出不得多发请求");
 });
@@ -2044,7 +2067,7 @@ test("parseScreenCoverageResponse 结构违规 fail-closed，单 piece 屏可省
 });
 
 test("提示词改变显示形态必须伴随缓存契约升版", () => {
-  assert.strictEqual(Core.BLOCK_CONTRACT_VERSION, "block-v20");
+  assert.strictEqual(Core.BLOCK_CONTRACT_VERSION, "block-v21");
   assert.ok(!/每屏译文以句号/.test(Core.DEFAULT_SYSTEM_PROMPT), "提示词不得同时要求写句号又禁止句号");
   // 2026-10-01 真轨：示例里把 "I could get my hands on" 写成「烧水的速度还比炉灶快得多」，
   // 等于教模型臆造；ds-40-r1001 出现「也就是在北美这边」「至于测试结果，稍后再看」。
@@ -4878,6 +4901,7 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     assert.ok(sent.slice(1).every((v) => v === false), "重试及后续请求都不得再带该字段");
   });
 
+  await Promise.all(pendingTests);
   console.log("\n========================================");
   console.log("  通过: " + passed + "  失败: " + failed);
   console.log("========================================");

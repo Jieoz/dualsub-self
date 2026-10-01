@@ -2922,6 +2922,11 @@
         if (semanticDisplayWidth(text) > maxWidth) {
           throw new Error("screen coverage soft: 第 " + (out.length + 1) + " 屏「" + text + "」超过 " + Math.floor(maxWidth / 2) + " 字，请在同一句内多切一屏");
         }
+        // 屏首「的」：中文切口落在定语和中心语之间（「我们的系统会限制大多数设备」|
+        // 「的功率上限为1500瓦」，v21 真轨），后屏单独读不成话。「的确」「的士」除外。
+        if (out.length && /^的(?![确士])/.test(text)) {
+          throw new Error("screen coverage soft: 第 " + (out.length + 1) + " 屏「" + text + "」以「的」开头，把定语和中心语劈到了两屏，请换切口或调整语序");
+        }
         var haveMs = Number(pieces[to].endMs) - Number(pieces[from].startMs);
         var needMs = Math.ceil(semanticDisplayWidth(text) / 2) * READING_MS_PER_CHAR;
         if (haveMs > 0 && needMs > haveMs * 2.5 && needMs > haveMs + 800) {
@@ -3069,7 +3074,7 @@
   // 源词 >14 时程序侧兜底拆屏；prompt 强调 sourceFrom/sourceTo 准确性。
   // v15: 语义主路径（semanticOnly）。
   // v16: 提示词要求每屏中文本地闭合；语义路径接可读性合并，合并处补逗号。
-  var BLOCK_CONTRACT_VERSION = "block-v20";
+  var BLOCK_CONTRACT_VERSION = "block-v21";
 
   var BLOCK_SEGMENT_MAX_GAP_MS = 750;
   var BLOCK_MIN_DISPLAY_MS = 300;
@@ -3711,6 +3716,19 @@
         // 软上限：只在 cue 边界断开，绝不切碎单条 cue
         if (maxCues > 0 && group.length >= maxCues) break;
         if (maxChars > 0 && charCount >= maxChars) break;
+      }
+      // clip 尽量收在原文句末：每个 clip 是一次独立的整句翻译请求，句子被 clip 边界劈开时
+      // 两边都看不到整句，前一 clip 只能把半句（常是「exactly 6」这种数字）译成一屏。
+      // 全片真轨 v19：50 个 clip 里 27 个收在句中，「那么所需时间正好是6」「用它可以在90」
+      // 都出自这里。回退到本 clip 后半段最近的句末；后半段没有句末（超长独白）就保持原切点，
+      // 不让 clip 缩得过短。只回退不前伸，所以时长/条数/字数上限依旧成立。
+      if (opts.preferSentenceEnd !== false && i < n && !SENTENCE_FINAL_RE.test(collapseWhitespace(group[group.length - 1].content || ""))) {
+        var back = group.length - 1;
+        while (back >= 0 && !SENTENCE_FINAL_RE.test(collapseWhitespace(group[back].content || ""))) back--;
+        if (back >= 0 && back + 1 >= Math.ceil(group.length / 2)) {
+          i -= group.length - 1 - back;
+          group.length = back + 1;
+        }
       }
       }
       clips.push({
