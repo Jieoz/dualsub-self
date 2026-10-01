@@ -663,10 +663,8 @@
           var cachedResult = await readVerifiedClipCache(clip, segmentationMode, identity, generation);
           if (cachedResult) return { cached: cachedResult };
           if (!identity.apiBaseUrl || !identity.apiModel) throw new Error("translation configuration missing");
-          // 不再计算 contextBefore/contextAfter：translateContextBlock 把它们透传给
-          // translateClipLines，而 payload 构造只取 unitId + sourceText，两者在函数边界
-          // 就被丢弃 —— 传了从不使用。真正的跨块连贯性由 block 分段本身保证（整段连续
-          // 语音一次翻），不靠额外发相邻 cue。
+          // 不计算 contextBefore/contextAfter：跨块连贯性由整句送译保证
+          // （translateSentenceScreens 一次发整段连续语音），不靠额外发相邻 cue。
           var result = await Core.translateContextBlock({
             cues: clip.cues,
             apiBaseUrl: identity.apiBaseUrl,
@@ -1261,7 +1259,7 @@
     render.sort(function (a, b) { return a.start - b.start || a.end - b.end; });
     // 去重叠必须在这里做 —— 整条时间线只有汇合后才完整。
     //
-    // materializeBlockTranslation 里的去重叠只看得见**单个块**，块与块之间没人管；
+    // materializeReadableSemanticUnits 里的去重叠只看得见**单个块**，块与块之间没人管；
     // 而滚动窗口 ASR 轨（YouTube 自动字幕）相邻 cue 天然大幅交叉（实测 DGdsIrAjp3k
     // 188/202 条重叠），块边界两侧的屏于是重叠上屏，播放器同时命中两屏 —— 用户看到
     // 的现象是「译文和原文错位、串行」。

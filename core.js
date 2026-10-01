@@ -401,7 +401,6 @@
     return ((hh * 60 + mm) * 60 + ss) * 1000 + fff;
   }
 
-
   /**
    * 按外部语义恢复器给出的句末 token 下标重组连续 token。模型只提出边界，
    * 文本和时间都由源 token 决定；无效边界被拒绝，避免模型改写/丢词。
@@ -437,7 +436,6 @@
     }
     return out;
   }
-
 
   function appendTimelineTokens(out, incoming) {
     var next = (incoming || []).filter(function (token) { return token && collapseWhitespace(token.text || ""); });
@@ -1027,142 +1025,6 @@
     });
   }
 
-  function resegmentTimelineSnapshot(snapshot, unitStart, unitEnd, replacementCues) {
-    if (!snapshot || !snapshot.timeline || !Array.isArray(snapshot.units)) throw new Error("timeline snapshot required");
-    var firstUnit = Number(unitStart);
-    var afterUnit = Number(unitEnd);
-    if (!Number.isInteger(firstUnit) || !Number.isInteger(afterUnit) || firstUnit < 0 || afterUnit <= firstUnit || afterUnit > snapshot.units.length) {
-      throw new Error("replacement unit range invalid");
-    }
-    var tokenStart = snapshot.units[firstUnit].tokenStart;
-    var tokenEnd = snapshot.units[afterUnit - 1].tokenEnd;
-    // 装载质量门禁必须与生成这些单元的同一份语言无关视觉预算一致。固定 12/14
-    // 会把连写文字按“字符数”拒掉，而空格语言按“词数”通过，形成隐蔽语言分支。
-    var replacementBudget = semanticTokenBudgets(snapshot.timeline.tokens.slice(tokenStart, tokenEnd));
-    (replacementCues || []).forEach(function (cue, ci) {
-      var n = restoredWords(String(cue && cue.content || "")).length;
-      var width = semanticDisplayWidth(String(cue && cue.content || ""));
-      if (n > SEMANTIC_MAX_TOKENS || width > replacementBudget.maxVisualWidth) {
-        throw new Error("semantic replacement unit " + ci + " has " + n + " tokens / " + width + " width");
-      }
-    });
-    var sourceWords = snapshot.timeline.tokens.slice(tokenStart, tokenEnd).map(function (token) { return token.text; });
-    var replacementWords = [];
-    var localEnds = [];
-    (replacementCues || []).forEach(function (cue) {
-      var words = restoredWords(cue && cue.content || "");
-      if (!words.length) throw new Error("replacement token unit empty");
-      for (var i = 0; i < words.length; i++) replacementWords.push(words[i]);
-      localEnds.push(tokenStart + replacementWords.length - 1);
-    });
-    // 带上实际数字：这条错误最常见的成因是调用方用了另一套下标空间
-    // （原始轨 cue vs snapshot units），只报"mismatch"无法区分。
-    if (replacementWords.length !== sourceWords.length) {
-      throw new Error(
-        "replacement token coverage mismatch: got " + replacementWords.length +
-        " words for units [" + firstUnit + "," + afterUnit + ") = tokens [" +
-        tokenStart + "," + tokenEnd + ") expecting " + sourceWords.length
-      );
-    }
-    for (var w = 0; w < sourceWords.length; w++) {
-      if (String(replacementWords[w]).toLowerCase() !== String(sourceWords[w]).toLowerCase()) {
-        throw new Error("replacement token text mismatch at " + w);
-      }
-    }
-    if (!localEnds.length || localEnds[localEnds.length - 1] !== tokenEnd - 1) throw new Error("replacement token coverage mismatch");
-    var boundaries = [];
-    for (var left = 0; left < firstUnit; left++) boundaries.push(snapshot.units[left].tokenEnd - 1);
-    boundaries = boundaries.concat(localEnds);
-    for (var right = afterUnit; right < snapshot.units.length; right++) boundaries.push(snapshot.units[right].tokenEnd - 1);
-    var nextUnits = buildTokenSpanUnits(snapshot.timeline, boundaries);
-    // semanticGroupId 必须穿过 snapshot 换入层；否则 display cut 一装载就退化成
-    // “每屏各自翻译”，完整语义与短屏又会重新绑死。区间 tokenStart 作为 namespace，
-    // 防止不同滑动区间里的 sg0/sg1 相撞。
-    var replacementGroupsByEnd = {};
-    (replacementCues || []).forEach(function (cue, index) {
-      replacementGroupsByEnd[localEnds[index] + 1] = "sem:" + tokenStart + ":" + String(cue.semanticGroupId || "sg" + index);
-    });
-    nextUnits.forEach(function (unit) {
-      if (unit.tokenStart >= tokenStart && unit.tokenEnd <= tokenEnd) {
-        unit.semanticGroupId = replacementGroupsByEnd[unit.tokenEnd] || "sem:" + tokenStart + ":sg" + unit.tokenStart;
-        return;
-      }
-      var prior = snapshot.units.find(function (oldUnit) { return oldUnit.tokenStart === unit.tokenStart && oldUnit.tokenEnd === unit.tokenEnd; });
-      if (prior && prior.semanticGroupId != null) unit.semanticGroupId = prior.semanticGroupId;
-    });
-
-    // 译文继承必须按「词」判定，不能要求 token 跨度逐字节相等。
-    //
-    // 曾用 oldBySpan[tokenStart+":"+tokenEnd] 精确匹配，但语义恢复的目的**就是
-    // 改断句** —— 跨度一变就匹配不上，译文全丢。实测用户轨（BhtgINeaJWg）单次
-    // 区间换入丢掉 67.9% 的已翻词，那批单元退回 [未翻译] 后要重新排队再翻一遍，
-    // 翻译量凭空翻倍，表现就是「翻译永远追不上播放」。
-    //
-    // 现在的判据：新单元的 token 跨度若被某条旧译文**完全覆盖**，就继承它。
-    // 只有跨越了两条不同旧译文（合并了不同句子）才必须重翻 —— 那时旧译文确实
-    // 无法拼接。跨度完全相同是它的一个特例，行为不变。
-    var oldByToken = [];
-    snapshot.units.forEach(function (unit) {
-      var text = snapshot.translations && snapshot.translations[unit.id] || "";
-      if (!text) return;
-      oldByToken.push({ start: unit.tokenStart, end: unit.tokenEnd, text: text });
-    });
-    // 两种方向都要处理，否则等于没保留（实测断句变粗时新单元跨越 2 条旧单元，
-    // 只做「被包含」判断时命中率为 0，一个词都保不住）：
-    //   1. 新单元被某条旧译文完整覆盖 → 直接继承（断句变细，跨度相同是其特例）
-    //   2. 新单元由若干条**连续且完整**的旧译文拼成 → 按序拼接
-    // 只有边界与旧译文交叉切开（旧句被拦腰截断）时才判定为无法继承，必须重翻 ——
-    // 那时旧译文确实对不上新单元的内容。
-    function inheritedTranslation(unit) {
-      var pieces = [];
-      var cursor = unit.tokenStart;
-      for (var i = 0; i < oldByToken.length; i++) {
-        var old = oldByToken[i];
-        if (old.end <= unit.tokenStart || old.start >= unit.tokenEnd) continue;
-        // 情形 1：整个新单元落在一条旧译文里
-        if (unit.tokenStart >= old.start && unit.tokenEnd <= old.end) return old.text;
-        // 情形 2：要求逐段严丝合缝地接上，任何错位都放弃继承
-        if (old.start !== cursor || old.end > unit.tokenEnd) return "";
-        pieces.push(old.text);
-        cursor = old.end;
-      }
-      // 拼接用已有的语言无关连接器：中日韩等连写文字不插空格，拉丁语族插空格。
-      // 不新写一套判定 —— joinRestoredWords 是这件事的唯一权威实现。
-      if (pieces.length && cursor === unit.tokenEnd) return joinRestoredWords(pieces);
-      return "";
-    }
-    var nextTranslations = {};
-    nextUnits.forEach(function (unit) {
-      nextTranslations[unit.id] = inheritedTranslation(unit);
-    });
-    return createTimelineSnapshot({
-      revision: Number(snapshot.revision || 0) + 1,
-      videoId: snapshot.videoId,
-      trackCode: snapshot.trackCode,
-      timeline: snapshot.timeline,
-      units: nextUnits,
-      translations: nextTranslations,
-    });
-  }
-
-  function withTimelineTranslations(snapshot, updates) {
-    if (!snapshot || !snapshot.timeline || !Array.isArray(snapshot.units)) throw new Error("timeline snapshot required");
-    var next = {};
-    var current = snapshot.translations || {};
-    snapshot.units.forEach(function (unit) {
-      var value = Object.prototype.hasOwnProperty.call(updates || {}, unit.id) ? updates[unit.id] : current[unit.id];
-      next[unit.id] = String(value == null ? "" : value);
-    });
-    return createTimelineSnapshot({
-      revision: Number(snapshot.revision || 0) + 1,
-      videoId: snapshot.videoId,
-      trackCode: snapshot.trackCode,
-      timeline: snapshot.timeline,
-      units: snapshot.units,
-      translations: next,
-    });
-  }
-
   // 语义恢复协议：模型只可在源词之间加入 .?!|，绝不拥有正文所有权。
   // 逐词归一化后必须完全相等，否则整个 chunk 无效并由调用方重试/回退。
   // 词数计量必须与「屏上所见」一致 —— 屏上显示为一个词的就算一个词,否则
@@ -1336,35 +1198,6 @@
     return out;
   }
 
-  function sameRestoredWords(source, restored) {
-    var a = Array.isArray(source) ? source : restoredWords(source);
-    var b = restoredWords(restored);
-    if (a.length !== b.length) return false;
-    for (var i = 0; i < a.length; i++) {
-      if (String(a[i]).toLowerCase() !== String(b[i]).toLowerCase()) return false;
-    }
-    return true;
-  }
-
-  function restoredBoundaryMarks(sourceWords, restored) {
-    var words = Array.isArray(sourceWords) ? sourceWords : restoredWords(sourceWords);
-    if (!sameRestoredWords(words, restored)) return null;
-    var matches = [];
-    // 同上:必须与 RESTORE_WORD_RE 同口径,否则连字符复合词会使
-    // matches.length 与 words.length 不等,恢复边界被整段丢弃。
-    var re = newWordRe();
-    var match;
-    while ((match = re.exec(String(restored || "")))) matches.push(match);
-    if (matches.length !== words.length) return null;
-    var marks = [];
-    for (var i = 0; i < matches.length; i++) {
-      var next = i + 1 < matches.length ? matches[i + 1].index : String(restored || "").length;
-      var tail = String(restored || "").slice(matches[i].index + matches[i][0].length, next);
-      marks.push(/[.!?]/.test(tail) ? "." : (tail.indexOf("|") >= 0 ? "|" : ""));
-    }
-    return marks;
-  }
-
   // 语义恢复分块的单一权威参数。整轨恢复按块送模型:块越大重叠开销越低。
   // 实测(gpt-5.5,180s 真实轨):c120/o30 需 10 次调用 13494 token;c200/o20 只需
   // 7 次调用 10145 token(省 25%)、快 31%,且句中硬切比例还略降(45%→42%)——
@@ -1415,214 +1248,8 @@
     return units;
   }
 
-  // 语义恢复的边界来自模型，但长句 rescue 仍可能在数字/介词/连词处给出
-  // 可验证却不适合阅读的边界。这里只合并相邻源 token，绝不改写、重排或删词。
-  var CONTINUATION_START_WORDS = {
-    from: true, to: true, of: true, in: true, on: true, at: true, with: true, for: true, by: true,
-    into: true, over: true, under: true, through: true, throughout: true, during: true, after: true, before: true, without: true,
-    up: true, down: true, out: true, off: true, away: true, back: true, around: true, apart: true,
-    forward: true, forth: true, ahead: true, along: true, across: true, together: true, aside: true,
-    past: true, round: true, behind: true, beyond: true,
-    and: true, or: true, but: true, because: true, that: true, which: true, who: true, whose: true,
-    when: true, while: true, if: true, than: true, as: true,
-  };
-  function isContinuationStart(word) {
-    return !!CONTINUATION_START_WORDS[String(word || "").toLowerCase()];
-  }
-  var DANGLING_END_RE = /\b(?:to|of|for|with|from|at|in|on|by|about|into|over|under|between|through|and|or|but|because|that|which|who|whose|when|while|if|than|as|more|less|the|a|an)$/i;
-  var NUMBER_END_RE = /(?:^|\s)[+-]?\d[\d,.]*(?:%|[a-z]+)?$/i;
-  var NUMBER_WORD_END_RE = /\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million|billion)$/i;
-  var UNIT_START_RE = /^(?:volts?|watts?|amps?|amperes?|hertz|hz|degrees?|celsius|fahrenheit|seconds?|minutes?|hours?|milliseconds?|kilometers?|metres?|meters?|miles?|kilograms?|grams?|pounds?|ohms?|pascals?|psi|newtons?|joules?|kelvin|liters?|litres?|gallons?|inches?|feet|yards?|mph|kph|rpm|decibels?|bytes?|kilobytes?|megabytes?|gigabytes?|terabytes?|percent|dollars?|euros?|yuan)\b/i;
-  var MULTIPLIER_END_RE = /\b(?:once|twice|times)$/i;
-  var COMPARATIVE_START_RE = /^(?:the|a|an|this|that|these|those|my|our|your|their|his|her|previous|original|more|less|better|worse|faster|slower|higher|lower|larger|smaller|greater|fewer|\w+er)\b/i;
-  var REPORTING_CLAUSE_PREFIX_RE = /^(?:let\s+(?:me|us)\s+(?:reiterate|say|note|explain|emphasize|stress|point\s+out|remind\s+you)\s+that|i\s+(?:think|believe|know|mean|guess|suppose)\s+that)\b/i;
-  var SUBORDINATE_CLAUSE_PREFIX_RE = /^(?:if|unless|although|though|even\s+if|because|when|while|before|after)\b/i;
-  var RELATIVE_SUBJECT_PREFIX_RE = /^(?:the|a|an|this|that|these|those|my|our|your|their|his|her)\b.+\b(?:that|which|who)\b/i;
-  var COMPLEMENT_THAT_RE = /\b(?:mean|means|meant|say|says|said|think|thinks|thought|believe|believes|believed|know|knows|knew|show|shows|showed|indicate|indicates|indicated|suggest|suggests|suggested|confirm|confirms|confirmed|ensure|ensures|ensured|explain|explains|explained|report|reports|reported|note|notes|noted)\s+that\b/i;
-  var CONTACT_RELATIVE_PRONOUN_RE = /^(?:the|a|an|this|that|these|those|my|our|your|their|his|her)\b.+\b(?:i|we|you|they|he|she)\s+(?:(?:\w+)\s+){0,3}(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did|\w+(?:s|ed))\b/i;
-  var CONTACT_RELATIVE_PROPER_RE = /^(?:the|a|an|this|that|these|those|my|our|your|their|his|her)\b.+\b[A-Z][a-z]+\s+(?:(?:\w+)\s+){0,3}(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did|\w+(?:s|ed))\b/;
-  var MAIN_PREDICATE_START_RE = /^(?:(?:still|also|already|actually|usually|generally|typically|often|sometimes|never|always|then)\s+)?(?!(?:whereas|thus|perhaps|besides|this|these|those|the|a|an|my|our|your|their|his|her|its)\b)(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did|\w+(?:s|ed))\b/i;
-  // 只识别省略关系代词的 contact clause（如 “camera we tested”）。
-  // 显式 that/which/who 从句仍属于主语，不得被 reporting 例外覆盖。
-  var EMBEDDED_RELATIVE_PREDICATE_RE = /\b(?:i|we|you|they|he|she)\s+(?:(?:\w+)\s+){0,3}(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did|\w+(?:s|ed))\b/i;
-  var DETERMINER_END_RE = /\b(?:the|a|an|this|that|these|those|my|our|your|their|his|her)$/i;
-
-  function completedReportingSubjectBoundary(leftText, rightText) {
-    if (!REPORTING_CLAUSE_PREFIX_RE.test(leftText) || !MAIN_PREDICATE_START_RE.test(rightText)) return false;
-    var tail = leftText.replace(REPORTING_CLAUSE_PREFIX_RE, "").trim();
-    return !DETERMINER_END_RE.test(tail) &&
-      /^(?:the|a|an|this|that|these|those|my|our|your|their|his|her)\b/i.test(tail) &&
-      !RELATIVE_SUBJECT_PREFIX_RE.test(tail) &&
-      EMBEDDED_RELATIVE_PREDICATE_RE.test(tail);
-  }
-
-  function normalizeBoundaryText(text) {
-    return collapseWhitespace(String(text || "")).replace(/[|.!?]+$/g, "");
-  }
-
-  function hasFinitePredicateText(text) {
-    var value = String(text || "");
-    if (/\b(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did)\b/i.test(value)) return true;
-    // 并列边界宁可保守：s/ed 也可能是复数名词或分词形容词。只有紧邻 -ly 副词
-    // （runs quietly / worked reliably）时才把它当作强谓语证据。
-    return /\b\w+(?:s|ed)\s+\w+ly\b/i.test(value);
-  }
-
-  function hasComparisonPredicateText(text) {
-    return hasFinitePredicateText(text) || /\b\w+(?:s|ed)\b.*\b(?:faster|slower|higher|lower|more|less|better|worse)\b/i.test(String(text || ""));
-  }
-
-  function hasExplicitRelativeSubject(text) {
-    var value = normalizeBoundaryText(text);
-    var complement = value.match(COMPLEMENT_THAT_RE);
-    if (!complement) return RELATIVE_SUBJECT_PREFIX_RE.test(value);
-    var nested = value.slice((complement.index || 0) + complement[0].length).trim();
-    return RELATIVE_SUBJECT_PREFIX_RE.test(nested);
-  }
-
-  function isCoordinatedIndependentBoundary(leftText, rightText) {
-    var right = normalizeBoundaryText(rightText);
-    if (!hasFinitePredicateText(leftText)) return false;
-    var pronounClause = /^(?:and|but|or)\s+(?:i|you|he|she|it|we|they|there)\s+(?:(?:still|also|already|actually|usually|generally|typically|often|sometimes|never|always|then)\s+){0,2}(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did|\w+(?:s|ed))\b/i.test(right);
-    var properClause = /^(?:and|but|or)\s+[A-Z][a-z]+\s+(?:(?:still|also|already|actually|usually|generally|typically|often|sometimes|never|always|then)\s+){0,2}(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did|\w+(?:s|ed))\b/.test(right);
-    return pronounClause || properClause;
-  }
-
-  function classifySemanticBoundary(leftText, rightText) {
-    var left = normalizeBoundaryText(leftText);
-    var right = normalizeBoundaryText(rightText);
-    if (!left || !right) return { safe: false, reason: "empty-side" };
-    var reportingLeft = REPORTING_CLAUSE_PREFIX_RE.test(left);
-    var structuralLeft = reportingLeft ? left.replace(REPORTING_CLAUSE_PREFIX_RE, "").trim() : left;
-    var lowerInitialStructuralLeft = structuralLeft ? structuralLeft.charAt(0).toLowerCase() + structuralLeft.slice(1) : structuralLeft;
-    var contactRelativeSubject = CONTACT_RELATIVE_PRONOUN_RE.test(structuralLeft) || CONTACT_RELATIVE_PROPER_RE.test(lowerInitialStructuralLeft);
-    // that 也可能是 means/says/thinks 后的宾语从句引导词；只豁免外层 complement，
-    // 继续检查其内部的 “the controller which ...” 显式关系主语。
-    var explicitRelativeSubject = hasExplicitRelativeSubject(structuralLeft);
-    // 关系主语保护优先于 and/but/or 例外；否则 conjunction 会把仍缺主谓的左屏伪装成完整并列句。
-    if (explicitRelativeSubject || (!reportingLeft && contactRelativeSubject)) {
-      return { safe: false, reason: "relative-subject-missing-predicate" };
-    }
-    var first = String(restoredWords(right)[0] || "").toLowerCase();
-    // 字幕屏是连续语流，不要求每屏都是脱离上下文的书面句。只有左右均有强谓语证据时，
-    // 才允许 and/but/or 开启第二个完整并列分句。
-    if (isContinuationStart(first) && !isCoordinatedIndependentBoundary(left, right)) return { safe: false, reason: "continuation-start" };
-    if (NUMBER_END_RE.test(left) || (NUMBER_WORD_END_RE.test(left) && UNIT_START_RE.test(right))) return { safe: false, reason: "number-quantity" };
-    if (MULTIPLIER_END_RE.test(left) && COMPARATIVE_START_RE.test(right)) return { safe: false, reason: "comparison-continuation" };
-    if (DANGLING_END_RE.test(left)) return { safe: false, reason: "dangling-end" };
-    if (SUBORDINATE_CLAUSE_PREFIX_RE.test(left)) return { safe: false, reason: "subordinate-clause-missing-main" };
-    if (REPORTING_CLAUSE_PREFIX_RE.test(left) && /^(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did)\b/i.test(right)) {
-      return { safe: false, reason: "reporting-clause-missing-predicate" };
-    }
-    return { safe: true, reason: "ok" };
-  }
-
   function unitWordCount(unit) {
     return restoredWords(unit && unit.content).length;
-  }
-
-  function mergeNaturalUnits(left, right) {
-    var merged = Object.assign({}, left);
-    merged.start = Math.min(toInt(left.start, 0), toInt(right.start, 0));
-    merged.end = Math.max(toInt(left.end, merged.start), toInt(right.end, merged.start));
-    merged.duration = Math.max(0, merged.end - merged.start);
-    merged.content = collapseWhitespace(String(left.content || "") + " " + String(right.content || ""));
-    if (Array.isArray(left.tokens) || Array.isArray(right.tokens)) {
-      merged.tokens = (Array.isArray(left.tokens) ? left.tokens : []).concat(Array.isArray(right.tokens) ? right.tokens : []);
-    }
-    return merged;
-  }
-
-  /**
-   * 修复被严格词数 rescue 切坏的英语显示单元：
-   * - 小写介词/连词/助动词开头是上句续接；
-   * - 小写 1-2 词单元是孤儿，优先回并；
-   * - 介词/连词/限定词尾不能悬空。
-   * preferredMaxWords 是偏好而非硬断点；为保持自然句界，可合并到 maxNaturalWords。
-   */
-  function repairNaturalUnitBoundaries(units, opts) {
-    opts = opts || {};
-    var maxNaturalWords = Math.max(1, Math.floor(Number(opts.maxNaturalWords) || 24));
-    var maxVisualWidth = Math.max(12, Math.floor(Number(opts.maxVisualWidth) || SOURCE_DISPLAY_MAX_WIDTH));
-    var maxJoinGapMs = opts.maxJoinGapMs != null ? Math.max(0, Number(opts.maxJoinGapMs)) : 2200;
-    var out = [];
-    for (var i = 0; i < (units || []).length; i++) {
-      var current = Object.assign({}, units[i]);
-      if (!current.content) continue;
-      // ASR 常漏句号，但保留句首大写。一个单元内出现 “And + 完整主谓” 时，
-      // 按 token 时间拆成两个真实 cue，避免把 1800W 与 20A/2400W 偷塞进同一屏。
-      var currentWords = restoredWords(current.content);
-      var capitalAnd = -1;
-      for (var ai = 4; ai < currentWords.length - 4; ai++) {
-        if (currentWords[ai] === "And" && /^(?:on|the|a|an|this|that|it|we|you|they|there)$/i.test(currentWords[ai + 1] || "")) { capitalAnd = ai; break; }
-      }
-      if (capitalAnd > 0 && Array.isArray(current.tokens) && current.tokens.length === currentWords.length) {
-        var left = Object.assign({}, current, {
-          content: joinRestoredWords(currentWords.slice(0, capitalAnd)),
-          tokens: current.tokens.slice(0, capitalAnd),
-          end: toInt(current.tokens[capitalAnd - 1].end, current.end),
-        });
-        left.duration = Math.max(0, left.end - toInt(left.start, 0));
-        var right = Object.assign({}, current, {
-          content: joinRestoredWords(currentWords.slice(capitalAnd)),
-          tokens: current.tokens.slice(capitalAnd),
-          start: toInt(current.tokens[capitalAnd].start, left.end),
-        });
-        right.duration = Math.max(0, toInt(right.end, right.start) - right.start);
-        // 这是句内强边界，不再送回“续接词自动合并”，否则 although 又会被并回 And 句。
-        out.push(left);
-        out.push(right);
-        continue;
-      }
-      var first = currentWords[0] || "";
-      var startsContinuation = first === first.toLowerCase() && isContinuationStart(first);
-      // despite + being + 过去分词构成可自然译成“尽管受到……”的完整让步字幕片段；
-      // 它有自己的非限定谓语，不是需要并回前屏的孤立介词短语。
-      if (/^despite\s+being\s+\w+/i.test(String(current.content || "")) && unitWordCount(current) >= 5) startsContinuation = false;
-      var isLowercaseOrphan = first === first.toLowerCase() && unitWordCount(current) <= 2;
-      var previous = out[out.length - 1];
-      var previousTail = previous && DANGLING_END_RE.test(String(previous.content || "").replace(/[.,;:!?]+$/, ""));
-      var previousIsSubordinate = previous && SUBORDINATE_CLAUSE_PREFIX_RE.test(normalizeBoundaryText(previous.content));
-      var previousIsAndAdverbial = previous && /^And\s+(?:on|in|at|with|for|by)\b/i.test(String(previous.content || "")) && /^\d/.test(String(current.content || ""));
-      var isPredicateContinuation = /^(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did)\b/i.test(String(current.content || ""));
-      var previousIsReportingUnit = previous && REPORTING_CLAUSE_PREFIX_RE.test(normalizeBoundaryText(previous.content));
-      var gapMs = previous ? Math.max(0, toInt(current.start, 0) - toInt(previous.end, 0)) : Infinity;
-      var mergedVisualWidth = previous ? semanticDisplayWidth(joinRestoredWords([previous.content, current.content])) : Infinity;
-      var sameSemanticGroup = !previous || previous.semanticGroupId == null || current.semanticGroupId == null || previous.semanticGroupId === current.semanticGroupId;
-      if (previous && sameSemanticGroup && gapMs <= maxJoinGapMs && (startsContinuation || isLowercaseOrphan || previousTail || previousIsSubordinate || previousIsAndAdverbial) && !(previousIsReportingUnit && isPredicateContinuation) && unitWordCount(previous) + unitWordCount(current) <= maxNaturalWords && mergedVisualWidth <= maxVisualWidth) {
-        out[out.length - 1] = mergeNaturalUnits(previous, current);
-      } else {
-        out.push(current);
-      }
-    }
-    return out;
-  }
-
-  /* ---------------------------------------------------------------
-   * 2. 时间轴清洗
-   * ------------------------------------------------------------- */
-
-  /**
-   * 对连续字幕单元做小幅视觉尾缩，制造句间消隐空隙。
-   * 只改外层 end/duration，保留文本、token 及其它元数据；语义/回退分段共用。
-   */
-  function applyTailTrim(cues, tailTrimMs) {
-    var trim = Number(tailTrimMs);
-    if (!(trim > 0)) return (cues || []).map(function (cue) { return Object.assign({}, cue); });
-    var minVisibleMs = 300;
-    return (cues || []).map(function (cue) {
-      var copy = Object.assign({}, cue);
-      var start = toInt(copy.start, 0);
-      var end = Math.max(start, toInt(copy.end, start));
-      if (end - start > trim * 2) {
-        var trimmed = Math.max(start + minVisibleMs, end - trim);
-        if (trimmed < end) end = trimmed;
-      }
-      copy.start = start;
-      copy.end = end;
-      copy.duration = Math.max(0, end - start);
-      return copy;
-    });
   }
 
   /**
@@ -2002,7 +1629,7 @@
       //  - 合并出来的单元是 grammarMerge / orphanPrepMerge 有意越过 maxWords 的产物
       //    （语法未完成的句子续接、孤立限定词并入）。在 maxWords 处拆会把刚合好的
       //    语义单元重新切碎，实测打红 7 条续接门禁；但完全不拆也不行 ——
-      //    translateClipWithBoundaryRepair 对超限单元直接抛 oversized source unit，
+      //    整句送译对超过 SEMANTIC_MAX_TOKENS 的单元直接 fail-closed，
       //    整 clip 变 [未翻译]。所以按「合并逻辑自己允许的最大宽度」兜底拆，
       //    上限口径复用 mergeHardCap（与 orphanCap / continuationCap 同源，
       //    不在这里另算一套，否则两处漂移就是下一个 bug）。
@@ -2351,7 +1978,6 @@
     "中文字幕不输出中文句号“。”；疑问句和感叹句保留问号或感叹号，必要的逗号可以保留。专名、数字、单位和固定表达必须保持完整。\n" +
     "严格遵守随后给出的 JSON 协议，只返回 JSON，不要返回 Markdown、解释或思考过程。";
 
-
   // 先确定源语言，再在同一 languageCode 内选择质量更高的轨。人工轨只有 cue 级
   // 时间也能由 canonical timeline 映射，不能再为了 ASR 的词级 offset 牺牲原文质量。
   // 该排序只看 YouTube 的 kind/code 数据契约，不包含任何语言名单。
@@ -2640,37 +2266,6 @@
     return { ok: true, reason: "ok" };
   }
 
-  /** Materialize already-verified 1:1 translations on immutable source cue timing. */
-  function buildClipUnits(lines, startMs, endMs, cues, opts) {
-    opts = opts || {};
-    var list = cues || [];
-    var rawLines = lines || [];
-    if (rawLines.length !== list.length) throw new Error("translation coverage alignment mismatch");
-    return list.map(function (cue, index) {
-      var cStart = Number(cue.start);
-      var cEnd = Number(cue.end);
-      if (!Number.isFinite(cStart) || !Number.isFinite(cEnd) || cEnd < cStart) {
-        throw new Error("translation coverage cue timing invalid");
-      }
-      var translation = String(rawLines[index] == null ? "" : rawLines[index]);
-      // 运行时 lenient：空译文表示该句回退显示英文原文（parseTranslationCoverageResponse 已把坏句置空）。
-      // 导出（lenient=false）时空译文仍是硬错误，成品绝不出现无译文单元。
-      if (!translation.trim() && !opts.lenient) throw new Error("translation coverage empty materialized unit");
-      return {
-        unitId: cue.unitId || "",
-        sourceFingerprint: cue.sourceFingerprint || "",
-        tokenStart: Number.isInteger(cue.tokenStart) ? cue.tokenStart : null,
-        tokenEnd: Number.isInteger(cue.tokenEnd) ? cue.tokenEnd : null,
-        srcStart: index + 1,
-        srcEnd: index + 1,
-        originalText: collapseWhitespace(cue.content || ""),
-        translation: translation,
-        startMs: cStart,
-        endMs: cEnd,
-      };
-    });
-  }
-
   var DEFAULT_RESTORATION_PROMPT =
     "你是多语言字幕语义边界规划器。源文可能是任意语言；sourceText 是完整连续原文，groups 是按 Unicode 词法边界映射回 canonical token 的原子组。\n" +
     "只决定应在哪些 token 之后结束一个字幕单元；不得回显、改写、添加、删除、合并、拆分或重排任何 token。\n" +
@@ -2690,20 +2285,6 @@
     });
     return width;
   }
-  function semanticTokenBudgets(tokens, opts) {
-    opts = opts || {};
-    var preferredVisualWidth = Math.max(12, Math.floor(Number(opts.preferredVisualWidth) || SOURCE_DISPLAY_PREFERRED_WIDTH));
-    var maxVisualWidth = Math.max(preferredVisualWidth, Math.floor(Number(opts.maxVisualWidth) || SOURCE_DISPLAY_MAX_WIDTH));
-    var words = (tokens || []).filter(function (t) { return t && String(t.text || "").trim(); });
-    if (!words.length) return { preferredTokens: 8, maxTokens: 10, averageVisualWidth: 1, preferredVisualWidth: preferredVisualWidth, maxVisualWidth: maxVisualWidth };
-    var joined = joinRestoredWords(words.map(function (t) { return String(t.text); }));
-    var average = semanticDisplayWidth(joined) / words.length;
-    var preferred = Math.max(6, Math.min(28, Math.floor(preferredVisualWidth / Math.max(1, average))));
-    var max = Math.max(8, Math.min(SEMANTIC_MAX_TOKENS, Math.floor(maxVisualWidth / Math.max(1, average))));
-    if (max < preferred) max = preferred;
-    return { preferredTokens: preferred, maxTokens: max, averageVisualWidth: average, preferredVisualWidth: preferredVisualWidth, maxVisualWidth: maxVisualWidth };
-  }
-
   // 给语义模型看的“词法提示层”。canonical token 仍是唯一时间/覆盖权威；这里仅用
   // 标准 Intl.Segmenter 在重建全文上形成不可切开的候选组，并把每组映射回 canonical
   // token ID。没有 languageCode、脚本名单或逐语言规则；不支持 Segmenter 的运行时则
@@ -2823,131 +2404,6 @@
 
   function parseDisplayCutsResponse(raw, allowedTokenIds) {
     return parseTokenCutsResponse(raw, allowedTokenIds, "displayCutsAfter");
-  }
-
-  function tokenWords(tokens) {
-    var out = [];
-    (tokens || []).forEach(function (t) {
-      var words = restoredWords(t && t.text || "");
-      for (var i = 0; i < words.length; i++) out.push(words[i]);
-    });
-    return out;
-  }
-
-  function hasNativeTokenTiming(cues, minimumCoverage) {
-    var total = 0;
-    var timed = 0;
-    (cues || []).forEach(function (cue) {
-      (cue && cue.tokens || []).forEach(function (token) {
-        if (!token || !token.text) return;
-        total++;
-        if (token.nativeTiming) timed++;
-      });
-    });
-    var min = minimumCoverage == null ? 0.8 : Number(minimumCoverage);
-    return total > 0 && timed / total >= min;
-  }
-
-  // 语义恢复一次处理多少播放时间。
-  //
-  // 取值依据（37 分钟真实轨实测，6257 token / 单块 16.4s）：
-  // 旧的整轨一次性恢复 = 35 块 ≈ 9.5 分钟，期间预取被降级 → 翻译永远追不上播放；
-  // 且无论用户看多久都要先付满 35 块。
-  //
-  // 改为按播放位置滑动后，区间长度的取舍（数字为模型块数，35 = 旧实现基线）：
-  //        看1min  看5min  看10min  看全片
-  //   90s     4       8       16       47
-  //   120s    3       8       16       42
-  //   180s    4      11       14       40
-  //   300s    6      11       16       37
-  // 取 120s：短时长观看（占绝大多数）最省或持平，看全片也只比 180s 多 5%。
-  // 区间边界会切出零头块，因此看全片比整轨基线多约 20% —— 这是换取
-  // 「按需付费 + 全程跟得上」的代价，短观看的节省远大于它（看 5 分钟 = 旧的 23%）。
-  //
-  // 单次恢复 3 块 ≈ 49s，覆盖 120s 播放 → 恢复速度约为播放速度的 2.4 倍，
-  // 足以持续领先播放。
-  // 首个区间的跨度。取 36s ≈ 一个预取窗口（当前段 + 3 段 × 12s）：
-  // 刚好铺满开场预取需要的范围，实测恢复约 6s 完成，不让翻译干等。
-  var SEMANTIC_FIRST_INTERVAL_MS = 36000;
-  var SEMANTIC_INTERVAL_MS = 120000;
-
-  /**
-   * 选出「该恢复哪一段」—— 语义恢复的滑动窗口。
-   *
-   * 为什么不整轨恢复：整轨要 9.5 分钟（实测），期间无论怎么调度都跟不上播放，
-   * 而且无论用户看多久都要为全部 35 块付 token。按播放位置滑动后，
-   * token 消耗正比于实际观看时长，且每一段仍是 semantic 断句（质量不降）。
-   *
-   * 区间必须定义在 **timeline snapshot 的 units 下标空间**上，而不是原始轨 cue 上。
-   * 原因（实测踩过，browser-replay 报 replacement token coverage mismatch）：
-   * 原始轨 cue 与 snapshot units 是两套下标 —— snapshot 由 fallback 重组产生
-   * （197 条原始 cue → 150 条 fallback 单元），拿原始轨下标去调
-   * resegmentTimelineSnapshot 会取到完全不同的 token 跨度。
-   *
-   * 送模型的词流直接取自 snapshot.timeline.tokens 的对应跨度，
-   * 与替换校验用的是同一份 token —— 覆盖校验因此天然成立。
-   *
-   * 返回 { startIndex, endIndex, tokens }（下标为 snapshot.units 下标，
-   * endIndex 为开区间）；无可恢复区间时返回 null。
-   */
-  function planSemanticInterval(snapshot, positionMs, opts) {
-    opts = opts || {};
-    if (!snapshot || !snapshot.timeline || !Array.isArray(snapshot.units)) return null;
-    var units = snapshot.units;
-    var tokens = snapshot.timeline.tokens || [];
-    if (!units.length || !tokens.length) return null;
-    var pos = Number(positionMs);
-    if (!Number.isFinite(pos)) pos = 0;
-    var spanMs = Number(opts.intervalMs);
-    if (!Number.isFinite(spanMs) || spanMs <= 0) {
-      // 首个区间刻意更短。
-      //
-      // 翻译不得越过恢复边界（否则跨边界译文作废重翻），所以开场时预取会一直等
-      // 恢复铺路。若首个区间就取满 120s，实测要 31s 才恢复完，这段时间预取被卡在
-      // 当前段，真机覆盖率从 93.6% 掉到 83.4%（比不截断更差）。
-      //
-      // 首屏只需要够用的一小段：实测前 26s（47 token）恢复仅 5.7s，之后恢复以
-      // 3.5x 播放速度持续领先，再用满长度区间摊薄每块开销。
-      spanMs = pos <= 0 ? SEMANTIC_FIRST_INTERVAL_MS : SEMANTIC_INTERVAL_MS;
-    }
-
-    // 起点：当前播放位置所在（或之后的第一个）单元。
-    var startIndex = -1;
-    for (var i = 0; i < units.length; i++) {
-      if (Number(units[i].endMs) > pos) { startIndex = i; break; }
-    }
-    if (startIndex < 0) return null;
-
-    // 终点：覆盖到起点 + spanMs 为止，且至少含一个单元。
-    var limit = Number(units[startIndex].startMs) + spanMs;
-    var endIndex = startIndex + 1;
-    while (endIndex < units.length && Number(units[endIndex].startMs) < limit) endIndex++;
-
-    var tokenStart = units[startIndex].tokenStart;
-    var tokenEnd = units[endIndex - 1].tokenEnd;
-    var slice = tokens.slice(tokenStart, tokenEnd);
-    if (!slice.length) return null;
-    return { startIndex: startIndex, endIndex: endIndex, tokens: slice };
-  }
-
-  // JSON3 滚动 event 常会把上一 event 的尾词重复一次。先在严格的词流层
-  // 去重，模型看到的才是一条连续语音，而不是 ASR 事件碎片的拼接。
-  function collectSemanticTokens(cues) {
-    var out = [];
-    (cues || []).forEach(function (cue) {
-      var next = (cue && cue.tokens || []).filter(function (t) { return t && t.text; });
-      var max = Math.min(out.length, next.length, 8);
-      var cut = 0;
-      for (var k = max; k >= 1; k--) {
-        var same = true;
-        for (var i = 0; i < k; i++) {
-          if (String(out[out.length - k + i].text).toLowerCase() !== String(next[i].text).toLowerCase()) { same = false; break; }
-        }
-        if (same) { cut = k; break; }
-      }
-      for (var j = cut; j < next.length; j++) out.push(next[j]);
-    });
-    return out;
   }
 
   /**
@@ -3166,231 +2622,6 @@
     }
   }
 
-  // 以下旧边界判据只供历史诊断测试；生产 semantic 路径不再调用它们。
-  // 模型偶尔会给出 "boiling water | than this ..."；删掉这个坏边界后，
-  // 同一句仍可保留前面的自然 14/20 分屏，而不是整句退化成 34 词。
-  // flow 模式(整轨首遍)只保留破坏词法绑定的硬否决:数字+单位、比较结构。
-  // 字幕是连续语流,一屏以介词/连词/从句引导词开头是自然的,首遍必须信任模型
-  // 已遵守短语规则的分屏,不能用「每屏都要是独立完整句」的从句级判据整屏否决。
-  var FLOW_INTEGRITY_REASONS = { "number-quantity": true, "comparison-continuation": true };
-  function filterUnsafeRescueMarks(words, marks, opts) {
-    opts = opts || {};
-    var flowMode = opts.mode === "flow";
-    var out = (marks || []).slice();
-    // 先按「原始」边界布局判定全部,再统一应用。绝不读一个改到一半的数组:
-    // 边删边读时,删掉一个边界会撑大相邻边界的左右跨度,级联把每个边界都删光。
-    var drop = [];
-    for (var i = 0; i < out.length - 1; i++) {
-      if (out[i] !== "|" && out[i] !== ".") continue;
-      var leftStart = 0;
-      for (var p = i - 1; p >= 0; p--) {
-        if (out[p] === "|" || out[p] === ".") { leftStart = p + 1; break; }
-      }
-      var rightEnd = words.length;
-      for (var n = i + 1; n < out.length; n++) {
-        if (out[n] === "|" || out[n] === ".") { rightEnd = n + 1; break; }
-      }
-      var leftText = words.slice(leftStart, i + 1).join(" ");
-      var rightText = words.slice(i + 1, rightEnd).join(" ");
-      var verdict = classifySemanticBoundary(leftText, rightText);
-      // Reporting 例外只允许“... get my hands on | 主谓”这种已完成修饰链的边界。
-      // 不能泛化放过“... adapter | I could get ...”等仍悬空的名词短语。
-      var reportingPrefix = REPORTING_CLAUSE_PREFIX_RE.test(leftText);
-      var reportingObjectBoundary = completedReportingSubjectBoundary(leftText, rightText);
-      var reportingTail = reportingPrefix ? leftText.replace(REPORTING_CLAUSE_PREFIX_RE, "") : "";
-      var reportingHasPredicate = MAIN_PREDICATE_START_RE.test(reportingTail) ||
-        /\b(?:is|are|was|were|has|have|had|can|could|will|would|may|might|must|should|does|do|did|\w+(?:s|ed))\b/i.test(reportingTail);
-      var naturalDespite = /^despite\s+being\s+\w+/i.test(rightText) && restoredWords(rightText).length >= 5;
-      var clauseDrop = reportingPrefix && !reportingHasPredicate && !reportingObjectBoundary;
-      var verdictDrop = !verdict.safe && !naturalDespite && !reportingObjectBoundary;
-      if (!clauseDrop && !verdictDrop) continue;
-      if (flowMode) {
-        // 首遍信任模型的从句级分屏;仅当切分破坏 number+unit / 比较结构等硬绑定才否决。
-        if (clauseDrop) continue;
-        if (!FLOW_INTEGRITY_REASONS[verdict.reason]) continue;
-      }
-      drop.push(i);
-    }
-    for (var d = 0; d < drop.length; d++) out[drop[d]] = "";
-    return out;
-  }
-
-  // 连续语流保底切分:当 strict DP 找不到「书面完整句」切点时,用与整轨首遍相同的
-  // flow 判据强制把过长单元切到硬上限内。连续字幕本就靠介词/连词/从句引导承接,
-  // 一个 13-14 词从句找不到 strict 安全点不该让整轨作废——但绝不在破坏词法硬绑定
-  // (number+unit、比较结构、数字)处下刀。只在已验证的原始 token 词边界放 |,不改正文。
-  // token 空间保底切分:切点只能落在 token 之间(| 放在某 token 之后),屏长按该屏
-  // 内各 token 的词数之和度量。返回数组长度 == token 数,与全系统 marks 契约一致。
-  // 入参:tokWordCounts[i] = 第 i 个 token 的词数;tokTexts[i] = 该 token 文本。
-  function forceFlowPartition(tokWordCounts, tokTexts, hard, preferred) {
-    var T = (tokWordCounts || []).length;
-    var out = new Array(T).fill("");
-    var total = 0;
-    for (var a = 0; a < T; a++) total += tokWordCounts[a];
-    if (total <= hard) return out;
-    var target = Math.max(1, Math.min(hard, preferred || hard));
-    // 累计词数,用于把「理想词位置」映射到 token 边界。
-    var cum = new Array(T + 1).fill(0);
-    for (var b = 0; b < T; b++) cum[b + 1] = cum[b] + tokWordCounts[b];
-    var joinText = function (s, e) { // tokens[s..e) 的文本(词级)拼接
-      var parts = [];
-      for (var t = s; t < e; t++) parts.push(String(tokTexts[t] || ""));
-      return parts.join(" ");
-    };
-    var runStartTok = 0;
-    while (cum[T] - cum[runStartTok] > hard) {
-      var baseWords = cum[runStartTok];
-      var aimWords = baseWords + target;
-      // 该屏最远只能到 hard 词:找满足「起点到该 token 末尾词数 <= hard」的最大 token 边界。
-      var maxTok = runStartTok;
-      while (maxTok < T && cum[maxTok + 1] - baseWords <= hard) maxTok++;
-      if (maxTok <= runStartTok) maxTok = runStartTok + 1; // 单 token 已超 hard,只能整块留
-      // 在 [runStartTok+1, maxTok] 里挑不破坏硬绑定、且离 aimWords 最近的 token 边界。
-      var chosen = -1, bestDist = Infinity;
-      for (var cut = runStartTok + 1; cut <= maxTok && cut < T; cut++) {
-        var verdict = classifySemanticBoundary(joinText(runStartTok, cut), joinText(cut, T));
-        if (FLOW_INTEGRITY_REASONS[verdict.reason]) continue; // 破坏词法硬绑定,跳过
-        var dist = Math.abs(cum[cut] - aimWords);
-        if (dist < bestDist) { bestDist = dist; chosen = cut; }
-      }
-      // 整段都是硬绑定找不到安全边界:退到 maxTok(守住不超 hard),但至少切一个 token。
-      if (chosen < 0) chosen = Math.min(maxTok, T - 1);
-      if (chosen <= runStartTok || chosen >= T) break;
-      out[chosen - 1] = "|"; // | 放在第 (chosen-1) 个 token 之后
-      runStartTok = chosen;
-    }
-    return out;
-  }
-
-  /**
-   * 对已确认过长的单句做确定性显示分区。候选只能来自已验收的模型 |，或两类
-   * 可验证的连续字幕边界：长主语→限定谓语、完整主句→despite being 让步附加语。
-   * 动态规划有界于 O(n * hardWords)，无额外模型调用；找不到全程安全路径就返回 null。
-   */
-  // 在 token 空间做确定性显示分区。切点只落在 token 之间;屏长按屏内各 token 的词数
-  // 之和度量(一个 ASR token 可能含多词,如 ".And"、"boily pory")。marks 与返回值都
-  // 按 token 索引(长度 == token 数),与 packRestoredTokens 的 marks.length===token 数
-  // 契约一致——绝不能用词级长度返回,否则多词 token 会让写回越界撑长整条 marks。
-  function partitionReadableTokenUnit(tokens, marks, opts) {
-    opts = opts || {};
-    var toks = tokens || [];
-    var T = toks.length;
-    var preferred = Math.max(1, Math.floor(Number(opts.preferredWords) || 14));
-    var hard = Math.max(preferred, Math.floor(Number(opts.hardWords) || 16));
-    var min = Math.max(1, Math.min(hard, Math.floor(Number(opts.minWords) || 6)));
-    // 每个 token 的词数(权重)与文本;累计词数 cum 用于按词度量屏长。
-    var wc = new Array(T);
-    var txt = new Array(T);
-    var totalWords = 0;
-    for (var ti = 0; ti < T; ti++) {
-      var tw = restoredWords(toks[ti] && toks[ti].text || "");
-      wc[ti] = tw.length;
-      txt[ti] = tw.join(" ");
-      totalWords += tw.length;
-    }
-    if (!T || totalWords <= hard) return (marks || []).slice();
-    var sourceMarks = (marks || []).slice();
-    while (sourceMarks.length < T) sourceMarks.push("");
-    var cum = new Array(T + 1).fill(0);
-    for (var ci = 0; ci < T; ci++) cum[ci + 1] = cum[ci] + wc[ci];
-    var joinTok = function (s, e) { // tokens[s..e) 的词级文本
-      var parts = [];
-      for (var t = s; t < e; t++) parts.push(txt[t]);
-      return parts.join(" ");
-    };
-    // 候选切点 = token 边界 c(| 放在第 c-1 个 token 后,屏为 tokens[start..c))。
-    var candidates = {};
-    for (var i = 1; i < T; i++) {
-      if (sourceMarks[i - 1] === "|") candidates[i] = 0;
-      var left = joinTok(0, i);
-      var right = joinTok(i, T);
-      var leftWordCount = cum[i];
-      var reportingMatch = left.match(REPORTING_CLAUSE_PREFIX_RE);
-      var progressiveReportingIntro = leftWordCount >= min && reportingMatch &&
-        normalizeBoundaryText(left).toLowerCase() === normalizeBoundaryText(reportingMatch[0]).toLowerCase();
-      var longSubjectPredicate = leftWordCount >= min && completedReportingSubjectBoundary(left, right);
-      var trailingAdjunct = leftWordCount >= min && /^(?:despite\s+being|although|though|even\s+(?:during|after|before)|during|after|before)\b/i.test(right) &&
-        hasComparisonPredicateText(left);
-      var coordinatedClause = leftWordCount >= min && isCoordinatedIndependentBoundary(left, right);
-      if (progressiveReportingIntro || longSubjectPredicate || trailingAdjunct || coordinatedClause) {
-        var penalty = longSubjectPredicate ? 1 : (progressiveReportingIntro || coordinatedClause ? 2 : 3);
-        if (candidates[i] == null || penalty < candidates[i]) candidates[i] = penalty;
-      }
-    }
-    // DP over token 边界;屏长以词数(cum[end]-cum[start])度量,超 hard 词的段禁止。
-    var dp = new Array(T + 1).fill(null);
-    dp[0] = { score: 0, prev: -1 };
-    for (var end = 1; end <= T; end++) {
-      if (end !== T && candidates[end] == null) continue;
-      for (var start = 0; start < end; start++) {
-        if (!dp[start]) continue;
-        var wlen = cum[end] - cum[start];
-        if (wlen > hard) continue; // 屏词数不得超硬上限
-        if (wlen < min && end !== T) continue;
-        var shortNaturalTail = end === T && wlen >= 3 &&
-          /^despite\s+being\s+\w+/i.test(joinTok(start, end));
-        if (end === T && wlen < min && start !== 0 && !shortNaturalTail) continue;
-        var boundaryPenalty = end === T ? 0 : candidates[end];
-        var score = dp[start].score + Math.pow(wlen - preferred, 2) + boundaryPenalty;
-        if (!dp[end] || score < dp[end].score) dp[end] = { score: score, prev: start };
-      }
-    }
-    var cuts = [];
-    var dpOk = !!dp[T];
-    if (dpOk) {
-      for (var at = T; at > 0;) {
-        var prev = dp[at].prev;
-        if (prev < 0) { dpOk = false; break; }
-        if (at < T) cuts.push(at);
-        at = prev;
-      }
-    }
-    // strict DP 找不到全程「书面完整句」路径时,不返回 null 让整轨作废;改用 token 空间
-    // 保底切分切到硬上限内(保留原句末 . 边界)。返回长度恒为 T。
-    if (!dpOk) {
-      var forced = forceFlowPartition(wc, txt, hard, preferred);
-      for (var si = 0; si < T; si++) if (sourceMarks[si] === ".") forced[si] = ".";
-      return forced;
-    }
-    var out = sourceMarks.map(function (m) { return m === "." ? "." : ""; });
-    cuts.forEach(function (cut) { out[cut - 1] = "|"; });
-    return out;
-  }
-
-  // 只重切「真正超长的单个屏」,绝不因局部一处超长而重排整轨。修复单位是屏
-  // (相邻两个已确认边界 |/. 之间的 token 段),不是「句子」——模型只产出 |、从不
-  // 产出句末 .,若按 . 分句会把整轨当成一个巨句,任一处漏切就触发整段 forceFlow
-  // 均匀硬切,抹平模型给出的全部自然边界(这正是完整轨退化成 95% 均匀 10 词屏的根因)。
-  // 每个屏的长度按其 token 的词数之和度量;仅超 hard 词的屏才交给 partitionReadableTokenUnit
-  // 细分,其余屏的模型边界原样保留。
-  function normalizeOversizeSentenceMarks(tokens, marks, opts) {
-    opts = opts || {};
-    var out = (marks || []).slice();
-    var hard = Math.max(1, Math.floor(Number(opts.hardWords) || 16));
-    var wordsOf = function (t) { return restoredWords(t && t.text || "").length; };
-    var segStart = 0;
-    for (var i = 0; i <= out.length; i++) {
-      var isBoundary = i === out.length || out[i] === "|" || out[i] === ".";
-      if (!isBoundary) continue;
-      var segEnd = i < out.length ? i + 1 : out.length; // 含边界 token
-      if (segEnd <= segStart) { segStart = segEnd; continue; }
-      var segWords = 0;
-      for (var j = segStart; j < segEnd; j++) segWords += wordsOf(tokens[j]);
-      if (segWords > hard) {
-        // 只把这个超长屏交给 partition 细分;它在 token 空间工作,返回长度 == 段 token 数。
-        var outerBoundary = out[segEnd - 1]; // 段末已确认边界(|/.),partition 会清掉,需恢复
-        var local = partitionReadableTokenUnit(tokens.slice(segStart, segEnd), out.slice(segStart, segEnd), opts);
-        if (local) {
-          for (var k = 0; k < local.length; k++) out[segStart + k] = local[k];
-          // partition 不在末位设边界,恢复本段与下一段之间的原始边界,避免两段被 pack 合并。
-          if (outerBoundary === "|" || outerBoundary === ".") out[segEnd - 1] = outerBoundary;
-        }
-      }
-      segStart = segEnd;
-    }
-    return out;
-  }
-
   function enforceVisualDisplayMarks(tokens, marks, maxVisualWidth) {
     var list = tokens || [];
     var out = (marks || []).slice();
@@ -3536,25 +2767,6 @@
     return units;
   }
 
-  function translationCoverageUnitsFromCues(cues) {
-    var cursor = 0;
-    return (cues || []).map(function (cue, index) {
-      var count = Math.max(1, tokenWords(cue && cue.tokens || []).length || restoredWords(cue && cue.content || "").length);
-      var start = Number.isInteger(cue && cue.tokenStart) ? cue.tokenStart : cursor;
-      var end = Number.isInteger(cue && cue.tokenEnd) ? cue.tokenEnd : start + count;
-      cursor = end;
-      return {
-        unitId: String(cue && cue.unitId || "clip:u" + index + ":" + start + "-" + end),
-        tokenStart: start,
-        tokenEnd: end,
-        sourceText: collapseWhitespace(cue && cue.content || ""),
-        sourceFingerprint: String(cue && cue.sourceFingerprint || ""),
-        maxVisualWidth: Math.max(1, Math.floor(Number(cue && cue.maxVisualWidth) || TRANSLATION_DISPLAY_MAX_WIDTH)),
-        semanticGroupId: String(cue && cue.semanticGroupId != null ? cue.semanticGroupId : "sg" + index),
-      };
-    });
-  }
-
   /**
    * 从模型返回里取出第一个完整 JSON 对象。
    *
@@ -3634,196 +2846,6 @@
       start = text.indexOf("{", start + 1);
     }
     return null;
-  }
-
-  function parseTranslationCoverageResponse(raw, expectedUnits, opts) {
-    opts = opts || {};
-    var payload = extractJsonObject(raw, "translations");
-    if (!payload) throw new Error("translation coverage invalid JSON");
-    if (typeof payload !== "object" || Array.isArray(payload)) throw new Error("translation coverage response must be an object");
-    // 顶层只要求 translations 存在且是数组。
-    //
-    // 此前要求「顶层恰好只有 translations 一个键」，于是模型顺手带个 usage/notes
-    // 就整块拒绝（约 32 秒字幕全丢）。廉价模型加解释字段是高频行为，而多余的顶层
-    // 字段对承重的覆盖账本没有任何影响 —— 拒绝它纯属自伤。
-    // 真正承重的（数量、unitId 存在性、无重复、无缺口）在下面逐条 fail-closed。
-    if (!Array.isArray(payload.translations)) {
-      throw new Error("translation coverage response must contain only translations");
-    }
-    var expected = (expectedUnits || []).map(function (unit) {
-      return {
-        unitId: String(unit && unit.unitId || ""),
-        tokenStart: Number(unit && unit.tokenStart),
-        tokenEnd: Number(unit && unit.tokenEnd),
-        // sourceText 必须带下来:译文合规性要对照原文判断(见 validateChineseDisplayUnit)。
-        // 此前这里只挑了 unitId/tokenStart/tokenEnd,原文被丢掉 → 校验侧永远拿到
-        // undefined,只能按「整句结尾」严格判,把句中切开的正确译文judge成违规。
-        sourceText: String(unit && unit.sourceText || ""),
-        maxVisualWidth: Math.max(1, Math.floor(Number(unit && unit.maxVisualWidth) || TRANSLATION_DISPLAY_MAX_WIDTH)),
-        semanticGroupId: String(unit && unit.semanticGroupId != null ? unit.semanticGroupId : ""),
-      };
-    });
-    var expectedById = {};
-    var previousEnd = null;
-    expected.forEach(function (unit) {
-      if (!unit.unitId || !Number.isInteger(unit.tokenStart) || !Number.isInteger(unit.tokenEnd) || unit.tokenStart < 0 || unit.tokenEnd <= unit.tokenStart) {
-        throw new Error("translation coverage expected unit invalid");
-      }
-      if (expectedById[unit.unitId]) throw new Error("translation coverage duplicate expected unit");
-      if (previousEnd != null && unit.tokenStart !== previousEnd) throw new Error("translation coverage expected units have gap or overlap");
-      previousEnd = unit.tokenEnd;
-      expectedById[unit.unitId] = unit;
-    });
-    if (payload.translations.length !== expected.length) throw new Error("translation coverage incomplete unit count");
-    var translatedById = {};
-    payload.translations.forEach(function (item) {
-      if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("translation coverage entry invalid");
-      // 未知字段忽略，不拒绝。
-      //
-      // 此前是白名单 + 「出现名单外字段就整块抛错」，于是模型加个 notes/confidence
-      // 就丢掉整块 32 秒字幕。承重的是 unitId 能否对上程序侧账本，多余字段无害。
-      // 弱模型还会把 translation 写成 text/content/translatedText（真实 gpt-5.4-mini
-      // 已见 text），所以译文字段名放宽为别名集合，但必须恰好给一个，避免两套文本。
-      var textFields = ["translation", "text", "content", "translatedText"].filter(function (k) { return item[k] != null; });
-      if (textFields.length !== 1 || item.unitId == null) throw new Error("translation coverage entry fields invalid");
-      var unitId = String(item.unitId || "");
-      var source = expectedById[unitId];
-      if (!source || translatedById[unitId]) throw new Error("translation coverage unknown or duplicate unit");
-      // coverFrom/coverTo 不再要求模型回抄 —— 范围由程序侧账本唯一决定（unitId 已编码它）。
-      // 但只要模型主动给了，就必须与账本一致：给错说明它在按自己的理解重新划分覆盖，
-      // 那正是 v0.9.0 要根除的病灶，必须 fail-closed 而不是默默忽略。
-      // 逐字段独立校验：给了哪个就验哪个。不能要求「两个都给」——弱模型只给
-      // coverTo 时本无害（范围仍由账本决定），要求成对会把它误判成 span mismatch。
-      if (item.coverFrom != null && (!Number.isInteger(item.coverFrom) || item.coverFrom !== source.tokenStart)) {
-        throw new Error("translation coverage span mismatch");
-      }
-      if (item.coverTo != null && (!Number.isInteger(item.coverTo) || item.coverTo !== source.tokenEnd)) {
-        throw new Error("translation coverage span mismatch");
-      }
-      // 结构性违规（JSON 形状 / 字段 / unitId / span / 数量 / 缺口重叠）永远 fail-closed——它们是协议漂移。
-      // 但单个单元的“内容”问题（空译文 / 中文单元不合规）在 lenient（运行时）模式下只把该条译文置空
-      // （= 该句回退显示英文原文），保留同 clip 其余合规译文，避免一句坏译文连坐整组 clip 全丢。
-      // opts.lenient=false（默认，导出 SRT 用）时仍严格 throw，成品绝不半英文半中文。
-      var translation = sanitizeSubtitleLine(String(item[textFields[0]] == null ? "" : item[textFields[0]]));
-      var contentError = "";
-      if (!translation.trim()) {
-        contentError = "translation coverage empty translation";
-      } else {
-        // 该句是否在本屏之后继续。判据只看**本单元原文自身**是否以终止标点收尾:
-        // 没有终止标点 = 整句还没说完,此时忠实译文断在句中是正确的。
-        //
-        // 不能用「本 clip 内是否还有下一单元」来判断:clip 是按时间切的,
-        // 一句话完全可能跨 clip —— 首 clip 末条原文 "...for lots of reasons,"
-        // 正是这种情况(实测该条被误杀 2/3 次)。也不能只看原文末字符是否逗号:
-        // 原文可能以单词结尾却仍未说完(如 "...want to do with")。
-        var srcText = String(source.sourceText == null ? "" : source.sourceText).trim();
-        var sourceIndex = expected.findIndex(function (unit) { return unit.unitId === source.unitId; });
-        var continuesWithinSemanticGroup = sourceIndex >= 0 && sourceIndex + 1 < expected.length && expected[sourceIndex + 1].semanticGroupId === source.semanticGroupId;
-        var midSentence = continuesWithinSemanticGroup || (srcText ? !/[.!?。！？…]["'”’)\]]?$/.test(srcText) : false);
-        var verdict = validateChineseDisplayUnit(translation, {
-          sourceText: source.sourceText,
-          continues: midSentence,
-          // 宽度不是 coverage ledger 的职责。ledger 只校验结构、覆盖和基本语言合规；
-          // 过宽译文交给后续分屏层切开，否则弱模型偶发长句会连坐整 clip 失败。
-          maxVisualWidth: Number.MAX_SAFE_INTEGER,
-        });
-        if (!verdict.ok) contentError = "translation coverage invalid Chinese unit: " + verdict.reason;
-      }
-      if (contentError) {
-        if (!opts.lenient) throw new Error(contentError);
-        translation = ""; // 运行时：该单元回退英文，不连坐整个 clip
-      }
-      translatedById[unitId] = {
-        unitId: unitId,
-        coverFrom: source.tokenStart,
-        coverTo: source.tokenEnd,
-        translation: translation,
-      };
-    });
-    return expected.map(function (unit) {
-      if (!translatedById[unit.unitId]) throw new Error("translation coverage missing unit: " + unit.unitId);
-      return translatedById[unit.unitId];
-    });
-  }
-
-  /** Translate one immutable token-span clip with an exact coverage ledger. */
-  async function translateClipLines(opts) {
-    opts = opts || {};
-    var cues = opts.cues || [];
-    if (!cues.length) return [];
-    var units = translationCoverageUnitsFromCues(cues);
-    var fingerprints = {};
-    units.forEach(function (unit) { if (unit.sourceFingerprint) fingerprints[unit.sourceFingerprint] = true; });
-    if (Object.keys(fingerprints).length > 1) throw new Error("translation coverage source fingerprint mismatch");
-    // 发给模型的 unitId 用短别名（u0、u1…），程序侧再映射回真实 unitId。
-    //
-    // 真实 unitId 是 "<sourceFingerprint>:u3:41-52"（timeline 快照生成，见 buildRenderUnits），
-    // 每单元 20+ 字符且全是程序内部信息：指纹用于跨块一致性校验、token span 用于覆盖账本，
-    // 模型两者都不需要，它只需要"这条译文属于哪一条输入"。让模型原样复制长 id 还额外
-    // 制造了一类失败：弱模型抄 12 组 "指纹:u序号:起-止" 必错 → unknown unit → 整块丢字幕。
-    //
-    // 别名保持可读的 "u<序号>" 而不是纯数字或单字母键：协议硬约束里要按名字引用它，
-    // 语义清楚的短标识对弱模型最稳（这是"不挑模型"优先于极限压缩的取舍）。
-    // 承重校验一条不减 —— 数量、未知别名、重复、缺口仍在 parseTranslationCoverageResponse
-    // 里 fail-closed，只是比对的是别名而非长 id。
-    var aliasToUnitId = {};
-    var aliasUnits = units.map(function (unit, index) {
-      var alias = "u" + index;
-      aliasToUnitId[alias] = unit.unitId;
-      var aliased = Object.assign({}, unit);
-      aliased.unitId = alias;
-      return aliased;
-    });
-    // 发给模型的字段只保留「它翻译时真正需要的信息」：哪个单元 + 原文。
-    //
-    // 此前还发了 coverFrom/coverTo、maxVisualWidth、semanticGroupId，实测占 user
-    // payload 的 45.9%，且三者全是冗余：
-    //  - coverFrom/coverTo 已编码在 unitId 尾部（"clip:u0:0-8" → 0-8），程序自己能推；
-    //    让模型回抄反而制造了一整类失败（弱模型抄 12 组数字必错 → span mismatch 整块丢）。
-    //  - maxVisualWidth 全单元恒定，且宽度是显示层职责，不该进翻译请求。
-    //  - semanticGroupId 与单元序号 1:1，不携带分组信息；parser 判断句子是否跨屏延续
-    //    读的是**程序侧** expectedUnits 的该字段，与发不发给模型无关。
-    //
-    // 覆盖账本的承重点是「程序定账本」，不是「模型抄账本」——校验一条不减。
-    // system 段必须逐请求逐字一致，否则前缀缓存永远打不中。
-    //
-    // 主流 provider（OpenAI / DeepSeek / 通义 等）对 system 前缀是**自动**缓存的，
-    // 命中条件是「前缀逐字节相同」；Anthropic 需要显式 cache_control。这里只做前者：
-    // 稳定化是纯文本层面的改动，对所有 provider 都无副作用，也不给不认识该字段的
-    // provider 发厂商专有结构（发了会被 400 拒或静默忽略 → 那才是"挑模型"）。
-    // 所以协议硬约束里绝不能插入随请求变化的值（单元数、指纹、宽度）。
-    var sys = buildSystemPrompt(opts.targetLang, opts.systemPrompt) +
-      "\n协议硬约束：只返回 {\"translations\":[{\"unitId\":\"…\",\"translation\":\"…\"}]}；" +
-      "unitId 必须原样复制，每个输入单元恰好一条，不多不少，不要输出其他字段。";
-    // sourceFingerprint 不再发给模型：它是程序侧跨块一致性校验用的内部指纹，
-    // 模型翻译时完全不需要，实测常见值为空串或短哈希——发它纯属占位。
-    // 承重的指纹一致性校验在上面 fingerprints 那段已 fail-closed，与发不发无关。
-    var userContent = JSON.stringify({
-      maxVisualWidth: aliasUnits[0] && aliasUnits[0].maxVisualWidth || TRANSLATION_DISPLAY_MAX_WIDTH,
-      units: aliasUnits.map(function (unit) {
-        return { unitId: unit.unitId, sourceText: unit.sourceText };
-      }),
-    });
-    var content = await chatCompletion({
-      apiBaseUrl: opts.apiBaseUrl,
-      apiKey: opts.apiKey,
-      apiModel: opts.apiModel,
-      temperature: opts.temperature,
-      reasoningEffort: opts.reasoningEffort,
-      systemContent: sys,
-      userContent: userContent,
-      timeoutMs: opts.timeoutMs,
-      fetchImpl: opts.fetchImpl,
-      onUsage: opts.onUsage,
-      signal: opts.signal,
-    });
-    // 校验按别名进行（模型看到的就是别名），通过后立刻映射回真实 unitId：
-    // 下游 applyTranslationCoverage / 渲染层全部按真实 unitId 索引，别名不得泄漏出本函数。
-    var aliasCoverage = parseTranslationCoverageResponse(content, aliasUnits, { maxLineChars: opts.maxLineChars, lenient: !!opts.lenient });
-    var coverage = remapAliasCoverage(aliasCoverage, aliasToUnitId, units);
-    var lines = coverage.map(function (entry) { return entry.translation; });
-    Object.defineProperty(lines, "coverage", { value: coverage, enumerable: false });
-    return lines;
   }
 
   // 整句翻译、中文自己切屏（2026-10-01 重构，思路移植自 VideoLingo 的 translate→align）。
@@ -3919,63 +2941,12 @@
       try {
         return parseScreenCoverageResponse(content, pieces, { lenient: !!opts.lenient });
       } catch (error) {
+        // fail-soft-ok: 只吞覆盖校验错误换一次重试，两次都失败时在循环后原样抛出 lastError。
         if (!/screen coverage/.test(String(error && error.message))) throw error;
         lastError = error;
       }
     }
     throw lastError;
-  }
-
-  // 把「模型看到的短别名」回落成真实 unitId，并对回落结果本身 fail-closed。
-  //
-  // 抽成独立纯函数而不是内联在 translateClipLines 里，是为了让守卫可被直接测试：
-  // 内联时 parseTranslationCoverageResponse 已按别名集合拦掉一切坏 unitId，本守卫在
-  // 正常路径下永远拿不到坏输入 —— 实测消融（把守卫改回 fail-open）后没有任何测试变红，
-  // 也就是说它当时是条空跑门禁。守卫不可达就无法证明承重，必须留一个能直接喂坏输入
-  // 的接缝。它守的是「映射层自己出错」这一类故障：上游放宽（为兼容弱模型做模糊匹配）、
-  // 或别名表构造 bug 让两个别名指向同一真实 id。这类错误一旦放行是静默的 —— 译文会
-  // 接到错误的 cue 区间上，用户看到的是「字幕串台」而不是报错。
-  function remapAliasCoverage(aliasCoverage, aliasToUnitId, expectedUnits) {
-    var entries = Array.isArray(aliasCoverage) ? aliasCoverage : [];
-    var map = aliasToUnitId || {};
-    var coverage = entries.map(function (entry) {
-      var mapped = Object.assign({}, entry);
-      var alias = entry && entry.unitId != null ? String(entry.unitId) : "";
-      if (!Object.prototype.hasOwnProperty.call(map, alias)) {
-        throw new Error("translation coverage unmapped unit alias");
-      }
-      mapped.unitId = map[alias];
-      return mapped;
-    });
-    // 回落后按真实 unitId 校验双射：每个期望单元恰好一条，不重不漏。
-    // 承重点必须落在真实 id 上，因为下游 applyTranslationCoverage 和渲染层全按它索引。
-    var seen = {};
-    coverage.forEach(function (entry) {
-      if (seen[entry.unitId]) throw new Error("translation coverage duplicate mapped unit");
-      seen[entry.unitId] = true;
-    });
-    (expectedUnits || []).forEach(function (unit) {
-      if (!seen[unit.unitId]) throw new Error("translation coverage missing mapped unit");
-    });
-    return coverage;
-  }
-
-  async function translateClipWithBoundaryRepair(opts) {
-    opts = opts || {};
-    var cues = (opts.cues || []).slice();
-    if (!cues.length) return { cues: [], lines: [], coverage: [], repaired: false };
-    // 输入卫士只保护模型容量；显示质量由 semanticTokenBudgets + 装载门禁负责。
-    // 两者共用 12/14 会把“英文词数”重新变成所有语言的模型输入限制。
-    var maxSourceWords = SEMANTIC_MAX_TOKENS;
-    for (var i = 0; i < cues.length; i++) {
-      var sourceWords = unitWordCount(cues[i]);
-      if (sourceWords > maxSourceWords) throw new Error("oversized source unit before translation: " + sourceWords + " words (cap " + maxSourceWords + ")");
-    }
-    var lines = await translateClipLines(Object.assign({}, opts, { cues: cues, lenient: !!opts.lenient }));
-    if (lines.length !== cues.length || !Array.isArray(lines.coverage) || lines.coverage.length !== cues.length) {
-      throw new Error("translation coverage alignment mismatch");
-    }
-    return { cues: cues, lines: lines, coverage: lines.coverage, repaired: false };
   }
 
   var DEFAULT_BLOCK_TRANSLATION_PROMPT =
@@ -4066,212 +3037,9 @@
   // 换算成每字最少显示毫秒数：1000/9 ≈ 111ms。此前代码里用过 180ms/字（5.5 字/秒）
   // 的自拟值，把合格的屏也算成读不完（实测同一批数据 17 屏 vs 4 屏），故以行业标准为准。
   var READING_MS_PER_CHAR = Math.ceil(1000 / 9);
-  var BLOCK_MAX_LINES_PER_SEGMENT = 64;
-
-  /**
-   * 一段源时长最多装几屏。
-   *
-   * 这个上限的作用是拦「模型把几十屏塞进一秒语音」，那是协议违规。
-   * 但它一度还会在源时长不足一屏（<300ms）时抛错 —— 那是把**源数据事实**
-   * 当协议违规处理，代价极不对称：逐 cue 覆盖后一个 segment 只覆盖一条 cue，
-   * 于是任何一条 200ms 的短 cue 都会让整块（约 32 秒字幕）翻译失败。
-   * CI 全轨实测 7/50 块因此整块丢字幕，而短 cue 在真实 ASR 轨里完全正常。
-   *
-   * 所以下限恒为 1：短 cue 允许出一屏，读不完由时间层解决（借静音、
-   * 与相邻屏合并）—— 那才是可读性该待的地方。真正的越界（屏数多于时长
-   * 能装下的）仍然 fail-closed。
-   */
-  function maxBlockDisplayLines(activeMs) {
-    var byTime = Math.floor(Math.max(0, Number(activeMs) || 0) / BLOCK_MIN_DISPLAY_MS);
-    return Math.min(BLOCK_MAX_LINES_PER_SEGMENT, Math.max(1, byTime));
-  }
-
-  /**
-   * 中文定语/状态标记不得留在屏尾而把被修饰成分甩到下一屏。
-   *
-   * 真实缺陷样本（日语人工轨 300s 内 5 处，约 10% 相邻屏对）：
-   *   「各处都饰有凤凰的」→「徽章」
-   *   「关上车门后，外面的」→「声音就会被隔绝」
-   * 这类断法在中文里明确是错的：读到屏尾时修饰语悬空，观众必须等下一屏才能成句。
-   *
-   * 判据是目标语言（中文输出）特性，不是源语言特性 —— 与既有设计一致：
-   * 只允许对目标语言和 Unicode 书写系统属性做处理，绝不引入源语言名单。
-   *
-   * 只对**非末行**生效。末行以「的」结尾通常是合法句末语气（「据说就是这样完成的」），
-   * 同理「的」后紧跟标点说明该屏已是完整小句。早先一版检测器没区分这两种情况，
-   * 在真实产出上产生了 4/9 的假阳性，因此这里的边界条件本身就是回归测试的一部分。
-   *
-   * prompt 里已写明"不得把词、词组拆到两屏"并额外点明助词不得收尾，实测把英语首次
-   * 通过率提到 10/10，但**不能只靠 prompt**：日语真实轨上仍有块连续 6 次都这样断
-   * （「车窗部分是类似铝材的」→ 名词甩到下一屏）。
-   *
-   * 因此这里不抛错拒绝，而是确定性修正：把悬挂行与下一行合并。两行都在手上，
-   * 合并是无损的，且宽度由后续 splitTargetDisplayLine 兜底。
-   * 早先一版实现选择抛错交给重试，实测导致 1/17 块耗尽 6 次后**整块无字幕** ——
-   * 丢字幕比断句难看严重得多，纯拒绝策略在这里是错的。
-   */
-  var DANGLING_MODIFIER_TAIL = /[的地得把将和与在从对向给为][\s"'”’)）]*$/u;
-
-  function mergeDanglingModifierLines(lines, maxWidth) {
-    var merged = [];
-    for (var i = 0; i < lines.length; i++) {
-      var current = String(lines[i] || "");
-      // 只要当前行以助词收尾且还有后继行，就吸收后继行；连续悬挂会持续吸收。
-      // 末行以「的」收尾不进入循环，因为那是合法句末语气。
-      while (DANGLING_MODIFIER_TAIL.test(current) && i + 1 < lines.length) {
-        current += String(lines[i + 1] || "");
-        i++;
-      }
-      merged.push(current);
-    }
-    // 合并后可能超宽，交回既有词法边界分屏；它按原子选择切点，不会再切在助词后。
-    var out = [];
-    merged.forEach(function (line) { out = out.concat(splitTargetDisplayLine(line, maxWidth)); });
-    return out;
-  }
-
-  function blockSegmentIntegrity(segment) {
-    return hashCacheIdentity([
-      "block-lines-v1",
-      String(segment.segmentId || ""),
-      Number(segment.sourceFrom),
-      Number(segment.sourceTo),
-      (segment.lines || []).join("\x1e"),
-    ].join("\x1f"));
-  }
-
-  function targetDisplayAtoms(text) {
-    var source = String(text || "");
-    var records = [];
-    var cursor = 0;
-    var urlRe = /(?:https?:\/\/|www\.)\S+/giu;
-    function addPlain(part) {
-      if (!part) return;
-      if (typeof Intl !== "undefined" && Intl.Segmenter) {
-        var seg = new Intl.Segmenter(undefined, { granularity: "word" });
-        Array.from(seg.segment(part)).forEach(function (item) {
-          records.push({ text: item.segment, wordLike: !!item.isWordLike, protected: false });
-        });
-      } else {
-        var fallback = part.match(/[\p{L}\p{N}\p{M}]+|\s+|[^\p{L}\p{N}\p{M}\s]/gu) || [];
-        fallback.forEach(function (piece) { records.push({ text: piece, wordLike: /[\p{L}\p{N}]/u.test(piece), protected: false }); });
-      }
-    }
-    var match;
-    while ((match = urlRe.exec(source))) {
-      addPlain(source.slice(cursor, match.index));
-      records.push({ text: match[0], wordLike: true, protected: true });
-      cursor = match.index + match[0].length;
-    }
-    addPlain(source.slice(cursor));
-
-    var atoms = [];
-    var pendingPrefix = "";
-    records.forEach(function (record) {
-      if (/^\s+$/u.test(record.text)) {
-        if (atoms.length) atoms[atoms.length - 1].text += record.text;
-        else pendingPrefix += record.text;
-      } else if (!record.wordLike && !record.protected) {
-        if (atoms.length) atoms[atoms.length - 1].text += record.text;
-        else pendingPrefix += record.text;
-      } else {
-        atoms.push({ text: pendingPrefix + record.text, wordLike: record.wordLike, protected: record.protected });
-        pendingPrefix = "";
-      }
-    });
-    if (pendingPrefix) {
-      if (atoms.length) atoms[atoms.length - 1].text += pendingPrefix;
-      else atoms.push({ text: pendingPrefix, wordLike: false, protected: false });
-    }
-    for (var i = 0; i + 1 < atoms.length; i++) {
-      if (/^\s*[+\-−]?\d[\d.,:/％%]*\s*$/u.test(atoms[i].text) && atoms[i + 1].wordLike) {
-        atoms[i].text += atoms[i + 1].text;
-        atoms.splice(i + 1, 1);
-      }
-    }
-    // 无空格书写系统（汉字等）里，Intl.Segmenter 会把词切成过细的碎片：实测
-    // 「工程师」被切成「工程|师」、「同样贵」被切成「同样|贵」。在这种原子上按
-    // 「原子之间断」的规则断屏，看起来合规，实际就是把词切开 —— 这是之前反复
-    // 事后搬词救不回来的根源。
-    //
-    // 因此把跟在汉字原子后面的**单字**汉字原子黏合上去，使其成为不可分整体。
-    // 判据只有两条：书写系统（Script=Han，无空格分词）与原子长度（单字），
-    // 不含任何词表；对拉丁、日文假名等有空格或有形态标记的书写系统不生效。
-    for (var k = 0; k + 1 < atoms.length; k++) {
-      var cur = atoms[k];
-      var next = atoms[k + 1];
-      if (cur.protected || next.protected) continue;
-      // 含标点的原子不参与黏合：标点是句读边界，黏过去会把两个小句焊成一屏，
-      // 实测产出「它们仍值得使用它们在许多日常任务中依然很实用」。
-      if (/[\p{P}\s]/u.test(cur.text) || /[\p{P}\s]/u.test(next.text)) continue;
-      if (!/^\p{Script=Han}+$/u.test(cur.text)) continue;
-      if (Array.from(next.text).length !== 1 || !/^\p{Script=Han}$/u.test(next.text)) continue;
-      cur.text += next.text;
-      atoms.splice(k + 1, 1);
-      k--;
-    }
-    return atoms.map(function (atom) { return atom.text; }).filter(Boolean);
-  }
-
-  /**
-   * 在 atoms[j] 之后断屏的代价 —— 越小越适合作为一屏结尾。
-   *
-   * 判据是标点，不是字表：目标语言的句读本来就由标点标记，在句末标点后断句永远
-   * 读得通，在句内标点（逗号、顿号、分号）后断也成立。没有标点的位置意味着断在
-   * 词与词之间，句子结构未完，代价最高。
-   *
-   * 语言无关：只用 Unicode 标点属性（\p{P}），不含任何语言的词表或语法规则。
-   * 惩罚量级与宽度项（(width-target)^2，量级可达数百）刻意可比 —— 让 DP 愿意为
-   * 一个好断点牺牲一些宽度均匀性，但不至于为此产出极端窄行。
-   */
-  /**
-   * 可断标点 —— 单一权威定义。
-   *
-   * Jay 明确：「逗号句号分号没有优先级，都一视同仁处理」。因此不再区分句末/句内两档，
-   * 只有「这里可以断」一个概念。字符集在此定义一次，splitIntoClauses（找断点）与
-   * stripTrailingBreakPunct（屏尾去标点）共用，避免两处字面量各自漂移。
-   */
-  // 顿号「、」刻意不在此列：它分隔并列项，不是小句边界。把它当断点会把型号列表劈开
-  // （实测「标准的 AA、AAA」/「C 和 D 电池…」）。Jay 说的「一视同仁」指句号逗号分号。
-  var BREAKABLE_PUNCT_CHARS = "。！？!?…，；：,;:.";
-  var BREAKABLE_PUNCT = new RegExp("[" + BREAKABLE_PUNCT_CHARS + "]", "u");
   // 句末标点 —— 断点强弱上与逗号同级（Jay：「一视同仁」），但它额外是**硬边界**：
   // 一件事说完了，下一件不得挤进同一屏。装填时用它强制换屏。
   var SENTENCE_FINAL_PUNCT = /[。！？!?….]\s*$/u;
-
-  /**
-   * 在句末标点后断开一屏。
-   *
-   * 句末标点（。！？…）是无争议的硬边界 —— 两个完整句子不得同屏，这不需要语感判断，
-   * 所以放在程序侧执行。其余断点（逗号、分句）一律尊重模型给的语义分屏。
-   * 语言中立：只看标点，不看内容。
-   */
-  function splitAtSentenceEnd(screen) {
-    var text = String(screen == null ? "" : screen);
-    var parts = [];
-    var buf = "";
-    for (var i = 0; i < text.length; i++) {
-      buf += text[i];
-      if (!/[。！？!?….]/u.test(text[i])) continue;
-      // 连续的句末标点（「？！」「……」）算同一个边界，全部吞掉再断。
-      while (i + 1 < text.length && /[。！？!?….]/u.test(text[i + 1])) { buf += text[++i]; }
-      parts.push(buf);
-      buf = "";
-    }
-    if (buf.trim()) parts.push(buf);
-    return parts.length ? parts : [text];
-  }
-  // 屏尾去标点的字符集比断点集多一个顿号：顿号不是断点，但它若恰好落在屏尾（被词组
-  // 间断切出来）同样是视觉噪音，要去掉。
-  var TRAILING_BREAKABLE_PUNCT = new RegExp("[" + BREAKABLE_PUNCT_CHARS + "、]+$", "u");
-
-  /**
-   * 这一屏实际会显示多宽 —— 屏尾标点与句号都不显示，判「装不装得下」必须按显示后的
-   * 宽度算。用带标点的宽度判会误断（样例 8 带标点 52、实显 48）。
-   */
-  function displayedWidth(text) {
-    return semanticDisplayWidth(stripTrailingBreakPunct(text));
-  }
 
   /**
    * 为保住词组允许的极小超宽（半角单位）—— 单一权威常量。
@@ -4281,520 +3049,6 @@
    * 也不要把词切开。只在候选断点是词内部时才动用，正常情况下容量仍是 cap。
    */
   var DISPLAY_SOFT_OVERFLOW = 2;
-
-  /**
-   * 一屏最少要有多少显示宽度才不算「碎」（半角单位，10 ≈ 5 个汉字）。
-   *
-   * 不足此宽度的小句不单独成屏 —— Jay 确认的样例 3「没错。」4 单位、样例 4
-   * 「麻烦的是，」8 单位、样例 8「可能到 1.6 伏」都必须与相邻屏合并。
-   */
-  var DISPLAY_MIN_SCREEN_WIDTH = 10;
-
-  /**
-   * 无标点长句多长才对半断（半角单位，40 ≈ 20 汉字）。
-   *
-   * 这个阈值**只**作用于整句没有任何可断标点的情形，不影响有标点的句子 —— 后者由
-   * 「一屏最多两个小句」决定，与字数无关。Jay 2026-07-27 反对追一条字数分界线
-   * （「21 假如我说要分开的话 22 呢」），两条路径分开后就不存在「为了断开无标点长句
-   * 而连累有标点句子」的牵制，这个数取 40 还是 44 都不改变后者的观感。
-   *
-   * 取 40：「你还得知道电压下降到什么程度之前电池都还算能用」(46) 对半断成
-   * 「你还得知道电压下降到」/「什么程度之前电池都还算能用」（样例 6）；
-   * 「所以它已经快没电了」(18) 远在阈值内保持一屏（样例 11）。
-   */
-  var PUNCTUATIONLESS_SPLIT_WIDTH = 40;
-
-  
-
-  
-
-  
-
-  /**
-   * 规则 3：屏尾不留标点符号。
-   *
-   * 断屏本身已经表达了停顿，屏尾再挂一个逗号/句号是冗余的视觉噪音。只在断屏处
-   * 移除，句子内部的标点不受影响。语言无关：只用 Unicode 标点属性。
-   *
-   * 实现在下方 stripTrailingBreakPunct。
-   */
-
-  
-
-  /**
-   * 显示末端统一处理标点 —— 分屏之后、交付之前的最后一步。
-   *
-   * 两件事，顺序固定：
-   *   1. 屏尾不留标点：断屏本身已表达停顿，屏尾再挂逗号/句号是冗余噪音。
-   *   2. 句号全部移除（产品显示契约）：句号的职责到分屏结束就完成了。屏内残留的
-   *      句号（两句被装进同一屏时）换成一个空格，避免「使用它们」这样粘连成词。
-   *
-   * 问号、感叹号是语义标点，保留在屏内；只有落在屏尾时才由第 1 条移除。
-   */
-  function stripTrailingBreakPunct(text) {
-    var s = String(text).trim().replace(TRAILING_BREAKABLE_PUNCT, "").trim();
-    // 屏内句号：删掉后左右若都是文字会粘连，用空格隔开；CJK 之间的空格随后压掉。
-    s = s.replace(/。+/gu, " ");
-    s = s.replace(/([\p{scx=Han}\p{scx=Hiragana}\p{scx=Katakana}])\s+(?=[\p{scx=Han}\p{scx=Hiragana}\p{scx=Katakana}])/gu, "$1");
-    return collapseWhitespace(s).trim();
-  }
-
-  function splitTargetDisplayLine(line, maxVisualWidth) {
-    var clean = sanitizeSubtitleLine(String(line == null ? "" : line));
-    if (!clean.trim()) throw new Error("block translation line empty");
-    var cap = Math.max(8, Math.floor(Number(maxVisualWidth) || TRANSLATION_DISPLAY_MAX_WIDTH));
-    // 「装得下就不断」按**去掉标点后**的实际显示宽度判 —— 屏尾标点不显示，用带标点的
-    // 宽度判会把本可一屏的内容误断（样例 8「…1.5 伏，可能到 1.6 伏」带标点 52、
-    // 实显 48）。
-    //
-    // 无标点长句不走这条早退：它有自己更低的阈值（PUNCTUATIONLESS_SPLIT_WIDTH），
-    // 在 cap 之内也可能需要对半断（样例 6，46 单位 < cap 48 但仍要两屏）。
-    if (displayedWidth(clean) <= cap && BREAKABLE_PUNCT.test(clean)) return [clean];
-    var atoms = targetDisplayAtoms(clean);
-    // 原子不可再分。若单个原子本身就超过容量+软超宽，无解 —— 例如一条超长 URL。
-    // 汉字黏合后的原子可能略超 cap，此时软超宽正是为它准备的。
-    if (!atoms.length || atoms.some(function (atom) { return semanticDisplayWidth(atom) > cap + DISPLAY_SOFT_OVERFLOW; })) {
-      throw new Error("block translation line contains an indivisible overwide target phrase");
-    }
-    // 一趟贪心填满，两个断点优先级，无回溯、无合并、无特判。
-    //
-    // 此前的实现把「按小句装屏」「短引子往哪并」「超宽后均分」拆成五个互相撤销的函数，
-    // 每加一条规则就要给别处加例外，Jay 明确反对这种堆法。改成单趟后规则只有两条：
-    //   1. 累到 minFill 且遇标点 → 断（标点是最自然的边界）
-    //   2. 超 cap → 回退到本屏最后一个标点；没有标点就退一个原子
-    // 均分改填满是关键：均分把断点强推到中点，正好落在词里（「电池|测试器」）；填满让
-    // 断点尽量靠后，落在自然边界上。Jay 给的排法「思路是，与其另外用某种电池测试器来
-    // 判断电池 / 还有没有电不如…」正是填满的结果。
-    // minFill 取 cap 的 5/8，实测 30/34/38 输出完全一致 —— 这个参数不敏感，无需调。
-    var minFill = Math.floor(cap * 5 / 8);
-    var screens = [];
-    var cur = [];
-    var lastPunct = -1;
-    var curWidth = function () { return displayedWidth(cur.join("")); };
-
-    atoms.forEach(function (atom) {
-      cur.push(atom);
-      if (BREAKABLE_PUNCT.test(atom)) {
-        if (curWidth() >= minFill) {
-          screens.push(cur.join(""));
-          cur = [];
-          lastPunct = -1;
-          return;
-        }
-        lastPunct = cur.length - 1;
-      }
-      if (curWidth() > cap) {
-        if (lastPunct >= 0) {
-          var rest = cur.slice(lastPunct + 1);
-          screens.push(cur.slice(0, lastPunct + 1).join(""));
-          cur = rest;
-        } else {
-          var last = cur.pop();
-          screens.push(cur.join(""));
-          cur = [last];
-        }
-        lastPunct = -1;
-      }
-    });
-    if (cur.length) screens.push(cur.join(""));
-
-    var out = screens.map(stripTrailingBreakPunct)
-      .map(function (s) { return s.trim(); })
-      .filter(Boolean);
-    if (!out.length) throw new Error("block translation line cannot be split at target lexical boundaries");
-    return out;
-  }
-
-  
-
-  /**
-   * 无标点可断的长句：断在词法原子之间，两屏长度尽量接近，虚词不留屏尾。
-   *
-   * 只有这条路径才考虑宽度均衡 —— Jay 确认样例 6「你还得知道电压下降到 / 什么程度
-   * 之前电池都还算能用」而非「你还得知道 / 电压下降到什么程度之前电池都还算能用」。
-   * 均衡与「断在标点」不共用代价：有标点时根本走不到这里，因此均衡永远压不过标点。
-   * 这是 v0.8.3 的教训 —— 那时两者共用一个 cost 标量，屏数/宽度悄悄压过了断句规则。
-   */
-  function splitClauseByAtoms(text, cap) {
-    var atoms = targetDisplayAtoms(text);
-    if (atoms.length < 2) return [text];
-    var total = semanticDisplayWidth(text);
-    var screenCount = Math.max(2, Math.ceil(total / cap));
-
-    // 断点只能落在原子边界上 —— 先枚举所有合法边界及其累计宽度，再挑离理想切点最近的
-    // 那个。这个顺序很关键：先定目标宽度再找最近原子，会把「什么|程度」这类词组切开
-    // （实测），因为宽度目标压过了原子边界。反过来，边界是硬约束、宽度是软偏好。
-    var boundaries = [];
-    var acc = "";
-    for (var i = 0; i < atoms.length - 1; i++) {
-      acc += atoms[i];
-      boundaries.push({ index: i + 1, width: semanticDisplayWidth(acc), text: acc });
-    }
-    if (!boundaries.length) return [text];
-
-    var out = [];
-    var startAtom = 0;
-    var consumedWidth = 0;
-    for (var seg = 1; seg < screenCount; seg++) {
-      // 本屏理想终点：把剩余内容均分给剩余屏数。
-      var remainingScreens = screenCount - seg + 1;
-      var ideal = consumedWidth + (total - consumedWidth) / remainingScreens;
-      var best = null;
-      boundaries.forEach(function (b) {
-        if (b.index <= startAtom) return;
-        var width = b.width - consumedWidth;
-        if (width <= 0 || width > cap) return;
-        // 虚词不许留在屏尾（样例 7）：断点右边第一个原子若是连词/助词，说明这个断点
-        // 会把它吊在上一屏末尾 —— 该虚词应当起下一行。
-        var penalty = leadsNextScreen(atoms[b.index - 1]) ? cap : 0;
-        var score = Math.abs(b.width - ideal) + penalty;
-        if (!best || score < best.score) best = { boundary: b, score: score };
-      });
-      if (!best) break;
-      // 按原子下标切片取本屏文本，不用字符串长度反推偏移（那样容易错位）。
-      out.push(atoms.slice(startAtom, best.boundary.index).join(""));
-      startAtom = best.boundary.index;
-      consumedWidth = best.boundary.width;
-    }
-    // 收尾：剩下的原子构成最后一屏。
-    var tail = atoms.slice(startAtom).join("");
-    if (tail) out.push(tail);
-    return out.filter(function (s) { return s && s.trim(); });
-  }
-
-  /**
-   * 这个原子该起一行，而不是吊在上一屏屏尾。
-   *
-   * Jay：「虚词留在下一句观感更好」—— 样例 7「改用同样贵 / 却寿命更短的 AAA」，
-   * 「却」若留在屏尾会让上一屏读起来断在半空。这些是**闭合的语法功能词**（连词与
-   * 结构助词），不是内容词表：它们数量固定、不随题材增长，与「不引入语言名单」的
-   * 约束不冲突 —— 该约束禁止的是靠逐样本扩充字表来打补丁。
-   */
-  var LEADING_FUNCTION_WORDS = ["却", "但", "而", "不过", "然而", "所以", "因为", "并且", "或者", "以及", "如果", "虽然", "尽管"];
-
-  function leadsNextScreen(atom) {
-    var s = String(atom || "").trim();
-    if (!s) return false;
-    return LEADING_FUNCTION_WORDS.indexOf(s) >= 0;
-  }
-
-  function joinLexicalAtoms(atoms) {
-    var out = "";
-    (atoms || []).forEach(function (atom) {
-      var part = String(atom == null ? "" : atom);
-      if (!part) return;
-      if (!out) { out = part; return; }
-      var needsSpace = /[A-Za-z\p{N}]$/u.test(out) && /^[A-Za-z\p{N}]/u.test(part);
-      out += (needsSpace ? " " : "") + part;
-    });
-    return out.trim();
-  }
-
-  function blockSourceCues(cues) {
-    return (cues || []).map(function (cue, index) {
-      var start = Number(cue && cue.start);
-      var end = Number(cue && cue.end);
-      if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) throw new Error("block source cue timing invalid");
-      var text = collapseWhitespace(cue && cue.content || "");
-      if (!text) throw new Error("block source cue text empty");
-      return { id: "c" + index, startMs: start, endMs: end, text: text };
-    });
-  }
-
-  function parseBlockTranslationResponse(raw, sourceCues, opts) {
-    opts = opts || {};
-    var source = blockSourceCues(sourceCues);
-    var text = String(raw || "").trim();
-    var fenced = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
-    if (fenced) text = fenced[1].trim();
-    var payload;
-    try { payload = JSON.parse(text); } catch (_) { throw new Error("block translation invalid JSON"); }
-    if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error("block translation response must be an object");
-    var outerKeys = Object.keys(payload);
-    if (outerKeys.length !== 1 || outerKeys[0] !== "segments" || !Array.isArray(payload.segments) || !payload.segments.length) {
-      throw new Error("block translation response must contain only non-empty segments");
-    }
-    var maxWidth = Math.max(8, Math.floor(Number(opts.maxVisualWidth) || TRANSLATION_DISPLAY_MAX_WIDTH));
-    var maxInternalGapMs = Math.max(0, Math.floor(Number(opts.maxInternalGapMs) || BLOCK_SEGMENT_MAX_GAP_MS));
-    var cursor = 0;
-    var screenItems = [];
-    function cueIndex(ref) {
-      return source.findIndex(function (cue) { return cue.id === String(ref || ""); });
-    }
-    function activeMsForRange(from, to) {
-      var ms = 0;
-      for (var i = from; i <= to; i++) ms += Math.max(0, source[i].endMs - source[i].startMs);
-      return ms;
-    }
-    function crossesLongPause(from, to) {
-      if (!(maxInternalGapMs > 0)) return false;
-      for (var i = from + 1; i <= to; i++) {
-        if (source[i].startMs - source[i - 1].endMs >= maxInternalGapMs) return true;
-      }
-      return false;
-    }
-    payload.segments.forEach(function (segment) {
-      if (!segment || typeof segment !== "object" || Array.isArray(segment)) throw new Error("block translation segment invalid");
-      // 契约 block-v8：每个 screen 都必须声明自己的 sourceFrom/sourceTo。
-      //
-      // v7 的根缺陷是：模型只返回 screens 字符串，程序事后用比例把屏猜配回源词。
-      // 模型知道每屏译文覆盖哪段原文，但这个信息在 JSON 里被丢掉；程序只能猜，猜错
-      // 就出现整句重译、译文与原文错开几屏、短屏读不完。v8 把覆盖范围变成显式契约：
-      //   screens: [{sourceFrom:"c0", sourceTo:"c2", text:"…"}, ...]
-      // 顶层 segment 仍只负责大块连续覆盖；屏级覆盖必须在块内连续、无重叠、无缺口。
-      var keys = Object.keys(segment).sort().join("|");
-      if (keys !== "screens|sourceFrom|sourceTo") throw new Error("block translation segment fields invalid");
-      var from = cueIndex(segment.sourceFrom);
-      var to = cueIndex(segment.sourceTo);
-      if (from !== cursor || to < from) {
-        if (!opts.lenient) throw new Error("block translation source coverage gap, overlap, or reorder");
-        // lenient：segment 不连续，补缺失 cue 的原文回退
-        for (var gi = cursor; gi < from; gi++) {
-          screenItems.push({ from: gi, to: gi, text: "" });
-        }
-        cursor = from;
-      }
-      if (!Array.isArray(segment.screens) || !segment.screens.length) throw new Error("block translation screens invalid");
-      var screenCursor = from;
-      segment.screens.forEach(function (screen) {
-        if (!screen || typeof screen !== "object" || Array.isArray(screen)) throw new Error("block translation screen invalid");
-        if (Object.keys(screen).sort().join("|") !== "sourceFrom|sourceTo|text") throw new Error("block translation screen fields invalid");
-        var sf = cueIndex(screen.sourceFrom);
-        var st = cueIndex(screen.sourceTo);
-        if (sf !== screenCursor || st < sf || st > to) {
-          if (!opts.lenient) throw new Error("block translation screen coverage gap, overlap, or reorder");
-          // lenient：screen 不连续，补缺失 cue 的原文回退
-          for (var si2 = screenCursor; si2 < sf; si2++) {
-            screenItems.push({ from: si2, to: si2, text: "" });
-          }
-          screenCursor = sf;
-        }
-        var textLine = collapseWhitespace(String(screen.text == null ? "" : screen.text));
-        if (!textLine) {
-          if (!opts.lenient) throw new Error("block translation screen text empty");
-          screenItems.push({ from: sf, to: st, text: "" });
-          screenCursor = st + 1;
-          return;
-        }
-        // 屏跨越长停顿：不再拒绝整块，而是在停顿处拆屏。
-        // 模型不知道停顿位置，返回的 screen 跨越 ≥750ms 静音时，
-        // 按停顿分组把源范围切开，译文按各组语音时长比例分配。
-        // 这样停顿两侧的语音都有字幕，且不丢失模型的译文。
-        var subRanges = [{ from: sf, to: sf }];
-        for (var si = sf + 1; si <= st; si++) {
-          var prevGap = source[si].startMs - source[si - 1].endMs;
-          if (maxInternalGapMs > 0 && prevGap >= maxInternalGapMs) {
-            subRanges.push({ from: si, to: si });
-          } else {
-            subRanges[subRanges.length - 1].to = si;
-          }
-        }
-        if (subRanges.length === 1) {
-          screenItems.push({ from: sf, to: st, text: textLine });
-        } else {
-          // 按各子范围语音时长比例分配译文
-          var subActiveMs = subRanges.map(function (r) {
-            var ms = 0;
-            for (var ri = r.from; ri <= r.to; ri++) ms += Math.max(0, source[ri].endMs - source[ri].startMs);
-            return Math.max(1, ms);
-          });
-          var subTotal = subActiveMs.reduce(function (a, b) { return a + b; }, 0);
-          // 用显示分词切译文，按比例分到各子范围
-          var transWords = splitDisplayWords(textLine);
-          var transCursor = 0;
-          for (var sri = 0; sri < subRanges.length; sri++) {
-            var isLast = sri === subRanges.length - 1;
-            var take = isLast ? transWords.length - transCursor
-              : Math.max(1, Math.round(transWords.length * subActiveMs[sri] / subTotal));
-            take = Math.min(take, transWords.length - transCursor);
-            var subText = transWords.slice(transCursor, transCursor + take).join("");
-            transCursor += take;
-            if (subText.trim()) {
-              screenItems.push({ from: subRanges[sri].from, to: subRanges[sri].to, text: collapseWhitespace(subText) });
-            }
-          }
-        }
-        screenCursor = st + 1;
-      });
-      if (screenCursor !== to + 1) {
-        if (!opts.lenient) throw new Error("block translation screen coverage incomplete");
-        // lenient：模型漏了部分 cue 的 screens，补原文回退 segment
-        for (var mi = screenCursor; mi <= to; mi++) {
-          screenItems.push({ from: mi, to: mi, text: "" });
-        }
-      }
-      cursor = to + 1;
-    });
-    if (cursor !== source.length) {
-      if (!opts.lenient) throw new Error("block translation source coverage incomplete");
-      // lenient：模型漏了尾部 segments，补原文回退
-      for (var ti = cursor; ti < source.length; ti++) {
-        screenItems.push({ from: ti, to: ti, text: "" });
-      }
-    }
-
-    var out = [];
-    screenItems.forEach(function (item) {
-      var lines = [];
-      // 句末标点是无争议的硬边界：两个完整句子不得同屏。实测 gpt-5.5 会交回
-      // 「确实就是这么做的事实上，这个版本的想法」——把上句尾和下句头焊在一屏。
-      splitAtSentenceEnd(item.text).forEach(function (part) {
-        if (displayedWidth(part) <= maxWidth) { lines.push(part); return; }
-        splitTargetDisplayLine(part, maxWidth).forEach(function (p) { lines.push(p); });
-      });
-      lines = mergeDanglingModifierLines(lines, maxWidth);
-      // 屏尾去标点必须是最后一步。
-      lines = lines.map(stripTrailingBreakPunct).filter(Boolean);
-      if (!lines.length) {
-        // lenient 运行态：译文为空表示该单元未翻译（回退显示原文），不是协议违规。
-        if (opts.lenient && !item.text) { lines = [""]; }
-        else throw new Error("block translation produced no display lines");
-      }
-      // 源词超限兜底：模型常给 1 屏覆盖 18 个英文词的单 cue，prompt 里的 ≤12 词限制
-      // 被忽略。程序侧强制拆译文为多行，materializeBlockTranslation 会按比例分配源词。
-      // 只对空格分词语言（拉丁/西里尔等）计数，CJK/泰文按字符宽度判定。
-      var srcWordCount = 0;
-      for (var swi = item.from; swi <= item.to; swi++) {
-        var swText = source[swi].text || "";
-        srcWordCount += swText.indexOf(" ") >= 0 ? swText.split(/\s+/).filter(Boolean).length : 0;
-      }
-      if (lines.length === 1 && srcWordCount > 14 && displayedWidth(lines[0]) > Math.max(6, Math.floor(maxWidth / 2))) {
-        var forceSplit = splitTargetDisplayLine(lines[0], Math.max(4, Math.ceil(displayedWidth(lines[0]) / 2)));
-        if (forceSplit.length > 1) lines = forceSplit;
-      }
-      if (lines.length > maxBlockDisplayLines(activeMsForRange(item.from, item.to))) {
-        if (!opts.lenient) throw new Error("block translation has too many display lines for source duration");
-        // lenient：截断到允许的最大行数
-        lines = lines.slice(0, maxBlockDisplayLines(activeMsForRange(item.from, item.to)));
-      }
-      var normalized = { segmentId: "b" + out.length, sourceFrom: item.from, sourceTo: item.to, lines: lines };
-      normalized.integrity = blockSegmentIntegrity(normalized);
-      out.push(normalized);
-    });
-    return out;
-  }
-
-  /**
-   * 按长停顿把源 cue 切成若干连续组。
-   *
-   * 长停顿（≥ maxInternalGapMs 的静音）是真实的语音结构边界，一屏字幕不得跨越它 ——
-   * 跨越的结果是这一屏被钳到停顿的一侧，停顿另一侧的语音就没有字幕可显示。
-   * 语言无关：只用 cue 时间。
-   */
-  function groupSourceByLongPause(source, maxInternalGapMs) {
-    var groups = [{ from: 0, to: 0 }];
-    for (var i = 1; i < source.length; i++) {
-      var gap = source[i].startMs - source[i - 1].endMs;
-      if (maxInternalGapMs > 0 && gap >= maxInternalGapMs) groups.push({ from: i, to: i });
-      else groups[groups.length - 1].to = i;
-    }
-    // activeMs 是该组的实际语音时长（不含组内短间隙），译文按它的比例分配。
-    groups.forEach(function (group) {
-      var activeMs = 0;
-      for (var i = group.from; i <= group.to; i++) activeMs += Math.max(0, source[i].endMs - source[i].startMs);
-      group.activeMs = activeMs;
-    });
-    return groups;
-  }
-
-  /**
-   * 把整块译文分配给各个源组，切点落在词法原子边界上。
-   *
-   * 按各组的语音时长比例切分：译文的推进速度大致跟随语音。只有一组时直接整块返回
-   * （最常见情形，不做任何切分）。切点吸附到最近的原子边界，绝不切在词内部。
-   */
-  /**
-   * 把模型给的屏按各组语音时长比例分配到长停顿分组。
-   *
-   * 屏是不可分单位 —— 模型的语义断点必须保留，所以只在屏之间分界，不切开屏内文本。
-   * 每组至少拿一屏（组是真实语音段，无字幕会导致该段画面吊着上一句）。
-   * 复杂度 O(屏数)，无原子级遍历。
-   */
-  function allocateScreensToGroups(screens, groups) {
-    if (groups.length === 1) return [screens.slice()];
-    // 屏数少于组数时无法每组分一屏 —— 把最宽的屏在标点处拆开补足。
-    // 不这样做后面的组会拿到空数组，那一段语音就没有字幕。
-    while (screens.length < groups.length) {
-      var widest = 0;
-      for (var w = 1; w < screens.length; w++) {
-        if (displayedWidth(screens[w]) > displayedWidth(screens[widest])) widest = w;
-      }
-      var halves = splitTargetDisplayLine(screens[widest], Math.max(8, Math.ceil(displayedWidth(screens[widest]) / 2)));
-      if (halves.length < 2) break; // 无可拆之处，接受组数不足
-      screens = screens.slice(0, widest).concat(halves, screens.slice(widest + 1));
-    }
-    var durations = groups.map(function (g) { return Math.max(1, g.activeMs || 1); });
-    var totalDuration = durations.reduce(function (a, b) { return a + b; }, 0);
-    var totalWidth = screens.reduce(function (sum, s) { return sum + displayedWidth(s); }, 0);
-    var out = [];
-    var cursor = 0;
-    for (var g = 0; g < groups.length; g++) {
-      var remainingGroups = groups.length - g - 1;
-      if (!remainingGroups) { out.push(screens.slice(cursor)); break; }
-      var target = totalWidth * durations[g] / totalDuration;
-      var acc = 0;
-      var take = cursor;
-      // 每组至少留一屏给后面每个组，否则后面的组会拿到空数组。
-      while (take < screens.length - remainingGroups && acc < target) {
-        acc += displayedWidth(screens[take]);
-        take++;
-      }
-      take = Math.max(cursor + 1, Math.min(take, screens.length - remainingGroups));
-      out.push(screens.slice(cursor, take));
-      cursor = take;
-    }
-    return out;
-  }
-
-  function activeOffsetToTime(cues, offset, startSide) {
-    var remaining = Math.max(0, Number(offset) || 0);
-    for (var i = 0; i < cues.length; i++) {
-      var duration = Math.max(0, Number(cues[i].end) - Number(cues[i].start));
-      if (remaining < duration) return Number(cues[i].start) + remaining;
-      if (remaining === duration) {
-        if (startSide && i + 1 < cues.length) return Number(cues[i + 1].start);
-        return Number(cues[i].end);
-      }
-      remaining -= duration;
-    }
-    return Number(cues[cues.length - 1].end);
-  }
-
-  /**
-   * 把「第几个源词」换算成时间。
-   *
-   * 词序号落在某个 cue 内部时按该 cue 内的词比例插值；正好落在 cue 边界上就直接取
-   * 该边界。这样一屏的时间范围严格等于它实际取用的那几个源 cue 的时间范围，字幕与
-   * 音轨不会错位，也不会侵入下一句。语言无关：只用词数与 cue 时间。
-   */
-  function wordOffsetToTime(cues, cursor, wordOffset, startSide) {
-    var boundaries = cursor.cueBoundaries;
-    if (!cues.length) return 0;
-    var prevBoundary = 0;
-    for (var i = 0; i < boundaries.length && i < cues.length; i++) {
-      var cueWords = boundaries[i] - prevBoundary;
-      var cueStart = Number(cues[i].start);
-      var cueEnd = Number(cues[i].end);
-      // 词序号正好落在 cue 分界上时，start 与 end 的正确答案不同：
-      // 上一屏的 end 是前一个 cue 的**结束**（语音到此为止），下一屏的 start 是这个
-      // cue 的**开始**（语音从此恢复）。两者之间就是静音，不属于任何一屏。
-      // 早先两侧都返回同一个值，导致下一屏的 start 被放到静音起点（实测 2200 而非 2800）。
-      if (wordOffset <= prevBoundary) return cueStart;
-      if (wordOffset < boundaries[i]) {
-        // cue 内部：按词比例插值。
-        var ratio = cueWords > 0 ? (wordOffset - prevBoundary) / cueWords : 0;
-        return cueStart + (cueEnd - cueStart) * ratio;
-      }
-      if (wordOffset === boundaries[i]) {
-        if (!startSide) return cueEnd;
-        // start 侧：落在分界上说明本屏从下一个 cue 开始说话。
-        var next = cues[i + 1];
-        return next ? Number(next.start) : cueEnd;
-      }
-      prevBoundary = boundaries[i];
-    }
-    return Number(cues[cues.length - 1].end);
-  }
 
   /** 源轨里所有 ≥ maxInternalGapMs 的真实停顿区间（说话人停下来的静音段） */
   function longPauseRanges(cues, maxInternalGapMs) {
@@ -4815,71 +3069,6 @@
       if (ms > pauses[i][0] && ms < pauses[i][1]) return startSide ? pauses[i][1] : pauses[i][0];
     }
     return ms;
-  }
-
-  /**
-   * 一屏文字整体横跨了某个停顿时（start 在停顿前、end 在停顿后），只钳边界是不够的
-   * —— 边界都在停顿外，字幕会硬挺过整段静音。实测真实英语轨 3/405 屏是这种情况
-   * （最长 6802ms 覆盖一整个停顿）。这里把 end 收到第一个被跨越停顿的起点，
-   * 让字幕在静音开始时消失。
-   *
-   * 若停顿前的说话时间不足可读下限（这一屏只摊到 <300ms 的真实语音），
-   * 就退让到 startMs + minDisplayMs：仍然会探进静音一点，但**有界**（最多
-   * minDisplayMs，且因停顿本身 ≥750ms 必然仍落在该停顿内），绝不会像早先那样
-   * 保留原 end 而横跨整段静音。宁可多显示 300ms，也不给一闪而过的字幕；
-   * 但"多显示"必须是常数级，不能是任意长的静音。
-   */
-  function trimSpannedPause(pauses, startMs, endMs, minDisplayMs) {
-    for (var i = 0; i < pauses.length; i++) {
-      if (startMs <= pauses[i][0] && endMs >= pauses[i][1]) {
-        if (pauses[i][0] - startMs >= minDisplayMs) return pauses[i][0];
-        return Math.min(endMs, startMs + minDisplayMs);
-      }
-    }
-    return endMs;
-  }
-
-  /**
-   * 从段内源词游标顺序取出本屏原文，永不回头。
-   *
-   * 取多少按本屏译文占整段的显示宽度比例估算 —— 只让原文与译文推进节奏大致一致，
-   * 不追求逐屏严格对应（严格对应会把源文切在语法中间，反而更难读）。切点在 ±2 词
-   * 内吸附到最近的源 cue 边界：那是上游按词法与停顿切好的自然断点。末屏兜掉余下
-   * 全部源词，段内无损。语言无关：只用词边界与源 cue 边界，无源语言判定。
-   */
-  function takeForwardSourceWords(cursor, lineIndex, lineCount) {
-    var words = cursor.words;
-    if (!words.length) return "";
-    var remaining = words.length - cursor.index;
-    if (remaining <= 0) return "";
-    if (lineIndex + 1 === lineCount) {
-      var tail = words.slice(cursor.index);
-      cursor.index = words.length;
-      // 必须用权威 joinRestoredWords：words 现在由 restoredWords() 切出，连写文字
-      // 一字一词，无脑 join(" ") 会把 45 字日文撑成 89 字散字（见其函数注释）。
-      return joinRestoredWords(tail);
-    }
-    var linesLeftAfter = lineCount - lineIndex - 1;
-    // 按整段总量算 share，不要"改成剩余量占比"。
-    //
-    // 我试过改成 remaining * weights[i] / weightLeft，动机是让每屏吸收前面累积的
-    // 偏差。真实轨实测反而更差：字/词异常屏 8 → 14。原因是剩余量占比会把边界吸附
-    // 造成的偶发偏差立刻转嫁给下一屏，形成振荡（实测出现 1词/4字 与 25词/18字
-    // 相邻）；整段总量虽然不补偿，但每屏目标独立，偏差不会被放大传播。
-    var share = words.length * cursor.weights[lineIndex] / cursor.totalWeight;
-    var maxTake = remaining - linesLeftAfter;
-    var take = Math.max(1, Math.min(Math.round(share), maxTake));
-    var best = take;
-    var bestDist = Infinity;
-    for (var bi = 0; bi < cursor.cueBoundaries.length; bi++) {
-      var boundary = cursor.cueBoundaries[bi] - cursor.index;
-      if (boundary < 1 || boundary > maxTake) continue;
-      var dist = Math.abs(boundary - take);
-      if (dist <= 2 && dist < bestDist) { bestDist = dist; best = boundary; }
-    }
-    var slice = words.slice(cursor.index, cursor.index + best);
-    cursor.index += best;
-    return joinRestoredWords(slice);
   }
 
   function semanticSegmentIntegrity(segment) {
@@ -4960,146 +3149,6 @@
       extendIntoSilence(mergeUnreadableUnits(units, { maxVisualWidth: opts.maxVisualWidth }), pauses,
         { blockEndMs: Number(lastCue && lastCue.end) || 0 }),
       Math.max(1, Math.floor(Number(opts.minDisplayMs) || BLOCK_MIN_DISPLAY_MS)));
-  }
-
-  function materializeBlockTranslation(parsedSegments, sourceCues, opts) {
-    opts = opts || {};
-    var source = blockSourceCues(sourceCues);
-    var raw = sourceCues || [];
-    var units = [];
-    var coverageCursor = 0;
-    var maxWidth = Math.max(8, Math.floor(Number(opts.maxVisualWidth) || TRANSLATION_DISPLAY_MAX_WIDTH));
-    var minDisplayMs = Math.max(1, Math.floor(Number(opts.minDisplayMs) || BLOCK_MIN_DISPLAY_MS));
-    var maxInternalGapMs = Math.max(0, Math.floor(Number(opts.maxInternalGapMs) || BLOCK_SEGMENT_MAX_GAP_MS));
-    var pauses = longPauseRanges(raw, maxInternalGapMs);
-    var pauseGroups = [];
-    raw.forEach(function (cue, index) {
-      if (index === 0) { pauseGroups.push(0); return; }
-      var gap = Number(cue.start) - Number(raw[index - 1].end);
-      pauseGroups.push(gap >= maxInternalGapMs ? pauseGroups[index - 1] + 1 : pauseGroups[index - 1]);
-    });
-    (parsedSegments || []).forEach(function (segment, segmentIndex) {
-      var cachedKeys = segment && typeof segment === "object" && !Array.isArray(segment) ? Object.keys(segment).sort().join("|") : "";
-      if (!segment || typeof segment !== "object" || Array.isArray(segment) ||
-          (cachedKeys !== "lines|segmentId|sourceFrom|sourceTo" && cachedKeys !== "integrity|lines|segmentId|sourceFrom|sourceTo") ||
-          segment.segmentId !== "b" + segmentIndex ||
-          !Number.isInteger(segment.sourceFrom) || segment.sourceFrom !== coverageCursor ||
-          !Number.isInteger(segment.sourceTo) || segment.sourceTo < segment.sourceFrom || segment.sourceTo >= source.length) {
-        throw new Error("block translation cached coverage invalid");
-      }
-      if (!Array.isArray(segment.lines) || !segment.lines.length) throw new Error("block translation cached lines invalid");
-      var cues = raw.slice(segment.sourceFrom, segment.sourceTo + 1);
-      var totalActive = cues.reduce(function (sum, cue) { return sum + Math.max(0, Number(cue.end) - Number(cue.start)); }, 0);
-      var maxLines = maxBlockDisplayLines(totalActive);
-      if (segment.lines.length > maxLines) throw new Error("block translation cached lines exceed duration capacity");
-      if (opts.requireIntegrity && segment.integrity !== blockSegmentIntegrity(segment)) {
-        throw new Error("block translation cache integrity mismatch");
-      }
-      // 跨长停顿的语义段合法：钳到停顿一侧由下面的 clampToPauseSide 完成，
-      // 静音处永不显示字幕，而语义完整性不因毫秒级时间事实被牺牲。
-      var cleanLines = segment.lines.map(function (line) {
-        // 末端标点处理必须在装载路径上也执行：sanitizeSubtitleLine 不再删句号
-        // （句号要留给分屏做断句判据），所以显示契约由 stripTrailingBreakPunct 收口。
-        // 缓存里存的是已分屏的 lines，对已处理过的文本再跑一次是幂等的。
-        var clean = stripTrailingBreakPunct(sanitizeSubtitleLine(String(line == null ? "" : line)));
-        if (!clean.trim()) throw new Error("block translation cached line empty");
-        if (semanticDisplayWidth(clean) > maxWidth + DISPLAY_SOFT_OVERFLOW) throw new Error("block translation cached line exceeds visual width");
-        return clean;
-      });
-      coverageCursor = segment.sourceTo + 1;
-      if (!(totalActive > 0)) throw new Error("block translation segment has no active duration");
-      var weights = cleanLines.map(function (line) { return Math.max(1, semanticDisplayWidth(line)); });
-      var totalWeight = weights.reduce(function (a, b) { return a + b; }, 0);
-      // 每屏原文顺序往前取，不回头重播。
-      //
-      // 原先按「本屏时间区间与哪些源 cue 重叠」反查原文。源 cue 通常比一屏译文长，
-      // 同一个 cue 会同时命中相邻两屏，其原文被逐屏重播 —— 画面上就是「中文推进
-      // 一屏、英文把整句重新滚一遍」，拼接后单屏原文可达 26 词并被浏览器折成 3 行。
-      // 真实轨 zsA3X40nz9w 已译区实测 52/75 相邻屏重复、平均重叠 9.2 词。
-      //
-      // 译文分屏由 splitTargetDisplayLine 独立决定，这里不参与、不干预：原文只是
-      // 跟着往前推进，位置大致对应即可，不追求逐屏严格对齐 —— 中英信息密度不同，
-      // 硬绑固定词数只会逼出切词或丢词（红线）。
-      //
-      // 但"不严格"不等于"误差可以累积"：取词量必须按剩余量占比算，让每屏吸收前面
-      // 的偏差（见 takeForwardSourceWords）。否则松对齐不闭环，会漂出几屏的错位。
-      // 分词必须走全系统唯一权威 restoredWords()，不能用 /\s+/ 自己切。
-      //
-      // 真机故障（日语轨 pczh.ja，两个模型同现，clip 5/6/10）：/\s+/ 对无词间空格的
-      // 语言（日/中/泰）每个 cue 只得到 1 个"词"。一旦模型给的译文屏数多于源词数，
-      // 末尾屏取到 0 词 → 游标停在 cue 分界 → start 取「下一 cue 起点」、end 取
-      // 「本 cue 终点」→ start > end → 抛错丢掉整块 32 秒字幕并退避重试重烧 token。
-      // restoredWords 对连写文字一字一词（见 RESTORE_WORD_RE），源词数与屏数量级
-      // 匹配，零词屏在真实轨上不再出现；同时消灭了这里自写的第 4 份分词实现。
-      // 必须用 splitDisplayWords 而不是 restoredWords：这里切出来的词要原样拼回**显示
-      // 用原文**，标点不能丢。restoredWords 走的是纯词边界（canonical 对齐用），会把
-      // "person," 变成 "person" —— 我第一版用了它，e2e coverage ledger 立刻 FAIL，
-      // 相当于把原文标点全吃掉。splitDisplayWords 同样以唯一权威 newWordRe() 定边界，
-      // 只是额外把标点附着回相邻 token，正是显示路径要的语义。
-      var cueWordLists = cues.map(function (cue) {
-        return splitDisplayWords(cue.content || "");
-      });
-      var cueBoundaries = [];
-      var boundaryAcc = 0;
-      var allWords = [];
-      cueWordLists.forEach(function (list) {
-        boundaryAcc += list.length;
-        cueBoundaries.push(boundaryAcc);
-        for (var wi = 0; wi < list.length; wi++) allWords.push(list[wi]);
-      });
-      var sourceCursor = {
-        index: 0,
-        words: allWords,
-        cueBoundaries: cueBoundaries,
-        weights: weights,
-        totalWeight: totalWeight,
-      };
-      cleanLines.forEach(function (line, lineIndex) {
-        // 时间源只有一个：本屏实际取用的源词范围。
-        //
-        // 早先按「本屏译文宽度占整段的比例」换算时间，但译文宽度与语音时长不成比例
-        // ——实测两屏宽度 38:30、源时长各 2200ms，第一屏 end 被算到 3059ms，越过第二句
-        // 起点占了它的语音时间。takeForwardSourceWords 已经把取词切点吸附到源 cue
-        // 边界（真实语音断点），所以先取词、再用游标位置定时间，两者必然一致。
-        var fromOffset = sourceCursor.index;
-        var original = takeForwardSourceWords(sourceCursor, lineIndex, cleanLines.length);
-        var toOffset = sourceCursor.index;
-        // 零词屏必须两侧同向取时间，否则跨 cue 分界时 start 取「下一 cue 起点」、
-        // end 取「本 cue 终点」→ start > end。根因已在上游修掉（分词改走权威
-        // restoredWords，连写文字一字一词，源词数与屏数量级匹配），这里只保留同向
-        // 求值这一条不变式，不再靠它兜整块字幕。
-        var startMs = clampToPauseSide(pauses, wordOffsetToTime(cues, sourceCursor, fromOffset, true), true);
-        var endMs = toOffset === fromOffset
-          ? startMs
-          : clampToPauseSide(pauses, wordOffsetToTime(cues, sourceCursor, toOffset, false), false);
-        endMs = trimSpannedPause(pauses, startMs, endMs, minDisplayMs);
-        if (endMs < startMs) throw new Error("block translation materialized timing invalid");
-        var roundedStart = Math.round(startMs);
-        var roundedEnd = Math.round(endMs);
-        // 短于最小显示时长不是协议违规，而是源 cue 本身就短（真实 ASR 轨常见）。
-        // 抛错的代价是整块 32 秒字幕全丢（CI 全轨实测 7/50 块），而正确处理是
-        // 给它最小显示时长、后续由 enforceDisplayMonotonicity 保证不侵占下一屏。
-        if (roundedEnd - roundedStart < minDisplayMs) roundedEnd = roundedStart + minDisplayMs;
-        units.push({
-          blockSegmentId: segment.segmentId,
-          // 可读性合并的唯一分组依据：长停顿分组。segmentId 只表示缓存覆盖序号，
-          // 两者必须分开 —— 逐 cue 覆盖时 segmentId 每屏都不同，用它当分组会让
-          // mergeUnreadableUnits 一屏都合不了（实测 8/30 屏读不完）。
-          pauseGroupId: pauseGroups[segment.sourceFrom] || 0,
-          srcStart: segment.sourceFrom + 1,
-          srcEnd: segment.sourceTo + 1,
-          originalText: original,
-          translation: line,
-          startMs: roundedStart,
-          endMs: roundedEnd,
-        });
-      });
-    });
-    if (coverageCursor !== source.length) throw new Error("block translation cached coverage incomplete");
-    // 顺序固定：先合并读不完的屏（会改变相邻关系），再借静音，最后去重叠。
-    // 反过来则合并后又产生新的重叠没人处理。
-    return enforceDisplayMonotonicity(
-      extendIntoSilence(mergeUnreadableUnits(units, { maxVisualWidth: maxWidth }), pauses), minDisplayMs);
   }
 
   /**
@@ -5342,7 +3391,6 @@
     return { segments: segments, units: materializeReadableSemanticUnits(segments, cues, { tokens: timeline, maxVisualWidth: opts.maxVisualWidth, maxInternalGapMs: opts.maxInternalGapMs, minDisplayMs: opts.minDisplayMs }) };
   }
 
-
   // 记住哪些 (baseUrl|model) 拒绝 reasoning_effort，避免每个 clip 都白撞一次 400。
   // 一轨 50 clip × 2 请求，不记的话就是上百次无谓往返。
   var REASONING_EFFORT_UNSUPPORTED = Object.create(null);
@@ -5357,7 +3405,7 @@
 
   /**
    * 发一次 chat/completions 并返回 message.content 字符串。
-   * translateClipLines 复用：构造请求、AbortController 超时、
+   * translateSentenceScreens / restoreTokenBoundaries 复用：构造请求、AbortController 超时、
    * HTTP/网络错误归一化抛出。纯 I/O，不做任何对齐/解析（交给调用方）。
    * 出错（HTTP 非 200、网络异常、超时）抛 Error，调用方决定兜底。
    */
@@ -5538,27 +3586,6 @@
   /* ---------------------------------------------------------------
    * 5. clip 切分（边播边翻的预取单元）
    * ------------------------------------------------------------- */
-
-  /**
-   * 把 cue 列表按时间切成 clip（默认 60 秒一个）。
-   * 一条 cue 归属到它 start 所在的 clip。返回 clip 数组：
-   * { index, startMs, endMs, cues: cue[] }。
-   * 注意：按硬时间格切会把跨边界的句子切到两个 clip 各翻一次，浪费 token。
-   * 推荐用 sliceClipsByCue（按 cue 边界就近切，不在句子中间断）。
-   */
-  function sliceClips(cues, clipMs) {
-    var size = clipMs && clipMs > 0 ? clipMs : 60000;
-    var clips = [];
-    for (var i = 0; i < cues.length; i++) {
-      var idx = Math.floor(cues[i].start / size);
-      if (!clips[idx]) {
-        clips[idx] = { index: idx, startMs: idx * size, endMs: (idx + 1) * size, cues: [] };
-      }
-      clips[idx].cues.push(cues[i]);
-    }
-    // 去掉空洞，返回紧凑数组（保留原 index 字段）
-    return clips.filter(Boolean);
-  }
 
   /**
    * 按 cue 边界切 clip：累积 cue 直到时长达到 ~targetMs，就在当前 cue 之后断开。
@@ -5762,116 +3789,6 @@
     return out;
   }
 
-  /** 将连续任务合成不超过 maxUnits 个 source units 的后台批次；超大单项 fail-closed。 */
-  function planCoverageBatches(items, maxUnits) {
-    var limit = Math.floor(Number(maxUnits) || 8);
-    if (limit < 1) limit = 1;
-    var out = [];
-    var batch = [];
-    var size = 0;
-    (items || []).forEach(function (item) {
-      var count = item && Array.isArray(item.cues) ? item.cues.length : 0;
-      if (count > limit) throw new Error("item exceeds coverage batch limit");
-      if (batch.length && size + count > limit) {
-        out.push(batch);
-        batch = [];
-        size = 0;
-      }
-      batch.push(item);
-      size += count;
-      if (size >= limit) {
-        out.push(batch);
-        batch = [];
-        size = 0;
-      }
-    });
-    if (batch.length) out.push(batch);
-    return out;
-  }
-
-  /* ---------------------------------------------------------------
-   * 5c. 全局并发信号量（跨 clip 的 in-flight 请求上限）
-   * -------------------------------------------------------------
-   * 滑动窗口预取(depth=3)会让 idx..idx+3 几乎同时各自发起翻译。每个 clip 现在
-   * 一次 translateClipLines = 一个请求。若不封顶，瞬时并发可达 ~4+，足以触发网关
-   * 429 → 退避 → 反而更卡。这里提供一个进程级（每个内容脚本
-   * 实例一个）的小信号量：所有 clip 的所有批请求都先 acquire 一个令牌再发，
-   * 发完 release。在全局 cap 下，滑动窗口仍能尽量保持最大领先，但绝不冲垮网关。
-   * 纯逻辑、无定时器、可离线单测：用 Promise 队列实现"超额则排队等令牌"。
-   */
-
-  /**
-   * 造一个并发信号量。
-   *  - max: 同时允许的最大令牌数（<=0 视为 1）。
-   * 返回 { run(fn), acquire(), release(), get inFlight(), get max(), get queued() }。
-   *  - run(fn): 等到有令牌后执行 fn()（可返回 Promise），结束(成功/抛错)自动 release。
-   *            这是给翻译请求用的入口——把单次请求包进来即受全局上限约束。
-   */
-  function makeSemaphore(max) {
-    var cap = Number(max);
-    if (!Number.isFinite(cap) || cap < 1) cap = 1;
-    cap = Math.floor(cap);
-    var inFlight = 0;
-    var waiters = []; // 等令牌的 resolve 队列（FIFO）
-
-    function acquire() {
-      if (inFlight < cap) {
-        inFlight++;
-        return Promise.resolve();
-      }
-      return new Promise(function (resolve) {
-        waiters.push(resolve);
-      });
-    }
-
-    function release() {
-      if (waiters.length > 0) {
-        // 把令牌直接转交给下一个等待者（inFlight 维持不变）
-        var next = waiters.shift();
-        next();
-      } else if (inFlight > 0) {
-        inFlight--;
-      }
-    }
-
-    function run(fn) {
-      return acquire().then(function () {
-        var p;
-        try {
-          p = Promise.resolve(fn());
-        } catch (e) {
-          release();
-          throw e;
-        }
-        return p.then(
-          function (v) {
-            release();
-            return v;
-          },
-          function (e) {
-            release();
-            throw e;
-          }
-        );
-      });
-    }
-
-    return {
-      run: run,
-      acquire: acquire,
-      release: release,
-      get inFlight() {
-        return inFlight;
-      },
-      get max() {
-        return cap;
-      },
-      get queued() {
-        return waiters.length;
-      },
-    };
-  }
-
   /**
    * 把一个翻译错误归类为 gate 可消费的种类（第3层）。
    *  - "429"：HTTP 限流（chatCompletion 已在 err.code 或 message 打标）。
@@ -6016,36 +3933,6 @@
       h2 = Math.imul(h2 ^ code, 0x85ebca6b);
     }
     return (h1 >>> 0).toString(36) + (h2 >>> 0).toString(36);
-  }
-
-  function semanticTokenFingerprint(tokens) {
-    var parts = [];
-    (tokens || []).forEach(function (token) {
-      parts.push([
-        String(token && token.text || ""),
-        Number(token && token.start) || 0,
-        Number(token && token.end) || 0,
-      ].join("\x1f"));
-    });
-    return parts.length + ":" + hashCacheIdentity(parts.join("\x1e"));
-  }
-
-  /** 严格词流语义恢复缓存 key；不把网关 URL 原文写入 storage key。 */
-  function makeSemanticCacheKey(parts) {
-    parts = parts || {};
-    return [
-      "dss-v8",
-      parts.videoId || "",
-      parts.trackCode || "",
-      parts.apiModel || "",
-      hashCacheIdentity(String(parts.apiBaseUrl || "").replace(/\/+$/, "")),
-      semanticTokenFingerprint(parts.tokens || []),
-      hashCacheIdentity(parts.systemPrompt || DEFAULT_RESTORATION_PROMPT),
-      Number(parts.chunkWords) || SEMANTIC_CHUNK_WORDS,
-      Number(parts.overlapWords) || SEMANTIC_OVERLAP_WORDS,
-      Number(parts.preferredMaxWords) || 14,
-      Number(parts.maxWords) || 16,
-    ].join("|");
   }
 
   function normalizeEndpointIdentity(value) {
@@ -6254,28 +4141,6 @@
     }
     return { site: adapter.id, videoId: videoId, files: files };
   }
-
-  /**
-   * LRU 裁剪缓存对象（防止 chrome.storage.local 配额溢出）。
-   * cacheObj: { key: { t:写入时间戳, lines:string[] } }。
-   * 超过 maxEntries 时按 t 升序淘汰最旧的。返回新对象（不改入参）。
-   */
-  function pruneCache(cacheObj, maxEntries) {
-    var max = maxEntries && maxEntries > 0 ? maxEntries : 800;
-    var keys = Object.keys(cacheObj || {});
-    if (keys.length <= max) return Object.assign({}, cacheObj);
-    keys.sort(function (a, b) {
-      return (cacheObj[a].t || 0) - (cacheObj[b].t || 0);
-    });
-    var drop = keys.length - max;
-    var out = {};
-    for (var i = drop; i < keys.length; i++) out[keys[i]] = cacheObj[keys[i]];
-    return out;
-  }
-
-  /* ---------------------------------------------------------------
-   * 7. 失败退避：连续失败 N 次后停止自动重试
-   * ------------------------------------------------------------- */
 
   /**
    * 造一个退避控制器（每个 clip 一个）。
@@ -6649,36 +4514,24 @@
     stripSubtitleAnnotations: stripSubtitleAnnotations,
     ttmlTimeToMs: ttmlTimeToMs,
     cleanupCues: cleanupCues,
-    applyTailTrim: applyTailTrim,
     resegmentCues: resegmentCues,
     segmentTokensByBoundaries: segmentTokensByBoundaries,
     buildCanonicalTokenTimeline: buildCanonicalTokenTimeline,
     buildCueTokenSpanUnits: buildCueTokenSpanUnits,
     buildTokenSpanUnits: buildTokenSpanUnits,
     cuesFromTimelineSnapshot: cuesFromTimelineSnapshot,
-    resegmentTimelineSnapshot: resegmentTimelineSnapshot,
-    withTimelineTranslations: withTimelineTranslations,
     validateTokenSpanCoverage: validateTokenSpanCoverage,
     createTimelineSnapshot: createTimelineSnapshot,
-    hasNativeTokenTiming: hasNativeTokenTiming,
-    collectSemanticTokens: collectSemanticTokens,
     semanticPlanningGroups: semanticPlanningGroups,
     enforceVisualDisplayMarks: enforceVisualDisplayMarks,
     restoredWords: restoredWords,
     TRANSLATE_TIMEOUT_MS: TRANSLATE_TIMEOUT_MS,
     BLOCK_CONTRACT_VERSION: BLOCK_CONTRACT_VERSION,
     joinRestoredWords: joinRestoredWords,
-    sameRestoredWords: sameRestoredWords,
-    restoredBoundaryMarks: restoredBoundaryMarks,
     chunkTokenRanges: chunkTokenRanges,
     SEMANTIC_CHUNK_WORDS: SEMANTIC_CHUNK_WORDS,
     SEMANTIC_OVERLAP_WORDS: SEMANTIC_OVERLAP_WORDS,
     packRestoredTokens: packRestoredTokens,
-    repairNaturalUnitBoundaries: repairNaturalUnitBoundaries,
-    filterUnsafeRescueMarks: filterUnsafeRescueMarks,
-    partitionReadableTokenUnit: partitionReadableTokenUnit,
-    normalizeOversizeSentenceMarks: normalizeOversizeSentenceMarks,
-    classifySemanticBoundary: classifySemanticBoundary,
     collapseWhitespace: collapseWhitespace,
     normalizeColor: normalizeColor,
     shadowCss: shadowCss,
@@ -6707,12 +4560,7 @@
     pickTrack: pickTrack,
     TRANSLATION_DISPLAY_MAX_WIDTH: TRANSLATION_DISPLAY_MAX_WIDTH,
     PREFETCH_AHEAD: PREFETCH_AHEAD,
-    planSemanticInterval: planSemanticInterval,
-    SEMANTIC_INTERVAL_MS: SEMANTIC_INTERVAL_MS,
-    SEMANTIC_FIRST_INTERVAL_MS: SEMANTIC_FIRST_INTERVAL_MS,
     prioritizePrefetch: prioritizePrefetch,
-    planCoverageBatches: planCoverageBatches,
-    makeSemaphore: makeSemaphore,
     makeAdaptiveGate: makeAdaptiveGate,
     errorKind: errorKind,
     DEFAULT_CONFIG: DEFAULT_CONFIG,
@@ -6720,29 +4568,19 @@
     DEFAULT_RESTORATION_PROMPT: DEFAULT_RESTORATION_PROMPT,
     DEFAULT_DISPLAY_PROMPT: DEFAULT_DISPLAY_PROMPT,
     semanticDisplayWidth: semanticDisplayWidth,
-    semanticTokenBudgets: semanticTokenBudgets,
     buildSystemPrompt: buildSystemPrompt,
     sanitizeSubtitleLine: sanitizeSubtitleLine,
     // 中文显示契约的收口点（屏尾去标点 + 句号不显示）。与 sanitizeSubtitleLine 同级：
     // 都是对外可见的产品契约，不是内部辅助，因此可直接断言。
-    stripTrailingBreakPunct: stripTrailingBreakPunct,
     // 中文分屏契约的唯一实现者。Jay 逐条确认过 11 组「输入 → 期望分屏」样例，那些
     // 样例就是本函数的产品规格，必须能直接断言 —— 经公开入口测会被时间层与屏数
     // 上限干扰，测不到排版本身。同 stripTrailingBreakPunct：契约点，不是内部辅助。
-    splitTargetDisplayLine: splitTargetDisplayLine,
     validateChineseDisplayUnit: validateChineseDisplayUnit,
-    buildClipUnits: buildClipUnits,
     preferManualTrack: preferManualTrack,
-    translationCoverageUnitsFromCues: translationCoverageUnitsFromCues,
-    parseTranslationCoverageResponse: parseTranslationCoverageResponse,
-    remapAliasCoverage: remapAliasCoverage,
     looksChineseSubtitleText: looksChineseSubtitleText,
     looksChineseCueList: looksChineseCueList,
     extractJsonObject: extractJsonObject,
     DEFAULT_BLOCK_TRANSLATION_PROMPT: DEFAULT_BLOCK_TRANSLATION_PROMPT,
-    blockSourceCues: blockSourceCues,
-    parseBlockTranslationResponse: parseBlockTranslationResponse,
-    materializeBlockTranslation: materializeBlockTranslation,
     materializeSemanticTranslation: materializeSemanticTranslation,
     materializeReadableSemanticUnits: materializeReadableSemanticUnits,
     // semantic segment 的完整性戳与其底层 hash 一并导出：缓存读回时
@@ -6756,8 +4594,6 @@
     translateSentenceScreens: translateSentenceScreens,
     parseScreenCoverageResponse: parseScreenCoverageResponse,
     SCREEN_PROTOCOL_PROMPT: SCREEN_PROTOCOL_PROMPT,
-    translateClipLines: translateClipLines,
-    translateClipWithBoundaryRepair: translateClipWithBoundaryRepair,
     parseBoundaryPlanResponse: parseBoundaryPlanResponse,
     parseDisplayCutsResponse: parseDisplayCutsResponse,
     suggestDisplayTokenBoundaries: suggestDisplayTokenBoundaries,
@@ -6765,15 +4601,12 @@
     restoreAndPackTokens: restoreAndPackTokens,
     chatCompletion: chatCompletion,
     chatCompletionsUrl: chatCompletionsUrl,
-    sliceClips: sliceClips,
     sliceClipsByCue: sliceClipsByCue,
     makeCacheKey: makeCacheKey,
-    makeSemanticCacheKey: makeSemanticCacheKey,
     validateTrackManifest: validateTrackManifest,
     SITE_ADAPTERS: SITE_ADAPTERS,
     siteAdapterFor: siteAdapterFor,
     pageVideoId: pageVideoId,
-    pruneCache: pruneCache,
     makeBackoff: makeBackoff,
     joinUrl: joinUrl,
     findCueIndexAt: findCueIndexAt,

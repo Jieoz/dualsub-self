@@ -48,7 +48,7 @@ function audit(units) {
         findings.unreadable.push({ i: i + 1, span: span, need: Math.round(need), text: trans });
       }
       const w = Core.semanticDisplayWidth(trans);
-      if (w > 48 + Core.DISPLAY_SOFT_OVERFLOW) {
+      if (w > 48 + 2 /* 显示软溢出容差 */) {
         findings.tooWide.push({ i: i + 1, width: w, text: trans });
       }
     }

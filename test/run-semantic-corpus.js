@@ -3,6 +3,15 @@ const assert = require("assert");
 const fs = require("fs");
 const path = require("path");
 const Core = require("../core.js");
+// 语料标注 → 每词边界标记："." 句界（词尾 .!?）、"|" 显示切、"" 无切。
+function corpusMarks(marked) {
+  const marks = [];
+  marked.split(/\s+/).filter(Boolean).forEach((part) => {
+    if (part === "|") { if (marks.length && !marks[marks.length - 1]) marks[marks.length - 1] = "|"; return; }
+    marks.push(/[.!?]\|?$/.test(part) ? "." : (/\|$/.test(part) ? "|" : ""));
+  });
+  return marks;
+}
 const cases = JSON.parse(fs.readFileSync(path.join(__dirname, "semantic-adversarial-corpus.json"), "utf8"));
 function plain(marked) { return marked.replace(/\s*\|\s*/g, " ").replace(/\s+/g, " ").trim(); }
 function tokensOf(text) { return text.split(/\s+/).map((word, i) => ({ text: word, start: i * 180, end: (i + 1) * 180, nativeTiming: true })); }
@@ -12,7 +21,7 @@ function tokensOf(text) { return text.split(/\s+/).map((word, i) => ({ text: wor
     const source = plain(item.marked);
     const tokens = tokensOf(source);
     let calls = 0;
-    const sourceMarks = Core.restoredBoundaryMarks(tokens.map(t => t.text), item.marked.trim().replace(/\.?$/, "."));
+    const sourceMarks = corpusMarks(item.marked.trim().replace(/\.?$/, "."));
     assert.ok(sourceMarks, `${item.name}: invalid corpus marks`);
     const globalSemanticCuts = new Set(sourceMarks.map((mark, index) => mark === "." ? `t${index}` : null).filter(Boolean));
     const invoke = () => Core.restoreAndPackTokens({

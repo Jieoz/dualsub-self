@@ -17,13 +17,10 @@ function tokensOf(text) { return text.split(/\s+/).map((word, i) => ({ text: wor
       const cues = await Core.restoreAndPackTokens({ tokens, apiBaseUrl: base, apiKey: key, apiModel: model, reasoningEffort: "low", preferredMaxWords: 10, maxWords: 12, attempts: 2, timeoutMs: 60000 });
       if (cues.some(c => c.content.split(/\s+/).length > 12)) throw new Error("oversized cue escaped");
       if (cues.map(c => c.content).join(" ") !== source) throw new Error("source word stream changed");
-      const translated = await Core.translateClipWithBoundaryRepair({ cues, apiBaseUrl: base, apiKey: key, apiModel: model, reasoningEffort: "low", targetLang: "简体中文", segmentationMode: "semantic", timeoutMs: 60000 });
-      if (translated.cues.length !== translated.lines.length) throw new Error("bilingual alignment mismatch");
-      translated.lines.forEach((line, i) => { const v = Core.validateChineseDisplayUnit(line); if (!v.ok) throw new Error(`invalid Chinese ${i + 1}: ${v.reason}`); if (line.includes("。")) throw new Error(`Chinese full stop escaped in line ${i + 1}`); });
-      if (translated.cues.some(c => c.content.split(/\s+/).length > 12)) throw new Error("translation repair recreated oversized cue");
-      const actualSegments = translated.cues.map(c => c.content);
-      if (item.exactSegments) assert.deepStrictEqual(actualSegments, markedSegments(item.marked), `${item.name}: semantic boundary drift`);
-      results.push({ name: item.name, outcome: "translated", cues: translated.cues.map((c, i) => ({ start: c.start, end: c.end, english: c.content, chinese: translated.lines[i] })) });
+      if (item.exactSegments) assert.deepStrictEqual(cues.map(c => c.content), markedSegments(item.marked), `${item.name}: semantic boundary drift`);
+      const screens = await Core.translateSentenceScreens({ pieces: cues, apiBaseUrl: base, apiKey: key, apiModel: model, reasoningEffort: "low", targetLang: "简体中文", timeoutMs: 60000 });
+      screens.forEach((s, i) => { if (!s.text) throw new Error(`empty Chinese screen ${i + 1}`); if (s.text.includes("。")) throw new Error(`Chinese full stop escaped in screen ${i + 1}`); });
+      results.push({ name: item.name, outcome: "translated", screens: screens.map((s) => ({ start: cues[s.from].start, end: cues[s.to].end, english: cues.slice(s.from, s.to + 1).map(c => c.content).join(" "), chinese: s.text })) });
     } catch (e) {
       results.push({ name: item.name, outcome: "fallback", reason: String(e && e.message || e).replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]") });
     }
