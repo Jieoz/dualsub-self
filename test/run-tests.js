@@ -1861,6 +1861,42 @@ test("读不完的屏必须合并相邻屏借时间，且不碰 startMs / 不越
   assert.strictEqual(fine.length, 2, "时间足够时必须原样保留模型断点");
 });
 
+test("整句协议：超宽屏/文字远多于语音的屏首轮带原因重试，末轮照收不整 clip 回退", async () => {
+  const pieces = [
+    { content: "I mean, if it takes more than triple the energy", start: 0, end: 3000, tokenStart: 0, tokenEnd: 10, semanticGroupId: "sg0" },
+    { content: "output", start: 3000, end: 3300, tokenStart: 10, tokenEnd: 11, semanticGroupId: "sg0" },
+    { content: "of a 1500 W electric kettle just to match its boiling time.", start: 3300, end: 7400, tokenStart: 11, tokenEnd: 22, semanticGroupId: "sg0" },
+  ];
+  const bad = { screens: [
+    { from: "u0", to: "u0", text: "我的意思是，所需能量超过" },
+    { from: "u1", to: "u1", text: "一台1500瓦电水壶输出的三倍" },
+    { from: "u2", to: "u2", text: "才能达到相同的烧水时间" } ] };
+  const good = { screens: [
+    { from: "u0", to: "u1", text: "如果所需能量超过一台1500瓦" },
+    { from: "u2", to: "u2", text: "电水壶的三倍才能烧得一样快" } ] };
+  const wide = { screens: [
+    { from: "u0", to: "u1", text: "如果所需能量超过一台1500瓦电水壶输出功率的整整三倍还多才行" },
+    { from: "u2", to: "u2", text: "才能达到相同的烧水时间" } ] };
+  const run = async (replies) => {
+    const sys = [];
+    const out = await Core.translateSentenceScreens({ pieces, apiBaseUrl: "http://mock/v1", apiKey: "k", apiModel: "m", maxVisualWidth: 32,
+      fetchImpl: async (_u, req) => { sys.push(JSON.parse(req.body)); const c = JSON.stringify(replies[sys.length - 1]);
+        return { ok: true, json: async () => ({ choices: [{ message: { content: c } }] }) }; } });
+    return { out, sys };
+  };
+  let r = await run([bad, good]);
+  assert.strictEqual(r.sys.length, 2, "挤屏必须触发一次重试");
+  assert.match(JSON.stringify(r.sys[1]), /文字远多于它覆盖的原文/);
+  assert.strictEqual(r.out.length, 2);
+  r = await run([wide, good]);
+  assert.strictEqual(r.sys.length, 2, "超宽必须触发一次重试");
+  assert.match(JSON.stringify(r.sys[1]), /超过 16 字/);
+  r = await run([bad, bad]);
+  assert.strictEqual(r.out.length, 3, "重试仍违规时照收，不让整 clip 回退英文");
+  r = await run([good]);
+  assert.strictEqual(r.sys.length, 1, "合格输出不得多发请求");
+});
+
 test("合并屏左侧以百分号收尾时也补逗号（全片真轨「长约16%为什么？」）", () => {
   assert.strictEqual(Core.joinDisplayScreens("实测时间仍比这长约16%", "为什么？"), "实测时间仍比这长约16%，为什么？");
   assert.strictEqual(Core.joinDisplayScreens("功率是1500", "瓦"), "功率是1500瓦", "数字+单位不得被逗号拆开");
@@ -2008,7 +2044,7 @@ test("parseScreenCoverageResponse 结构违规 fail-closed，单 piece 屏可省
 });
 
 test("提示词改变显示形态必须伴随缓存契约升版", () => {
-  assert.strictEqual(Core.BLOCK_CONTRACT_VERSION, "block-v19");
+  assert.strictEqual(Core.BLOCK_CONTRACT_VERSION, "block-v20");
   assert.ok(!/每屏译文以句号/.test(Core.DEFAULT_SYSTEM_PROMPT), "提示词不得同时要求写句号又禁止句号");
   // 2026-10-01 真轨：示例里把 "I could get my hands on" 写成「烧水的速度还比炉灶快得多」，
   // 等于教模型臆造；ds-40-r1001 出现「也就是在北美这边」「至于测试结果，稍后再看」。

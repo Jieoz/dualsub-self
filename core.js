@@ -2882,7 +2882,8 @@
       if (piece.endsSentence == null) piece.endsSentence = SENTENCE_FINAL_RE.test(String(piece.sourceText || ""));
     });
     var cursor = 0;
-    var out = payload.screens.map(function (item) {
+    var out = [];
+    payload.screens.forEach(function (item) {
       if (!item || typeof item !== "object") throw new Error("screen coverage entry invalid");
       var from = indexById[String(item.from)];
       // 弱模型单 piece 屏常省略 to：按 from 处理。
@@ -2911,8 +2912,25 @@
         if (!opts.lenient) throw new Error("screen coverage invalid Chinese unit: " + verdict.reason);
         text = "";
       }
+      // 软约束：首轮违规就带原因重试一次，末轮照收（整 clip 回退英文远比一屏偏宽/偏挤严重）。
+      //  - 超宽：模型没守 maxChars，后续合并/渲染都兜不住（全片真轨「你能找到的硬接线电磁炉，
+      //    无论是独立式还是与烤箱相连的」26 字）。
+      //  - 文字远多于覆盖的语音：语序调整把整句挂到一个极短 piece 上（全片真轨 "output" 0.3s
+      //    挂「一台1500瓦电水壶输出的三倍」），借静音和合并都救不回来。
+      if (opts.strictSoft && text) {
+        var maxWidth = Math.max(8, Math.floor(Number(opts.maxVisualWidth) || TRANSLATION_DISPLAY_MAX_WIDTH));
+        if (semanticDisplayWidth(text) > maxWidth) {
+          throw new Error("screen coverage soft: 第 " + (out.length + 1) + " 屏「" + text + "」超过 " + Math.floor(maxWidth / 2) + " 字，请在同一句内多切一屏");
+        }
+        var haveMs = Number(pieces[to].endMs) - Number(pieces[from].startMs);
+        var needMs = Math.ceil(semanticDisplayWidth(text) / 2) * READING_MS_PER_CHAR;
+        if (haveMs > 0 && needMs > haveMs * 2.5 && needMs > haveMs + 800) {
+          throw new Error("screen coverage soft: 第 " + (out.length + 1) + " 屏「" + text + "」文字远多于它覆盖的原文「" +
+            pieces.slice(from, to + 1).map(function (p) { return p.sourceText; }).join(" ") + "」，请把意思放回对应原文所在的屏");
+        }
+      }
       cursor = to + 1;
-      return { from: from, to: to, text: text };
+      out.push({ from: from, to: to, text: text });
     });
     if (cursor !== pieces.length) throw new Error("screen coverage tail missing");
     return out;
@@ -2931,6 +2949,8 @@
         tokenEnd: piece.tokenEnd,
         semanticGroupId: String(piece.semanticGroupId != null ? piece.semanticGroupId : "sg" + index),
         endsSentence: SENTENCE_FINAL_RE.test(collapseWhitespace(piece.content || "")),
+        startMs: Number(piece.start),
+        endMs: Number(piece.end),
       };
     });
     if (!pieces.length) return [];
@@ -2950,7 +2970,7 @@
         apiModel: opts.apiModel,
         temperature: opts.temperature,
         reasoningEffort: opts.reasoningEffort,
-        systemContent: attempt ? baseSys + "\n上一次输出未通过覆盖校验（" + String(lastError && lastError.message) + "）：屏必须按顺序首尾相接、恰好覆盖全部 piece 一次，且原文句末标点之后必须换屏。" : baseSys,
+        systemContent: attempt ? baseSys + "\n上一次输出未通过覆盖校验（" + String(lastError && lastError.message) + "）：屏必须按顺序首尾相接、恰好覆盖全部 piece 一次，原文句末标点之后必须换屏，每屏不超过 maxChars 字，每屏文字对应它覆盖的原文。" : baseSys,
         userContent: userContent,
         timeoutMs: opts.timeoutMs,
         fetchImpl: opts.fetchImpl,
@@ -2958,7 +2978,9 @@
         signal: opts.signal,
       });
       try {
-        return parseScreenCoverageResponse(content, pieces, { lenient: !!opts.lenient });
+        return parseScreenCoverageResponse(content, pieces, {
+          lenient: !!opts.lenient, strictSoft: attempt === 0, maxVisualWidth: opts.maxVisualWidth,
+        });
       } catch (error) {
         // fail-soft-ok: 只吞覆盖校验错误换一次重试，两次都失败时在循环后原样抛出 lastError。
         if (!/screen coverage/.test(String(error && error.message))) throw error;
@@ -3047,7 +3069,7 @@
   // 源词 >14 时程序侧兜底拆屏；prompt 强调 sourceFrom/sourceTo 准确性。
   // v15: 语义主路径（semanticOnly）。
   // v16: 提示词要求每屏中文本地闭合；语义路径接可读性合并，合并处补逗号。
-  var BLOCK_CONTRACT_VERSION = "block-v19";
+  var BLOCK_CONTRACT_VERSION = "block-v20";
 
   var BLOCK_SEGMENT_MAX_GAP_MS = 750;
   var BLOCK_MIN_DISPLAY_MS = 300;
