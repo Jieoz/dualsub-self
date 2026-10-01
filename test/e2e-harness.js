@@ -21,6 +21,7 @@
  *   node test/e2e-harness.js                 # mock，前 limit 条
  *   node test/e2e-harness.js --full          # mock，全量 373 条
  *   node test/e2e-harness.js --limit=80      # mock，前 80 条
+ *   node test/e2e-harness.js --full --clips=6,29  # 只跑指定 clip（0 起），最小样本复验
  *   node test/e2e-harness.js --real --key-file=/tmp/dskey [--limit=40]
  *
  * 输出目录：test/e2e-out/（subtitles.srt, review.html, stats.json）
@@ -54,6 +55,8 @@ function parseArgs(argv) {
     if (arg === "--real") { a.real = true; a.mock = false; }
     else if (arg === "--mock") { a.mock = true; a.real = false; }
     else if (arg === "--full") { a.full = true; }
+    // 只重跑指定 clip（0 起，逗号分隔）：修完某个 clip 的真轨失败后最小样本复验，不整轨重跑
+    else if (arg.startsWith("--clips=")) a.clips = new Set(arg.slice(8).split(",").filter(Boolean).map(Number));
     else if (arg.startsWith("--limit=")) a.limit = parseInt(arg.slice(8), 10) || 50;
     else if (arg.startsWith("--key=")) a.key = arg.slice(6);
     else if (arg.startsWith("--key-file=")) a.keyFile = arg.slice(11);
@@ -186,6 +189,7 @@ async function run() {
   let cacheRoundTrips = 0;
   let ledgerExact = true;
   for (let ci = 0; ci < clips.length; ci++) {
+    if (a.clips && !a.clips.has(ci)) continue;
     const clip = clips[ci], ct0 = Date.now();
     let result;
     try {
@@ -257,7 +261,7 @@ async function run() {
   // 而重译/漏译才是要抓的缺陷，判据是原文词序列本身。
   // coverage ledger 已按生产 clip 粒度逐个验证：token span 连续、完整且展示原文逐词一致。
   const noChineseFullStop=renderUnits.every(u=>!(u.translation||"").includes("。"));
-  const cacheOk=stats.cacheRoundTrips===clips.length;
+  const cacheOk=stats.cacheRoundTrips===(a.clips ? a.clips.size : clips.length);
   console.log("coverage ledger :",ledgerExact?"PASS":"FAIL");
   console.log("时间轴/缓存往返:",timelineOk&&cacheOk?"PASS":"FAIL");
   console.log("中文字幕无句号:",noChineseFullStop?"PASS":"FAIL");

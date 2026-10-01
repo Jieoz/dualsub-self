@@ -2259,7 +2259,9 @@
 
     if (!continues) {
       if (/[，、：；,……]$/.test(s)) return { ok: false, reason: "non-terminal-punctuation" };
-      if (/(?:虽然|尽管|如果|因为|但是|但|可能|以及|而且|所以|就是|从|到|和|与|或|并且)$/.test(s)) {
+      // 单字连接词「到/和/与/从」不进表：它们常是词尾（想到、做到、暖和、参与、服从），
+      // 全片真轨 clip 6「真没想到」被判悬空，整个 clip 回退英文。
+      if (/(?:虽然|尽管|如果|因为|但是|但|可能|以及|而且|所以|就是|或|并且)$/.test(s)) {
         return { ok: false, reason: "dangling-tail" };
       }
     }
@@ -2897,7 +2899,11 @@
       if (tokenCount > SEMANTIC_MAX_TOKENS) throw new Error("screen coverage span exceeds token limit");
       var rawText = item.text != null ? item.text : item.translation;
       var text = sanitizeSubtitleLine(String(rawText == null ? "" : rawText));
-      var continues = to + 1 < pieces.length && pieces[to + 1].semanticGroupId === pieces[to].semanticGroupId;
+      // 「本屏之后句子是否还在继续」与上面的换屏硬约束同口径：只看原文句末标点。
+      // 旧判据按语义分组（分句级）判断，模型在分句交界处收「但」「因为」这种
+      // 承接下一分句的词时被当成悬空尾巴，整个 clip 失败回退英文（v0.11.0 候选
+      // 全片真轨 clip 6 / 29：screen coverage invalid Chinese unit: dangling-tail）。
+      var continues = !pieces[to].endsSentence;
       var verdict = text.trim()
         ? validateChineseDisplayUnit(text, { sourceText: pieces[to].sourceText, continues: continues, maxVisualWidth: Number.MAX_SAFE_INTEGER })
         : { ok: false, reason: "empty" };
@@ -3198,43 +3204,58 @@
     function shortfall(unit) {
       return readMsNeeded(unit.translation) - (unit.endMs - unit.startMs);
     }
+    // 每字可用毫秒：合并的判据。合并把两屏的字数和时间都相加，缺口绝对值完全可能
+    // 变大（字加得比时间快），但人均阅读时间被摊平 —— 那才是合并的目的（skill §3：
+    // 91→156 ms/字）。旧判据比总缺口，2026-08-24 真轨实测把 7 屏可救的正确合并拒掉。
+    function msPerReadChar(unit) {
+      return (unit.endMs - unit.startMs) / Math.max(1, readMsNeeded(unit.translation) / msPerChar);
+    }
+    // 两屏能否合成一屏：同一停顿组、原文前屏不是句末、译文前屏不是完整句、合并后不超宽。
+    // 原文句末判据与整句协议的硬约束同口径（SENTENCE_FINAL_RE），不把两句焊进一屏。
+    function mergePair(a, b) {
+      if ((b.pauseGroupId || 0) !== (a.pauseGroupId || 0)) return null; // 不跨长停顿（真实静音边界）
+      if (endsWithSentenceFinal(a.translation)) return null;
+      // 原文前屏已是句末时，只允许并入同样完整的下一句（「I don't know. | Doesn't matter.」
+      // → 「我不知道，无所谓」），不许把上一句的尾巴和下一句的半句拼进一屏（ds-40-v18 第 18 屏）。
+      if (SENTENCE_FINAL_RE.test(collapseWhitespace(a.originalText || "")) &&
+        !SENTENCE_FINAL_RE.test(collapseWhitespace(b.originalText || ""))) return null;
+      var mergedText = joinDisplayScreens(a.translation, b.translation);
+      if (semanticDisplayWidth(mergedText) > maxWidth) return null;
+      return {
+        blockSegmentId: a.blockSegmentId,
+        pauseGroupId: a.pauseGroupId || 0,
+        srcStart: a.srcStart,
+        srcEnd: b.srcEnd,
+        // token span 取并集：coverage ledger 靠它验证「每个源词恰好覆盖一次」。
+        tokenStart: a.tokenStart,
+        tokenEnd: b.tokenEnd,
+        originalText: joinDisplayScreens(a.originalText, b.originalText),
+        translation: mergedText,
+        startMs: a.startMs,   // 红线：出现时刻取前屏，绝不前推
+        endMs: b.endMs,       // 红线：结束取后屏，绝不越过它
+      };
+    }
     var out = [];
     for (var i = 0; i < units.length; i++) {
       var cur = units[i];
-      // 反复尝试把后继屏并进来，直到读得完或撞上任一硬约束。
+      // 先向后并：反复把后继屏并进来，直到读得完或撞上任一硬约束。
       while (shortfall(cur) > 0 && i + 1 < units.length) {
-        var next = units[i + 1];
-        // 不跨长停顿：判据是 pauseGroupId（真实静音边界），不是 segmentId（缓存序号）。
-        if ((next.pauseGroupId || 0) !== (cur.pauseGroupId || 0)) break;
-        if (endsWithSentenceFinal(cur.translation)) break;     // 不并两个完整句
-        var mergedText = joinDisplayScreens(cur.translation, next.translation);
-        if (semanticDisplayWidth(mergedText) > maxWidth) break; // 不制造超宽屏
-        var mergedUnit = {
-          blockSegmentId: cur.blockSegmentId,
-          pauseGroupId: cur.pauseGroupId || 0,
-          srcStart: cur.srcStart,
-          srcEnd: next.srcEnd,
-          // token span 取并集：coverage ledger 靠它验证「每个源词恰好覆盖一次」。
-          // 漏传会让合并屏的 span 断裂，把合法合并误判成丢词 —— 2026-08-24 真轨实测
-          // 三个 clip 全部 span 断裂，而词流断言全过，证明词没丢、只是字段没带下去。
-          tokenStart: cur.tokenStart,
-          tokenEnd: next.tokenEnd,
-          originalText: joinDisplayScreens(cur.originalText, next.originalText),
-          translation: mergedText,
-          startMs: cur.startMs,   // 红线：出现时刻取前屏，绝不前推
-          endMs: next.endMs,      // 红线：结束取后屏，绝不越过它
-        };
-        // 只在确实改善时接受。判据是**每字可用毫秒**上升，不是缺口绝对值下降：
-        // 合并把两屏的字数和时间都相加，缺口绝对值完全可能变大（字加得比时间快），
-        // 但人均阅读时间被摊平 —— 那才是合并的目的（skill §3：91→156 ms/字）。
-        // 旧判据 `after < before` 用总缺口比较，把这类正确合并全部拒掉：
-        // 2026-08-24 真轨实测 7 屏可救未救（如 1.1s「你也许会把这归到烹饪一类」
-        // 132ms 缺口，并后 244ms/屏摊到 740ms 但每字 149ms > 原 109ms —— 明明更可读）。
-        var before = (cur.endMs - cur.startMs) / Math.max(1, readMsNeeded(cur.translation) / msPerChar);
-        var after = (mergedUnit.endMs - mergedUnit.startMs) / Math.max(1, readMsNeeded(mergedUnit.translation) / msPerChar);
-        if (!(after > before)) break;
-        cur = mergedUnit;
+        var forward = mergePair(cur, units[i + 1]);
+        if (!forward || !(msPerReadChar(forward) > msPerReadChar(cur))) break;
+        cur = forward;
         i++;
+      }
+      // 向后并不了（下一屏是新句子、或并了更挤）时再向前并进上一屏。
+      // ds-40-v19：「看这里」0.4s | 「这个理由被引用了三次」0.8s——后屏读不完，
+      // 而它的下一屏是新句子，只能并回前屏。只在两屏里更挤的那一屏变宽松时才接受，
+      // 不把一个够读的前屏拖成读不完。
+      if (shortfall(cur) > 0 && out.length) {
+        var prev = out[out.length - 1];
+        var backward = mergePair(prev, cur);
+        if (backward && msPerReadChar(backward) > Math.min(msPerReadChar(prev), msPerReadChar(cur))) {
+          out[out.length - 1] = backward;
+          continue;
+        }
       }
       out.push(cur);
     }

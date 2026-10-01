@@ -1861,6 +1861,48 @@ test("读不完的屏必须合并相邻屏借时间，且不碰 startMs / 不越
   assert.strictEqual(fine.length, 2, "时间足够时必须原样保留模型断点");
 });
 
+test("以「到/和/与/从」收尾的完整词不算悬空（全片真轨 clip 6「真没想到」）", () => {
+  for (const s of ["真没想到", "我终于做到", "今天挺暖和", "大家都来参与", "只能服从"]) {
+    assert.strictEqual(Core.validateChineseDisplayUnit(s, { continues: false }).ok, true, s);
+  }
+  for (const s of ["我想去但", "因为", "我们可以喝茶或者咖啡并且"]) {
+    assert.strictEqual(Core.validateChineseDisplayUnit(s, { continues: false }).reason, "dangling-tail", s);
+  }
+});
+
+test("屏尾承接词只在原文句末才算悬空（全片真轨 dangling-tail 整 clip 失败）", () => {
+  // u0 与 u1 属于不同语义分组（分句级），但原文同一句没说完：「…, but | the result…」
+  const pieces = [
+    { alias: "u0", sourceText: "It was cited three times, but", tokenStart: 0, tokenEnd: 6, semanticGroupId: "sg0" },
+    { alias: "u1", sourceText: "the result surprised me.", tokenStart: 6, tokenEnd: 10, semanticGroupId: "sg1" },
+  ];
+  const resp = JSON.stringify({ screens: [
+    { from: "u0", to: "u0", text: "它被引用了三次，但" }, { from: "u1", to: "u1", text: "结果让我很意外" },
+  ] });
+  assert.strictEqual(Core.parseScreenCoverageResponse(resp, pieces).length, 2, "原文句子未结束时，屏尾的「但」是正常承接");
+  // 原文已在句末：中文仍以承接词收尾才是真悬空
+  const closed = pieces.map((p, i) => ({ ...p, endsSentence: undefined, sourceText: i === 0 ? "It was cited three times." : p.sourceText }));
+  assert.throws(() => Core.parseScreenCoverageResponse(resp, closed), /dangling-tail|non-terminal/);
+});
+
+test("读不完的屏向后并不了时并回前屏（ds-40-v19「看这里」|「这个理由被引用了三次」）", () => {
+  const mk = (s, e, o, t) => ({ pauseGroupId: 0, srcStart: 1, srcEnd: 1, tokenStart: s, tokenEnd: e, originalText: o, translation: t, startMs: s, endMs: e });
+  const units = [
+    mk(55000, 55400, "Look here", "看这里"),
+    mk(55400, 56200, "it's cited three times.", "这个理由被引用了三次"),
+    mk(56300, 60800, "But by the end of this video, I hope you'll learn,", "但视频结束时，我希望你能明白"),
+  ];
+  const got = Core.mergeUnreadableUnits(units, { maxVisualWidth: 48 });
+  assert.strictEqual(got.length, 2, "读不完的第 2 屏应并回第 1 屏，而不是跨句并进第 3 屏");
+  assert.strictEqual(got[0].translation, "看这里，这个理由被引用了三次");
+  assert.strictEqual(got[0].startMs, 55000, "startMs 取前屏");
+  assert.strictEqual(got[0].endMs, 56200);
+  assert.strictEqual(got[1].translation, "但视频结束时，我希望你能明白", "原文句末之后不并");
+  // 前屏原文已是句末、后屏是新句的半句：不得合并（上一句尾巴 + 下一句开头）
+  const closed = Core.mergeUnreadableUnits([mk(0, 3000, "That is all.", "就这些"), mk(3000, 3300, "Next one", "下一个话题来了")], { maxVisualWidth: 48 });
+  assert.strictEqual(closed.length, 2, "前屏原文以句号收尾、后屏是半句时不得合并");
+});
+
 test("合并相邻屏不得把两句中文粘成一句（ds-40-prog 真轨病例）", () => {
   // 2026-08-25 真轨 luna --limit=40：物化时已去句号，合并直接拼接，屏上出现
   //「其中一个用途就是烧水我们这么做有很多原因」「我也说不好不过这并不重要」。
