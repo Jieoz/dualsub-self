@@ -2258,7 +2258,14 @@
     }
 
     if (!continues) {
-      if (/[，、：；,……]$/.test(s)) return { ok: false, reason: "non-terminal-punctuation" };
+      // 源文本身就以省略号悬着（ASR 轨常见：说话人话说一半收住，「But actually, they’re among the...」），
+      // 忠实译文以「……」收尾不是半句，不能判 non-terminal —— 否则重试永远产出同样被拒的译文，
+      // 整个 clip 死锁回退英文（yttrans 0.4.10 真轨 clip 15280 实测误杀）。逗号族照拒：
+      // 译文自己断在逗号上与源文形态无关；无源文上下文时维持旧行为。
+      var srcTrailsOff = /(?:\.{3}|…)["'”’)\]]*$/.test(src);
+      if (/[，、：；,]$/.test(s) || (!srcTrailsOff && /…$/.test(s))) {
+        return { ok: false, reason: "non-terminal-punctuation" };
+      }
       // 单字连接词「到/和/与/从」不进表：它们常是词尾（想到、做到、暖和、参与、服从），
       // 全片真轨 clip 6「真没想到」被判悬空，整个 clip 回退英文。
       if (/(?:虽然|尽管|如果|因为|但是|但|可能|以及|而且|所以|就是|或|并且)$/.test(s)) {

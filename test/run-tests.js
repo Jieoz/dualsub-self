@@ -1296,6 +1296,28 @@ test("validateChineseDisplayUnit 拒绝逗号半句、悬空词和内部换行",
   assert.strictEqual(Core.validateChineseDisplayUnit("第一行\n第二行").reason, "internal-newline");
 });
 
+test("validateChineseDisplayUnit 源文以省略号悬着时，译文省略号不算半句（yttrans 真轨 clip 15280 死锁复现）", () => {
+  // 真机误杀：ASR cue「But actually, they’re among the...」忠实译文「但实际上，它们属于……」
+  // 被 non-terminal-punctuation 拒收，重试产出同样收尾的译文，整个 clip 回退英文。
+  const src = "But actually, they’re among the...";
+  assert.strictEqual(
+    Core.validateChineseDisplayUnit("但实际上，它们属于……", { sourceText: src, continues: false }).ok,
+    true, "源文省略号收尾 -> 译文省略号合法");
+  assert.strictEqual(
+    Core.validateChineseDisplayUnit("但实际上，它们属于...", { sourceText: src, continues: false }).ok,
+    true, "三个点形式同样合法");
+  // 逗号族照拒：自己断在逗号上与源文形态无关
+  assert.strictEqual(
+    Core.validateChineseDisplayUnit("但实际上，", { sourceText: src, continues: false }).reason,
+    "non-terminal-punctuation", "源文省略号也不救逗号半句");
+  // 源文没有省略号时，译文省略号照旧拒绝
+  assert.strictEqual(
+    Core.validateChineseDisplayUnit("事情还没完……", { sourceText: "But that is not all", continues: false }).reason,
+    "non-terminal-punctuation", "源文非省略号收尾 -> 译文省略号仍是半句");
+  // 无源文上下文（旧调用形态）维持旧行为
+  assert.strictEqual(Core.validateChineseDisplayUnit("事情还没完……").reason, "non-terminal-punctuation");
+});
+
 test("resegment 句末标点处断句", () => {
   // 两个都达 minWords(3) 的完整句应各自成段（句尾标点切句）
   const frags = Core.cleanupCues([

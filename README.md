@@ -22,7 +22,9 @@
 
 ## 安装（加载已解压的扩展程序）
 
-当前版本：**v0.11.1**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.11.1) 下载 Chrome MV3 安装包。
+当前版本：**v0.11.2**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.11.2) 下载 Chrome MV3 安装包。
+
+v0.11.2 修掉一例校验死锁：源文以省略号收尾（说话人话说一半收住）时，忠实译文以「……」收尾被 `non-terminal-punctuation` 误判为半句——重试永远产出同样被拒的译文，整个 clip 死锁回退英文。现在源文省略号收尾时放行译文省略号；逗号族照拒。
 
 v0.11.1 修掉 v0.11.0 整句协议下的四类残留：
 
