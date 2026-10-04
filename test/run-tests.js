@@ -1855,8 +1855,25 @@ test("validateTrackManifest 按站点校验 Netflix CDN 直链", () => {
   }), null, "未知站点必须拒绝");
 });
 
-test("读不完的屏必须合并相邻屏借时间，且不碰 startMs / 不越过后屏 end", () => {
-  // 真实缺陷（E4HGfagANiQ 西语轨）：源 cue「y por moda」只有 820ms，中文「也为了时尚，
+test("屏间短缝必须桥接（语义重组屏界≠源cue界），长停顿不桥", () => {
+  // 2026-10-04 真轨 pid=13190（VztSdwYPFCE）：cue 211.9s/216.8s/218.3s 全部落在语义屏
+  // 之间的空洞里，渲染层 at() 查不到单元 → 一直显示英文。「读得完」和「接得上」是两个
+  // 不变量：合并/借静音保证前者，桥接保证后者。
+  const mkU = (s, e, t) => ({ startMs: s, endMs: e, translation: t, originalText: "src" });
+  // 300ms 缝：桥上。
+  const gapped = Core.bridgeDisplayGaps([mkU(0, 2000, "一"), mkU(2300, 5000, "二")]);
+  assert.strictEqual(gapped[0].endMs, 2300, "≤600ms 的缝由前屏 end 平推补上");
+  // 长停顿（>600ms）：不桥 —— 静音处不显示字幕是既有红线。
+  const paused = Core.bridgeDisplayGaps([mkU(0, 2000, "一"), mkU(3300, 5000, "二")]);
+  assert.strictEqual(paused[0].endMs, 2000, ">600ms 的缝不桥接");
+  // 尾屏只到 blockEndMs 为止，不探进下一个 clip。
+  const tail = Core.bridgeDisplayGaps([mkU(0, 2000, "一"), mkU(2100, 4000, "二")], { blockEndMs: 4200 });
+  assert.strictEqual(tail[1].endMs, 4200, "尾屏 end 平推到块尾");
+  // 不碰 startMs：桥接只延 end。
+  assert.ok(gapped.every((u, i) => u.startMs === [0, 2300][i]));
+});
+
+test("读不完的屏必须合并相邻屏借时间，且不碰 startMs / 不越过后屏 end", () => {  // 真实缺陷（E4HGfagANiQ 西语轨）：源 cue「y por moda」只有 820ms，中文「也为了时尚，
   // 展现个性」9 字按 Netflix 9 字/秒需 1000ms → 91ms/字读不完。红线禁止前推 startMs
   // 或侵入下一屏，唯一合法解是与相邻屏合并，让时间窗与字数一起相加。
   const mk = (id, s, e, t) => ({ blockSegmentId: id, pauseGroupId: Number(String(id).replace(/^\D+/, "")) || 0, srcStart: 1, srcEnd: 2, originalText: "src", translation: t, startMs: s, endMs: e });

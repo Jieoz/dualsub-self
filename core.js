@@ -3275,10 +3275,35 @@
     var units = materializeSemanticTranslation(segments, cues, opts);
     var lastCue = cues[cues.length - 1];
     var pauses = longPauseRanges(cues, Math.max(0, Math.floor(Number(opts.maxInternalGapMs) || BLOCK_SEGMENT_MAX_GAP_MS)));
+    // 收尾顺序固定：合并读不完的屏 → 借静音 → 桥接 ≤600ms 屏间空洞 → 去重叠兜底。
+    // 桥接只处理借完静音后仍剩下的句间短缝（语义重组的屏界 ≠ 源 cue 界）。
     return enforceDisplayMonotonicity(
-      extendIntoSilence(mergeUnreadableUnits(units, { maxVisualWidth: opts.maxVisualWidth }), pauses,
+      bridgeDisplayGaps(
+        extendIntoSilence(mergeUnreadableUnits(units, { maxVisualWidth: opts.maxVisualWidth }), pauses,
+          { blockEndMs: Number(lastCue && lastCue.end) || 0 }),
         { blockEndMs: Number(lastCue && lastCue.end) || 0 }),
       Math.max(1, Math.floor(Number(opts.minDisplayMs) || BLOCK_MIN_DISPLAY_MS)));
+  }
+
+  /**
+   * 语义重组的屏界 ≠ 源 cue 界：相邻两屏之间会留下几百毫秒的显示空洞（2026-10-04 真轨
+   * pid=13190：同一 clip 内 cue 211.9s/216.8s/218.3s 全部落缝显示英文，「段与段之间不能
+   * 无缝衔接」）。读不完合并与借静音只保证「够读」，不保证「接上」—— 这里在收尾把
+   * 每屏的 end 平推到下一屏的 start（≤600ms 的缝），消除屏间闪烁式空洞。只动 end、
+   * 不碰 start、不越过下一屏，长停顿（>600ms）不桥接：那是说话人真实的停顿。
+   */
+  function bridgeDisplayGaps(units, opts) {
+    opts = opts || {};
+    var maxBridgeMs = Math.max(0, Math.floor(Number(opts.maxBridgeMs) || 600));
+    var blockEndMs = Number(opts.blockEndMs) || 0;
+    for (var i = 0; i < units.length; i++) {
+      var ceiling = i + 1 < units.length ? units[i + 1].startMs
+        : (blockEndMs > 0 ? blockEndMs : 0);
+      if (!(ceiling > units[i].endMs)) continue;
+      if (ceiling - units[i].endMs > maxBridgeMs) continue;
+      units[i].endMs = ceiling;
+    }
+    return units;
   }
 
   /**
@@ -4743,6 +4768,7 @@
     DEFAULT_BLOCK_TRANSLATION_PROMPT: DEFAULT_BLOCK_TRANSLATION_PROMPT,
     materializeSemanticTranslation: materializeSemanticTranslation,
     materializeReadableSemanticUnits: materializeReadableSemanticUnits,
+    bridgeDisplayGaps: bridgeDisplayGaps,
     // semantic segment 的完整性戳与其底层 hash 一并导出：缓存读回时
     // materializeSemanticTranslation({requireIntegrity:true}) 会复算它，
     // 任何要产出「与 translateContextBlock 同形」segments 的外部调用方
