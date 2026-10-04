@@ -2893,14 +2893,36 @@
     });
     var cursor = 0;
     var out = [];
-    payload.screens.forEach(function (item) {
+    // 先解析并按 from 排序：真机 v0.4.14（pid=26297）仍有 13 个 clip 死于 gap or overlap，
+    // 模式是「特定 clip 两次尝试同样死法」——模型偶尔把屏幕分组乱序输出（先输出后半再
+    // 输出前半）。排序归位后乱序不再致命；完全重复（span 已被覆盖）的屏丢弃；只有部分
+    // 重叠（跨已处理边界）才是真正的二义，保持 fail-closed。
+    var entries = payload.screens.map(function (item) {
       if (!item || typeof item !== "object") throw new Error("screen coverage entry invalid");
       var from = indexById[String(item.from)];
       // 弱模型单 piece 屏常省略 to：按 from 处理。
       var to = item.to == null ? from : indexById[String(item.to)];
       if (from == null || to == null) throw new Error("screen coverage unknown piece");
       if (to < from) throw new Error("screen coverage gap or overlap");
-      if (from < cursor) throw new Error("screen coverage gap or overlap"); // 回头改写无法归位
+      return { from: from, to: to, item: item };
+    });
+    entries.sort(function (a, b) { return a.from - b.from || b.to - a.to; });
+    // 包含去重：同起点时更宽的屏排前（sort 次键 to 降序），被它完全包含的屏（模型把
+    // 一个 piece 先单发又并进大屏，或同 span 重复输出）丢弃 —— 宽屏已覆盖其全部内容。
+    var kept = [];
+    entries.forEach(function (e) {
+      var last = kept[kept.length - 1];
+      if (last && e.from >= last.from && e.to <= last.to) return;
+      kept.push(e);
+    });
+    kept.forEach(function (entry) {
+      var item = entry.item;
+      var from = entry.from;
+      var to = entry.to;
+      if (from < cursor) {
+        if (to < cursor) return; // 完全重复的屏：丢弃，不二义
+        throw new Error("screen coverage gap or overlap"); // 部分重叠：无法归位
+      }
       // 跳段（from 越过 cursor）：缺口补空屏回退英文，保住模型已翻好的部分。
       if (from > cursor) out.push({ from: cursor, to: from - 1, text: "", recovered: true });
       // 原文句末标点之后必须换屏：跨句合并会把上一句的尾巴和下一句的开头拼进同一屏

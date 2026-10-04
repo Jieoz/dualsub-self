@@ -2107,14 +2107,26 @@ test("parseScreenCoverageResponse 结构缺口降级补空屏，不再连坐整�
     { from: "u0", to: "u1", text: "一二" }, { from: "u2", text: "三" }] }), pieces);
   assert.deepStrictEqual(tail.map((s) => [s.from, s.to, s.text]), [[0, 1, "一二"], [2, 2, "三"], [3, 3, ""]]);
   assert.strictEqual(tail[2].recovered, true);
-  // 回头改写（from < cursor，同 span 翻译两次）无法归位：仍然 fail-closed。
-  assert.throws(() => Core.parseScreenCoverageResponse(JSON.stringify({ screens: [
-    { from: "u0", to: "u1", text: "一二" }, { from: "u0", text: "重" }] }), pieces), /gap or overlap/);
-  // 完全覆盖旧输出不变：无 recovered 屏、无多余空屏。
+  // v0.4.14 真机（pid=26297）仍有 13 clip 死于 gap or overlap：模型乱序输出分组。
+  // 乱序 → 排序归位；同 span 重复 / 被宽屏包含 → 丢弃；部分重叠 → 仍 fail-closed。
+  const reordered = Core.parseScreenCoverageResponse(JSON.stringify({ screens: [
+    { from: "u2", to: "u3", text: "三四" }, { from: "u0", to: "u1", text: "一二" }] }), pieces);
+  assert.deepStrictEqual(reordered.map((s) => [s.from, s.to]), [[0, 1], [2, 3]], "乱序输出排序归位");
+  const contained = Core.parseScreenCoverageResponse(JSON.stringify({ screens: [
+    { from: "u0", to: "u1", text: "一二" }, { from: "u1", text: "二" }, { from: "u2", to: "u3", text: "三四" }] }), pieces);
+  assert.deepStrictEqual(contained.map((s) => [s.from, s.to]), [[0, 1], [2, 3]], "被包含的屏丢弃，宽屏保留");
   const clean = Core.parseScreenCoverageResponse(JSON.stringify({ screens: [
     { from: "u0", to: "u1", text: "一二" }, { from: "u2", to: "u3", text: "三四" }] }), pieces);
   assert.deepStrictEqual(clean.map((s) => [s.from, s.to]), [[0, 1], [2, 3]]);
   assert.ok(clean.every((s) => !s.recovered));
+  // 部分重叠（共享边界 piece，如 [u0-u1]+[u1-u2]，切口二义）：仍然 fail-closed。
+  assert.throws(() => Core.parseScreenCoverageResponse(JSON.stringify({ screens: [
+    { from: "u0", to: "u1", text: "一二" }, { from: "u1", to: "u2", text: "二三" }] }), pieces), /gap or overlap/);
+  // 完全被宽屏包含的部分重叠（[u1-u2] ⊂ [u0-u2]）：包含去重安全挽回；尾部 piece 3
+  // 未被覆盖，由漏尾降级自动补空屏。
+  const nested = Core.parseScreenCoverageResponse(JSON.stringify({ screens: [
+    { from: "u0", to: "u2", text: "一二三" }, { from: "u1", to: "u2", text: "二三" }] }), pieces);
+  assert.deepStrictEqual(nested.map((s) => [s.from, s.to]), [[0, 2], [3, 3]]);
 });
 
 test("提示词改变显示形态必须伴随缓存契约升版", () => {
