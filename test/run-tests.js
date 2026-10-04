@@ -1873,6 +1873,26 @@ test("屏间短缝必须桥接（语义重组屏界≠源cue界），长停顿�
   assert.ok(gapped.every((u, i) => u.startMs === [0, 2300][i]));
 });
 
+test("finalizeSentenceScreens：直翻屏也必须过合并/借静音/桥接收尾", () => {
+  // 2026-10-04 集成缺口：runtime 直翻路径此前绕过 materialize 收尾管线，
+  // 桥接/借静音对新鲜翻译不生效。本测试锁住「所有上屏路径同一收尾」。
+  const mkP = (s, e, t) => ({ content: t, start: s, end: e });
+  const pieces = [mkP(0, 2000, "one"), mkP(2100, 4000, "two"), mkP(4100, 6000, "three")];
+  const screens = [
+    { from: 0, to: 0, text: "第一屏" },
+    { from: 1, to: 1, text: "第二" },
+    { from: 2, to: 2, text: "第三" },
+  ];
+  const out = Core.finalizeSentenceScreens(screens, pieces);
+  assert.ok(out.length >= 3, "三屏都在");
+  // 100ms 屏间缝必须被桥上：前屏 end 平推到后屏 start
+  assert.strictEqual(out[0].endMs, out[1].startMs, "缝 0-1 已桥");
+  assert.strictEqual(out[1].endMs, out[2].startMs, "缝 1-2 已桥");
+  // 空文本屏被过滤；from/to 越界的屏整条丢弃（错标时间的中文比缺中文更糟，fail-soft）
+  const sparse = Core.finalizeSentenceScreens([{ from: 0, to: 0, text: "" }, { from: 2, to: 9, text: "越界" }], pieces);
+  assert.strictEqual(sparse.length, 0, "空屏过滤+越界屏丢弃");
+});
+
 test("读不完的屏必须合并相邻屏借时间，且不碰 startMs / 不越过后屏 end", () => {  // 真实缺陷（E4HGfagANiQ 西语轨）：源 cue「y por moda」只有 820ms，中文「也为了时尚，
   // 展现个性」9 字按 Netflix 9 字/秒需 1000ms → 91ms/字读不完。红线禁止前推 startMs
   // 或侵入下一屏，唯一合法解是与相邻屏合并，让时间窗与字数一起相加。

@@ -3503,6 +3503,38 @@
     });
   }
 
+  /**
+   * 句子屏直翻路径的显示收尾（与 materializeReadableSemanticUnits 的收尾同管线）：
+   * screens {from,to,text} → 时间单元 → 合并读不完的屏 → 借静音 → 桥接 ≤600ms 屏间
+   * 空洞 → 去重叠兜底。2026-10-04 发现模块 runtime 直翻路径此前绕过了整套收尾，
+   * 桥接修复对新鲜翻译不生效（只有缓存命中路径走了 materialize）。内核提供本函数后，
+   * LSP runtime 与浏览器扩展的直翻路径都调它，保证「读得完、接得上」两个不变量
+   * 在所有上屏路径一致。
+   */
+  function finalizeSentenceScreens(screens, pieces, opts) {
+    opts = opts || {};
+    var units = (screens || []).filter(function (s) { return String(s.text || "").trim(); }).map(function (s) {
+      var from = pieces[s.from], to = pieces[s.to];
+      if (!from || !to) return null;
+      return {
+        startMs: Number(from.start),
+        endMs: Math.max(Number(to.end), Number(from.start)),
+        translation: String(s.text),
+        originalText: String(from.content || ""),
+      };
+    }).filter(Boolean);
+    if (!units.length) return [];
+    units.sort(function (a, b) { return a.startMs - b.startMs || a.endMs - b.endMs; });
+    var cues = (pieces || []).map(function (p) { return { start: Number(p.start), end: Number(p.end) }; });
+    var pauses = longPauseRanges(cues, Math.max(0, Math.floor(Number(opts.maxInternalGapMs) || BLOCK_SEGMENT_MAX_GAP_MS)));
+    var blockEndMs = cues.length ? cues[cues.length - 1].end : 0;
+    return enforceDisplayMonotonicity(
+      bridgeDisplayGaps(
+        extendIntoSilence(mergeUnreadableUnits(units, { maxVisualWidth: opts.maxVisualWidth }), pauses, { blockEndMs: blockEndMs }),
+        { blockEndMs: blockEndMs }),
+      Math.max(1, Math.floor(Number(opts.minDisplayMs) || BLOCK_MIN_DISPLAY_MS)));
+  }
+
   function endsWithSentenceFinal(text) {
     var s = collapseWhitespace(String(text || ""));
     if (!s) return false;
@@ -4832,6 +4864,7 @@
     materializeSemanticTranslation: materializeSemanticTranslation,
     materializeReadableSemanticUnits: materializeReadableSemanticUnits,
     bridgeDisplayGaps: bridgeDisplayGaps,
+    finalizeSentenceScreens: finalizeSentenceScreens,
     // semantic segment 的完整性戳与其底层 hash 一并导出：缓存读回时
     // materializeSemanticTranslation({requireIntegrity:true}) 会复算它，
     // 任何要产出「与 translateContextBlock 同形」segments 的外部调用方
