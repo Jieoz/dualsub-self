@@ -3051,6 +3051,11 @@
     var maxChars = Math.max(4, Math.floor((Number(opts.maxVisualWidth) || TRANSLATION_DISPLAY_MAX_WIDTH) / 2));
     var userContent = JSON.stringify({ maxChars: maxChars, sentences: sentences });
     var baseSys = buildSystemPrompt(opts.targetLang, opts.systemPrompt) + SCREEN_PROTOCOL_PROMPT;
+    // 内核级自愈：lenient 降级（丢弃倒写/重叠屏、置空巨型屏）会在覆盖里留下「无译文
+    // piece」——渲染层回退英文的局部洞（2026-10-04 真机 0.4.17：clip 48-78s 三处落洞）。
+    // 对洞区间再发一次请求只补洞；补不出才回退。retryHoles 默认开，浏览器扩展与
+    // 模块共享同一行为；并发受限环境可传 retryHoles:false 关闭。
+    var retryHoles = opts.retryHoles !== false;
     var lastError = null;
     for (var attempt = 0; attempt < 2; attempt++) {
       var content = await chatCompletion({
@@ -3067,9 +3072,11 @@
         signal: opts.signal,
       });
       try {
-        return parseScreenCoverageResponse(content, pieces, {
+        var screens = parseScreenCoverageResponse(content, pieces, {
           lenient: !!opts.lenient, strictSoft: attempt === 0, maxVisualWidth: opts.maxVisualWidth,
         });
+        if (retryHoles && opts.lenient) screens = await healCoverageHoles(screens, pieces, opts);
+        return screens;
       } catch (error) {
         // fail-soft-ok: 只吞覆盖校验错误换一次重试，两次都失败时在循环后原样抛出 lastError。
         if (!/screen coverage/.test(String(error && error.message))) throw error;
@@ -3077,6 +3084,59 @@
       }
     }
     throw lastError;
+  }
+
+  /**
+   * lenient 覆盖的补洞：找出没有任何译文屏覆盖的 piece 区间，对每段洞发一次独立请求
+   *（piece 子集 + 同配置），把补出的屏以 piece 偏移量拼回。补洞失败静默维持回退，
+   * 不影响主结果；只针对 lenient（strict 路径整体成功，无洞）。
+   */
+  async function healCoverageHoles(screens, pieces, opts) {
+    var covered = new Array(pieces.length);
+    (screens || []).forEach(function (s) {
+      if (String(s.text || "").trim()) {
+        for (var i = s.from; i <= s.to; i++) if (i >= 0 && i < pieces.length) covered[i] = true;
+      }
+    });
+    var holes = [];
+    for (var i = 0; i < pieces.length; i++) {
+      if (covered[i]) continue;
+      var j = i; while (j < pieces.length && !covered[j]) j++;
+      holes.push([i, j - 1]); i = j;
+    }
+    if (!holes.length) return screens;
+    var out = (screens || []).slice();
+    var healed = [];
+    for (var h = 0; h < holes.length; h++) {
+      var a = holes[h][0], b = holes[h][1];
+      try {
+        if (opts.signal && opts.signal.aborted) throw new Error("aborted");
+        var sub = pieces.slice(a, b + 1).map(function (p, k) {
+          var copy = {}; Object.keys(p).forEach(function (key) { copy[key] = p[key]; });
+          copy.semanticGroupId = "h" + k;
+          return copy;
+        });
+        var fix = await translateSentenceScreens(Object.assign({}, opts, { pieces: sub, lenient: true, retryHoles: false }));
+        (fix || []).forEach(function (s) {
+          if (String(s.text || "").trim()) {
+            healed.push([a + s.from, a + s.to]);
+            out.push({ from: a + s.from, to: a + s.to, text: String(s.text) });
+          }
+        });
+      } catch (e) { /* 补洞失败维持英文回退，不连坐主结果 */ }
+    }
+    // 洞补上后撤掉同区间的空白占位屏（lenient 的 gap-fill/置空产物），不留给消费方重复覆盖。
+    if (healed.length) {
+      out = out.filter(function (s) {
+        if (String(s.text || "").trim()) return true;
+        for (var i = 0; i < healed.length; i++) {
+          if (s.from <= healed[i][1] && healed[i][0] <= s.to) return false;
+        }
+        return true;
+      });
+    }
+    out.sort(function (x, y) { return x.from - y.from; });
+    return out;
   }
 
   var DEFAULT_BLOCK_TRANSLATION_PROMPT =

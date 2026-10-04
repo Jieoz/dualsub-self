@@ -1965,8 +1965,50 @@ test("整句协议：超宽屏/文字远多于语音的屏首轮带原因重试�
   assert.strictEqual(r.sys.length, 1, "合格输出不得多发请求");
 });
 
-test("合并屏左侧以百分号收尾时也补逗号（全片真轨「长约16%为什么？」）", () => {
-  assert.strictEqual(Core.joinDisplayScreens("实测时间仍比这长约16%", "为什么？"), "实测时间仍比这长约16%，为什么？");
+test("lenient 降级留下的覆盖洞必须内核自愈补翻（真机 0.4.17 clip 48-78s 三处落洞）", async () => {
+  const pieces = [
+    { content: "They tell us the total number of pixels", start: 0, end: 3000, tokenStart: 0, tokenEnd: 8, semanticGroupId: "c0" },
+    { content: "on the screen", start: 3000, end: 5000, tokenStart: 8, tokenEnd: 11, semanticGroupId: "c1" },
+    { content: "are not resolutions per se", start: 5000, end: 8000, tokenStart: 11, tokenEnd: 16, semanticGroupId: "c2" },
+  ];
+  const reqs = [];
+  const fetchImpl = async (_u, r) => {
+    reqs.push(JSON.parse(r.body));
+    // 主请求：中屏倒写被 lenient 丢弃 → 洞；补洞请求：给合格译文
+    const reply = reqs.length === 1
+      ? { screens: [
+          { from: "u0", to: "u0", text: "它们告诉我们像素总数" },
+          { from: "u1", to: "u2", text: "屏幕上的并不是分辨率本身" } ] } // 覆盖含 u2 但 text 无倒写 → 无洞
+      : { screens: [{ from: "u0", to: "u0", text: "补出来的译文" }] };
+    return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify(reply) } }] }) };
+  };
+  // 命中洞的形状：主回复第二屏 from=u1 被丢弃（from 必须 = 前一屏 to+1 起步的连续覆盖被破坏）
+  const fetchImpl2 = async (_u, r) => {
+    reqs.push(JSON.parse(r.body));
+    const reply = reqs.length === 1
+      ? { screens: [
+          { from: "u0", to: "u0", text: "它们告诉我们像素总数" },
+          { from: "u2", to: "u2", text: "并不是分辨率本身" } ] } // u1 无覆盖 → 洞
+      : { screens: [{ from: "u0", to: "u0", text: "屏幕上补的" }] };
+    return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify(reply) } }] }) };
+  };
+  reqs.length = 0;
+  const out = await Core.translateSentenceScreens({ pieces, apiBaseUrl: "http://mock/v1", apiKey: "k", apiModel: "m", maxVisualWidth: 32,
+    lenient: true, fetchImpl: fetchImpl2 });
+  assert.strictEqual(reqs.length, 2, "检测到覆盖洞必须发起补洞请求");
+  assert.ok(out.some((s) => s.from === 1 && s.to === 1 && /补/.test(s.text)), "洞区间被补上译文");
+  assert.strictEqual(out.filter((s) => !String(s.text || "").trim()).length, 0, "补上后不留空白占位屏");
+  // 合格输出不得多发请求
+  reqs.length = 0;
+  await Core.translateSentenceScreens({ pieces, apiBaseUrl: "http://mock/v1", apiKey: "k", apiModel: "m", maxVisualWidth: 32,
+    lenient: true, fetchImpl: async (_u, r) => { reqs.push(JSON.parse(r.body));
+      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ screens: [
+        { from: "u0", to: "u0", text: "它们告诉我们像素总数" },
+        { from: "u1", to: "u2", text: "屏幕上的并不是分辨率本身" } ] }) } }] }) }; } });
+  assert.strictEqual(reqs.length, 1, "无洞时不得发补洞请求");
+});
+
+test("合并屏左侧以百分号收尾时也补逗号（全片真轨「长约16%为什么？」）", () => {  assert.strictEqual(Core.joinDisplayScreens("实测时间仍比这长约16%", "为什么？"), "实测时间仍比这长约16%，为什么？");
   assert.strictEqual(Core.joinDisplayScreens("功率是1500", "瓦"), "功率是1500瓦", "数字+单位不得被逗号拆开");
 });
 
