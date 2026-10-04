@@ -2876,8 +2876,11 @@
 
   /**
    * 校验 {screens:[{from,to,text}]}：按 piece 顺序首尾相接、恰好覆盖一次。
-   * 结构违规（缺口/重叠/未知 id/超 token 上限）一律 fail-closed；
-   * lenient 时只把内容不合格的屏置空（该屏回退原文），不连坐整个 clip。
+   * 内容违规（中文单位不合格）在 lenient 时只把该屏置空（回退原文），不连坐整个 clip。
+   * 结构违规降级（2026-10-04 真轨 pid=32284：单轨 22/207 clip 因 gap or overlap 整段
+   * 回退英文）：模型输出总体可用但偶尔跳过一两个 piece（from 越位）或漏收尾（tail
+   * missing），这类缺口补空屏（该段回退英文）继续用模型已翻好的部分，只有回头重复
+   * （from < cursor，同一 span 被翻译两次、无法归位）仍 fail-closed。
    */
   function parseScreenCoverageResponse(raw, pieces, opts) {
     opts = opts || {};
@@ -2896,7 +2899,10 @@
       // 弱模型单 piece 屏常省略 to：按 from 处理。
       var to = item.to == null ? from : indexById[String(item.to)];
       if (from == null || to == null) throw new Error("screen coverage unknown piece");
-      if (from !== cursor || to < from) throw new Error("screen coverage gap or overlap");
+      if (to < from) throw new Error("screen coverage gap or overlap");
+      if (from < cursor) throw new Error("screen coverage gap or overlap"); // 回头改写无法归位
+      // 跳段（from 越过 cursor）：缺口补空屏回退英文，保住模型已翻好的部分。
+      if (from > cursor) out.push({ from: cursor, to: from - 1, text: "", recovered: true });
       // 原文句末标点之后必须换屏：跨句合并会把上一句的尾巴和下一句的开头拼进同一屏
       // （ds-40-v18 第 18 屏「它被引用了三次，但到视频结束时」）。只认源文自带的句末标点，
       // 不认语义阶段的分组：分组是分句级的，按它拦会挡掉「electric | kettles」这类必须的合并。
@@ -2952,7 +2958,12 @@
       cursor = to + 1;
       out.push({ from: from, to: to, text: text });
     });
-    if (cursor !== pieces.length) throw new Error("screen coverage tail missing");
+    // 漏收尾（tail missing）：模型翻完了正文却没覆盖到最后一个 piece。尾部补空屏，
+    // 上面已翻好的部分照常上屏 —— 比 8% 的整 clip 回退英文强。
+    if (cursor !== pieces.length) {
+      if (cursor > pieces.length) throw new Error("screen coverage tail missing");
+      out.push({ from: cursor, to: pieces.length - 1, text: "", recovered: true });
+    }
     return out;
   }
 

@@ -2082,8 +2082,8 @@ test("parseScreenCoverageResponse 结构违规 fail-closed，单 piece 屏可省
   const pieces = [0, 1, 2].map((i) => ({ alias: "u" + i, sourceText: i === 0 ? "first sentence." : "w" + i, tokenStart: i, tokenEnd: i + 1, semanticGroupId: "sg" + i }));
   const ok = Core.parseScreenCoverageResponse(JSON.stringify({ screens: [{ from: "u0", text: "一" }, { from: "u1", to: "u2", text: "二三" }] }), pieces);
   assert.deepStrictEqual(ok.map((s) => [s.from, s.to]), [[0, 0], [1, 2]]);
-  assert.throws(() => Core.parseScreenCoverageResponse(JSON.stringify({ screens: [{ from: "u0", to: "u0", text: "一" }, { from: "u2", to: "u2", text: "三" }] }), pieces), /gap or overlap/);
-  assert.throws(() => Core.parseScreenCoverageResponse(JSON.stringify({ screens: [{ from: "u0", to: "u0", text: "一" }] }), pieces), /tail missing/);
+  // 缺口/漏尾自 2026-10-04 起降级补空屏（见下一测试），不再 fail-closed；
+  // 仍 fail-closed 的结构违规：unknown piece、回头改写、跨句合并。
   assert.throws(() => Core.parseScreenCoverageResponse(JSON.stringify({ screens: [{ from: "u0", to: "u9", text: "x" }] }), pieces), /unknown piece/);
   // 跨句合并：u0 以句号收尾，一屏不得越过它（ds-40-v18「它被引用了三次，但到视频结束时」）
   assert.throws(() => Core.parseScreenCoverageResponse(JSON.stringify({ screens: [{ from: "u0", to: "u1", text: "一二" }, { from: "u2", text: "三" }] }), pieces), /crosses sentence/);
@@ -2092,6 +2092,29 @@ test("parseScreenCoverageResponse 结构违规 fail-closed，单 piece 屏可省
     "无句末标点时跨语义分组合并照常允许（electric | kettles）");
   const lenient = Core.parseScreenCoverageResponse(JSON.stringify({ screens: [{ from: "u0", text: "" }, { from: "u1", to: "u2", text: "二三" }] }), pieces, { lenient: true });
   assert.strictEqual(lenient[0].text, "", "lenient 只把坏屏置空");
+});
+
+test("parseScreenCoverageResponse 结构缺口降级补空屏，不再连坐整个 clip", () => {
+  // 2026-10-04 真轨 pid=32284：单轨 22/207 clip 因 gap or overlap 整段回退英文。
+  const pieces = [0, 1, 2, 3].map((i) => ({ alias: "u" + i, sourceText: "w" + i, tokenStart: i, tokenEnd: i + 1, semanticGroupId: "sg" + i }));
+  // 模型跳过 u1（from 越位）：u1 补空屏回退英文，u0/u2/u3 已翻好的部分保住。
+  const skipped = Core.parseScreenCoverageResponse(JSON.stringify({ screens: [
+    { from: "u0", text: "一" }, { from: "u2", to: "u3", text: "三四" }] }), pieces);
+  assert.deepStrictEqual(skipped.map((s) => [s.from, s.to, s.text]), [[0, 0, "一"], [1, 1, ""], [2, 3, "三四"]]);
+  assert.strictEqual(skipped[1].recovered, true, "缺口屏带 recovered 标记");
+  // 漏收尾：最后一段补空屏，正文保住。
+  const tail = Core.parseScreenCoverageResponse(JSON.stringify({ screens: [
+    { from: "u0", to: "u1", text: "一二" }, { from: "u2", text: "三" }] }), pieces);
+  assert.deepStrictEqual(tail.map((s) => [s.from, s.to, s.text]), [[0, 1, "一二"], [2, 2, "三"], [3, 3, ""]]);
+  assert.strictEqual(tail[2].recovered, true);
+  // 回头改写（from < cursor，同 span 翻译两次）无法归位：仍然 fail-closed。
+  assert.throws(() => Core.parseScreenCoverageResponse(JSON.stringify({ screens: [
+    { from: "u0", to: "u1", text: "一二" }, { from: "u0", text: "重" }] }), pieces), /gap or overlap/);
+  // 完全覆盖旧输出不变：无 recovered 屏、无多余空屏。
+  const clean = Core.parseScreenCoverageResponse(JSON.stringify({ screens: [
+    { from: "u0", to: "u1", text: "一二" }, { from: "u2", to: "u3", text: "三四" }] }), pieces);
+  assert.deepStrictEqual(clean.map((s) => [s.from, s.to]), [[0, 1], [2, 3]]);
+  assert.ok(clean.every((s) => !s.recovered));
 });
 
 test("提示词改变显示形态必须伴随缓存契约升版", () => {
