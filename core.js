@@ -2903,9 +2903,15 @@
       // 弱模型单 piece 屏常省略 to：按 from 处理。
       var to = item.to == null ? from : indexById[String(item.to)];
       if (from == null || to == null) throw new Error("screen coverage unknown piece");
-      if (to < from) throw new Error("screen coverage gap or overlap");
+      if (to < from) {
+        // 乱序 span（from>to 的倒写）：v0.4.15 真机 clip 78820 的形态。lenient 下丢弃
+        // 这一条（后续缺口降级会兜住覆盖），strict 下仍 fail-closed。
+        if (!opts.lenient) throw new Error("screen coverage gap or overlap");
+        return null;
+      }
       return { from: from, to: to, item: item };
     });
+    entries = entries.filter(Boolean);
     entries.sort(function (a, b) { return a.from - b.from || b.to - a.to; });
     // 包含去重：同起点时更宽的屏排前（sort 次键 to 降序），被它完全包含的屏（模型把
     // 一个 piece 先单发又并进大屏，或同 span 重复输出）丢弃 —— 宽屏已覆盖其全部内容。
@@ -2921,6 +2927,13 @@
       var to = entry.to;
       if (from < cursor) {
         if (to < cursor) return; // 完全重复的屏：丢弃，不二义
+        // 部分重叠（跨已处理边界）：lenient 下把重叠之外的新增段置空收下（该段回退
+        // 原文），已翻好的部分照常上屏；切口二义比整 clip 丢英文轻得多。strict 仍炸。
+        if (opts.lenient) {
+          out.push({ from: cursor, to: to, text: "", recovered: true });
+          cursor = to + 1;
+          return;
+        }
         throw new Error("screen coverage gap or overlap"); // 部分重叠：无法归位
       }
       // 跳段（from 越过 cursor）：缺口补空屏回退英文，保住模型已翻好的部分。
@@ -2929,10 +2942,23 @@
       // （ds-40-v18 第 18 屏「它被引用了三次，但到视频结束时」）。只认源文自带的句末标点，
       // 不认语义阶段的分组：分组是分句级的，按它拦会挡掉「electric | kettles」这类必须的合并。
       for (var k = from; k < to; k++) {
-        if (pieces[k].endsSentence) throw new Error("screen coverage crosses sentence boundary");
+        if (pieces[k].endsSentence) {
+          // 跨句合并：模型把两句并进一屏。lenient 下接受次优显示（内容没丢，只是断句
+          // 少一次），strict 下 fail-closed（ds-40-v18 的教训只在严格模式有意义）。
+          if (!opts.lenient) throw new Error("screen coverage crosses sentence boundary");
+          break;
+        }
       }
       var tokenCount = pieces[to].tokenEnd - pieces[from].tokenStart;
-      if (tokenCount > SEMANTIC_MAX_TOKENS) throw new Error("screen coverage span exceeds token limit");
+      if (tokenCount > SEMANTIC_MAX_TOKENS) {
+        // 超 token 上限的巨型屏：lenient 下置空回退原文（模型输出太贪，该段不该合并）。
+        if (opts.lenient) {
+          out.push({ from: from, to: to, text: "", recovered: true });
+          cursor = to + 1;
+          return;
+        }
+        throw new Error("screen coverage span exceeds token limit");
+      }
       var rawText = item.text != null ? item.text : item.translation;
       var text = sanitizeSubtitleLine(String(rawText == null ? "" : rawText));
       // 「本屏之后句子是否还在继续」与上面的换屏硬约束同口径：只看原文句末标点。

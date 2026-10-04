@@ -2119,9 +2119,22 @@ test("parseScreenCoverageResponse 结构缺口降级补空屏，不再连坐整�
     { from: "u0", to: "u1", text: "一二" }, { from: "u2", to: "u3", text: "三四" }] }), pieces);
   assert.deepStrictEqual(clean.map((s) => [s.from, s.to]), [[0, 1], [2, 3]]);
   assert.ok(clean.every((s) => !s.recovered));
-  // 部分重叠（共享边界 piece，如 [u0-u1]+[u1-u2]，切口二义）：仍然 fail-closed。
+  // 部分重叠（共享边界 piece，如 [u0-u1]+[u1-u2]）：strict 下 fail-closed…
   assert.throws(() => Core.parseScreenCoverageResponse(JSON.stringify({ screens: [
     { from: "u0", to: "u1", text: "一二" }, { from: "u1", to: "u2", text: "二三" }] }), pieces), /gap or overlap/);
+  // …lenient 下把重叠之外的新增段置空收下（该段回退原文），已翻好的部分保留。
+  const partial = Core.parseScreenCoverageResponse(JSON.stringify({ screens: [
+    { from: "u0", to: "u1", text: "一二" }, { from: "u1", to: "u2", text: "二三" }] }), pieces, { lenient: true });
+  // 重叠条的新增段只有 [2]（cursor 已在 2）：置空收下；[3] 漏尾降级补空屏。
+  assert.deepStrictEqual(partial.map((s) => [s.from, s.to, s.text]), [[0, 1, "一二"], [2, 2, ""], [3, 3, ""]]);
+  // 乱序 span（from>to 倒写，v0.4.15 真机 clip 78820）：strict 炸、lenient 丢弃该条，
+  // 缺口降级兜住覆盖。
+  assert.throws(() => Core.parseScreenCoverageResponse(JSON.stringify({ screens: [
+    { from: "u1", to: "u0", text: "倒" }] }), pieces), /gap or overlap/);
+  const inverted = Core.parseScreenCoverageResponse(JSON.stringify({ screens: [
+    { from: "u0", to: "u1", text: "一二" }, { from: "u2", to: "u1", text: "倒" }] }), pieces, { lenient: true });
+  // 倒写条丢弃后，[2..3] 由尾部缺口降级合并补空屏。
+  assert.deepStrictEqual(inverted.map((s) => [s.from, s.to, s.text]), [[0, 1, "一二"], [2, 3, ""]]);
   // 完全被宽屏包含的部分重叠（[u1-u2] ⊂ [u0-u2]）：包含去重安全挽回；尾部 piece 3
   // 未被覆盖，由漏尾降级自动补空屏。
   const nested = Core.parseScreenCoverageResponse(JSON.stringify({ screens: [
