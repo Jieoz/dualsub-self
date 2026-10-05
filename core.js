@@ -3124,7 +3124,14 @@
             out.push({ from: a + s.from, to: a + s.to, text: String(s.text) });
           }
         });
-      } catch (e) { /* 补洞失败维持英文回退，不连坐主结果 */ }
+      } catch (e) {
+      // 补洞失败维持英文回退，不连坐主结果；但必须留痕，禁止静默空跑。
+      if (opts.onHoleHealFailure) {
+        opts.onHoleHealFailure(e, a, b);
+      } else {
+        console.warn("[dualsub] coverage-hole heal failed [" + a + "-" + b + "]", e && e.message || e);
+      }
+    }
     }
     // 洞补上后撤掉同区间的空白占位屏（lenient 的 gap-fill/置空产物），不留给消费方重复覆盖。
     if (healed.length) {
