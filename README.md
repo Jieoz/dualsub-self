@@ -22,7 +22,7 @@
 
 ## 安装（加载已解压的扩展程序）
 
-当前版本：**v0.11.2**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.11.2) 下载 Chrome MV3 安装包。
+当前版本：**v0.11.3**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.11.3) 下载 Chrome MV3 安装包。
 
 v0.11.3 翻译质量打磨 + 显示管线收尾：
 
