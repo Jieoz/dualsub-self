@@ -22,7 +22,16 @@
 
 ## 安装（加载已解压的扩展程序）
 
-当前版本：**v0.11.5**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.11.5) 下载 Chrome MV3 安装包。
+当前版本：**v0.11.6**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.11.6) 下载 Chrome MV3 安装包。
+
+v0.11.6 修「卡在开头一直翻译中」死锁：
+
+- **根因**：视频开头字幕未到时扩展自动暂停并轮询首块状态；失败/端点异常时 clip 0 长期停留在 `error`/`pending`，旧逻辑把 `"error"` 一律视为「仍在翻译」→ 永久暂停，视频停在 0:00，字幕显示「翻译中…」。API 未配全（base/key/model 缺一项）时更糟：`retryTick` 明确跳过未配 API 的 error clip → 永不重试 → 永久卡死。
+- **修复**：
+  - 首块等待加 30s 硬上限（cap），超时无条件恢复播放、后台重试不受影响，译文迟到照样上屏。正常慢块（实测最慢 23.6s）不触发。
+  - `"error"` 只在仍有重试机会时才算「在干活」：API 未配全或退避预算已耗尽 → 立即放行。
+  - API 未配全改为终态 `failed` + 警告 `[dualsub] clip 0 API 未配全…`，UI 显示「翻译失败」而非永久转圈；配齐配置后 set-config 自动清态重试。
+- **回归门禁**：新增 `wait-deadlock`（失败端点 + 30s cap 解死锁）与 `wait-config-missing`（未配 API ≤5s 放行）两个浏览器回放场景，与 happy/config-race 一起锁住等待逻辑。19/19 浏览器回放、离线 261/261、MOCK e2e 全绿。
 
 v0.11.5 token 用量优化：
 

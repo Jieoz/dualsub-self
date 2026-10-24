@@ -113,6 +113,7 @@
     lastPrefetchMs: -1e9, // 上次 prefetch 的播放位置（节流）
     seeking: false, // 进度条拖动中（防抖期间不渲染/不预取目标外位置）
     waitPausedByUs: false,
+    waitPausedAt: null,
     waitTimer: null,
     firstClipReady: false,
     apiUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0, reasoningTokens: 0, requests: 0 },
@@ -182,6 +183,9 @@
   var TRACK_RETRY_DELAYS_MS = [800, 2000, 5000];
   var SEEK_SETTLE_MS = 350; // seek 停稳多少 ms 后才翻目标 clip
   var RETRY_INTERVAL_MS = 3000; // 失败 clip 后台重试调度节拍（第2层）
+  // 首块等待的硬上限（毫秒）：翻译故障/端点异常时视频不能永远卡在 0:00。
+  // 后台重试不受影响，译文迟到照样上屏；cap 只用于解死锁，正常慢块（实测最慢 23.6s）不触发。
+  var FIRST_WAIT_HARD_CAP_MS = 30000;
 
   /* =====================================================
    * 配置存取
@@ -496,6 +500,7 @@
     }
     state.firstClipReady = false;
     state.waitPausedByUs = false;
+    state.waitPausedAt = null;
     clearWaitTimer();
     clearTrackRetryTimer();
     var requestContext = beginRuntimeRequest();
@@ -822,9 +827,11 @@
 
   function releaseWaitPause() {
     state.waitTimer = null;
+    state.waitPausedAt = null;
     state.firstClipReady = true;
     if (state.waitPausedByUs) {
       state.waitPausedByUs = false;
+    state.waitPausedAt = null;
       var v = videoEl();
       if (v && v.paused) { var p = v.play(); if (p && p.catch) p.catch(function () {}); }
     }
@@ -848,9 +855,20 @@
     state.waitTimer = setTimeout(function () {
       state.waitTimer = null;
       if (state.firstClipReady) return;
+      // 硬上限：翻译故障/端点异常时视频不能永远卡在 0:00。
+      // 后台重试不受影响，译文迟到照样上屏；cap 只用于解死锁，正常慢块（实测最慢 23.6s）不触发。
+      if (state.waitPausedAt && Date.now() - state.waitPausedAt > FIRST_WAIT_HARD_CAP_MS) {
+        releaseWaitPause();
+        return;
+      }
       // 首块仍在正常翻译中（排队/在飞/等重试）→ 继续等，不放行。
       var st = state.clipState[0];
-      var stillWorking = state.clipInflight[0] === true || st === "pending" || st === "error";
+      // 「error」只在真的还有重试机会时才算「在干活」：
+      //  - API 未配全 → retryTick 明确跳过、永不重试 → 立即放行（旧逻辑永久卡死）
+      //  - 退避预算已耗尽（retryTick 马上转 failed）→ 不必等它转终态，直接放行
+      var backoff0 = getBackoff(0);
+      var retryPossible = !!config.apiBaseUrl && !!config.apiModel && !!config.apiKey && !(backoff0 && backoff0.stopped);
+      var stillWorking = state.clipInflight[0] === true || st === "pending" || (st === "error" && retryPossible);
       if (stillWorking) {
         scheduleWaitDeadline();
         return;
@@ -867,6 +885,7 @@
     try {
       v.pause();
       state.waitPausedByUs = true;
+      state.waitPausedAt = Date.now();
       setRendererText((state.renderUnits[0] && state.renderUnits[0].originalText) || "", "", true, false);
       clearWaitTimer();
       scheduleWaitDeadline();
@@ -878,6 +897,7 @@
     clearWaitTimer();
     if (!state.waitPausedByUs) return;
     state.waitPausedByUs = false;
+    state.waitPausedAt = null;
     var v = videoEl();
     if (v && v.paused) { var p = v.play(); if (p && p.catch) p.catch(function () {}); }
   }
@@ -970,6 +990,8 @@
     // 退避 → 更卡」要避免的。所以每块只给一次复活，用 clipRevived 记账。
     if (state.clipState[idx] === "failed") {
       if (priority !== 100) return;
+      // API 未配全时复活无意义，避免无效重试 spam 警告；配齐 config 后 set-config 会清态并自动重试
+      if (!config.apiBaseUrl || !config.apiModel || !config.apiKey) return;
       if (state.clipRevived[idx]) return;
       state.clipRevived[idx] = true;
       getBackoff(idx).reset();
@@ -1002,7 +1024,11 @@
         return;
       }
       if (/configuration missing/i.test(String(e && e.message || ""))) {
-        state.clipState[idx] = "error";
+        console.warn("[dualsub] clip", idx, "API 未配全（base/key/model），跳过翻译；请在弹窗 settings 中补全");
+        state.clipState[idx] = "failed";
+        delete state.clipUnits[idx];
+        rebuildRenderTimeline();
+        requestRender();
         return;
       }
       ensureGate().reportError(Core.errorKind(e));
@@ -1847,6 +1873,7 @@
     clearWaitTimer();
     if (state.waitPausedByUs) {
       state.waitPausedByUs = false;
+    state.waitPausedAt = null;
       var waitingVideo = videoEl();
       if (waitingVideo && waitingVideo.paused) {
         var resumePromise = waitingVideo.play();
