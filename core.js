@@ -409,8 +409,8 @@
     var list = (tokens || []).map(function (token) {
       return {
         text: collapseWhitespace(token && token.text || ""),
-        start: toInt(token && token.start, 0),
-        end: toInt(token && token.end, 0),
+        start: toInt(token && (token.start != null ? token.start : token.startMs), 0),
+        end: toInt(token && (token.end != null ? token.end : token.endMs), 0),
       };
     }).filter(function (token) { return token.text; });
     if (!list.length) return [];
@@ -3597,41 +3597,60 @@
     var cues = opts.cues || [];
     if (!cues.length) return { segments: [], units: [] };
     var timeline = buildCanonicalTokenTimeline(cues);
-    var semantic = await restoreAndPackTokens({
-      tokens: timeline.tokens,
-      apiBaseUrl: opts.apiBaseUrl,
-      apiKey: opts.apiKey,
-      apiModel: opts.apiModel,
-      targetLang: opts.targetLang,
-      systemPrompt: opts.boundarySystemPrompt,
-      preferredMaxWords: opts.preferredMaxWords,
-      maxWords: opts.maxWords,
-      preferredVisualWidth: opts.preferredVisualWidth,
-      maxVisualWidth: opts.maxVisualWidth,
-      semanticOnly: true,
-      onRefineFailure: opts.onRefineFailure,
-      attempts: opts.attempts,
-      timeoutMs: opts.timeoutMs,
-      fetchImpl: opts.fetchImpl,
-      onUsage: opts.onUsage,
-      signal: opts.signal,
-    });
     var semanticCues = [];
     var tokenCursor = 0;
-    (semantic || []).forEach(function (unit, index) {
-      var count = unit.tokens.length;
-      semanticCues.push({
-        start: unit.start,
-        end: unit.end,
-        content: unit.content,
-        tokens: unit.tokens,
-        tokenStart: tokenCursor,
-        tokenEnd: tokenCursor + count,
-        unitId: "u" + index,
-        semanticGroupId: unit.semanticGroupId,
+    if (opts.bypassBoundary === true || opts.semanticMode === "cue") {
+      for (var ci = 0; ci < cues.length; ci++) {
+        var c = cues[ci];
+        var cTokens = buildCanonicalTokenTimeline([c]).tokens;
+        var count = cTokens.length;
+        semanticCues.push({
+          start: toInt(c.start, 0),
+          end: toInt(c.end, 0),
+          content: collapseWhitespace(c.content || ""),
+          tokens: timeline.tokens.slice(tokenCursor, tokenCursor + count),
+          tokenStart: tokenCursor,
+          tokenEnd: tokenCursor + count,
+          unitId: "u" + ci,
+          semanticGroupId: "sg" + ci,
+        });
+        tokenCursor += count;
+      }
+    } else {
+      var semantic = await restoreAndPackTokens({
+        tokens: timeline.tokens,
+        apiBaseUrl: opts.apiBaseUrl,
+        apiKey: opts.apiKey,
+        apiModel: opts.apiModel,
+        targetLang: opts.targetLang,
+        systemPrompt: opts.boundarySystemPrompt,
+        preferredMaxWords: opts.preferredMaxWords,
+        maxWords: opts.maxWords,
+        preferredVisualWidth: opts.preferredVisualWidth,
+        maxVisualWidth: opts.maxVisualWidth,
+        semanticOnly: true,
+        onRefineFailure: opts.onRefineFailure,
+        attempts: opts.attempts,
+        timeoutMs: opts.timeoutMs,
+        fetchImpl: opts.fetchImpl,
+        onUsage: opts.onUsage,
+        signal: opts.signal,
       });
-      tokenCursor += count;
-    });
+      (semantic || []).forEach(function (unit, index) {
+        var count = unit.tokens.length;
+        semanticCues.push({
+          start: unit.start,
+          end: unit.end,
+          content: unit.content,
+          tokens: unit.tokens,
+          tokenStart: tokenCursor,
+          tokenEnd: tokenCursor + count,
+          unitId: "u" + index,
+          semanticGroupId: unit.semanticGroupId,
+        });
+        tokenCursor += count;
+      });
+    }
     if (tokenCursor !== timeline.tokens.length) throw new Error("semantic token packing coverage mismatch");
     var screens = await translateSentenceScreens({
       pieces: semanticCues,

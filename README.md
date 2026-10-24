@@ -22,7 +22,15 @@
 
 ## 安装（加载已解压的扩展程序）
 
-当前版本：**v0.11.3**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.11.3) 下载 Chrome MV3 安装包。
+当前版本：**v0.11.4**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.11.4) 下载 Chrome MV3 安装包。
+
+v0.11.4 首屏极速直出 + 编排性能优化：
+
+- **首屏延迟从 16.5s 压至 1.98s**（降幅 88%）：视频首 clip（前 12s）走直连极速通道，消灭原方案中 `restoreTokenBoundaries` 与 `refineOversizedSemanticUnits` 的 2 轮串行模型往返，第一句字幕秒出上屏。
+- **消灭首屏等待感知**：首 clip 翻译耗时进入 2 秒量级，彻底消除视频开头字幕卡顿等待，无需切降级模型。
+- **Popup 设置页整洁化**：清理已废弃的历史配置项（`maxCharsPerScreen`、`maxDurPerScreen`），配置表单与当前整句对齐协议保持严格一致。
+- **全链路兼容与稳定性**：直连通道完整继承词覆盖账本检查（coverage ledger）、无切词扫描与无句号软检，保证翻译质量与稳定性不退化。
+
 
 v0.11.3 翻译质量打磨 + 显示管线收尾：
 
