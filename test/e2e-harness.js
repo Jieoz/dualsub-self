@@ -194,7 +194,7 @@ async function run() {
     let result;
     try {
       // 与生产一致：不再传 contextBefore/contextAfter（payload 从不读取）。
-      result=await Core.translateContextBlock(Object.assign({cues:clip.cues,maxVisualWidth:48,onRefineFailure:(m)=>stats.refineFailures.push(m)},apiCfg));
+      result=await Core.translateContextBlock(Object.assign({cues:clip.cues,bypassBoundary:clip.index===0,maxVisualWidth:48,onRefineFailure:(m)=>stats.refineFailures.push(m)},apiCfg));
     } catch(e) { console.warn("[harness] clip",ci,"翻译失败：",e.message);stats.clipFallbacks++;result=null; }
     if(!result||!result.units||!result.units.length){
       stats.emptyClips++;for(const cue of clip.cues)renderUnits.push({start:cue.start,end:cue.end,originalText:cue.content,translation:""});

@@ -667,6 +667,7 @@
           // （translateSentenceScreens 一次发整段连续语音），不靠额外发相邻 cue。
           var result = await Core.translateContextBlock({
             cues: clip.cues,
+            bypassBoundary: clip.index === 0,
             apiBaseUrl: identity.apiBaseUrl,
             apiKey: identity.apiKey,
             apiModel: identity.apiModel,
