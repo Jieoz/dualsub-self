@@ -4073,6 +4073,40 @@ test("buildSrt：兼容 isolated.js 的 start/end 命名", () => {
     assert.ok(/popup\.js/.test(html));
   });
 
+  // 发布事故根因闸门（v0.11.4 首版产物漏打 main.js / netflix-main.js，
+  // Chrome 拒绝加载「Could not load manifest」）。打包是手工 `cp` 时极易漏掉
+  // manifest 引用的注入脚本，必须在离线门禁里静态比对引用表，而不是靠人记得。
+  test("manifest 引用的每个文件都真实存在于仓库", () => {
+    const m = JSON.parse(fs.readFileSync(path.join(ROOT, "manifest.json"), "utf8"));
+    const referenced = new Set();
+    Object.values(m.icons || {}).forEach((p) => referenced.add(p));
+    if (m.action && m.action.default_popup) referenced.add(m.action.default_popup);
+    if (m.action && m.action.default_icon) {
+      if (typeof m.action.default_icon === "string") referenced.add(m.action.default_icon);
+      else Object.values(m.action.default_icon).forEach((p) => referenced.add(p));
+    }
+    for (const cs of m.content_scripts || []) {
+      (cs.js || []).forEach((p) => referenced.add(p));
+      (cs.css || []).forEach((p) => referenced.add(p));
+    }
+    for (const war of m.web_accessible_resources || []) {
+      for (const r of war.resources || []) {
+        // 允许通配，逐个展开到实际文件目录
+        if (!/[*?]/.test(r)) referenced.add(r);
+      }
+    }
+    if (m.background) {
+      (m.background.scripts || []).forEach((p) => referenced.add(p));
+      if (m.background.service_worker) referenced.add(m.background.service_worker);
+    }
+    assert.ok(referenced.size > 0, "manifest 必须引用至少一个文件");
+    const missing = [...referenced].filter((p) => !fs.existsSync(path.join(ROOT, p)));
+    assert.deepStrictEqual(
+      missing, [],
+      "manifest 引用了仓库里不存在的文件（打包后 Chrome 会拒绝加载）：" + missing.join(", "),
+    );
+  });
+
   test("canonical overlap 只去除时间重叠的滚动前缀，保留真实相邻重复词并支持超过 8 词", () => {
     const repeated = Core.buildCanonicalTokenTimeline([
       { start: 0, end: 500, content: "yes", tokens: [{ text: "yes", start: 0, end: 500, nativeTiming: true }] },
