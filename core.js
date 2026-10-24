@@ -2277,11 +2277,11 @@
   }
 
   var DEFAULT_RESTORATION_PROMPT =
-    "你是多语言字幕语义边界规划器。源文可能是任意语言；sourceText 是完整连续原文，groups 是按 Unicode 词法边界映射回 canonical token 的原子组。\n" +
+    "你是多语言字幕语义边界规划器。源文可能是任意语言；sourceText 是完整连续原文，tokens 是按顺序切出的词（id 为位置标识），groups 是允许下刀的全部候选 id（与 groupWidths 一一对应，后者是该组视觉宽度）。\n" +
     "只决定应在哪些 token 之后结束一个字幕单元；不得回显、改写、添加、删除、合并、拆分或重排任何 token。\n" +
     "只判断完整句、完整分句或自然话语的含义在哪里结束。不得在条件与结果、否定范围、因果、转折、指代、短语、修饰关系、数字+单位、专名、URL、复合词或不可分割表达中间结束语义。\n" +
     "字幕一屏只能放下有限内容：请在保证每段语义自足的前提下尽量多切。一个单元通常不应超过约 14 个英文词；超过时，请在它内部找到同样能独立成句的分句边界（并列分句、从句边界、话题转折处）再切一刀，而不是留成一个长段。确实切不动才允许保留长段。\n" +
-    "只返回严格 JSON：{\"semanticCutsAfter\":[\"token-id\",...]}; 每个 id 必须是 group.toId 且严格递增。不要返回其它字段、正文、Markdown 或解释。";
+    "只返回严格 JSON：{\"semanticCutsAfter\":[\"id\",...]}; 每个 id 必须取自 groups 且严格递增。不要返回其它字段、正文、Markdown 或解释。";
 
   // 语义字幕长度不能再用“英文词数”一把尺子量所有语言。这里按实际字符视觉负载
   // 计算 token 预算，不读取 languageCode，也没有逐语言分支：全宽东亚字符约占两个
@@ -2443,15 +2443,59 @@
       var chunk = tokens.slice(range.start, range.end);
       var planning = semanticPlanningGroups(chunk);
       var ids = planning.groups.map(function (group) { return group.toId; });
-      var request = JSON.stringify({
+      // Payload 瘦身（token 优化的主战场）：旧 payload 把同一段原文写了三遍 ——
+      // sourceText 写一次、groups[].text 写一次、tokens[].text 再写一次，实测
+      // 91 词小 chunk 就有 8642 字符，其中 groups 占 5503、tokens 占 2507，
+      // 真正的原文 sourceText 只有 515。也就是 ~90% 的 prompt token 是纯冗余。
+      //
+      // 实测 groups 与 chunk tokens 严格 1:1（fromId===toId、tokenStart 递增 1），
+      // 所以 tokens 数组整体可删；text 只保留在 tokens 里让模型能把 ID 对回词，
+      // groups 只留切点候选 ID。
+      //
+      // ID 同时换成 chunk 内位序号（"g0".."gN"）：canonical tokenId 是
+      // "1qq44tvt8zhev:0" 这种 15 字符的溯源标识，对模型判断语义毫无信息量，
+      // 91 个就是 1.4KB 噪声。解析后再映射回真实 tokenId。
+      // groups 是权威切点集（连写文字会按 Intl.Segmenter 合并成 fromId!=toId 的
+      // 原子组，比裸 token 更粗）。旧 payload 同时发 groups{fromId,toId,text,
+      // visualWidth} 和 tokens{id,text} —— 同一批词写两遍，再加 sourceText 第三遍。
+      // 现在：groups 只留 {toId}（切点只看它），词面统一由 sourceText 承载；
+      // ID 用位序号 "g0".."gN" 取代 "1qq44tvt8zhev:0" 这类 15 字符溯源串。
+      // 两套编号必须共用一套：tokens 用 g{chunk 内下标}，groups 也必须是
+      // g{同一 token 下标} 的**结束**位置。此前 groups 用 g{tokenStart}、
+      // tokens 用 g{ti}，当连写文字把多个 token 合并成一个 group 时两套编号
+      // 长度不同（372 tokens vs 300 groups），模型按 groups 下标继续数下去
+      // 就会给出 g371 这种越界 id，整 chunk 判 invalid → clip 直接失败。
+      var idMap = {};
+      var planGroups = [];
+      // alias 必须落在 chunk 的 token 下标上（tokens 数组就是 chunk），
+      // 而 group.tokenStart/tokenEnd 是 semanticPlanningGroups 在**同一次
+      // 输入**上算出来的下标，两者同一坐标系。切点 = group 末 token 下标。
+      planning.groups.forEach(function (group) {
+        var endIdx = group.tokenEnd != null ? group.tokenEnd - 1 : null;
+        if (endIdx == null || endIdx < 0 || endIdx >= chunk.length) return;
+        var alias = "g" + endIdx;
+        idMap[alias] = group.toId;
+        planGroups.push(alias);
+      });
+      // 模型判断「在哪断句」需要看得到词面 + 视觉宽度（一屏放得下多少）。
+      // 压缩只砍重复：sourceText 保留（整句语流是语义判断的主依据）、tokens
+      // 保留词面、groups 只留切点 id（原先把 text/visualWidth 又写一遍是纯重复）。
+      // visualWidth 仍按 group 给一次，因为它是分组后的宽度、不等于词长之和。
+      var widthsSeq = [];
+      planning.groups.forEach(function (group) {
+        if (group.tokenEnd != null) widthsSeq.push(group.visualWidth);
+      });
+      var payload = {
         sourceText: planning.sourceText,
-        groups: planning.groups.map(function (group) { return { fromId: group.fromId, toId: group.toId, text: group.text, visualWidth: group.visualWidth }; }),
-        tokens: chunk.map(function (token) { return { id: token.tokenId, text: String(token.text) }; }),
+        tokens: chunk.map(function (token, ti) { return { id: "g" + ti, text: String(token.text) }; }),
+        groups: planGroups,
+        groupWidths: widthsSeq,
         preferredTokens: Math.max(1, Math.floor(Number(opts.preferredMaxWords) || 10)),
         maxTokens: Math.max(1, Math.floor(Number(opts.maxWords) || 12)),
         preferredVisualWidth: Math.max(12, Math.floor(Number(opts.preferredVisualWidth) || SOURCE_DISPLAY_PREFERRED_WIDTH)),
         maxVisualWidth: Math.max(12, Math.floor(Number(opts.maxVisualWidth) || SOURCE_DISPLAY_MAX_WIDTH)),
-      });
+      };
+      var request = JSON.stringify(payload);
       var plan = null;
       var attempts = opts.attempts != null ? Math.max(1, Number(opts.attempts)) : 2;
       for (var attempt = 0; attempt < attempts; attempt++) {
@@ -2474,7 +2518,7 @@
             });
           };
           var response = typeof opts.runRequest === "function" ? await opts.runRequest(doChat) : await doChat();
-          plan = parseBoundaryPlanResponse(response, ids);
+          plan = parseBoundaryPlanResponse(response, planGroups);
           break;
         } catch (error) {
           if (error && /translate aborted|translate timeout|translate network|translate HTTP/i.test(String(error.message || error))) throw error;
@@ -2483,7 +2527,11 @@
       }
       if (!plan) throw new Error("invalid boundary plan chunk " + ri);
       var semanticSet = {};
-      plan.semanticCutsAfter.forEach(function (id) { semanticSet[id] = true; });
+      // alias（"g12"）→ 真实 canonical tokenId。模型只见位序号，落 marks 必须用真 ID。
+      plan.semanticCutsAfter.forEach(function (alias) {
+        var real = idMap[alias];
+        if (real != null) semanticSet[String(real)] = true;
+      });
       for (var pos = range.commitStart; pos < range.commitEnd; pos++) {
         var tokenId = tokens[pos].tokenId;
         if (semanticSet[tokenId]) marks[pos] = ".";

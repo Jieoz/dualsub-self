@@ -102,11 +102,21 @@ function makeMockFetch(stats, opts) {
   return function mockFetch(url,fetchOpts){
     const body=JSON.parse(fetchOpts.body),payload=JSON.parse((body.messages[1]&&body.messages[1].content)||"{}");
     if (Array.isArray(payload.tokens)) {
-      const cuts = (payload.groups || []).filter((_, i) => i >= 11 && i % 12 === 11).map((g) => g.toId);
+      if (stats.reqTally) stats.reqTally[payload.currentWordCount != null ? "refine" : "restore"]++;
+      if (stats.reqBytes) { const k = payload.currentWordCount != null ? "refine" : "restore";
+        stats.reqBytes[k].n++; stats.reqBytes[k].body += JSON.stringify(payload).length;
+        stats.reqBytes[k].sys += ((body.messages&&body.messages[0]&&body.messages[0].content)||"").length; }
+      // groups 现在是纯切点 id 列表（"g0".."gN"）；refine 仍发 {fromId,toId,text}
+      const rawGroups = payload.groups || [];
+      const cuts = rawGroups.filter((g, i) => i >= 11 && i % 12 === 11)
+        .map((g) => (typeof g === "string" ? g : g && g.toId)).filter(Boolean);
       const content = JSON.stringify({ semanticCutsAfter: cuts });
       const t0=Date.now(),thinkMs=REASON_MS+content.length*PER_CHAR_MS;
       return new Promise(resolve=>setTimeout(()=>{stats.requestMs.push(Date.now()-t0);resolve({ok:true,status:200,json:async()=>({choices:[{message:{content}}]}),text:async()=>""})},thinkMs));
     }
+    if (stats.reqTally) stats.reqTally.translate++;
+    if (stats.reqBytes) { stats.reqBytes.translate.n++; stats.reqBytes.translate.body += JSON.stringify(payload).length;
+      stats.reqBytes.translate.sys += ((body.messages&&body.messages[0]&&body.messages[0].content)||"").length; }
     const pieces=(payload.sentences||[]).flat();
     const screens=pieces.map((p,i)=>({from:p.id,to:p.id,text:structuralMockZh(i)}));
     const content=JSON.stringify({screens}),t0=Date.now(),thinkMs=REASON_MS+content.length*PER_CHAR_MS;
@@ -147,7 +157,9 @@ async function run() {
   });
 
   const stats = { requestMs: [], retries429: 0, clipFallbacks: 0, emptyClips: 0,
-                  refineFailures: [],
+                  refineFailures: [], usage: { prompt: 0, completion: 0, reasoning: 0, requests: 0 },
+                  reqTally: { restore: 0, refine: 0, translate: 0 },
+                  reqBytes: { restore: {n:0,body:0,sys:0}, refine: {n:0,body:0,sys:0}, translate: {n:0,body:0,sys:0} },
                   firstUnitMs: null, totalMs: 0, clipMs: [] };
 
 
@@ -194,7 +206,12 @@ async function run() {
     let result;
     try {
       // 与生产一致：不再传 contextBefore/contextAfter（payload 从不读取）。
-      result=await Core.translateContextBlock(Object.assign({cues:clip.cues,bypassBoundary:clip.index===0,maxVisualWidth:48,onRefineFailure:(m)=>stats.refineFailures.push(m)},apiCfg));
+      result=await Core.translateContextBlock(Object.assign({cues:clip.cues,bypassBoundary:clip.index===0,maxVisualWidth:48,onRefineFailure:(m)=>stats.refineFailures.push(m),onUsage:(u)=>{
+        const p=Number(u&&(u.prompt_tokens??u.input_tokens))||0, c=Number(u&&(u.completion_tokens??u.output_tokens))||0;
+        stats.usage.prompt+=p; stats.usage.completion+=c; stats.usage.requests++;
+        const d=(u&&(u.completion_tokens_details||u.output_tokens_details))||{};
+        stats.usage.reasoning+=Number(d.reasoning_tokens)||0;
+      }},apiCfg));
     } catch(e) { console.warn("[harness] clip",ci,"翻译失败：",e.message);stats.clipFallbacks++;result=null; }
     if(!result||!result.units||!result.units.length){
       stats.emptyClips++;for(const cue of clip.cues)renderUnits.push({start:cue.start,end:cue.end,originalText:cue.content,translation:""});
@@ -364,6 +381,21 @@ function printStats(stats, renderUnits, a) {
   console.log("clip 数       :", stats.clipMs.length);
   console.log("每 clip 耗时  : avg", clipAvg, "ms  max", clipMax, "ms");
   console.log("请求数        :", stats.requestMs.length, " avg", avg(stats.requestMs), "ms");
+  if (stats.reqTally) console.log("请求构成      : restore", stats.reqTally.restore, "/ refine", stats.reqTally.refine, "/ translate", stats.reqTally.translate);
+  if (stats.reqBytes) for (const k of ["restore", "refine", "translate"]) {
+    const b = stats.reqBytes[k];
+    if (b.n) console.log("  " + k + ": n=" + b.n + " avgUserChars=" + Math.round(b.body / b.n) + " avgSysChars=" + Math.round(b.sys / b.n));
+  }
+  {
+    const u = stats.usage;
+    const total = u.prompt + u.completion;
+    console.log("Token 用量    : prompt", u.prompt, "/ completion", u.completion, "/ total", total,
+                " (reasoning " + u.reasoning + ", 有 usage 的请求 " + u.requests + ")");
+    if (renderUnits.length) {
+      console.log("Token 效率    : 每屏", (total / renderUnits.length).toFixed(1), "tokens / 每 clip",
+                  (total / Math.max(1, stats.clipMs.length)).toFixed(0), "tokens");
+    }
+  }
   console.log("clip 翻译失败 :", stats.clipFallbacks);
   console.log("空 clip(显原文):", stats.emptyClips);
   console.log("429 次数      :", stats.retries429);

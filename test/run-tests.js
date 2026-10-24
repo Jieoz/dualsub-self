@@ -597,8 +597,9 @@ test("translateContextBlock 整段投喂：模型看到完整语流而非逐 cue
     fetchImpl: async (_url, req) => {
       const body = JSON.parse(req.body); sent = JSON.parse(body.messages[1].content);
       if (sent.tokens) {
-        const cut = sent.groups.find((g) => g.text === "cue");
-        return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ semanticCutsAfter: cut ? [cut.toId] : [] }) } }] }) };
+        // groups 现在是权威切点 id 列表，词面在 tokens 里（同一批词不再写两遍）。
+        const hit = sent.tokens.find((t) => t.text === "cue");
+        return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ semanticCutsAfter: hit && sent.groups.includes(hit.id) ? [hit.id] : [] }) } }] }) };
       }
       return { ok: true, json: async () => ({ choices: [{ message: { content: translationCoverageJson(req, ["第一句译文", "第二句译文"]) } }] }) };
     },
@@ -630,8 +631,8 @@ test("block-v10 对多书写系统使用同一请求、parser 与时间物化路
         sent = JSON.parse(JSON.parse(req.body).messages[1].content);
         if (sent.tokens) {
           const lastWord = pair[0].trim().split(/\s+/).pop();
-          const cut = sent.groups.find((g) => String(g.text).split(/\s+/).pop() === lastWord);
-          return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ semanticCutsAfter: cut ? [cut.toId] : [] }) } }] }) };
+          const hit = sent.tokens.find((t) => String(t.text).split(/\s+/).pop() === lastWord);
+          return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ semanticCutsAfter: hit && sent.groups.includes(hit.id) ? [hit.id] : [] }) } }] }) };
         }
         return { ok: true, json: async () => ({ choices: [{ message: { content: translationCoverageJson(req, (unit) => "译文-" + unit.unitId) } }] }) };
       },
