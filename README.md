@@ -22,7 +22,14 @@
 
 ## 安装（加载已解压的扩展程序）
 
-当前版本：**v0.11.4**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.11.4) 下载 Chrome MV3 安装包。
+当前版本：**v0.11.5**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.11.5) 下载 Chrome MV3 安装包。
+
+v0.11.5 token 用量优化：
+
+- **Token 总量 -40.5%**（真实抽样实测：61,762 → 36,749）：语义边界请求的 payload 去重——此前同一段原文在 `sourceText`、`groups[].text`、`tokens[].text` 写了三遍，约 90% 的 prompt token 是纯冗余；现在词面只保留一份，切点候选收敛为 id 列表。
+- **更快还更省**：总耗时 -23%（108.2s → 83.2s），首屏再降至 1.9s（-42%），零失败、零 429。
+- **翻译质量不退化**：模型判断所需的完整语流（sourceText）、词面与视觉宽度全部保留，只砍重复；coverage ledger、无切词扫描、无句号软检与 17 个浏览器回放场景全绿。
+- **Release 打包防复发**：manifest 引用文件存在性纳入离线门禁，杜绝 v0.11.4 首发包漏文件的安装事故。
 
 v0.11.4 首屏极速直出 + 编排性能优化：
 
