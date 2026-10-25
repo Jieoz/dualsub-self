@@ -372,9 +372,10 @@
 
   function onManifest(content) {
     var pageVideoId = currentPageVideoId();
-    var manifest = Core.validateTrackManifest(content, { expectedVideoId: pageVideoId });
+    var reason = {};
+    var manifest = Core.validateTrackManifest(content, { expectedVideoId: pageVideoId, rejectReason: reason });
     if (!manifest) {
-      console.warn("[dualsub] rejected subtitle manifest not bound to current page/video/track");
+      console.warn("[dualsub] rejected subtitle manifest: " + (reason.msg || "unknown"));
       return;
     }
     var nextIdentity = manifestIdentity(manifest);

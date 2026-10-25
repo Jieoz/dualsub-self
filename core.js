@@ -4459,36 +4459,42 @@
    */
   function validateTrackManifest(content, options) {
     options = options || {};
-    if (!content || typeof content !== "object" || !Array.isArray(content.files)) return null;
+    // 拒收必须可观测：真实页排查只靠这一条日志，无原因的 null 曾把 65 轨 TED 视频误诊成"绑定失败"。
+    function rejectManifest(reason) {
+      if (options.rejectReason) options.rejectReason.msg = reason;
+      return null;
+    }
+    if (!content || typeof content !== "object" || !Array.isArray(content.files)) return rejectManifest("shape");
     var adapter = SITE_ADAPTERS[String(content.site || options.site || "youtube")];
-    if (!adapter) return null;
+    if (!adapter) return rejectManifest("site");
     var videoId = String(content.videoId == null ? "" : content.videoId);
-    if (!/^[A-Za-z0-9_-]{1,128}$/.test(videoId)) return null;
-    if (options.expectedVideoId != null && String(options.expectedVideoId) !== videoId) return null;
-    if (!content.files.length || content.files.length > 64) return null;
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(videoId)) return rejectManifest("videoId-format");
+    if (options.expectedVideoId != null && String(options.expectedVideoId) !== videoId) return rejectManifest("videoId-mismatch");
+    // 上限 128：真实视频字幕轨实测可达 65 条（TED 多语言字幕），旧上限 64 会整包误杀；128 仍可挡注入式超大清单。
+    if (!content.files.length || content.files.length > 128) return rejectManifest("too-many-files(" + content.files.length + ")");
     var files = [];
     var identities = {};
     for (var i = 0; i < content.files.length; i++) {
       var raw = content.files[i];
-      if (!raw || typeof raw !== "object") return null;
+      if (!raw || typeof raw !== "object") return rejectManifest("file[" + i + "]-shape");
       var rawUrl = String(raw.url == null ? "" : raw.url);
-      if (!rawUrl || rawUrl.length > 8192) return null;
+      if (!rawUrl || rawUrl.length > 8192) return rejectManifest("file[" + i + "]-url");
       var parsed;
-      try { parsed = new URL(rawUrl); } catch (e) { return null; }
+      try { parsed = new URL(rawUrl); } catch (e) { return rejectManifest("file[" + i + "]-url-parse"); }
       var host = String(parsed.hostname || "").toLowerCase();
       if (parsed.protocol !== "https:" || !adapter.trustedHostRe.test(host) ||
-        !adapter.pathRe.test(parsed.pathname)) return null;
+        !adapter.pathRe.test(parsed.pathname)) return rejectManifest("file[" + i + "]-host-or-path");
       var code = String(raw.code == null ? "" : raw.code);
       var languageCode = String(raw.languageCode == null ? "" : raw.languageCode);
       var name = String(raw.name == null ? code : raw.name);
       var kind = String(raw.kind == null ? "" : raw.kind);
-      if (!/^[A-Za-z0-9_.-]{1,64}$/.test(languageCode) || name.length > 256 || (kind !== "" && kind !== "asr")) return null;
+      if (!/^[A-Za-z0-9_.-]{1,64}$/.test(languageCode) || name.length > 256 || (kind !== "" && kind !== "asr")) return rejectManifest("file[" + i + "]-meta");
       // URL 与元数据的交叉校验规则由适配器自己给出，不在这里按站点分支。
       if (!adapter.checkTrackUrl(parsed, {
         videoId: videoId, code: code, languageCode: languageCode, kind: kind,
-      })) return null;
+      })) return rejectManifest("file[" + i + "]-cross-check");
       var identity = [code, languageCode, kind].join("\x1f");
-      if (identities[identity]) return null;
+      if (identities[identity]) return rejectManifest("file[" + i + "]-duplicate-identity");
       identities[identity] = true;
       // kind 必须保留：auto 选轨靠 kind="asr" 那条轨的 languageCode 判定音轨语言
       // （轨顺序不保证原语言在前，其他元数据无法区分原语言轨和人工翻译轨）。

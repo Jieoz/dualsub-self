@@ -1732,7 +1732,22 @@ test("validateTrackManifest 只接受受信 YouTube HTTPS 字幕 URL", () => {
   ]) {
     assert.strictEqual(Core.validateTrackManifest({ videoId: "x", files: [{ code: "en", url }] }), null, "不受信 URL 必须整包拒绝: " + url);
   }
-  assert.strictEqual(Core.validateTrackManifest({ videoId: "x", files: new Array(65).fill({ code: "en", url: "https://www.youtube.com/api/timedtext?v=x" }) }), null, "轨道数量必须有上限");
+  // 真实视频字幕轨实测可达 65 条（TED 多语言），旧上限 64 曾整包误杀；上限提至 128 且拒收必须带原因。
+  const manyFiles = n => Array.from({ length: n }, (_, i) => ({ code: "en" + i, languageCode: "en" + i,
+    url: "https://www.youtube.com/api/timedtext?v=x&lang=en" + i + "&fmt=json3&pot=signed" }));
+  assert.strictEqual(Core.validateTrackManifest({ videoId: "x", files: manyFiles(65) }).files.length, 65, "65 轨真实场景必须整包通过");
+  assert.strictEqual(Core.validateTrackManifest({ videoId: "x", files: manyFiles(128) }).files.length, 128, "128 轨在上限内");
+  const sizeReason = {};
+  assert.strictEqual(Core.validateTrackManifest({ videoId: "x", files: manyFiles(129) }, { rejectReason: sizeReason }), null, "轨道数量必须有上限");
+  assert.ok(/too-many-files/.test(sizeReason.msg), "超限拒收必须带原因: " + sizeReason.msg);
+  const bindReason = {};
+  assert.strictEqual(Core.validateTrackManifest({ videoId: "x", files: manyFiles(2) }, { expectedVideoId: "y", rejectReason: bindReason }), null, "videoId 不符必须拒绝");
+  assert.ok(/videoId-mismatch/.test(bindReason.msg), "绑定失败拒收必须带原因: " + bindReason.msg);
+  const dupReason = {};
+  assert.strictEqual(Core.validateTrackManifest({ videoId: "x", files: [
+    { code: "en", languageCode: "en", url: "https://www.youtube.com/api/timedtext?v=x&lang=en&fmt=json3&pot=signed" },
+    { code: "en", languageCode: "en", url: "https://www.youtube.com/api/timedtext?v=x&lang=en&fmt=json3&pot=signed" }] }, { rejectReason: dupReason }), null, "重复轨道身份必须拒绝");
+  assert.ok(/duplicate-identity/.test(dupReason.msg), "重复身份拒收必须带原因: " + dupReason.msg);
 });
 
 test("站点适配表：按 host 判定，未支持站点不猜不回落", () => {

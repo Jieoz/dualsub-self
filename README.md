@@ -22,7 +22,13 @@
 
 ## 安装（加载已解压的扩展程序）
 
-当前版本：**v0.11.6**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.11.6) 下载 Chrome MV3 安装包。
+当前版本：**v0.11.7**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.11.7) 下载 Chrome MV3 安装包。
+
+v0.11.7 修多语言视频（65+ 字幕轨）整包拒收：
+
+- **根因**：轨道清单校验给字幕轨数设了 64 条的防溢出上限，而真实多语言视频实测可达 65 条轨（TED 演讲），超限即**整包拒收**→ 扩展在这类视频上完全不工作。旧拒收日志文案（"not bound to current page/video/track"）有误导性，该缺陷只有真实 YouTube 端到端才暴露，mock 数据轨数从不超过 64。
+- **修复**：上限提到 128（真实世界 2 倍余量，仍挡注入式超大清单）；每一条拒收现在都带精确原因（如 `too-many-files(65)`、`videoId-mismatch`）写入 console 警告，不再误诊。
+- **回归门禁**：单测按真实形状重写（65/128 轨整包通过、129 轨拒绝、重复身份拒绝、拒收必须带原因）；浏览器回放 19/19、MOCK e2e 全绿，并新增真实 YouTube 端到端验证。
 
 v0.11.6 修「卡在开头一直翻译中」死锁：
 
