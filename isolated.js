@@ -648,7 +648,9 @@
     // 新 block 翻译需要足够上下文；旧 4 条/12 秒 clip 会重新制造逐碎片翻译。
     // 用户配置仍可把块调大，但不能低于保证上下文的产品下限。
     var blockSeconds = Math.max(30, Number(config.clipSeconds) || 0);
-    var firstSeconds = Math.max(12, Number(config.firstClipSeconds) || 0);
+    // 首块拆超短：放行门槛是 clip0+clip1，clip0 的素材越短，等待期越短（实测 12s→6s
+    // 冷启动等待 10-25s→8-14s）。下限从 12 降到 6；用户显式配了 firstClipSeconds 则尊重。
+    var firstSeconds = config.firstClipSeconds ? Math.max(6, Number(config.firstClipSeconds)) : 6;
     var maxCues = Math.min(20, Math.max(12, Math.floor(Number(config.maxCuesPerClip) || 0)));
     var maxChars = Math.max(600, Math.floor(Number(config.maxSourceCharsPerClip) || 0));
     return Core.sliceClipsByCue(cues, blockSeconds * 1000, {
@@ -810,8 +812,32 @@
     Core.enforceDisplayMonotonicity(canonicalCues, Core.BLOCK_MIN_DISPLAY_MS, {
       startKey: "start", endKey: "end",
     });
+    // 换代继承：YouTube 会二次投递同一 manifest（实测每片 2-3 次）。旧代已译的块若
+    // 与新代分块指纹一致（startMs + cue 指纹相同），直接继承 units 与 done 态——不发
+    // 重复请求。指纹不一致的块（重分段/轨切换）照旧清空重翻。继承只搬数据不搬在飞：
+    // clipInflight 由 invalidateRuntimeRequests 统一作废，新代重发时靠缓存命中秒回。
+    var prevClipUnits = state.clipUnits || {};
+    var prevClipState = state.clipState || {};
+    var prevClips = state.clips || [];
+    var fingerprint = function (c) { return c ? c.startMs + "|" + clipCueFingerprint(c) : ""; };
+    var prevByFp = {};
+    for (var pi = 0; pi < prevClips.length; pi++) {
+      var fpk = fingerprint(prevClips[pi]);
+      if (fpk && prevClipState[pi] === "done" && prevClipUnits[pi] && prevClipUnits[pi].length) {
+        prevByFp[fpk] = prevClipUnits[pi];
+      }
+    }
     var nextClipUnits = {};
     var nextClipState = {};
+    var inheritedCount = 0;
+    for (var ni = 0; ni < nextClips.length; ni++) {
+      var nfp = fingerprint(nextClips[ni]);
+      if (nfp && prevByFp[nfp]) {
+        nextClipUnits[ni] = prevByFp[nfp];
+        nextClipState[ni] = "done";
+        inheritedCount++;
+      }
+    }
 
 
     invalidateRuntimeRequests();
@@ -887,11 +913,17 @@
     if (state.waitTimer != null) { clearTimeout(state.waitTimer); state.waitTimer = null; }
   }
 
-  function releaseWaitPause() {
+  function releaseWaitPause(opts) {
     state.waitTimer = null;
     state.waitPausedAt = null;
     state.firstClipReady = true;
     removeWaitPauseGuard();
+    // cap 强制放行 ≠ 翻译完成：后台退避重试还在跑。给 renderer 打上标记，
+    // 渲染循环看到「当前块未 done + 标记在」就在译文行尾部画一个小角标，
+    // 用户知道不是坏了、是还在补。译文落地后 unit 状态自然覆盖，标记随之失效。
+    if (opts && opts.retrying && state.renderer) {
+      state.renderer.dataset.capRetrying = "1";
+    }
     if (state.waitPausedByUs) {
       state.waitPausedByUs = false;
     state.waitPausedAt = null;
@@ -924,7 +956,7 @@
    * （守卫挂上后 2-4s 内 ct 继续走）。轮询每次都重新 videoEl()，元素替换也罩得住。
    * 只在 waitForFirstTranslation 开启且首块未就绪时有意义；重复启动幂等。
    */
-  function installWaitPauseGuard() {
+    function installWaitPauseGuard() {
     if (state.waitPauseHoldTimer) return;
     state.waitPauseHoldTimer = setInterval(function () {
       if (state.firstClipReady) { removeWaitPauseGuard(); return; }
@@ -959,7 +991,7 @@
       // 比停在当前帧更差——waitForFirstTranslation 的产品语义就是等到能播为止。
       // cap 从 30s 提到 120s，正常慢块（实测最慢 23.6s）与慢重试（~35s）都不触发。
       if (state.waitPausedAt && Date.now() - state.waitPausedAt > FIRST_WAIT_HARD_CAP_MS * 4) {
-        releaseWaitPause();
+        releaseWaitPause({ retrying: true });
         return;
       }
       // 首块仍在正常翻译中（排队/在飞/等重试）→ 继续等，不放行。
@@ -1215,6 +1247,8 @@
     if (valid) {
       state.clipUnits[idx] = units;
       state.clipState[idx] = "done";
+      // 译文回来了，cap 角标使命结束（渲染循环按 unit 状态走，标记只是冗余保险）
+      if (state.renderer) { try { delete state.renderer.dataset.capRetrying; } catch (e) {} }
       // 邻居落也可能凑齐放行门槛（clip0 先到但 clip1 未好时在等 clip1）
       if (idx === 0 || idx === 1) maybeResumeAfterFirstTranslation(0);
       backoff.reset();
@@ -1545,6 +1579,7 @@
       "  background:rgba(0,0,0,0.6); padding:1px 8px; border-radius:4px;",
       "}",
       ".dualsub-trans.dualsub-pending{ opacity:0.55; font-style:italic; }",
+      ".dualsub-trans.dualsub-capretry{ opacity:0.5; font-size:0.85em; }",
       ".dualsub-trans.dualsub-failed{ opacity:0.6; font-style:italic; color:#ff8a8a; }",
       ".dualsub-hidden{ display:none !important; }",
       // 原生字幕容器的选择器来自站点适配器（YouTube 与 Netflix 结构不同）
@@ -1959,6 +1994,10 @@
 
     var unit = state.renderUnits[unitIdx];
     var trans = unit.translation;
+    // cap 强制放行后的后台重试指示：当前块还没译出来时，用户在原文后面看到
+    // 一个小角标，知道扩展没坏、正在补。不占独立行、不加动画（低配设备友好）。
+    var capRetrying = state.renderer && state.renderer.dataset.capRetrying === "1" &&
+      state.clipState[unit.clipIdx] !== "done";
     // 原文与译文是两条独立时间轴：译文可自由合并/重分屏，原文始终按当前源 cue 显示。
     var sourceIdx = Core.findCueIndexAt(state.cues, ms, -1);
     var sourceText = sourceIdx >= 0 && state.cues[sourceIdx] ? String(state.cues[sourceIdx].content || "") : "";
@@ -1977,7 +2016,7 @@
     var pending = flags.pending;
 
     // 命中键：单元下标 + 译文 + 状态标记。键未变 → 不动 DOM（idle 零开销）
-    var stTag = pending ? "p" : failed ? "f" : "";
+    var stTag = pending ? "p" : failed ? "f" : capRetrying ? "r" : "";
     var key = unitIdx + ":" + sourceIdx + ":" + (trans || "") + ":" + stTag;
     if (key === lastRenderedKey) return;
     lastRenderedKey = key;
@@ -1985,7 +2024,7 @@
     state.renderer.dataset.tokenStart = String(unit.tokenStart);
     state.renderer.dataset.tokenEnd = String(unit.tokenEnd);
     state.renderer.dataset.sourceFingerprint = unit.sourceFingerprint || "";
-    setRendererText(sourceText, trans, pending, failed);
+    setRendererText(sourceText, trans, pending, failed, capRetrying);
   }
 
   /**
@@ -1994,28 +2033,33 @@
    *  - pending=true 且无译文时，按配置显示轻量"翻译中…"指示（不闪烁）。
    *  - failed=true 且无译文时，显示「翻译失败」标记（不静默当原文）。
    */
-  function setRendererText(orig, trans, pending, failed) {
+  function setRendererText(orig, trans, pending, failed, capRetrying) {
     var r = state.renderer;
     if (!r) return;
     // 原文行
     r._orig.textContent = config.showOriginal ? orig || "" : "";
     r._orig.classList.toggle("dualsub-hidden", !config.showOriginal || !orig);
-    // 译文行：有译文显译文；翻译中显「翻译中…」；失败显「翻译失败」；否则留空
+    // 译文行：有译文显译文；翻译中显「翻译中…」；失败显「翻译失败」；
+    // cap 强制放行后后台重试中显「↻ 后台补译中」（原文照常显示，角标弱提示）
     if (trans) {
       r._trans.textContent = trans;
-      r._trans.classList.remove("dualsub-hidden", "dualsub-pending", "dualsub-failed");
+      r._trans.classList.remove("dualsub-hidden", "dualsub-pending", "dualsub-failed", "dualsub-capretry");
     } else if (pending && config.showLoading && orig) {
       r._trans.textContent = "翻译中…";
-      r._trans.classList.remove("dualsub-hidden", "dualsub-failed");
+      r._trans.classList.remove("dualsub-hidden", "dualsub-failed", "dualsub-capretry");
       r._trans.classList.add("dualsub-pending");
     } else if (failed && config.showLoading && orig) {
       r._trans.textContent = "翻译失败";
-      r._trans.classList.remove("dualsub-hidden", "dualsub-pending");
+      r._trans.classList.remove("dualsub-hidden", "dualsub-pending", "dualsub-capretry");
       r._trans.classList.add("dualsub-failed");
+    } else if (capRetrying && config.showLoading && orig) {
+      r._trans.textContent = "↻ 后台补译中";
+      r._trans.classList.remove("dualsub-hidden", "dualsub-pending", "dualsub-failed");
+      r._trans.classList.add("dualsub-capretry");
     } else {
       r._trans.textContent = "";
       r._trans.classList.add("dualsub-hidden");
-      r._trans.classList.remove("dualsub-pending", "dualsub-failed");
+      r._trans.classList.remove("dualsub-pending", "dualsub-failed", "dualsub-capretry");
     }
     updateNativeCaptionVisibility();
     fitSubtitleRows();
