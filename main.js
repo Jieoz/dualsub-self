@@ -28,9 +28,21 @@
     window.dispatchEvent(new CustomEvent(CHANNEL, { detail: detail }));
   }
 
+  // isolated.js → main.js 的回执通道（命名与 isolated.js 的 CHANNEL_OUT 一致）
+  var CHANNEL_IN = "__dualsub_main_to_iso_9f47c2ae51d8__";
+  window.addEventListener(CHANNEL_IN, function (ev) {
+    try {
+      var d = ev && ev.detail;
+      if (!d || d.sender !== "isolated" || d.subject !== "manifest-ack") return;
+      lastAckedSignature = lastSignature; // 当前签名已被确认，停止重发
+    } catch (e) {}
+  });
+
   /* ---------------- 轨道抓取 ---------------- */
 
   var lastSignature = ""; // 上次推送的轨道签名，避免重复推送
+  var lastAckedSignature = ""; // isolated.js 已确认收到的签名（manifest-ack 回执）
+  var lastSentAt = 0; // 上次推送时刻（未 ack 时限流 2s 重发）
 
   // 当前是否移动端 m.youtube.com（影响 c 参数）
   function isMobile() {
@@ -162,8 +174,13 @@
             return f.code + "=" + f.url;
           })
           .join("|");
-      if (signature === lastSignature) return;
+      if (signature === lastSignature && signature === lastAckedSignature) return;
+      // 未 ack 的签名每 2s 重发一次：isolated.js 与本文件同为 document_start，
+      // 但 isolated 的 RPC 监听器注册有先后竞态——首发若落在监听器就绪前会被
+      // 静默丢弃，而签名去重会阻止重发，页面就永远死了（实测偶发整页无字幕）。
+      if (signature === lastSignature && Date.now() - lastSentAt < 2000) return;
       lastSignature = signature;
+      lastSentAt = Date.now();
 
       // site 必须显式声明：isolated.js 靠它选站点适配器做 URL 校验，
       // 不靠猜。缺省回落到 youtube 只是为了兼容旧包，新代码一律显式发。
@@ -185,11 +202,14 @@
     } catch (e) {}
   }
 
-  // 3 秒轮询
+  // 1.5 秒轮询。manifest 就绪时刻直接决定首字幕时刻：轮询 3s 时实测
+  // 播放器就绪慢的页面要 20-30s 才拿到轨道（用户面前干瞪眼）；
+  // 1.5s 把平均落地提前 ~0.75s、最坏提前 ~1.5s，轮询本身只是读播放器
+  // 状态，开销可忽略。
   setInterval(function () {
     checkRoute();
     poll();
-  }, 3000);
+  }, 1500);
 
   // 启动时也立即跑一次
   checkRoute();

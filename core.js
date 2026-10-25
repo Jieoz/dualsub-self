@@ -523,6 +523,12 @@
   // 源 cue 时间失真的判定阈值。低于此值即认为该 cue 自报的时长不可能是真实语速
   // (200ms/词 ≈ 300 wpm 已是极快语速的地板)。
   var IMPLAUSIBLE_MS_PER_WORD = 200;
+  // 时间修复允许向后借时的「明确静音」判据：与下一 cue 的间隙 ≥ 此值视为真实停顿，
+  // 拉伸不得越过（否则静音被吞成假语速，token 层吃掉后下游无法恢复）。
+  var MIN_REPAIR_ADJACENT_GAP_MS = 500;
+  // 补可读时长时给真实停顿留的呼吸空档（毫秒）。停顿间隙 ≥500ms 时，
+  // 补时长的 end 至少离下一屏 start 这么远，保证观众看得见停顿。
+  var SILENCE_RESERVE_MS = 300;
 
   /**
    * 修复源轨自报时间失真的 cue —— 这是「字幕后半段几乎看不见」的**根**。
@@ -802,6 +808,18 @@
       var next = list[i + 1];
       // 末条没有后继约束,可以直接补到下限
       var limit = next ? next.startMs : u.startMs + floor;
+      // 后面是真实停顿（间隙 ≥ MIN_REPAIR_ADJACENT_GAP_MS）时，补时长得留一口呼吸：
+      // 补到 next.start 本身会把说话人的停顿整个填平——语速快于可读地板的段落
+      // 每一条都顶满，字幕就连成一片没有停顿（实测 TED 轨 371 处源静音只剩 44 处
+      // 可见停顿的主因之一）。
+      //
+      // 但可读性优先于停顿：只有「让出 SILENCE_RESERVE_MS 之后仍够读到可读下限」
+      // 时才让。即上限 = next.start − reserve，但若那样就到不了 floor，退回
+      // 旧行为填满整个间隙（极端失真 77ms/词的 cue 仍保住可读性，回归用例锁定）。
+      if (next && next.startMs - u.endMs >= MIN_REPAIR_ADJACENT_GAP_MS) {
+        var withReserve = next.startMs - SILENCE_RESERVE_MS;
+        if (u.startMs + floor <= withReserve) limit = Math.min(limit, withReserve);
+      }
       var target = Math.min(u.startMs + floor, limit);
       if (target > u.endMs) u.endMs = target;
     }
@@ -827,6 +845,10 @@
   // 让出的空隙小于这个值就不值得让（避免制造大量肉眼看不见的 1 帧空档）
   var MIN_MEANINGFUL_GAP_MS = 120;
 
+  // 非原生时间单元的削尾判定余量：单元时长超过可读地板这个量才削（避免为几十
+  // 毫秒的差额来回折腾）。
+  var OVERHANG_TRIM_MIN_MS = 200;
+
   /**
    * 把单元尾部那段"其实没人在说话"的时间让回去，形成真实停顿。
    *
@@ -846,11 +868,31 @@
       var u = list[i];
       if (!u) continue;
       var next = list[i + 1];
+      var words = restoredWords(u.originalText).length;
+      if (!words) continue;
+      var floor = minVisibleMsForUnit(u.originalText);
+      var dur = u.endMs - u.startMs;
+
+      // 均摊/修复时间（非原生词级时间）的单元：ASR 把句间停顿摊进了末词尾巴，
+      // 单元时长常常远超说完它所需的时间（实测 TED 轨 330/373 个单元超出可读
+      // 地板，均摊每条多挂 ~1.6s）。这种"假语速尾巴"削到可读地板即可——观众
+      // 已获得完整阅读时间，字幕在说完就走，句间停顿回归可见。削尾判据不依赖
+      // lastTokenStartMs（它被同样的均摊污染），直接用「时长 − 地板」判定。
+      // 原生词级时间（json3 tOffsetMs 实测）的单元不削：时长就是真实语音跨度。
+      if (u.nativeTiming === false && dur > floor + OVERHANG_TRIM_MIN_MS) {
+        var trimmed = u.startMs + floor;
+        // 不得与下一单元重叠；下一单元就在眼前时至少留出最小可见空隙，
+        // 否则这次削尾毫无意义（挤出来的时间立刻被重叠吃掉）。
+        if (next) {
+          if (trimmed > next.startMs) trimmed = next.startMs;
+          else if (next.startMs - trimmed < MIN_MEANINGFUL_GAP_MS) trimmed = u.endMs; // 放弃这次削
+        }
+        if (trimmed > u.startMs + MIN_VISIBLE_MS && trimmed < u.endMs) u.endMs = trimmed;
+      }
+
       if (!next) continue; // 末条后面没有内容，留着不影响观感
       var gap = next.startMs - u.endMs;
       if (gap >= MIN_MEANINGFUL_GAP_MS) continue; // 本来就有停顿
-      var words = restoredWords(u.originalText).length;
-      if (!words) continue;
       // 停顿发生在【末词说完之后】，不是均摊在整个单元上。所以判据必须落在末词上：
       // 单元里最后一个词的开口时刻 + 一个词的说话时长 = 这句话真正说完的时刻，
       // 之后的时间都是静音。按整单元均摊会漏掉一半真实停顿（实测 ASR 轨只能
@@ -860,7 +902,6 @@
         ? lastWordStartMs + MAX_SPEECH_MS_PER_WORD
         : u.startMs + words * MAX_SPEECH_MS_PER_WORD;
       // 不得短于可读下限，也不得早于 startMs
-      var floor = minVisibleMsForUnit(u.originalText);
       var target = Math.max(spokenUntil, u.startMs + floor);
       if (target >= u.endMs) continue;
       // 让出的空隙太小就不折腾
@@ -962,6 +1003,14 @@
       // 末词开口时刻：restoreSpeechPauses 判断"话说完了没"的依据。
       // 只读不改 canonical token 时间。
       var lastTok = timelineTokens[unit.tokenEnd - 1];
+      // 词级时间是否原生可信：原生时间（json3 tOffsetMs 实测）的单元时长就是真实
+      // 语音跨度，不得按可读地板削尾；均摊/修复时间（fallbackCueTokens、时间修复
+      // 拉伸）的单元时长是猜测值，ASR 把句间停顿摊进了末词尾巴，必须允许削。
+      var spanNative = true;
+      for (var ti = unit.tokenStart; ti < unit.tokenEnd; ti++) {
+        var tk = timelineTokens[ti];
+        if (tk && tk.nativeTiming === false) { spanNative = false; break; }
+      }
       return {
         unitId: unit.id,
         sourceFingerprint: unit.sourceFingerprint,
@@ -972,6 +1021,8 @@
         startMs: unit.startMs,
         endMs: unit.endMs,
         lastTokenStartMs: lastTok ? lastTok.startMs : null,
+        lastTokenEndMs: lastTok ? lastTok.endMs : null,
+        nativeTiming: spanNative,
       };
     });
     // 可读时长补偿只作用于呈现层:units 必须与 token 跨度严格一致
@@ -4058,6 +4109,10 @@
    * idx/idx+1/idx+2 各自 concurrency=3 → ~9 并发 → 429 → 退避 → 更卡。
    */
   var PREFETCH_AHEAD = 3; // 预取提前段数（当前段 + 后续 3 段）。再深需配合全局并发上限。
+  var PREFETCH_MAX_DEPTH = 8; // 自适应深度上限：延迟极高时也不无限囤积（并发 4 封顶才是真正的闸）。
+  // 领先倍数：窗口播放时长 ≥ 1.5× 请求延迟才稳。系数取 1.5 是因为并发 4 封顶下，
+  // 窗口内 clip 是分批落地的，单请求延迟只吃掉窗口的一部分；1.0 会过度加深。
+  var PREFETCH_LATENCY_FACTOR = 1.5;
 
   // 当前段剩余播放时间低于此阈值时，动态多预取 1 段（追平被限速拖慢的窗口）。
   var PREFETCH_DEEPEN_MS = 15000;
@@ -4093,7 +4148,11 @@
     var count = Number(opts.clipCount);
     if (!Number.isFinite(count) || count <= 0) return { plan: [], reason: "no-clips" };
     if (!Number.isFinite(idx) || idx < 0 || idx >= count) return { plan: [], reason: "idx-out-of-range" };
-    var plan = planPrefetch(idx, count, opts.ahead, { remainMsInCurrent: opts.remainMsInCurrent });
+    var plan = planPrefetch(idx, count, opts.ahead, {
+      remainMsInCurrent: opts.remainMsInCurrent,
+      avgClipDurationMs: opts.avgClipDurationMs,
+      requestLatencyMs: opts.requestLatencyMs,
+    });
 
     // 翻译不得越过语义恢复边界。
     //
@@ -4134,6 +4193,21 @@
     var depth = Number(ahead);
     if (!Number.isFinite(depth) || depth < 0) depth = PREFETCH_AHEAD;
     depth = Math.floor(depth);
+    // 自适应加深：深度必须保证「窗口播放时长 ≥ 1.5× 实测请求延迟」。
+    //
+    // 为什么固定 3 不够：clip 播放期 ~29s 时，窗口领先 = depth×29s − 请求延迟。
+    // 推理模型实测延迟 20-35s，depth=3 余量只剩 4s —— 播放追上翻译，屏幕出现
+    // 「翻译中」。深度按「(latency×1.5)/clipDurationMs」上取整，再与调用方给的
+    // ahead 取较大者。clipDurationMs 取不到（无 clipStartMs/clipCount 对不上）时
+    // 用默认 clipSeconds 档的 30s 兜底。
+    if (opts && opts.avgClipDurationMs != null && opts.requestLatencyMs != null) {
+      var clipDur = Number(opts.avgClipDurationMs);
+      var lat = Number(opts.requestLatencyMs);
+      if (Number.isFinite(clipDur) && clipDur > 0 && Number.isFinite(lat) && lat > 0) {
+        var needed = Math.ceil((lat * PREFETCH_LATENCY_FACTOR) / clipDur) - 1; // 减去当前段自身
+        if (needed > depth) depth = Math.min(needed, PREFETCH_MAX_DEPTH);
+      }
+    }
     // 动态加深：接近当前段段尾（剩余播放时间不足）时多预取 1 段。
     if (opts && opts.remainMsInCurrent != null) {
       var remain = Number(opts.remainMsInCurrent);
@@ -4923,6 +4997,7 @@
     pickTrack: pickTrack,
     TRANSLATION_DISPLAY_MAX_WIDTH: TRANSLATION_DISPLAY_MAX_WIDTH,
     PREFETCH_AHEAD: PREFETCH_AHEAD,
+    PREFETCH_MAX_DEPTH: PREFETCH_MAX_DEPTH,
     prioritizePrefetch: prioritizePrefetch,
     makeAdaptiveGate: makeAdaptiveGate,
     errorKind: errorKind,

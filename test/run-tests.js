@@ -2388,18 +2388,21 @@ test("等首块译文不得用固定超时上限放行", () => {
   const sched = iso.slice(iso.indexOf("function scheduleWaitDeadline"));
   const body = sched.slice(0, sched.indexOf("\n  }"));
   // 到点必须检查首块是否仍在翻译中，在跑就继续等
-  assert.match(body, /clipInflight\[0\]|clipState\[0\]/,
+  assert.match(body, /clipInflight\[0\]|clipState\[0\]|clipUnits\[0\]/,
     "到点必须检查首块实际状态，不能无条件放行");
-  assert.match(body, /stillWorking[\s\S]*?scheduleWaitDeadline\(\)/,
-    "仍在翻译中时必须继续等待（重新排期）");
+  assert.match(body, /gateReady[\s\S]{0,600}?maybeResumeAfterFirstTranslation\(0\)/,
+    "门槛凑齐时才放行，且必须走 maybeResume 的统一放行路径");
+  assert.match(body, /scheduleWaitDeadline\(\)/,
+    "门槛未凑齐且非死路时必须继续等待（重新排期）");
   // 旧的固定上限键必须从默认配置里消失，并在迁移时清除
   assert.ok(!("waitForFirstTranslationMs" in Core.DEFAULT_CONFIG),
     "旧的固定超时上限键不得留在默认配置");
   assert.strictEqual(Core.DEFAULT_CONFIG.waitForFirstTranslationCheckMs, 2000);
   const migrated = Core.migrateConfig({ waitForFirstTranslationMs: 8000 });
   assert.ok(!("waitForFirstTranslationMs" in migrated), "迁移必须清除旧键");
-  // failed 是终态，不得被当成「仍在翻译中」而永久卡住视频
-  assert.doesNotMatch(body, /"failed"/, "failed 终态不得计入 stillWorking");
+  // failed 是终态，不得被当成「仍在翻译中」而永久卡住视频（deadEnd 判定必须放行）
+  assert.match(body, /failed"\] === |deadEnd/,
+    "failed 终态必须进 deadEnd 放行路径");
 });
 
 test("每条上屏路径都必须去重叠 —— 结构性锁死，不靠人记得测", () => {
@@ -3250,6 +3253,65 @@ test("planPrefetch 动态加深：当前段剩余时间 < 15s → 多预取 1 �
     [0, 1, 2],
     "显式 ahead 也能叠加加深"
   );
+});
+
+test("planPrefetch 自适应深度：高延迟模型自动加深窗口", () => {
+  // 延迟 26s（推理模型实测）、clip 播放期 29s：needed = ceil(26×1.5/29)−1 = ceil(1.34)−1 = 1
+  // → 比默认 3 小，不加深，保持 [0..3]
+  assert.deepStrictEqual(
+    Core.planPrefetch(0, 10, undefined, { avgClipDurationMs: 29000, requestLatencyMs: 26000 }),
+    [0, 1, 2, 3],
+    "29s clip × 26s 延迟：默认深度已够，不加深"
+  );
+  // 延迟极高（120s/clip 60s 短块）：needed = ceil(120×1.5/60)−1 = 2 → 仍 < 3，不加深
+  assert.deepStrictEqual(
+    Core.planPrefetch(0, 10, undefined, { avgClipDurationMs: 60000, requestLatencyMs: 120000 }),
+    [0, 1, 2, 3],
+    "长 clip 下默认深度仍够"
+  );
+  // 短 clip（12s 首块档）+ 高延迟：needed = ceil(26×1.5/12)−1 = ceil(3.25)−1 = 3
+  // → 需要 3 段后续，默认也是 3，不加深，[0..3]
+  assert.deepStrictEqual(
+    Core.planPrefetch(0, 10, undefined, { avgClipDurationMs: 12000, requestLatencyMs: 26000 }),
+    [0, 1, 2, 3],
+    "短 clip 高延迟临界：恰好默认深度"
+  );
+  // 更高延迟（40s）：needed = ceil(40×1.5/12)−1 = 5−1 = 4 → 加深到 4
+  assert.deepStrictEqual(
+    Core.planPrefetch(0, 10, undefined, { avgClipDurationMs: 12000, requestLatencyMs: 40000 }),
+    [0, 1, 2, 3, 4],
+    "延迟超临界 → 自动加深到 4"
+  );
+  // 极端延迟压 PREFETCH_MAX_DEPTH=8 上限：needed = ceil(300×1.5/12)−1 = 37 → 封顶 8
+  assert.deepStrictEqual(
+    Core.planPrefetch(0, 20, undefined, { avgClipDurationMs: 12000, requestLatencyMs: 300000 }),
+    [0, 1, 2, 3, 4, 5, 6, 7, 8],
+    "极端延迟封顶 depth=8"
+  );
+  // 显式 ahead=1 + 自适应：ahead 小于 needed 时取 needed
+  assert.deepStrictEqual(
+    Core.planPrefetch(0, 10, 1, { avgClipDurationMs: 12000, requestLatencyMs: 40000 }),
+    [0, 1, 2, 3, 4],
+    "ahead=1 被自适应 needed=4 覆盖"
+  );
+  // 显式 ahead=6 大于 needed=4：显式值生效（只放宽不收紧调用方的明确意图）
+  assert.deepStrictEqual(
+    Core.planPrefetch(0, 10, 6, { avgClipDurationMs: 12000, requestLatencyMs: 40000 }),
+    [0, 1, 2, 3, 4, 5, 6],
+    "显式 ahead 大于 needed 时保留显式值"
+  );
+  // 延迟/时长非法或缺失：行为与旧版完全一致（回归保护）
+  assert.deepStrictEqual(
+    Core.planPrefetch(0, 10, undefined, { avgClipDurationMs: NaN, requestLatencyMs: 26000 }),
+    [0, 1, 2, 3],
+    "NaN 时长 → 回落默认深度"
+  );
+  assert.deepStrictEqual(
+    Core.planPrefetch(0, 10, undefined, { avgClipDurationMs: 29000 }),
+    [0, 1, 2, 3],
+    "缺 requestLatencyMs → 回落默认深度"
+  );
+  assert.deepStrictEqual(Core.planPrefetch(0, 10), [0, 1, 2, 3], "无 opts → 完全旧行为");
 });
 
 /* ============ 5m. export/import round-trip 含 v4 新字段 ============ */

@@ -116,6 +116,9 @@
     waitPausedAt: null,
     waitTimer: null,
     firstClipReady: false,
+    waitPauseGuard: null, // 首块等待期的 play 事件守卫（顶掉 YouTube 自动续播）
+    waitPauseGuardVideo: null,
+    clipLatencyEwma: null, // 单 clip 翻译请求延迟 EWMA（recordClipLatency 采样）
     apiUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0, reasoningTokens: 0, requests: 0 },
     cacheWriteSeq: 0,
     srtJob: null,
@@ -222,6 +225,32 @@
    * ===================================================== */
   // v0.5.2：JSON3 词级时间可用时，先做严格词流等价的句子/从句恢复。
   // 所有失败都整轨回落，绝不把模型改写或半段边界混进字幕时间轴。
+  /**
+   * 请求延迟采样（供 planPrefetch 自适应预取深度）。
+   *
+   * 为什么要有它：模型单请求延迟方差极大（flash-lite ~5s，推理模型 20-35s），
+   * 预取深度若固定 3，一个 clip 播放期 ~29s 时，翻译领先播放的余量 =
+   * 3×29s − 请求延迟。延迟 25s+ 时余量只剩 4s —— 任何一次慢请求播放就追上翻译，
+   * 屏幕出现「翻译中」。深度必须跟实测延迟走，而不是拍脑袋定死。
+   *
+   * 样本来源：loadOrTranslateClip 的真实网络请求（不含缓存命中）。EWMA 平滑
+   * （α=0.3）抗单次抖动；冷启动无样本时用保守默认 20000ms（宁深勿浅）。
+   */
+  var CLIP_LATENCY_EWMA_ALPHA = 0.3;
+  var CLIP_LATENCY_DEFAULT_MS = 20000;
+
+  function recordClipLatency(ms) {
+    var v = Number(ms);
+    if (!Number.isFinite(v) || v <= 0) return;
+    state.clipLatencyEwma = state.clipLatencyEwma == null
+      ? v
+      : Math.round(state.clipLatencyEwma * (1 - CLIP_LATENCY_EWMA_ALPHA) + v * CLIP_LATENCY_EWMA_ALPHA);
+  }
+
+  function currentClipLatencyMs() {
+    return state.clipLatencyEwma != null ? state.clipLatencyEwma : CLIP_LATENCY_DEFAULT_MS;
+  }
+
   function recordApiUsage(usage) {
     if (!usage || typeof usage !== "object") return;
     var prompt = Number(usage.prompt_tokens != null ? usage.prompt_tokens : usage.input_tokens) || 0;
@@ -343,6 +372,17 @@
     return writeEntry(CACHE_ENTRY_PREFIX, key, payload, CACHE_MAX_ENTRIES, generation, isAccepted);
   }
 
+
+  var CHANNEL_OUT = "__dualsub_main_to_iso_9f47c2ae51d8__"; // 与 main.js 约定的出站通道
+  /** isolated.js → main.js 的单行回执通道（manifest-ack 等） */
+  function sendToPeer(subject, content) {
+    try {
+      var detail = { sender: SENDER, receiver: RPC_PEER, subject: subject, content: content };
+      window.dispatchEvent(new CustomEvent(CHANNEL_OUT, { detail: detail }));
+    } catch (e) {
+      // 通道异常只影响重发节流，不致命
+    }
+  }
 
   /* =====================================================
    * RPC：接收 main.js 的轨道清单
@@ -661,6 +701,7 @@
     var task = (async function () {
       var context = beginRuntimeRequest();
       var pendingUsage = [];
+      var latencyStartMs = Date.now(); // gate 排队也计入延迟——预取深度关心的是「翻好这块要等多久」
       try {
         // Intent 先进入优先级 gate，再做异步 storage lookup。否则高优先级 seek 会在
         // cache callback 尚未返回时被稍后到达的低优先级全轨任务抢先占槽。
@@ -690,6 +731,8 @@
           return { translated: result };
         }, priority == null ? 20 : priority);
         if (payload.cached) return payload.cached;
+        // 只采真实网络请求的延迟（缓存命中不算）；失败不采（重试的退避不是模型延迟）。
+        recordClipLatency(Date.now() - latencyStartMs);
         if (!isRuntimeRequestCurrent(context) || generation !== state.requestGeneration) throw runtimeAbortError();
         var result = payload.translated;
         var out = {
@@ -787,10 +830,28 @@
     state.clipRevived = {};
     state.clipInflight = {};
     state.lastHitCueIdx = -1;
+    // 新一代时间轴 = 旧的放行资格全部作废。实测 YouTube 会二次投递 manifest：第一代
+    // 数据凑齐放行门槛（firstClipReady=true，guard 撤了，视频续播），紧接着第二代把
+    // clipUnits/clipState 清空重翻，但 firstClipReady 没人重置——等待期守卫就此失效，
+    // 用户看着 10-15s 的「翻译中」。这里按 waitForFirstTranslation 语义重置：新代次
+    // 重新走 等待→放行 全流程。
+    if (config.waitForFirstTranslation) {
+      state.firstClipReady = false;
+      state.waitPausedByUs = false;
+      // 硬上限计时一并重置：deadline 的 cap 是「本代等待不超过 30s」，不是「从上次
+      // 暂停起算」——换代后沿用旧时间戳会让 cap 立即判超（clip0State=undefined 时
+      // 直接放行，守卫撤掉，视频带着「翻译中」跑十几秒，实测 4 代连续换代的场景）。
+      state.waitPausedAt = config.waitForFirstTranslation ? Date.now() : null;
+    }
+    sendToPeer("manifest-ack", { videoId: state.videoId }); // 让 main.js 停止重发
     rebuildRenderTimeline();
     ensureRenderer();
     bindVideo();
     prefetchAround(currentTimeMs(), true);
+    // waitForFirstTranslation 的暂停必须在 manifest 落地那一刻就触发，不能等 clip0 请求
+    // 发出才触发：实测从 installCueTimeline 到 translateClip 进入之间视频还在播，
+    // 用户多看 3-12s 无字幕内容。此刻暂停 + play 守卫接管，直到首块落地。
+    if (config.waitForFirstTranslation) maybePauseForFirstTranslation(0);
     requestRender();
     return true;
   }
@@ -830,6 +891,7 @@
     state.waitTimer = null;
     state.waitPausedAt = null;
     state.firstClipReady = true;
+    removeWaitPauseGuard();
     if (state.waitPausedByUs) {
       state.waitPausedByUs = false;
     state.waitPausedAt = null;
@@ -837,6 +899,42 @@
       if (v && v.paused) { var p = v.play(); if (p && p.catch) p.catch(function () {}); }
     }
     requestRender();
+  }
+
+  function removeWaitPauseGuard() {
+    if (state.waitPauseHoldTimer) {
+      clearInterval(state.waitPauseHoldTimer);
+      state.waitPauseHoldTimer = null;
+    }
+    if (state.waitPauseGuard && state.waitPauseGuardVideo) {
+      try { state.waitPauseGuardVideo.removeEventListener("play", state.waitPauseGuard); } catch (e) {}
+    }
+    state.waitPauseGuard = null;
+    state.waitPauseGuardVideo = null;
+  }
+
+  /**
+   * 首块等待期的续播压制：firstClipReady 之前，任何来源的续播（YouTube 自动播放、
+   * 用户点播放键、播放器换 video 元素）都被立刻按回去。用户在等待期看到的画面是
+   * 冻结的当前帧 + 原文 + 「翻译中…」占位，首块落地后 maybeResumeAfterFirstTranslation
+   * 精确续播并停表。
+   *
+   * 实现是 250ms 轮询而不是 play 事件监听：实测 YouTube 续播不总在 video 元素上派发
+   * play 事件（自家状态机直接驱动，且可能替换 video 元素），事件守卫两次都被逃逸
+   * （守卫挂上后 2-4s 内 ct 继续走）。轮询每次都重新 videoEl()，元素替换也罩得住。
+   * 只在 waitForFirstTranslation 开启且首块未就绪时有意义；重复启动幂等。
+   */
+  function installWaitPauseGuard() {
+    if (state.waitPauseHoldTimer) return;
+    state.waitPauseHoldTimer = setInterval(function () {
+      if (state.firstClipReady) { removeWaitPauseGuard(); return; }
+      var el = videoEl();
+      if (el && !el.paused) {
+        try { el.pause(); } catch (e) {}
+        // 续播被顶掉的这几百毫秒里 renderer 可能被 native 层改写，重铺等待占位
+        setRendererText((state.renderUnits[0] && state.renderUnits[0].originalText) || "", "", true, false);
+      }
+    }, 250);
   }
 
   /**
@@ -856,33 +954,50 @@
     state.waitTimer = setTimeout(function () {
       state.waitTimer = null;
       if (state.firstClipReady) return;
-      // 硬上限：翻译故障/端点异常时视频不能永远卡在 0:00。
-      // 后台重试不受影响，译文迟到照样上屏；cap 只用于解死锁，正常慢块（实测最慢 23.6s）不触发。
-      if (state.waitPausedAt && Date.now() - state.waitPausedAt > FIRST_WAIT_HARD_CAP_MS) {
+      // 硬上限：只兜真正的僵尸态（死路判定覆盖不了的场景）。翻译故障/端点异常
+      // 已由下方 deadEnd 精确放行；活重试场景下放行视频只会让用户看「翻译中」跑，
+      // 比停在当前帧更差——waitForFirstTranslation 的产品语义就是等到能播为止。
+      // cap 从 30s 提到 120s，正常慢块（实测最慢 23.6s）与慢重试（~35s）都不触发。
+      if (state.waitPausedAt && Date.now() - state.waitPausedAt > FIRST_WAIT_HARD_CAP_MS * 4) {
         releaseWaitPause();
         return;
       }
       // 首块仍在正常翻译中（排队/在飞/等重试）→ 继续等，不放行。
-      var st = state.clipState[0];
-      // 「error」只在真的还有重试机会时才算「在干活」：
-      //  - API 未配全 → retryTick 明确跳过、永不重试 → 立即放行（旧逻辑永久卡死）
-      //  - 退避预算已耗尽（retryTick 马上转 failed）→ 不必等它转终态，直接放行
-      var backoff0 = getBackoff(0);
-      var retryPossible = !!config.apiBaseUrl && !!config.apiModel && !!config.apiKey && !(backoff0 && backoff0.stopped);
-      var stillWorking = state.clipInflight[0] === true || st === "pending" || (st === "error" && retryPossible);
-      if (stillWorking) {
-        scheduleWaitDeadline();
+      // 放行条件与 maybeResumeAfterFirstTranslation 的放行门槛完全一致（clip0+clip1，
+      // 单 clip 轨退化为 clip0）：deadline 提前放行而门槛没到，视频就会带着「翻译中」
+      // 恢复播放——实测 clip0 先落地、clip1 还在飞时 deadline 判 stillWorking=false
+      // 直接 release，守卫撤掉，用户看 12-15s 假卡顿。
+      // 只在真正的死路（配置残缺/退避耗尽，重试已无意义）才提前放行解死锁。
+      var gateReady = state.clipUnits[0] && state.clipUnits[0].length > 0 &&
+        (state.clips.length <= 1 || (state.clipUnits[1] && state.clipUnits[1].length > 0));
+      if (gateReady) {
+        maybeResumeAfterFirstTranslation(0);
         return;
       }
-      releaseWaitPause();
+      var backoff0 = getBackoff(0);
+      var retryPossible = !!config.apiBaseUrl && !!config.apiModel && !!config.apiKey && !(backoff0 && backoff0.stopped);
+      var deadEnd = !retryPossible ||
+        (state.clipState[0] === "failed" && !(backoff0 && !backoff0.stopped)) ||
+        (state.clipState[1] === "failed" && !(getBackoff(1) && !getBackoff(1).stopped));
+      if (deadEnd) {
+        releaseWaitPause();
+        return;
+      }
+      // 还活着（在飞/排队/等重试/刚换代还没起步）→ 继续等。
+      scheduleWaitDeadline();
     }, ms);
   }
   function maybePauseForFirstTranslation(clipIdx) {
-    if (!config.waitForFirstTranslation) return;
-    if (state.firstClipReady) return;
-    if (clipIdx !== 0) return;
+    if (!config.waitForFirstTranslation) { return; }
+    if (state.firstClipReady) { return; }
+    if (clipIdx !== 0) { return; }
+    // 守卫无条件先挂上：不管视频此刻是播是停。实测冷启动时 clip0 开始翻译的瞬间视频
+    // 恰好是暂停态（YouTube 播放器自己的就绪暂停），旧代码在这里直接 return，守卫没挂，
+    // 随后 YouTube 自动续播就逃逸了——视频继续播 11-17s 的「翻译中」。守卫的生命周期
+    // 只由 firstClipReady 决定（release/maybeResume 移除），与挂上瞬间的播放态无关。
+    installWaitPauseGuard();
     var v = videoEl();
-    if (!v || v.paused) return;
+    if (!v || v.paused) { return; }
     try {
       v.pause();
       state.waitPausedByUs = true;
@@ -894,8 +1009,28 @@
   }
   function maybeResumeAfterFirstTranslation(clipIdx) {
     if (clipIdx !== 0) return;
+    // 放行门槛不只看 clip0：恢复播放的瞬间 ct 往往已越过 clip0 边界（等待期 YouTube
+    // 自动续播 + 放行后 guard 已撤），若 clip1 尚未落地，用户立刻又看 10-15s「翻译中」
+    // （实测 4 次冷启动全部复现）。要求当前自适应预取窗口内的 clip 全部就绪才放行——
+    // 它们是同一批并发请求，多等的只是彼此的延迟差，通常 <3s；换来的是恢复后
+    // 永不再见「翻译中」。窗口还没铺开（clips<=1）退回只看 clip0。
+    var gate = Math.min(1, state.clips.length - 1);
+    for (var gi = 0; gi <= gate; gi++) {
+      if (!state.clipUnits[gi] || !state.clipUnits[gi].length) {
+        state.firstClipReady = false; // 已到但邻居没好：保持等待，由邻居的 apply 回调再进来
+        return;
+      }
+    }
     state.firstClipReady = true;
     clearWaitTimer();
+    removeWaitPauseGuard();
+    // deferRender 的缓存命中路径 apply 后不重建渲染时间轴，依赖后续 rebuild 触发器；
+    // 放行恢复播放前必须自己刷一次，否则 renderer 继续显「翻译中…」直到下一个
+    // 无关的 rebuild 才翻身（实测 warm-cache 冷启动 20s 的假卡顿全是这条路径）。
+    rebuildRenderTimeline();
+    requestRender();
+    onRenderTick(); // 立即重画一帧：checkMs 节流下 requestRender 可能要 2-3s 后才轮到，
+    // 恢复播放的头几秒用户会看到上一帧的「翻译中…」残留（实测 3s）。
     if (!state.waitPausedByUs) return;
     state.waitPausedByUs = false;
     state.waitPausedAt = null;
@@ -927,10 +1062,24 @@
     // 滑动窗口下标列表（含当前段）。每段整段一起翻。
     // 调度判据收敛到 Core.planTranslationWindow（单一权威 + 可被门禁覆盖）。
     // 所有 block 统一由 planTranslationWindow 决定当前与后续预取，不在调用点旁路。
+    // 平均 clip 播放时长 + 实测请求延迟喂给自适应深度：延迟高的模型自动加深窗口。
+    var clipStartList = state.clips.map(function (c) { return c ? c.startMs : NaN; });
+    var avgClipDurMs = null;
+    var validDurs = 0, durSum = 0;
+    for (var di = 0; di < state.clips.length; di++) {
+      var dc = state.clips[di];
+      if (!dc) continue;
+      var dend = dc.endMs != null ? dc.endMs : (dc.cues && dc.cues.length ? dc.cues[dc.cues.length - 1].end : NaN);
+      var dstart = clipStartList[di];
+      if (Number.isFinite(dend) && Number.isFinite(dstart) && dend > dstart) { durSum += dend - dstart; validDurs++; }
+    }
+    if (validDurs) avgClipDurMs = Math.round(durSum / validDurs);
     var plan = Core.planTranslationWindow({
       currentIdx: idx,
       clipCount: state.clips.length,
       remainMsInCurrent: remainMsInCurrent,
+      avgClipDurationMs: avgClipDurMs,
+      requestLatencyMs: currentClipLatencyMs(),
       // 翻译不得跑到语义恢复前面。
       //
       // 根因（用户轨 BhtgINeaJWg 实测）：预取窗口领先约 56s，而语义区间换入发生在
@@ -941,7 +1090,7 @@
       // 语义恢复比播放快 3.5x，因此把预取截到已恢复边界内不会让翻译闲着 ——
       // 只是不再把算力花在马上要作废的断句上。
       semanticReadyUntilMs: null,
-      clipStartMs: state.clips.map(function (c) { return c ? c.startMs : NaN; }),
+      clipStartMs: clipStartList,
     }).plan;
     // force（刚加载/seek）时：先只踢当前段，下一 macrotask 再铺后续预取，
     // 让首包请求更早离开浏览器、更少与同批预取抢模型算力。
@@ -1004,7 +1153,7 @@
     state.clipInflight[idx] = true;
     try {
       state.clipState[idx] = "pending";
-      if (idx === 0) maybePauseForFirstTranslation(0);
+      if (idx === 0) { maybePauseForFirstTranslation(0); }
       var result = await loadOrTranslateClip(clip, segmentationModeAtStart, priority);
       if (requestGeneration !== state.requestGeneration || timelineEpoch !== state.timelineEpoch || segmentationModeAtStart !== state.segmentationMode) return;
       applyBlockUnits(idx, clip, result.key, result.units, { skipCacheWrite: true });
@@ -1066,7 +1215,8 @@
     if (valid) {
       state.clipUnits[idx] = units;
       state.clipState[idx] = "done";
-      if (idx === 0) maybeResumeAfterFirstTranslation(0);
+      // 邻居落也可能凑齐放行门槛（clip0 先到但 clip1 未好时在等 clip1）
+      if (idx === 0 || idx === 1) maybeResumeAfterFirstTranslation(0);
       backoff.reset();
       if (!opts.skipCacheWrite) console.warn("[dualsub] block units without normalized segments are not cached");
       if (!opts.deferRender) {
@@ -1786,8 +1936,13 @@
     var unitIdx = Core.findCueIndexAt(state.renderUnits, ms, state.lastHitCueIdx);
 
     if (unitIdx === -1) {
-      // 落在间隙/越界：仅当之前有字幕时才清一次（避免每 tick 重复写 DOM）
-      if (state.lastHitCueIdx !== -1 || lastRenderedKey !== "") {
+      // 落在间隙/越界：仅当之前有字幕时才清一次（避免每 tick 重复写 DOM）。
+      // 还要覆盖 wait-pause 占位的残留：占位由 maybePause/hold 直接 setRendererText
+      // 写入，绕过了渲染循环 —— lastRenderedKey 此刻为空，旧条件永假，占位会一直
+      // 挂到 ct 走进首个 clip（实测 27s 的片头空窗，用户全程看「翻译中…」）。
+      // 判据补上「DOM 里还挂着 pending 标记」就清。
+      var pendingStuck = state.renderer && state.renderer.querySelector(".dualsub-pending");
+      if (state.lastHitCueIdx !== -1 || lastRenderedKey !== "" || pendingStuck) {
         state.lastHitCueIdx = -1;
         setRendererText("", "", false);
         if (state.renderer) {
