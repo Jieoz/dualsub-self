@@ -4480,7 +4480,9 @@
       var rawUrl = String(raw.url == null ? "" : raw.url);
       if (!rawUrl || rawUrl.length > 8192) return rejectManifest("file[" + i + "]-url");
       var parsed;
-      try { parsed = new URL(rawUrl); } catch (e) { return rejectManifest("file[" + i + "]-url-parse"); }
+      try { parsed = new URL(rawUrl); }
+      // fail-soft-ok: 拒收原因经 rejectReason 上报给调用方 console.warn，非静默吞错（静态门禁无法识别该参数路径）。
+      catch (e) { return rejectManifest("file[" + i + "]-url-parse"); }
       var host = String(parsed.hostname || "").toLowerCase();
       if (parsed.protocol !== "https:" || !adapter.trustedHostRe.test(host) ||
         !adapter.pathRe.test(parsed.pathname)) return rejectManifest("file[" + i + "]-host-or-path");
