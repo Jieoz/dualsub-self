@@ -22,9 +22,9 @@
 
 ## 安装（加载已解压的扩展程序）
 
-当前版本：**v0.11.8**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.11.8) 下载 Chrome MV3 安装包。
+当前版本：**v0.11.9**。可从 [GitHub Releases](https://github.com/Jieoz/dualsub-self/releases/tag/v0.11.9) 下载 Chrome MV3 安装包。
 
-v0.11.8 把播放中的「翻译中…」残留清零（真机三轮各 ~100s 逐 400ms 采样：0/245、0/245、0/270）：
+v0.11.9 = v0.11.8 全部内容（四层修复 + 四项打磨）：
 
 - **续播压制失效**：YouTube 播放器会自动顶回单次 `pause()`，play 事件守卫也会被逃逸。改为 250ms 轮询保持，首块+邻居译文落地前视频稳定停在当前帧。
 - **放行门槛漏邻居**：clip0 一到就恢复播放，此刻常已越过 clip0 而 clip1 在飞 → 立刻又看十几秒「翻译中」。门槛统一为 clip0+clip1 都就绪，deadline 与门槛对齐。
